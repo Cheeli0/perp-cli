@@ -865,7 +865,9 @@ export class HyperliquidAdapter implements ExchangeAdapter {
     };
     // No "dex" field needed — the global asset index (110000+) encodes the dex
 
-    return this._signAndSendAction(action);
+    const result = await this._signAndSendAction(action);
+    this._validateVenueAck(result, "order");
+    return result;
   }
 
   async limitOrder(symbol: string, side: "buy" | "sell", price: string, size: string, opts?: { reduceOnly?: boolean; tif?: string }) {
@@ -903,6 +905,9 @@ export class HyperliquidAdapter implements ExchangeAdapter {
       type: "cancel",
       cancels: [{ a: assetIndex, o: parseInt(orderId) }],
     });
+    // A refused cancel (already filled, unknown oid) also comes back under an
+    // "ok" envelope — without this the user is told the order was cancelled.
+    this._validateVenueAck(result, `cancel ${orderId}`);
     await this._invalidateAccountCache();
     return result;
   }
@@ -923,12 +928,12 @@ export class HyperliquidAdapter implements ExchangeAdapter {
     const results = [];
     for (const o of toCancel) {
       const assetIndex = await this.getAssetIndex(o.symbol);
-      results.push(
-        await this._signAndSendAction({
-          type: "cancel",
-          cancels: [{ a: assetIndex, o: parseInt(o.orderId) }],
-        })
-      );
+      const res = await this._signAndSendAction({
+        type: "cancel",
+        cancels: [{ a: assetIndex, o: parseInt(o.orderId) }],
+      });
+      this._validateVenueAck(res, `cancel ${o.orderId}`);
+      results.push(res);
     }
     return results;
   }
@@ -1123,7 +1128,9 @@ export class HyperliquidAdapter implements ExchangeAdapter {
       grouping: opts?.grouping ?? "positionTpsl",
     };
 
-    return this._signAndSendAction(action);
+    const result = await this._signAndSendAction(action);
+    this._validateVenueAck(result, `${tpsl.toUpperCase()} trigger order for ${symbol.toUpperCase()}`);
+    return result;
   }
 
   /**
@@ -1270,32 +1277,39 @@ export class HyperliquidAdapter implements ExchangeAdapter {
   }
 
   /**
-   * Validate that a batchModify actually took.
+   * Validate that the venue actually accepted an order/cancel/modify action.
    *
-   * HL returns the envelope `status: "ok"` even when the individual modify was
-   * rejected — the real verdict is per-order in `response.data.statuses[]`.
-   * `_signAndSendAction` only throws on the envelope, so without this check a
-   * rejected edit (crossing price, trigger order, stale oid) was reported to the
-   * user as a green success.
+   * HL returns the envelope `status: "ok"` even when the individual entry was
+   * rejected — the real verdict is per-entry in `response.data.statuses[]`,
+   * where an accepted entry is `{filled}` / `{resting}` / the string "success"
+   * and a rejected one is `{error: "..."}`. `_signAndSendAction` only throws on
+   * the ENVELOPE, so every path that skipped this check reported a rejection to
+   * the user as a green success.
    */
-  private _validateModifyResult(result: unknown, orderId: number): void {
-    const r = result as { response?: { data?: { statuses?: Array<Record<string, unknown>> } } };
+  private _validateVenueAck(result: unknown, what: string): void {
+    const r = result as { response?: { data?: { statuses?: unknown[] } } };
     const statuses = r?.response?.data?.statuses;
-    if (!statuses || statuses.length === 0) {
+    if (!Array.isArray(statuses) || statuses.length === 0) {
       throw new PerpError(
         "EXCHANGE_ERROR",
-        `Hyperliquid modify ${orderId}: no order status in response`,
+        `Hyperliquid ${what}: no order status in response`,
         { exchange: "hyperliquid" },
       );
     }
-    const st = statuses[0];
-    if (st.error) {
+    const errors = statuses
+      .map((s) => (s && typeof s === "object" ? (s as Record<string, unknown>).error : undefined))
+      .filter((e): e is string => typeof e === "string" && e.length > 0);
+    if (errors.length > 0) {
       throw new PerpError(
         "EXCHANGE_ERROR",
-        `Hyperliquid modify ${orderId} rejected: ${String(st.error)}`,
+        `Hyperliquid ${what} rejected: ${errors.join("; ")}`,
         { exchange: "hyperliquid" },
       );
     }
+  }
+
+  private _validateModifyResult(result: unknown, orderId: number): void {
+    this._validateVenueAck(result, `modify ${orderId}`);
   }
 
   /**

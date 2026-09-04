@@ -1,7 +1,7 @@
 import { Command } from "commander";
 import type { ExchangeAdapter } from "../exchanges/index.js";
 import { printJson, errorAndExit, withJsonErrors, jsonOk, jsonError, symbolMatch, formatUsd } from "../utils.js";
-import { extractErrorMessage } from "../errors.js";
+import { extractErrorMessage, PerpError } from "../errors.js";
 import { logExecution } from "../execution-log.js";
 import { validateTrade, enforceOrderRisk } from "../trade-validator.js";
 import { generateClientId, logClientId, isOrderDuplicate } from "../client-id-tracker.js";
@@ -567,33 +567,55 @@ export function registerTradeCommands(
         if (isJson()) return printJson(jsonOk(result));
         console.log(chalk.green(`\n  TP/SL set for ${symbol.toUpperCase()} on Pacifica.\n`));
       } else if (isTriggerOrderCapable(adapter)) {
-        // HL uses trigger orders for TP/SL
+        // HL uses trigger orders for TP/SL. TP and SL are TWO separate exchange
+        // actions, so they are NOT atomic: if the second is rejected the first
+        // is already resting. Report which legs actually landed instead of
+        // failing with a bare error that hides the half-set bracket.
         const results: unknown[] = [];
+        const placed: string[] = [];
         const posSize = opts.size || "0"; // 0 = full position via positionTpsl grouping
 
-        if (opts.tp) {
-          results.push(
-            await adapter.triggerOrder(
-              symbol.toUpperCase(),
-              s === "buy" ? "sell" : "buy", // Close opposite side
-              posSize,
-              opts.tp,
-              "tp",
-              { isMarket: !opts.tpLimit, reduceOnly: true, grouping: "positionTpsl" }
-            )
-          );
-        }
-        if (opts.sl) {
-          results.push(
-            await adapter.triggerOrder(
-              symbol.toUpperCase(),
-              s === "buy" ? "sell" : "buy",
-              posSize,
-              opts.sl,
-              "sl",
-              { isMarket: true, reduceOnly: true, grouping: "positionTpsl" }
-            )
-          );
+        try {
+          if (opts.tp) {
+            results.push(
+              await adapter.triggerOrder(
+                symbol.toUpperCase(),
+                s === "buy" ? "sell" : "buy", // Close opposite side
+                posSize,
+                opts.tp,
+                "tp",
+                { isMarket: !opts.tpLimit, reduceOnly: true, grouping: "positionTpsl" }
+              )
+            );
+            placed.push(`TP @ ${opts.tp}`);
+          }
+          if (opts.sl) {
+            results.push(
+              await adapter.triggerOrder(
+                symbol.toUpperCase(),
+                s === "buy" ? "sell" : "buy",
+                posSize,
+                opts.sl,
+                "sl",
+                { isMarket: true, reduceOnly: true, grouping: "positionTpsl" }
+              )
+            );
+            placed.push(`SL @ ${opts.sl}`);
+          }
+        } catch (err) {
+          const msg = extractErrorMessage(err);
+          if (placed.length > 0) {
+            throw new PerpError(
+              "APPROVE_PARTIAL",
+              `TP/SL only partially set on ${symbol.toUpperCase()}: ${placed.join(", ")} placed, then failed — ${msg}`,
+              {
+                exchange: adapter.name,
+                placed,
+                remediation: `The position is protected on one side only. Inspect with: perp trade orders -e ${adapter.name}, then place the missing leg or cancel the placed one.`,
+              },
+            );
+          }
+          throw err;
         }
         if (isJson()) return printJson(jsonOk(results));
         console.log(chalk.green(`\n  TP/SL set for ${symbol.toUpperCase()} on Hyperliquid.\n`));

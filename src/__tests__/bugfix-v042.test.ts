@@ -253,3 +253,72 @@ describe("BUG 7: cli-spec reads version from package.json", () => {
     expect(spec.version).toBe(pkg.version);
   });
 });
+
+/**
+ * Every HL action path must check the PER-ENTRY verdict, not just the envelope.
+ *
+ * HL answers `status:"ok"` even when the individual order/cancel/trigger was
+ * rejected — the real verdict is `response.data.statuses[]`, where acceptance is
+ * `{filled}` / `{resting}` / the string "success" and rejection is `{error}`.
+ * `_signAndSendAction` throws only on the envelope, so limit orders, trigger
+ * (TP/SL) orders and cancels all reported rejections to the user as success.
+ * `trade scale-tp` even logged status "success" and printed an OK column,
+ * because its per-level try/catch never saw a thrown error.
+ */
+describe("HL per-entry acknowledgement is validated on every action path", () => {
+  const OK = (statuses) => ({ status: "ok", response: { type: "order", data: { statuses } } });
+  const REJECT = OK([{ error: "Order price cannot be more than 95% away from the reference price" }]);
+
+  const mkAdapter = async (sendResult) => {
+    const mod = await import("../exchanges/hyperliquid.js");
+    const adapter = Object.create(mod.HyperliquidAdapter.prototype);
+    adapter.ensureSigner = vi.fn();
+    adapter.getAssetIndex = vi.fn().mockResolvedValue(1);
+    adapter.getSzDecimals = vi.fn().mockReturnValue(2);
+    adapter._hlRoundPrice = (n) => String(n);
+    adapter._invalidateAccountCache = vi.fn();
+    adapter._signAndSendAction = vi.fn().mockResolvedValue(sendResult);
+    return adapter;
+  };
+
+  it("limitOrder throws when the venue rejects the order", async () => {
+    const adapter = await mkAdapter(REJECT);
+    await expect(adapter.limitOrder("ETH", "buy", "3000", "0.1")).rejects.toThrow(/order rejected: Order price/);
+  });
+
+  it("limitOrder resolves when the order rests", async () => {
+    const adapter = await mkAdapter(OK([{ resting: { oid: 5 } }]));
+    await expect(adapter.limitOrder("ETH", "buy", "3000", "0.1")).resolves.toBeDefined();
+  });
+
+  it("triggerOrder (TP/SL) throws when the venue rejects it", async () => {
+    const adapter = await mkAdapter(REJECT);
+    await expect(
+      adapter.triggerOrder("ETH", "sell", "0.1", "4000", "tp", { reduceOnly: true }),
+    ).rejects.toThrow(/TP trigger order for ETH rejected/);
+  });
+
+  it("triggerOrder names the SL leg distinctly so a half-set bracket is legible", async () => {
+    const adapter = await mkAdapter(REJECT);
+    await expect(
+      adapter.triggerOrder("ETH", "sell", "0.1", "2000", "sl", { reduceOnly: true }),
+    ).rejects.toThrow(/SL trigger order for ETH rejected/);
+  });
+
+  it("cancelOrder throws when the cancel is refused (already filled / unknown oid)", async () => {
+    const adapter = await mkAdapter(OK([{ error: "Order was never placed, already canceled, or filled" }]));
+    await expect(adapter.cancelOrder("ETH", "42")).rejects.toThrow(/cancel 42 rejected/);
+  });
+
+  it("cancelOrder accepts the plain \"success\" status string", async () => {
+    // HL cancels answer with a bare string, not an object — it must not be
+    // mistaken for a rejection.
+    const adapter = await mkAdapter(OK(["success"]));
+    await expect(adapter.cancelOrder("ETH", "42")).resolves.toBeDefined();
+  });
+
+  it("throws when the response carries no statuses at all", async () => {
+    const adapter = await mkAdapter({ status: "ok", response: { type: "order", data: { statuses: [] } } });
+    await expect(adapter.limitOrder("ETH", "buy", "3000", "0.1")).rejects.toThrow(/no order status in response/);
+  });
+});
