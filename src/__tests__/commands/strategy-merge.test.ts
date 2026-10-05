@@ -20,6 +20,7 @@ import { existsSync, mkdirSync, rmSync } from "fs";
 import { resolve } from "path";
 import os from "os";
 import { Command } from "commander";
+import { addRootSafetyOptions, honorsDryRun } from "../../cli-flags.js";
 
 // ── Stable temp-dir for settings I/O ──────────────────────────────────────
 
@@ -35,6 +36,7 @@ const { registerBackgroundCommands } = await import("../../commands/jobs.js");
 
 function makeProgram() {
   const prog = new Command();
+  addRootSafetyOptions(prog);
   prog.exitOverride();
   // Tolerate stray text on stderr/stdout from action handlers without
   // polluting test output (we only inspect topology, not behavior).
@@ -103,14 +105,15 @@ describe("strategy merge — top-level commands consolidated under strategy", ()
     expect(args).toContain("file");
   });
 
-  it("`strategy plan execute` accepts --dry-run", () => {
+  it("`strategy plan execute` honors the root --dry-run (no local copy the root would swallow)", () => {
     const prog = makeProgram();
     const strategy = prog.commands.find((c) => c.name() === "strategy")!;
     const plan = strategy.commands.find((c) => c.name() === "plan")!;
     const execute = plan.commands.find((c) => c.name() === "execute");
     expect(execute).toBeTruthy();
     const optionLongFlags = execute!.options.map((o) => o.long).filter(Boolean);
-    expect(optionLongFlags).toContain("--dry-run");
+    expect(optionLongFlags).not.toContain("--dry-run");
+    expect(honorsDryRun(execute!)).toBe(true);
   });
 
   it("`strategy plan example` is reachable (no required args)", () => {

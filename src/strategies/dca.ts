@@ -1,4 +1,6 @@
+import { assertCanClosePositions } from "../exchanges/trading-v2.js";
 import type { ExchangeAdapter } from "../exchanges/index.js";
+import { resolveAdapterSlippage } from "../exchanges/slippage.js";
 import { updateJobState } from "../jobs.js";
 
 export interface DCAParams {
@@ -27,6 +29,7 @@ export async function runDCA(
   jobId?: string,
   log: (msg: string) => void = console.log,
 ): Promise<{ ordersPlaced: number; totalFilled: number; avgPrice: number; runtime: number }> {
+  assertCanClosePositions(adapter, `DCA on ${adapter.name}`);
   const { symbol, side, amountPerOrder, intervalSec, totalOrders } = params;
   const maxRuntime = (params.maxRuntime ?? 0) * 1000;
 
@@ -90,7 +93,7 @@ export async function runDCA(
 
       // Place market order
       try {
-        const result = await adapter.marketOrder(symbol, side, String(amountPerOrder)) as Record<string, unknown>;
+        const result = await adapter.marketOrder(symbol, side, String(amountPerOrder), { reduceOnly: false, slippage: resolveAdapterSlippage(adapter, null) }) as Record<string, unknown>;
         state.ordersPlaced++;
         state.totalFilled += amountPerOrder;
 

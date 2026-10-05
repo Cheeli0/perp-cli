@@ -87,6 +87,9 @@ async function buildAdapter() {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+// marketOrder opts are required (interface.ts, design §13.2): reduceOnly + resolved slippage.
+const MARKET_OPTS = { reduceOnly: false, slippage: { bps: 50, source: "default" as const } };
+
 describe("AsterAdapter — three-tier signer routing", () => {
   beforeEach(() => {
     vi.resetAllMocks();
@@ -113,8 +116,12 @@ describe("AsterAdapter — three-tier signer routing", () => {
     const meta = makeAgentMeta();
     const agentStrat = makeAgentStrategy(meta.agentEvmAddress);
     ast.setAgent(meta, agentStrat);
+    // The protection price (mark ± bound, tick-aligned) reads public market data; stub it —
+    // this test is about which signer signs the order.
+    (ast as unknown as { computeProtectionPrice: unknown }).computeProtectionPrice =
+      vi.fn().mockResolvedValue({ referencePrice: "60000", protectionPrice: "60300", appliedBps: 50 });
 
-    await ast.marketOrder("BTC", "buy", "0.001");
+    await ast.marketOrder("BTC", "buy", "0.001", MARKET_OPTS);
 
     expect(ast.activeSignerTier).toBe("agent");
     expect(agentStrat.signTypedData).toHaveBeenCalled();
@@ -131,7 +138,7 @@ describe("AsterAdapter — three-tier signer routing", () => {
 
     let err: unknown;
     try {
-      await ast.marketOrder("BTC", "buy", "0.001");
+      await ast.marketOrder("BTC", "buy", "0.001", MARKET_OPTS);
     } catch (e) {
       err = e;
     }
@@ -154,7 +161,7 @@ describe("AsterAdapter — three-tier signer routing", () => {
 
     let err: unknown;
     try {
-      await ast.marketOrder("BTC", "buy", "0.001");
+      await ast.marketOrder("BTC", "buy", "0.001", MARKET_OPTS);
     } catch (e) {
       err = e;
     }
@@ -182,7 +189,7 @@ describe("AsterAdapter — three-tier signer routing", () => {
 
     let err: unknown;
     try {
-      await ast.marketOrder("BTC", "buy", "0.001");
+      await ast.marketOrder("BTC", "buy", "0.001", MARKET_OPTS);
     } catch (e) {
       err = e;
     }
@@ -203,7 +210,7 @@ describe("AsterAdapter — three-tier signer routing", () => {
 
     let err: unknown;
     try {
-      await ast.marketOrder("BTC", "buy", "0.001");
+      await ast.marketOrder("BTC", "buy", "0.001", MARKET_OPTS);
     } catch (e) {
       err = e;
     }
@@ -223,7 +230,7 @@ describe("AsterAdapter — three-tier signer routing", () => {
 
     let err: unknown;
     try {
-      await ast.marketOrder("BTC", "buy", "0.001");
+      await ast.marketOrder("BTC", "buy", "0.001", MARKET_OPTS);
     } catch (e) {
       err = e;
     }
@@ -249,7 +256,7 @@ describe("AsterAdapter — three-tier signer routing", () => {
 
     let err: unknown;
     try {
-      await ast.marketOrder("BTC", "buy", "0.001");
+      await ast.marketOrder("BTC", "buy", "0.001", MARKET_OPTS);
     } catch (e) {
       err = e;
     }
@@ -261,7 +268,7 @@ describe("AsterAdapter — three-tier signer routing", () => {
   });
 
   // ─── Test 7: AGENT_EXPIRED + master also throws (no master-self-sign path) ──
-  it("expired agent + master throws NOT_IMPLEMENTED (Aster requires fresh agent)", async () => {
+  it("expired agent + master throws AGENT_EXPIRED (no fall-through to the master tier)", async () => {
     const AsterAdapter = await buildAdapter();
     const ast = new AsterAdapter(undefined, false);
     await ast.init();
@@ -277,15 +284,14 @@ describe("AsterAdapter — three-tier signer routing", () => {
 
     let err: unknown;
     try {
-      await ast.marketOrder("BTC", "buy", "0.001");
+      await ast.marketOrder("BTC", "buy", "0.001", MARKET_OPTS);
     } catch (e) {
       err = e;
     }
 
     expect(err).toBeDefined();
     const e = err as { structured?: { code: string; remediation?: string } };
-    // Tier 1 falls through (expired) → Tier 2/3 rejected → NOT_IMPLEMENTED
-    expect(e.structured?.code ?? "").toBe("NOT_IMPLEMENTED");
+    expect(e.structured?.code ?? "").toBe("AGENT_EXPIRED");
     expect(masterSigner.signTypedData).not.toHaveBeenCalled();
     expect(agentStrat.signTypedData).not.toHaveBeenCalled();
   });
@@ -391,7 +397,7 @@ describe("AsterAdapter — AC-19 remediation fields", () => {
 
     let err: unknown;
     try {
-      await ast.marketOrder("BTC", "buy", "0.001");
+      await ast.marketOrder("BTC", "buy", "0.001", MARKET_OPTS);
     } catch (e) {
       err = e;
     }
@@ -417,7 +423,7 @@ describe("AsterAdapter — AC-19 remediation fields", () => {
 
     let err: unknown;
     try {
-      await ast.marketOrder("BTC", "buy", "0.001");
+      await ast.marketOrder("BTC", "buy", "0.001", MARKET_OPTS);
     } catch (e) {
       err = e;
     }
@@ -429,10 +435,10 @@ describe("AsterAdapter — AC-19 remediation fields", () => {
     expect(e.structured?.remediation ?? "").toContain("--rotate");
   });
 
-  it("withdraw without master throws NO_SIGNER_AVAILABLE with remediation", async () => {
+  it("withdraw on testnet is the uniform CAPABILITY_UNSUPPORTED (mainnet only; venue withdrawAssets = USDT)", async () => {
     makeInitFetch();
     const { AsterAdapter } = await import("../../exchanges/aster.js");
-    const ast = new AsterAdapter(undefined, false);
+    const ast = new AsterAdapter(undefined, true);
     await ast.init();
 
     let err: unknown;
@@ -445,8 +451,10 @@ describe("AsterAdapter — AC-19 remediation fields", () => {
     expect(err).toBeDefined();
     const e = err as { structured?: { code: string; remediation?: string } };
     expect(e.structured).toBeDefined();
-    expect(e.structured?.code ?? "").toBe("NO_SIGNER_AVAILABLE");
-    expect(e.structured?.remediation ?? "").toContain("--ows");
+    expect(e.structured?.code ?? "").toBe("CAPABILITY_UNSUPPORTED");
+    expect(e.structured?.remediation ?? "").toContain("without -n testnet");
+    const { asterVenue } = await import("../../exchanges/venues/aster.js");
+    expect(asterVenue.capabilities?.withdrawAssets).toEqual(["USDT"]);
   });
 });
 
@@ -621,6 +629,32 @@ describe("AsterAdapter — venue JSON error envelope validation (Rule #2)", () =
       err = e;
     }
     expect(err).toBeDefined();
+  });
+
+  // asterdex/api-docs futures V3 "Cancel All Open Orders (TRADE)" response.
+  it("cancelAllOrders accepts the documented {\"code\": \"200\"} success", async () => {
+    const done = { code: "200", msg: "The operation of cancel all open order is done." };
+    stubInitThen(done);
+
+    const { AsterAdapter } = await import("../../exchanges/aster.js");
+    const ast = new AsterAdapter(undefined, false);
+    await ast.init();
+    const meta = makeAgentMeta();
+    ast.setAgent(meta, makeAgentStrategy(meta.agentEvmAddress));
+
+    await expect(ast.cancelAllOrders("BTC")).resolves.toEqual(done);
+  });
+
+  it("a {\"code\": 0} envelope is not a documented success and throws", async () => {
+    stubInitThen({ code: 0, msg: "Unknown property" });
+
+    const { AsterAdapter } = await import("../../exchanges/aster.js");
+    const ast = new AsterAdapter(undefined, false);
+    await ast.init();
+    const meta = makeAgentMeta();
+    ast.setAgent(meta, makeAgentStrategy(meta.agentEvmAddress));
+
+    await expect(ast.cancelAllOrders("BTC")).rejects.toMatchObject({ structured: { details: { venueCode: 0 } } });
   });
 
   it("signed GET accepts array responses (e.g. /openOrders empty list)", async () => {

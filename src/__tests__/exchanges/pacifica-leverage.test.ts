@@ -11,9 +11,13 @@ import { describe, it, expect, vi } from "vitest";
 import { Keypair } from "@solana/web3.js";
 import { PacificaAdapter } from "../../exchanges/pacifica.js";
 
-async function build(positions: Array<Record<string, unknown>>, prices: Array<{ symbol: string; mark: string }>) {
+async function build(positions: Array<Record<string, unknown>>, prices: Array<{ symbol: string; mark: string }>, marginSettings: unknown = []) {
   const pac = new PacificaAdapter(Keypair.generate(), "mainnet");
-  (pac as unknown as { client: unknown }).client = { setRequestAgentWallet: vi.fn() };
+  (pac as unknown as { client: unknown }).client = {
+    setRequestAgentWallet: vi.fn(),
+    // GET /account/settings: an object; `margin_settings` lists only non-default markets.
+    getAccountSettings: vi.fn().mockResolvedValue({ auto_lend_disabled: null, margin_settings: marginSettings, spot_settings: [] }),
+  };
   (pac as unknown as { _getPositions: () => Promise<unknown> })._getPositions = vi.fn().mockResolvedValue(positions);
   (pac as unknown as { _getPrices: () => Promise<unknown> })._getPrices = vi.fn().mockResolvedValue(prices);
   return pac;
@@ -62,8 +66,9 @@ describe("PacificaAdapter.getPositions — cross-margin leverage default", () =>
     positions: Array<Record<string, unknown>>,
     prices: Array<{ symbol: string; mark: string }>,
     markets: Array<{ symbol: string; maxLeverage: number }> | Error,
+    marginSettings: unknown = [],
   ) => {
-    const pac = await build(positions, prices);
+    const pac = await build(positions, prices, marginSettings);
     const getMarkets = markets instanceof Error
       ? vi.fn().mockRejectedValue(markets)
       : vi.fn().mockResolvedValue(markets);
@@ -95,14 +100,57 @@ describe("PacificaAdapter.getPositions — cross-margin leverage default", () =>
     expect(getMarkets).not.toHaveBeenCalled();
   });
 
-  it("falls back to 1 only when the market carries no max leverage", async () => {
+  it("no settings entry AND no market max → EXCHANGE_ERROR, never a fabricated 1x", async () => {
     const { pac } = await buildWithMarkets(
       [{ symbol: "WIF", side: "bid", amount: "1", entry_price: "2", margin: "0", isolated: false, mark_price: "2", unrealized_pnl: "0", liquidation_price: "1" }],
       [{ symbol: "WIF", mark: "2" }],
       [],
     );
+    await expect(pac.getPositions()).rejects.toMatchObject({ structured: { code: "EXCHANGE_ERROR" } });
+    await expect(pac.getPositions()).rejects.toThrow(/leverage cannot be determined/);
+  });
+
+  const ETH_CROSS = { symbol: "ETH", side: "bid", amount: "1", entry_price: "3000", margin: "0", isolated: false, mark_price: "3000", unrealized_pnl: "0", liquidation_price: "2000" };
+  const ETH_SETTING = { symbol: "ETH", isolated: false, leverage: 5, created_at: 1758085929703, updated_at: 1758086074002 };
+
+  it("a cross position uses the symbol's /account/settings leverage (ETH set to 5x), not the market max 50x", async () => {
+    // Live mainnet: `trade leverage ETH 5` → /account/settings ETH leverage 5, positions showed 50.
+    const { pac, getMarkets } = await buildWithMarkets([ETH_CROSS], [{ symbol: "ETH", mark: "3000" }], [{ symbol: "ETH", maxLeverage: 50 }], [ETH_SETTING]);
     const pos = await pac.getPositions();
-    expect(pos[0].leverage).toBe(1);
+    expect(pos[0].leverage).toBe(5);
+    expect(getMarkets).not.toHaveBeenCalled();
+  });
+
+  it("settings blank for the symbol = documented default (max leverage); another symbol's entry is not used", async () => {
+    const { pac } = await buildWithMarkets(
+      [ETH_CROSS, { ...ETH_CROSS, symbol: "BTC", entry_price: "60000", mark_price: "60000" }],
+      [{ symbol: "ETH", mark: "3000" }, { symbol: "BTC", mark: "60000" }],
+      [{ symbol: "ETH", maxLeverage: 50 }, { symbol: "BTC", maxLeverage: 40 }],
+      [ETH_SETTING],
+    );
+    const pos = await pac.getPositions();
+    expect(pos.map(p => [p.symbol, p.leverage])).toEqual([["ETH", 5], ["BTC", 40]]);
+  });
+
+  it("the position's own API leverage / isolated margin still win, and then settings are not read", async () => {
+    const { pac } = await buildWithMarkets(
+      [{ ...ETH_CROSS, leverage: 7 }, { ...ETH_CROSS, symbol: "BTC", entry_price: "60000", margin: "3000", isolated: true }],
+      [{ symbol: "ETH", mark: "3000" }, { symbol: "BTC", mark: "60000" }],
+      [{ symbol: "ETH", maxLeverage: 50 }],
+      [ETH_SETTING],
+    );
+    const pos = await pac.getPositions();
+    expect(pos.map(p => p.leverage)).toEqual([7, 20]);
+    expect((pac as unknown as { client: { getAccountSettings: ReturnType<typeof vi.fn> } }).client.getAccountSettings).not.toHaveBeenCalled();
+  });
+
+  it("a settings read failure or an unexpected shape (the old array model) propagates — no silent market-max", async () => {
+    const failing = await buildWithMarkets([ETH_CROSS], [{ symbol: "ETH", mark: "3000" }], [{ symbol: "ETH", maxLeverage: 50 }]);
+    (failing.pac as unknown as { client: { getAccountSettings: unknown } }).client.getAccountSettings = vi.fn().mockRejectedValue(new Error("GET /account/settings failed (500)"));
+    await expect(failing.pac.getPositions()).rejects.toThrow(/account\/settings failed/);
+    const legacy = await buildWithMarkets([ETH_CROSS], [{ symbol: "ETH", mark: "3000" }], [{ symbol: "ETH", maxLeverage: 50 }]);
+    (legacy.pac as unknown as { client: { getAccountSettings: unknown } }).client.getAccountSettings = vi.fn().mockResolvedValue([{ symbol: "ETH", margin_mode: "cross", leverage: 5 }]);
+    await expect(legacy.pac.getPositions()).rejects.toMatchObject({ structured: { code: "EXCHANGE_ERROR" } });
   });
 
   it("surfaces a markets fetch failure instead of silently defaulting to 1x", async () => {

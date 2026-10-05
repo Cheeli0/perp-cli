@@ -9,6 +9,11 @@ export interface MarketInfo {
   volume_24h: string;
   mark_price: string;
   index_price: string;
+  /** "perpetual" | "spot" (live /info rows). */
+  instrument_type: string;
+  base_asset: string;
+  /** USD notional minimum. */
+  min_order_size: string;
 }
 
 export interface PriceInfo {

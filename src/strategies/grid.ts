@@ -1,3 +1,4 @@
+import { assertCanClosePositions } from "../exchanges/trading-v2.js";
 import type { ExchangeAdapter } from "../exchanges/index.js";
 import { updateJobState } from "../jobs.js";
 
@@ -37,6 +38,7 @@ export async function runGrid(
   jobId?: string,
   log: (msg: string) => void = console.log,
 ): Promise<{ fills: number; totalPnl: number; runtime: number }> {
+  assertCanClosePositions(adapter, `Grid on ${adapter.name}`);
   const { symbol, upperPrice, lowerPrice, grids, totalSize } = params;
   const intervalMs = (params.intervalSec ?? 10) * 1000;
   const maxRuntime = (params.maxRuntime ?? 0) * 1000;

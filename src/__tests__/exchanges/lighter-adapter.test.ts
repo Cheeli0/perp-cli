@@ -1,6 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
 import { LighterAdapter } from "../../exchanges/lighter.js";
 import type { AgentMeta } from "../../settings.js";
+import { PerpError as mod_PerpError } from "../../errors.js";
+import { lighterFamilyNetworks } from "../../exchanges/venues/lighter-family.js";
 
 describe("LighterAdapter.withdraw — USDC 6-decimal scaling (P0 under-scale regression)", () => {
   function makeAdapter() {
@@ -9,7 +11,9 @@ describe("LighterAdapter.withdraw — USDC 6-decimal scaling (P0 under-scale reg
     (a as unknown as { ensureSigner: () => void }).ensureSigner = () => {};
     (a as unknown as { getNextNonce: () => Promise<number> }).getNextNonce = async () => 7;
     (a as unknown as { _signer: { signWithdraw: typeof signWithdraw } })._signer = { signWithdraw } as never;
-    (a as unknown as { sendTx: (s: unknown) => Promise<unknown> }).sendTx = async () => ({ ok: true });
+    (a as unknown as { sendTx: (s: unknown) => Promise<unknown> }).sendTx = async () => ({ code: 200, tx_hash: "ab" });
+    // The withdraw is polled to executed (M6); the poll itself is covered in premainnet/lighter.test.ts.
+    (a as unknown as { awaitTxExecuted: () => Promise<void> }).awaitTxExecuted = async () => {};
     return { a, signWithdraw };
   }
 
@@ -61,7 +65,9 @@ describe("LighterAdapter.getMarketIndex", () => {
 });
 
 describe("LighterAdapter.toTicks — size/price → integer ticks", () => {
-  type ToTicks = (symbol: string, size: number, price: number) => { baseAmount: number; priceTicks: number };
+  // toTicks takes the size as a decimal string and FLOORS it to the size step with exact
+  // decimal arithmetic (precision.ts floorSize) — never rounded up past the request.
+  type ToTicks = (symbol: string, size: string, price: string) => { baseAmount: number; priceTicks: number };
   function makeAdapter(): LighterAdapter {
     const a = new LighterAdapter("0xabc", true);
     // BTC: 5 size decimals (min size 0.00001), 1 price decimal (min price 0.1)
@@ -73,40 +79,44 @@ describe("LighterAdapter.toTicks — size/price → integer ticks", () => {
     (a as unknown as { toTicks: ToTicks }).toTicks.bind(a);
 
   it("converts size and price using the market's decimals", () => {
-    const { baseAmount, priceTicks } = toTicks(makeAdapter())("BTC", 0.001, 76000);
+    const { baseAmount, priceTicks } = toTicks(makeAdapter())("BTC", "0.001", "76000");
     expect(baseAmount).toBe(100);    // 0.001 * 1e5
     expect(priceTicks).toBe(760000); // 76000 * 1e1
   });
 
   it("is case-insensitive on the symbol lookup", () => {
-    const { baseAmount } = toTicks(makeAdapter())("btc", 0.001, 76000);
+    const { baseAmount } = toTicks(makeAdapter())("btc", "0.001", "76000");
     expect(baseAmount).toBe(100);
   });
 
-  it("rounds to the nearest integer tick", () => {
-    // 0.000014 * 1e5 = 1.4 → round → 1
-    const { baseAmount } = toTicks(makeAdapter())("BTC", 0.000014, 76000);
-    expect(baseAmount).toBe(1);
+  it("floors the size to the size step (never rounds up past the request)", () => {
+    // 0.000014 → floor to 0.00001 → 1 tick
+    expect(toTicks(makeAdapter())("BTC", "0.000014", "76000").baseAmount).toBe(1);
+    // 0.000019 would ROUND to 2 ticks (more than requested); floor keeps it at 1
+    expect(toTicks(makeAdapter())("BTC", "0.000019", "76000").baseAmount).toBe(1);
   });
 
   it("throws when market decimals are not loaded for the symbol", () => {
     const a = new LighterAdapter("0xabc", true);
-    expect(() => toTicks(a)("BTC", 0.001, 76000)).toThrow(/No market decimals loaded for BTC/);
+    expect(() => toTicks(a)("BTC", "0.001", "76000")).toThrow(/No market decimals loaded for BTC/);
   });
 
   it("throws when the size is below the market's precision (baseAmount rounds to 0)", () => {
-    // 0.000001 * 1e5 = 0.1 → round → 0, but size > 0 → dust guard
-    expect(() => toTicks(makeAdapter())("BTC", 0.000001, 76000))
+    // 0.000001 floors to 0 at step 0.00001 → SIZE_TOO_SMALL (dust guard)
+    expect(() => toTicks(makeAdapter())("BTC", "0.000001", "76000"))
       .toThrow(/Order size 0\.000001 too small for BTC \(sizeDecimals=5/);
   });
 
-  it("throws when the price is below the market's precision (priceTicks rounds to 0)", () => {
+  it("refuses an off-tick price instead of rounding it to the nearest tick (INVALID_TICK)", () => {
     const a = new LighterAdapter("0xabc", true);
     (a as unknown as { _marketDecimals: Map<string, { size: number; price: number }> })._marketDecimals =
       new Map([["TINY", { size: 2, price: 1 }]]);
-    // size 1 * 1e2 = 100 (ok); price 0.04 * 1e1 = 0.4 → round → 0 → guard
-    expect(() => toTicks(a)("TINY", 1, 0.04))
-      .toThrow(/Order price 0\.04 too small for TINY \(priceDecimals=1/);
+    // price tick 0.1: 0.04 and 76000.05 are off the grid — refused, never rounded (0 / 76000.1)
+    expect(() => toTicks(a)("TINY", "1", "0.04")).toThrow(/price 0\.04 is not on the price tick 0\.1/);
+    try { toTicks(a)("TINY", "1", "76000.05"); throw new Error("no throw"); } catch (e) {
+      expect((e as { structured?: { code?: string } }).structured?.code).toBe("INVALID_TICK");
+    }
+    expect(toTicks(a)("TINY", "1", "76000.1").priceTicks).toBe(760001);
   });
 });
 
@@ -146,9 +156,14 @@ describe("LighterAdapter._resolveSigner / activeSignerTier — 3-tier priority",
     expect(a.activeSignerTier).toBe("agent");
   });
 
-  it("falls back to 'pk' when the agent is expired but an evmKey exists", () => {
+  it("an expired agent is AGENT_EXPIRED even when an evmKey exists (no fall-through to the master tier)", () => {
     const a = new LighterAdapter("0xpk", true);
     a.setAgentSigner(makeMeta(past), "deadbeef");
+    expect(a.activeSignerTier).toBeNull();
+    expect(() => resolveSigner(a)()).toThrow(expect.objectContaining({ structured: expect.objectContaining({ code: "AGENT_EXPIRED" }) }));
+    // Trading paths say so too (init never loads an expired agent's key).
+    expect(() => (a as unknown as { ensureSigner(): void }).ensureSigner()).toThrow(expect.objectContaining({ structured: expect.objectContaining({ code: "AGENT_EXPIRED" }) }));
+    a.setNoAgent(true);
     expect(a.activeSignerTier).toBe("pk");
   });
 
@@ -195,9 +210,15 @@ describe("LighterAdapter.withdraw — non-USDC assets refuse instead of mis-scal
     const adapter = Object.create(mod.LighterAdapter.prototype);
     adapter.ensureSigner = vi.fn();
     adapter.getNextNonce = vi.fn().mockResolvedValue(1);
-    adapter.sendTx = vi.fn().mockResolvedValue({ ok: true });
+    adapter.sendTx = vi.fn().mockResolvedValue({ code: 200, tx_hash: "ab" });
+    adapter.awaitTxExecuted = vi.fn().mockResolvedValue(undefined);
     adapter._apiKeyIndex = 4;
     adapter._accountIndex = 42;
+    // Object.create bypasses the constructor: set the venue network config it would derive
+    // (collateral / collateralAssetIndex come from venues/lighter-family.ts, design §10).
+    adapter._network = lighterFamilyNetworks("lighter").mainnet;
+    adapter.venueId = "lighter";
+    adapter.name = "lighter";
     adapter._signer = { signWithdraw: vi.fn().mockResolvedValue({ txType: 13, txInfo: "{}" }) };
     return adapter;
   };
@@ -232,42 +253,141 @@ describe("LighterAdapter.withdraw — non-USDC assets refuse instead of mis-scal
 });
 
 /**
- * cancel-all must be IMMEDIATE.
+ * cancel-all is per-order on PERP markets only.
  *
- * CancelAllOrders carries its own TIF enum, distinct from the order TIF enum:
- * ImmediateCancelAll = 0 / ScheduledCancelAll = 1 / AbortScheduledCancelAll = 2
- * (lighter-go types/txtypes/constants.go:109-111). The adapter sent 1 with
- * time = now + 1h, which is a SCHEDULED cancel — nothing was cancelled at call
- * time, `trade cancel-all` and `trade flatten` still printed success, and an
- * hour later the schedule fired and wiped whatever was resting by then.
+ * The account-wide CancelAllOrders tx (market index 255) also cancels the account's SPOT orders,
+ * and its sendTx ack was reported as success without the tx being polled. cancelAllOrders now
+ * cancels each listed perp order and polls each cancel to executed (pre-mainnet review M6).
  */
-describe("LighterAdapter.cancelAllOrders — immediate, not scheduled", () => {
+describe("LighterAdapter.cancelAllOrders — per perp order, never the account-wide tx", () => {
   const buildAdapter = async () => {
     const mod = await import("../../exchanges/lighter.js");
     const adapter = Object.create(mod.LighterAdapter.prototype);
     adapter.ensureSigner = vi.fn();
-    adapter.getNextNonce = vi.fn().mockResolvedValue(7);
-    adapter.sendTx = vi.fn().mockResolvedValue({ ok: true });
-    adapter._apiKeyIndex = 4;
-    adapter._accountIndex = 42;
-    adapter._signer = { signCancelAllOrders: vi.fn().mockResolvedValue({ txType: 16, txInfo: "{}" }) };
+    adapter.getOpenOrders = vi.fn().mockResolvedValue([
+      { orderId: "10", symbol: "ETH" }, { orderId: "11", symbol: "BTC" },
+    ]);
+    adapter.cancelOrder = vi.fn(async (_s: string, id: string) => ({ code: 200, tx_hash: `h${id}` }));
+    adapter.awaitTxExecuted = vi.fn().mockResolvedValue(undefined);
+    adapter._signer = { signCancelAllOrders: vi.fn() };
     return adapter;
   };
 
-  it("signs ImmediateCancelAll (0), never ScheduledCancelAll (1)", async () => {
+  it("never signs CancelAllOrders (market 255); cancels each perp order and polls each tx", async () => {
     const adapter = await buildAdapter();
     await adapter.cancelAllOrders();
-    const arg = adapter._signer.signCancelAllOrders.mock.calls[0][0];
-    expect(arg.timeInForce).toBe(0);
+    expect(adapter._signer.signCancelAllOrders).not.toHaveBeenCalled();
+    expect(adapter.cancelOrder.mock.calls.map((c: unknown[]) => c[1])).toEqual(["10", "11"]);
+    expect(adapter.awaitTxExecuted).toHaveBeenCalledTimes(2);
   });
 
-  it("does not schedule the cancel into the future", async () => {
+  it("a cancel tx that is not executed surfaces (never a silent success)", async () => {
     const adapter = await buildAdapter();
-    await adapter.cancelAllOrders();
-    const arg = adapter._signer.signCancelAllOrders.mock.calls[0][0];
-    // A non-zero future `time` combined with TIF 1 is precisely the dead-man
-    // switch shape that made cancel-all a no-op.
-    expect(arg.time).toBe(0);
+    adapter.awaitTxExecuted = vi.fn().mockRejectedValue(new mod_PerpError("ORDER_PENDING", "tx not executed"));
+    await expect(adapter.cancelAllOrders("ETH")).rejects.toMatchObject({ structured: { code: "ORDER_PENDING" } });
+    expect(adapter.cancelOrder).toHaveBeenCalledTimes(1);
+  });
+
+  it("a failed cancel does not stop the rest: every order is attempted, the error carries per-order results", async () => {
+    const adapter = await buildAdapter();
+    adapter.name = "lighter";
+    adapter.cancelOrder = vi.fn(async (_s: string, id: string) => {
+      if (id === "10") throw new mod_PerpError("ORDER_REJECTED", "order not found");
+      return { code: 200, tx_hash: `h${id}` };
+    });
+    const err = await adapter.cancelAllOrders().catch((e: unknown) => e) as InstanceType<typeof mod_PerpError>;
+    expect(adapter.cancelOrder).toHaveBeenCalledTimes(2);
+    expect(err.structured.code).toBe("ORDER_PARTIAL");
+    expect(err.structured.details?.results).toEqual([
+      { orderId: "10", symbol: "ETH", cancelled: false, code: "ORDER_REJECTED", error: "order not found" },
+      { orderId: "11", symbol: "BTC", cancelled: true, code: null, error: null },
+    ]);
+  });
+
+  it("nothing cancelled: all definite refusals → ORDER_REJECTED, an unknown outcome → ORDER_PENDING", async () => {
+    const adapter = await buildAdapter();
+    adapter.name = "lighter";
+    adapter.cancelOrder = vi.fn().mockRejectedValue(new mod_PerpError("ORDER_REJECTED", "refused"));
+    await expect(adapter.cancelAllOrders()).rejects.toMatchObject({ structured: { code: "ORDER_REJECTED" } });
+    adapter.cancelOrder = vi.fn().mockRejectedValue(new mod_PerpError("ORDER_PENDING", "unknown"));
+    await expect(adapter.cancelAllOrders()).rejects.toMatchObject({ structured: { code: "ORDER_PENDING" } });
+  });
+});
+
+describe("LighterAdapter docs alignment (apidocs.lighter.xyz)", () => {
+  it("updateLeverage truncates 10000/leverage like the official SDK int()", async () => {
+    const mod = await import("../../exchanges/lighter.js");
+    const adapter = Object.create(mod.LighterAdapter.prototype);
+    adapter.ensureSigner = vi.fn();
+    adapter.ensureMarketMap = vi.fn();
+    adapter.getNextNonce = vi.fn().mockResolvedValue(1);
+    adapter.getMarketIndex = vi.fn().mockReturnValue(0);
+    adapter._signer = { signUpdateLeverage: vi.fn().mockResolvedValue({ txType: 20, txInfo: "{}" }) };
+    adapter.sendTx = vi.fn().mockResolvedValue({ code: 200 });
+    adapter.awaitTxExecuted = vi.fn();
+    await adapter.updateLeverage("ETH", 3); // 3333.33 → 3333
+    await adapter.updateLeverage("ETH", 7); // 1428.57 → 1428 (Math.round gave 1429)
+    expect(adapter._signer.signUpdateLeverage.mock.calls.map((c: Array<{ fraction: number }>) => c[0].fraction)).toEqual([3333, 1428]);
+  });
+
+  it("getOpenOrders is one request for all perp markets; an order on an unlisted market_index throws", async () => {
+    const mod = await import("../../exchanges/lighter.js");
+    const adapter = Object.create(mod.LighterAdapter.prototype);
+    Object.assign(adapter, { _address: "0xabc", _accountIndex: 5, _readOnly: false, venueId: "lighter-rh", name: "lighter-rh" });
+    adapter._marketMap = new Map([["ETH", 0], ["BTC", 1]]);
+    adapter.ensureMarketMap = vi.fn();
+    const row = (id: string, market: number) => ({ order_id: id, market_index: market, is_ask: true, price: "2", initial_base_amount: "1", filled_base_amount: "0", status: "open", type: "limit" });
+    adapter.restGetAuth = vi.fn().mockResolvedValue({ orders: [row("1", 0), row("2", 1)] });
+    expect((await adapter.getOpenOrders()).map((o: { symbol: string }) => o.symbol)).toEqual(["ETH", "BTC"]);
+    expect(adapter.restGetAuth).toHaveBeenCalledTimes(1);
+    adapter.restGetAuth = vi.fn().mockResolvedValue({ orders: [row("3", 77)] });
+    await expect(adapter.getOpenOrders()).rejects.toMatchObject({ structured: { code: "EXCHANGE_ERROR" } });
+    adapter.restGetAuth = vi.fn().mockResolvedValue({ code: 200 });
+    await expect(adapter.getOpenOrders()).rejects.toMatchObject({ structured: { code: "EXCHANGE_ERROR" } });
+  });
+
+  it("lighterPostSendTx: a timeout after the send is ORDER_PENDING", async () => {
+    const mod = await import("../../exchanges/lighter.js");
+    const fetchMock = vi.fn().mockRejectedValue(Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" }));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await expect(mod.lighterPostSendTx("https://lt.test", { txType: 14, txInfo: "{}" }, "lighter", "order", "order"))
+        .rejects.toMatchObject({ structured: { code: "ORDER_PENDING" } });
+      expect(fetchMock.mock.calls[0][1].signal).toBeInstanceOf(AbortSignal);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe("LighterSpotAdapter docs alignment", () => {
+  const spotFor = async (lt: Record<string, unknown>) => {
+    const { LighterSpotAdapter } = await import("../../exchanges/lighter-spot.js");
+    const spot = Object.create(LighterSpotAdapter.prototype);
+    spot._lt = lt;
+    spot.name = "lighter";
+    return spot;
+  };
+
+  it("self-transfer signs the fee read from transferFeeInfo (charged on top, must match exactly)", async () => {
+    const signTransfer = vi.fn().mockReturnValue({ txType: 12, txInfo: "{}" });
+    const spot = await spotFor({ isReadOnly: false, accountIndex: 7, collateralAssetIndex: 3, collateralSymbol: "USDC", _apiKeyIndex: 2, signer: { signTransfer } });
+    spot._restGetAuth = vi.fn().mockResolvedValue({ code: 200, transfer_fee_usdc: 1500 });
+    spot._getNextNonce = vi.fn().mockResolvedValue(9);
+    spot._sendTx = vi.fn().mockResolvedValue({ code: 200 });
+    await spot.transferToSpot("5", "USDC");
+    expect(spot._restGetAuth).toHaveBeenCalledWith("/transferFeeInfo", { account_index: "7", to_account_index: "7" });
+    expect(signTransfer.mock.calls[0][0]).toMatchObject({ amount: 5_000_000, usdcFee: 1500, fromRouteType: 0, toRouteType: 1 });
+  });
+
+  it("an unusable transferFeeInfo answer sends nothing", async () => {
+    const signTransfer = vi.fn();
+    const spot = await spotFor({ isReadOnly: false, accountIndex: 7, collateralAssetIndex: 3, collateralSymbol: "USDC", _apiKeyIndex: 2, signer: { signTransfer } });
+    spot._restGetAuth = vi.fn().mockResolvedValue({ code: 200 });
+    spot._sendTx = vi.fn();
+    await expect(spot.transferToPerp("5", "USDC")).rejects.toMatchObject({ structured: { code: "EXCHANGE_ERROR" } });
+    expect(signTransfer).not.toHaveBeenCalled();
+    expect(spot._sendTx).not.toHaveBeenCalled();
   });
 });
 
@@ -292,18 +412,22 @@ describe("LighterAdapter.marketOrder — reduceOnly is honoured", () => {
     adapter.ensureMarketMap = vi.fn();
     adapter.getNextNonce = vi.fn().mockResolvedValue(1);
     adapter.getMarketIndex = vi.fn().mockReturnValue(0);
-    adapter.getMarkPrice = vi.fn().mockResolvedValue(100);
+    adapter.getReferencePrice = vi.fn().mockResolvedValue(100);
     adapter.toTicks = vi.fn().mockReturnValue({ baseAmount: 1000, priceTicks: 200 });
-    adapter.nextClientOrderIndex = vi.fn().mockReturnValue(1);
+    adapter.protectionFor = vi.fn().mockReturnValue({ protection: {}, priceTicks: 200 });
+    adapter.clientOrderIndexFor = vi.fn().mockReturnValue(1);
     adapter.signOrder = vi.fn().mockResolvedValue({ txType: 14, txInfo: "{}" });
     adapter.sendTx = vi.fn().mockResolvedValue({ ok: true });
-    adapter._verifyFill = vi.fn();
+    adapter.awaitIocOutcome = vi.fn().mockResolvedValue({});
+    adapter.name = "lighter";
     return adapter;
   };
+  // marketOrder opts are required (interface.ts): reduceOnly + the resolved slippage bound.
+  const slippage = { bps: 50, source: "default" as const };
 
   it("sends reduceOnly=1 when the caller asks to reduce only", async () => {
     const adapter = await buildAdapter();
-    await adapter.marketOrder("BTC", "sell", "0.01", { reduceOnly: true }).catch(() => {});
+    await adapter.marketOrder("BTC", "sell", "0.01", { reduceOnly: true, slippage }).catch(() => {});
     expect(adapter.signOrder).toHaveBeenCalledWith(
       expect.objectContaining({ reduceOnly: 1, orderType: 1 }),
     );
@@ -311,15 +435,16 @@ describe("LighterAdapter.marketOrder — reduceOnly is honoured", () => {
 
   it("sends reduceOnly=0 for a normal entry", async () => {
     const adapter = await buildAdapter();
-    await adapter.marketOrder("BTC", "buy", "0.01").catch(() => {});
+    await adapter.marketOrder("BTC", "buy", "0.01", { reduceOnly: false, slippage }).catch(() => {});
     expect(adapter.signOrder).toHaveBeenCalledWith(
       expect.objectContaining({ reduceOnly: 0 }),
     );
   });
 
-  it("sends reduceOnly=0 when opts explicitly says false", async () => {
+  it("passes the resolved slippage bound to the protection price", async () => {
     const adapter = await buildAdapter();
-    await adapter.marketOrder("BTC", "buy", "0.01", { reduceOnly: false }).catch(() => {});
+    await adapter.marketOrder("BTC", "buy", "0.01", { reduceOnly: false, slippage }).catch(() => {});
+    expect(adapter.protectionFor).toHaveBeenCalledWith("BTC", "buy", 100, slippage, expect.anything());
     expect(adapter.signOrder).toHaveBeenCalledWith(
       expect.objectContaining({ reduceOnly: 0 }),
     );

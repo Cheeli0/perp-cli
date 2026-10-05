@@ -179,7 +179,13 @@ describe("wallet merge — relocated commands are reachable", () => {
     const prog = makeProgram();
     const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
-    await prog.parseAsync(["node", "perp", "wallet", "generate", "merge-test"]);
+    // Non-interactive: the passphrase must be explicit (empty = unencrypted vault wallet).
+    process.env.OWS_PASSPHRASE = "";
+    try {
+      await prog.parseAsync(["node", "perp", "wallet", "generate", "merge-test"]);
+    } finally {
+      delete process.env.OWS_PASSPHRASE;
+    }
 
     expect(mockOws.createWallet).toHaveBeenCalled();
     consoleSpy.mockRestore();

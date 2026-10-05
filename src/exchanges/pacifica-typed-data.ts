@@ -139,3 +139,26 @@ export function buildRevokeAllAgentsMessage(
     payload,
   };
 }
+
+/**
+ * Build the canonical JSON for `list_agent_wallets` (POST /agent/list).
+ * Payload is empty per the official SDK (`rest/api_agent_keys_detailed.py`
+ * `list_agent_wallets`), so the signed message nests `"data":{}`:
+ *   {"data":{},"expiry_window":5000,"timestamp":...,"type":"list_agent_wallets"}
+ */
+export function buildListAgentWalletsMessage(
+  params: { timestamp?: number; expiryWindow?: number } = {},
+): BuiltMessage {
+  const timestamp = params.timestamp ?? Date.now();
+  const expiryWindow = params.expiryWindow ?? DEFAULT_EXPIRY_WINDOW;
+  const type = "list_agent_wallets";
+  const payload: Record<string, unknown> = {};
+  const header = { type, timestamp, expiry_window: expiryWindow };
+  const wrapped = { ...header, data: payload };
+  const sorted = sortJsonKeys(wrapped);
+  return {
+    canonicalJson: JSON.stringify(sorted),
+    header,
+    payload,
+  };
+}

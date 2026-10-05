@@ -1,9 +1,11 @@
 import { Command } from "commander";
+import { listConfiguredAccountVenues } from "../config.js";
 import chalk from "chalk";
 import type { ExchangeAdapter } from "../exchanges/index.js";
 import { printJson, jsonOk, jsonError, makeTable, formatUsd, formatPnl, withJsonErrors } from "../utils.js";
 import { readExecutionLog, getExecutionStats, pruneExecutionLog } from "../execution-log.js";
 import { loadArbState } from "../arb/index.js";
+import { networkOf } from "../cli-flags.js";
 import { readPositionHistory, getPositionStats } from "../position-history.js";
 import {
   saveEquitySnapshot,
@@ -14,7 +16,6 @@ import {
   type EquitySnapshot,
 } from "../equity-tracker.js";
 
-const EXCHANGES = ["pacifica", "hyperliquid", "lighter", "aster"] as const;
 
 function parseSince(since?: string): string | undefined {
   if (!since) return undefined;
@@ -48,7 +49,7 @@ export function registerHistoryCommands(
   history
     .command("list")
     .description("Show recent executions")
-    .option("-n, --limit <n>", "Number of records to show", "20")
+    .option("--limit <n>", "Number of records to show", "20")
     .option("-e, --exchange <exchange>", "Filter by exchange")
     .option("-s, --symbol <symbol>", "Filter by symbol")
     .option("-t, --type <type>", "Filter by type (market_order, limit_order, arb_entry, etc.)")
@@ -179,7 +180,7 @@ export function registerHistoryCommands(
   history
     .command("positions")
     .description("Show position history (from event stream logging)")
-    .option("-n, --limit <n>", "Number of records to show", "20")
+    .option("--limit <n>", "Number of records to show", "20")
     .option("-e, --exchange <exchange>", "Filter by exchange")
     .option("-s, --symbol <symbol>", "Filter by symbol")
     .option("--status <status>", "Filter by status (open, closed, updated)")
@@ -400,12 +401,12 @@ function registerAnalyticsSubcommands(
     .option("-e, --exchange <exchanges>", "Comma-separated exchanges")
     .option("--period <duration>", "Time period: 7d, 30d, 90d, all (default: all)")
     .option("--since <period>", "Alias for --period")
-    .option("-n, --limit <n>", "History limit per exchange", "200")
+    .option("--limit <n>", "History limit per exchange", "200")
     .action(async (opts: { exchange?: string; period?: string; since?: string; limit: string }) => {
       await withJsonErrors(isJson(), async () => {
         const exchanges = opts.exchange
           ? opts.exchange.split(",").map(e => e.trim())
-          : [...EXCHANGES];
+          : await listConfiguredAccountVenues();
 
         const period = opts.period ?? opts.since;
         const periodMs = parsePeriodMs(period);
@@ -540,12 +541,12 @@ function registerAnalyticsSubcommands(
     .option("-s, --symbol <symbol>", "Filter by symbol")
     .option("--period <duration>", "Time period: 7d, 30d, 90d, all (default: all)")
     .option("--daily", "Show daily funding breakdown")
-    .option("-n, --limit <n>", "Funding history limit per exchange", "200")
+    .option("--limit <n>", "Funding history limit per exchange", "200")
     .action(async (opts: { exchange?: string; symbol?: string; period?: string; daily?: boolean; limit: string }) => {
       await withJsonErrors(isJson(), async () => {
         const exchanges = opts.exchange
           ? opts.exchange.split(",").map(e => e.trim())
-          : [...EXCHANGES];
+          : await listConfiguredAccountVenues();
 
         const periodMs = parsePeriodMs(opts.period);
         const sinceMs = periodMs ? Date.now() - periodMs : 0;
@@ -603,7 +604,7 @@ function registerAnalyticsSubcommands(
             : 1;
 
         // Match funding to arb positions
-        const arbState = loadArbState();
+        const arbState = loadArbState(networkOf(parent));
         const arbPositions = arbState?.positions ?? [];
         const arbFunding = new Map<string, { longFunding: number; shortFunding: number }>();
         for (const pos of arbPositions) {
@@ -721,7 +722,7 @@ function registerAnalyticsSubcommands(
 
         const exchanges = opts.exchange
           ? opts.exchange.split(",").map(e => e.trim())
-          : [...EXCHANGES];
+          : await listConfiguredAccountVenues();
 
         // Volume from log
         let logVolume = 0;
@@ -809,10 +810,10 @@ function registerAnalyticsSubcommands(
     .command("compare")
     .description("Compare active arb positions — ROI, realized PnL, funding income side by side")
     .option("--period <duration>", "Funding lookup period: 7d, 30d, 90d, all (default: all)")
-    .option("-n, --limit <n>", "Funding history limit per exchange", "200")
+    .option("--limit <n>", "Funding history limit per exchange", "200")
     .action(async (opts: { period?: string; limit: string }) => {
       await withJsonErrors(isJson(), async () => {
-        const arbState = loadArbState();
+        const arbState = loadArbState(networkOf(parent));
         const positions = arbState?.positions ?? [];
 
         if (positions.length === 0) {
@@ -1002,10 +1003,10 @@ function registerPnlSubcommands(
   parent
     .command("snapshot")
     .description("Take equity snapshot across all exchanges")
-    .option("--exchanges <list>", "Comma-separated exchange list", EXCHANGES.join(","))
-    .action(async (opts: { exchanges: string }) => {
+    .option("--exchanges <list>", "Comma-separated exchange list (default: all with configured credentials)")
+    .action(async (opts: { exchanges?: string }) => {
       await withJsonErrors(isJson(), async () => {
-        const exchanges = opts.exchanges.split(",").map(e => e.trim());
+        const exchanges = opts.exchanges ? opts.exchanges.split(",").map(e => e.trim()) : await listConfiguredAccountVenues();
         const snaps = await takeSnapshot(getAdapterForExchange, exchanges);
 
         if (isJson()) {
@@ -1032,10 +1033,10 @@ function registerPnlSubcommands(
     .command("track")
     .description("Continuously track equity (foreground)")
     .option("--interval <sec>", "Snapshot interval in seconds", "300")
-    .option("--exchanges <list>", "Comma-separated exchange list", EXCHANGES.join(","))
-    .action(async (opts: { interval: string; exchanges: string }) => {
+    .option("--exchanges <list>", "Comma-separated exchange list (default: all with configured credentials)")
+    .action(async (opts: { interval: string; exchanges?: string }) => {
       const intervalMs = parseInt(opts.interval) * 1000;
-      const exchanges = opts.exchanges.split(",").map(e => e.trim());
+      const exchanges = opts.exchanges ? opts.exchanges.split(",").map(e => e.trim()) : await listConfiguredAccountVenues();
 
       console.log(chalk.cyan(`PnL tracker started — snapshot every ${opts.interval}s for [${exchanges.join(", ")}]`));
       console.log(chalk.gray("Press Ctrl+C to stop\n"));

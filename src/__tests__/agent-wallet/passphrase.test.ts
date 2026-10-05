@@ -1,5 +1,12 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { Readable } from "stream";
+
+// fd 0 kind as seen by resolvePassphrase (pipe by default; tests flip it).
+const fdKind = vi.hoisted(() => ({ pipe: true }));
+vi.mock("node:fs", async (orig) => {
+  const real = await orig<typeof import("node:fs")>();
+  return { ...real, fstatSync: (fd: number) => (fd === 0 ? { isFIFO: () => fdKind.pipe, isFile: () => false } : real.fstatSync(fd)) };
+});
 
 describe("resolvePassphrase", () => {
   const originalStdin = process.stdin;
@@ -73,5 +80,30 @@ describe("resolvePassphrase", () => {
     const { resolvePassphrase } = await import("../../agent-wallet/passphrase.js");
     const result = await resolvePassphrase({});
     expect(result).toBe("piped-passphrase");
+  });
+
+  // Real Node pipes / redirected files leave isTTY undefined (only a TTY sets it).
+  it("reads passphrase from a real pipe where isTTY is undefined", async () => {
+    delete process.env["OWS_PASSPHRASE"];
+    const pipedStream = new Readable({ read() {} });
+    setImmediate(() => {
+      pipedStream.push(Buffer.from("pipe-pp"));
+      pipedStream.push(null);
+    });
+    Object.defineProperty(process, "stdin", { value: pipedStream, configurable: true });
+    const { resolvePassphrase } = await import("../../agent-wallet/passphrase.js");
+    expect(await resolvePassphrase({})).toBe("pipe-pp");
+  });
+
+  it("non-TTY stdin that is not a pipe/file (e.g. /dev/null, socket) fails fast instead of blocking", async () => {
+    delete process.env["OWS_PASSPHRASE"];
+    fdKind.pipe = false;
+    try {
+      Object.defineProperty(process, "stdin", { value: new Readable({ read() {} }), configurable: true });
+      const { resolvePassphrase } = await import("../../agent-wallet/passphrase.js");
+      await expect(resolvePassphrase({})).rejects.toThrow(/not a terminal or a pipe/);
+    } finally {
+      fdKind.pipe = true;
+    }
   });
 });

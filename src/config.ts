@@ -4,35 +4,60 @@ import chalk from "chalk";
 import { resolve } from "path";
 import { existsSync, readFileSync } from "fs";
 import { createRequire } from "node:module";
+import { PerpError } from "./errors.js";
+import type { LegacyVenueId, Network, VenueId } from "./exchanges/venue-types.js";
+import { isLegacyVenueId } from "./exchanges/venue-types.js";
+import type { VenueCredentials } from "./exchanges/venue.js";
 
 const _require = createRequire(import.meta.url);
 
-export type Exchange = "pacifica" | "hyperliquid" | "lighter" | "aster";
+
+/** @deprecated alias — every venue id is an exchange id (design §10.3). */
+export type Exchange = VenueId;
 
 /**
- * Try to load a private key without throwing if none is found.
- * Returns null if no key is configured.
+ * Legacy env private-key variables (design §10.3). New venues have no env tier:
+ * loadPrivateKey()/resolveCredentials() never read env keys for them.
+ * v0.12.10 restored ASTER_PRIVATE_KEY so Aster Tier 3 env-PK loading works.
  */
-export async function tryLoadPrivateKey(exchange: Exchange, pkOverride?: string, walletName?: string): Promise<string | null> {
-  try {
-    return await loadPrivateKey(exchange, pkOverride, walletName);
-  } catch {
-    return null;
-  }
+const envMap: Partial<Record<LegacyVenueId, string[]>> = {
+  pacifica: ["PACIFICA_PRIVATE_KEY", "pk"],
+  hyperliquid: ["HYPERLIQUID_PRIVATE_KEY", "HL_PRIVATE_KEY"],
+  lighter: ["LIGHTER_PRIVATE_KEY"],
+  aster: ["ASTER_PRIVATE_KEY"],
+};
+
+/** CLI (and MCP) inputs that select credentials. Absent flag = null. */
+export interface CliCredentialOpts {
+  privateKey: string | null;
+  /** --wallet <name>: OWS wallet, else local wallets.json entry */
+  wallet: string | null;
+  /** --ows <name> */
+  ows: string | null;
+  /** --ows-key <token> (or OWS_API_KEY env) */
+  owsKey: string | null;
+  /** --passphrase <pp> */
+  passphrase: string | null;
+}
+
+export const NO_CLI_CREDENTIAL_OPTS: CliCredentialOpts = {
+  privateKey: null, wallet: null, ows: null, owsKey: null, passphrase: null,
+};
+
+type MasterKey = { kind: "ows"; wallet: string } | { kind: "pk"; key: string };
+
+/** True when the OWS vault holds a wallet with this name (no catch: a broken OWS install throws). */
+export function owsWalletExists(walletName: string): boolean {
+  const { listWallets } = _require("@open-wallet-standard/core") as typeof import("@open-wallet-standard/core");
+  return listWallets().some((w: { name: string }) => w.name === walletName);
 }
 
 /**
- * Resolve an OWS wallet name to a signer-ready marker.
- * Returns the OWS wallet name prefixed with "ows:" so callers can detect OWS mode.
+ * Resolve an OWS wallet name to a signer-ready marker ("ows:<name>"), or null
+ * when the vault has no such wallet.
  */
 export function resolveOwsWallet(walletName: string): string | null {
-  try {
-    const { getWallet } = _require("@open-wallet-standard/core") as typeof import("@open-wallet-standard/core");
-    getWallet(walletName); // throws if not found
-    return `ows:${walletName}`;
-  } catch {
-    return null;
-  }
+  return owsWalletExists(walletName) ? `ows:${walletName}` : null;
 }
 
 /** Check if a key string represents an OWS wallet reference. */
@@ -45,83 +70,249 @@ export function getOwsWalletName(key: string): string {
   return key.slice(4);
 }
 
-export async function loadPrivateKey(exchange: Exchange, pkOverride?: string, walletName?: string): Promise<string> {
-  // 0a. OWS wallet (--ows flag sets walletName with "ows:" prefix)
-  if (walletName?.startsWith("ows:")) {
-    return walletName; // pass through — adapters detect the ows: prefix
+function legacyKeyFile(venue: LegacyVenueId): string {
+  return resolve(process.env.HOME || "~", ".perp", `${venue}.key`);
+}
+
+function envKeyOf(venue: LegacyVenueId): string | null {
+  for (const envVar of envMap[venue] ?? []) {
+    const v = process.env[envVar];
+    if (v) return v;
   }
+  // config.ts generic PRIVATE_KEY — recorded as out of scope in §10.11, legacy venues only.
+  const generic = process.env.PRIVATE_KEY;
+  return generic ? generic : null;
+}
 
-  // 0b. Wallet name override (--wallet flag) — check OWS first, then local
-  if (walletName) {
-    // Try OWS vault
-    const owsKey = resolveOwsWallet(walletName);
-    if (owsKey) return owsKey;
+/**
+ * The master key source for a venue, in precedence order:
+ *   --ows → --wallet (OWS, else local wallets.json) → --private-key →
+ *   settings.owsActiveWallet → [legacy venues only] env → wallets.json active → ~/.perp/<venue>.key
+ * Returns null only when no source is configured. A configured source that
+ * cannot be resolved throws (SSOT Rule #2).
+ */
+async function resolveMasterKey(venue: VenueId, opts: CliCredentialOpts): Promise<MasterKey | null> {
+  if (opts.ows !== null) return { kind: "ows", wallet: opts.ows };
 
-    // Fall back to local wallets
+  if (opts.wallet !== null) {
+    if (owsWalletExists(opts.wallet)) return { kind: "ows", wallet: opts.wallet };
     const { getWalletKeyByName } = await import("./commands/wallet.js");
-    const key = getWalletKeyByName(walletName);
-    if (!key) throw new Error(`Wallet "${walletName}" not found. Run: perp wallet list`);
-    return key;
+    const key = getWalletKeyByName(opts.wallet);
+    if (!key) throw new PerpError("KEY_NOT_FOUND", `Wallet "${opts.wallet}" not found`, { remediation: "Run: perp wallet list" });
+    return { kind: "pk", key };
   }
 
-  // 1. CLI flag
-  if (pkOverride) return pkOverride;
+  if (opts.privateKey !== null) return { kind: "pk", key: opts.privateKey };
 
-  // 2. OWS active wallet (highest priority after explicit flags)
-  try {
-    const { loadSettings } = await import("./settings.js");
-    const settings = loadSettings();
-    if (settings.owsActiveWallet) {
-      const owsKey = resolveOwsWallet(settings.owsActiveWallet);
-      if (owsKey) return owsKey;
+  const { loadSettings } = await import("./settings.js");
+  const active = loadSettings().owsActiveWallet;
+  if (active) {
+    if (!owsWalletExists(active)) {
+      throw new PerpError("KEY_NOT_FOUND", `Active OWS wallet "${active}" is not in the OWS vault`, {
+        remediation: "Run: perp wallet list, then select an existing wallet (perp wallet use <name>)",
+      });
     }
-  } catch {
-    // settings module not available, skip
+    return { kind: "ows", wallet: active };
   }
 
-  // 3. Exchange-specific env vars
-  // v0.12.4 retired the legacy HMAC ASTER_API_KEY/SECRET path.
-  // v0.12.6 restored Aster as a normal EVM exchange in EXCHANGE_ENV_MAP
-  // (setup wizard / wallet show), but missed this map — leaving Tier 3
-  // env-PK loading broken. v0.12.10 restores ASTER_PRIVATE_KEY here so
-  // `tryLoadPrivateKey("aster")` finds the env value, mirroring HL/LT.
-  const envMap: Record<Exchange, string[]> = {
-    pacifica: ["PACIFICA_PRIVATE_KEY", "pk"],
-    hyperliquid: ["HYPERLIQUID_PRIVATE_KEY", "HL_PRIVATE_KEY"],
-    lighter: ["LIGHTER_PRIVATE_KEY"],
-    aster: ["ASTER_PRIVATE_KEY"],
+  if (!isLegacyVenueId(venue)) return null;
+
+  const envKey = envKeyOf(venue);
+  if (envKey !== null) return { kind: "pk", key: envKey };
+
+  const { getActiveWalletKey } = await import("./commands/wallet.js");
+  const walletKey = getActiveWalletKey(venue);
+  if (walletKey) return { kind: "pk", key: walletKey };
+
+  const keyFile = legacyKeyFile(venue);
+  if (existsSync(keyFile)) return { kind: "pk", key: readFileSync(keyFile, "utf-8").trim() };
+
+  return null;
+}
+
+/** Registered agent meta for a venue (any network), or null — presence check only. */
+async function agentOf(venue: VenueId): Promise<VenueCredentials["agent"]> {
+  const store = await import("./agent-wallet/store.js");
+  switch (venue) {
+    case "ondo": return store.getVenueAgent("ondo");
+    case "arcus": return store.getVenueAgent("arcus");
+    case "qfex": return store.getVenueAgent("qfex");
+    case "pacifica":
+    case "hyperliquid":
+    case "lighter":
+    case "lighter-rh":
+    case "aster":
+      return store.getAgent(venue);
+  }
+}
+
+/**
+ * Agent meta to sign with on `network`. Legacy-shaped agents are selected by
+ * their recorded network (a mainnet agent is never handed to a testnet adapter).
+ * Ondo / Arcus metas are selected by their `network` field the same way.
+ */
+async function agentForNetwork(venue: VenueId, network: Network): Promise<VenueCredentials["agent"]> {
+  const store = await import("./agent-wallet/store.js");
+  switch (venue) {
+    case "ondo": return store.getVenueAgentForNetwork("ondo", network);
+    case "arcus": return store.getVenueAgentForNetwork("arcus", network);
+    case "qfex": return store.getVenueAgentForNetwork("qfex", network);
+    case "pacifica":
+    case "hyperliquid":
+    case "lighter":
+    case "lighter-rh":
+    case "aster":
+      return store.getAgentForNetwork(venue, network);
+  }
+}
+
+/**
+ * Passphrase that opens an OWS master wallet. Precedence between explicit
+ * user inputs: --ows-key token (routes through the OWS policy engine) →
+ * --passphrase → OWS_PASSPHRASE env. None given → "" (the OWS empty
+ * passphrase; this is what the pre-venue OWS path always used).
+ */
+function owsPassphraseOf(opts: CliCredentialOpts): string {
+  if (opts.owsKey !== null) return opts.owsKey;
+  if (opts.passphrase !== null) return opts.passphrase;
+  if ("OWS_PASSPHRASE" in process.env) return process.env.OWS_PASSPHRASE ?? "";
+  return "";
+}
+
+function owsKeyTokenOf(opts: CliCredentialOpts): string | null {
+  if (opts.owsKey !== null) return opts.owsKey;
+  // OWS_API_KEY env: recorded as out of scope in §10.11 (kept as before).
+  const env = process.env.OWS_API_KEY;
+  return env ? env : null;
+}
+
+/** CLI/MCP-shared credential resolution (design §10.2). */
+export async function resolveCredentials(venue: VenueId, opts: CliCredentialOpts, network: Network): Promise<VenueCredentials> {
+  const withToken: CliCredentialOpts = { ...opts, owsKey: owsKeyTokenOf(opts) };
+  // Custodial venues (masterKeyKind "none": qfex) have no master key to resolve.
+  const { ensureVenuesRegistered } = await import("./exchanges/venues/index.js");
+  const { getVenue } = await import("./exchanges/venue.js");
+  ensureVenuesRegistered();
+  const master = getVenue(venue).masterKeyKind === "none" ? null : await resolveMasterKey(venue, withToken);
+  return {
+    pk: master?.kind === "pk" ? master.key : null,
+    owsWallet: master?.kind === "ows" ? master.wallet : null,
+    owsPassphrase: master?.kind === "ows" ? owsPassphraseOf(withToken) : null,
+    owsKeyToken: withToken.owsKey,
+    agent: await agentForNetwork(venue, network),
   };
+}
 
-  for (const envVar of envMap[exchange]) {
-    if (process.env[envVar]) return process.env[envVar]!;
+/**
+ * Whether any credential source is configured for the venue (explicit checks,
+ * no catch). true does not mean the source is valid — creating the adapter
+ * surfaces that error.
+ */
+export async function hasCredentials(venue: VenueId, opts: CliCredentialOpts): Promise<boolean> {
+  // A venue without any owner-wallet signing path (qfex: custodial, API key only) is configured
+  // only by an imported key — a master wallet / private key is not a credential for it.
+  const { ensureVenuesRegistered } = await import("./exchanges/venues/index.js");
+  const { getVenue } = await import("./exchanges/venue.js");
+  ensureVenuesRegistered();
+  if (getVenue(venue).masterKeyKind === "none") return (await agentOf(venue)) !== null;
+  if (opts.ows !== null || opts.wallet !== null || opts.privateKey !== null) return true;
+  if ((await agentOf(venue)) !== null) return true;
+  const { loadSettings } = await import("./settings.js");
+  if (loadSettings().owsActiveWallet) return true;
+  if (!isLegacyVenueId(venue)) return false;
+  if (envKeyOf(venue) !== null) return true;
+  const { getActiveWalletKey } = await import("./commands/wallet.js");
+  if (getActiveWalletKey(venue)) return true;
+  return existsSync(legacyKeyFile(venue));
+}
+
+/**
+ * Account-role venues (registry order) with a configured credential source —
+ * the default set for "all exchanges" aggregate views. Market-data-only venues
+ * never qualify.
+ */
+export async function listConfiguredAccountVenues(opts: CliCredentialOpts = NO_CLI_CREDENTIAL_OPTS): Promise<VenueId[]> {
+  const { ensureVenuesRegistered } = await import("./exchanges/venues/index.js");
+  const { listVenuesWithRole } = await import("./exchanges/venue.js");
+  ensureVenuesRegistered();
+  const venues = listVenuesWithRole("account").map(v => v.id);
+  const configured = await Promise.all(venues.map(v => hasCredentials(v, opts)));
+  return venues.filter((_, i) => configured[i]);
+}
+
+/**
+ * Master key for a venue as a string: "ows:<name>" for OWS wallets, else the raw key.
+ * Throws NO_ENV_TIER for venues without an env/PK tier when nothing else is configured,
+ * and a setup hint when no source exists.
+ */
+export async function loadPrivateKey(exchange: VenueId, pkOverride?: string, walletName?: string): Promise<string> {
+  const opts: CliCredentialOpts = {
+    ...NO_CLI_CREDENTIAL_OPTS,
+    privateKey: pkOverride ?? null,
+    ows: walletName?.startsWith("ows:") ? walletName.slice(4) : null,
+    wallet: walletName && !walletName.startsWith("ows:") ? walletName : null,
+  };
+  const master = await resolveMasterKey(exchange, opts);
+  if (master?.kind === "ows") return `ows:${master.wallet}`;
+  if (master?.kind === "pk") return master.key;
+  if (!isLegacyVenueId(exchange)) {
+    throw new PerpError("NO_ENV_TIER", `${exchange} has no env/private-key tier`, {
+      remediation: `Use an OWS wallet (perp wallet generate, then --ows <name>) or register an agent: perp wallet agent approve ${exchange}`,
+    });
   }
-
-  // 4. Generic fallback
-  if (process.env.PRIVATE_KEY) return process.env.PRIVATE_KEY;
-
-  // 5. Legacy: Active wallet from wallets.json
-  try {
-    const { getActiveWalletKey } = await import("./commands/wallet.js");
-    const walletKey = getActiveWalletKey(exchange);
-    if (walletKey) return walletKey;
-  } catch {
-    // wallet module not available, skip
-  }
-
-  // 6. Legacy key file (~/.perp/<exchange>.key)
-  const keyFile = resolve(process.env.HOME || "~", ".perp", `${exchange}.key`);
-  if (existsSync(keyFile)) {
-    return readFileSync(keyFile, "utf-8").trim();
-  }
-
-  throw new Error(
+  throw new PerpError("NO_SIGNER_AVAILABLE",
     `No wallet configured for ${exchange}.\n\n` +
       `  Quick start:  ${chalk.cyan("perp wallet generate")}\n\n` +
       `  Or manually:\n` +
-      `    perp wallet import <key>     Import key to OWS vault\n` +
-      `    perp wallet set ${exchange} <key>  Legacy: set env var\n` +
-      `    --private-key <key>          Per-command override`
+      `    perp wallet import           Import key to OWS vault (hidden prompt / stdin)\n` +
+      `    perp wallet set ${exchange}     Import key (hidden prompt / stdin) to OWS vault`,
+    { exchange, remediation: masterMissingRemediation(exchange) },
   );
+}
+
+/** Root-program option values → credential selectors (shared by the CLI adapter factory and master-only commands). */
+export function cliCredentialOptsFrom(rootOpts: Record<string, unknown>): CliCredentialOpts {
+  const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
+  return {
+    privateKey: str(rootOpts.privateKey),
+    wallet: str(rootOpts.wallet),
+    ows: str(rootOpts.ows),
+    owsKey: str(rootOpts.owsKey),
+    passphrase: str(rootOpts.passphrase),
+  };
+}
+
+function masterMissingRemediation(venue: VenueId): string {
+  const chain = venue === "pacifica" ? "solana" : "evm";
+  return `Do this on the exchange website, or add the master wallet to this computer: perp wallet import --name <name> --chain ${chain} (hidden prompt / stdin), then perp wallet use <name> (or pass --ows <name>). An imported agent / API key can trade but cannot move funds.`;
+}
+
+/**
+ * Commands that only the account owner can sign (deposit, withdraw, transfer, bridge, referral
+ * set, agent approve/revoke): refuse up front with NO_SIGNER_AVAILABLE when no master wallet is
+ * configured on this machine — e.g. only an agent / API key imported from the exchange website.
+ * Never falls back to the agent key (it cannot sign these). A configured-but-missing master
+ * (active wallet not in the vault) throws KEY_NOT_FOUND from resolveMasterKey.
+ */
+export async function requireMasterWallet(venue: VenueId, opts: CliCredentialOpts, action: string): Promise<void> {
+  const master = await resolveMasterKey(venue, { ...opts, owsKey: owsKeyTokenOf(opts) });
+  if (master !== null) return;
+  throw new PerpError("NO_SIGNER_AVAILABLE", `${action} needs the ${venue} master wallet, which is not on this computer`, {
+    exchange: venue,
+    remediation: masterMissingRemediation(venue),
+  });
+}
+
+/**
+ * The OWS master wallet selected by the CLI flags / active wallet, with the passphrase that opens
+ * it — for on-chain transactions the master signs itself (deposits, bridges). null when the
+ * master source is not an OWS wallet (none configured, or a raw private key).
+ */
+export async function resolveOwsMaster(venue: VenueId, opts: CliCredentialOpts): Promise<{ wallet: string; passphrase: string } | null> {
+  const withToken: CliCredentialOpts = { ...opts, owsKey: owsKeyTokenOf(opts) };
+  const master = await resolveMasterKey(venue, withToken);
+  if (master === null || master.kind !== "ows") return null;
+  return { wallet: master.wallet, passphrase: owsPassphraseOf(withToken) };
 }
 
 export function parseSolanaKeypair(input: string): Keypair {

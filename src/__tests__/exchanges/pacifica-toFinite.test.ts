@@ -42,7 +42,7 @@ describe("PacificaAdapter.getBalance — parseFiniteVenueNumber guards (Phase 2.
 
   it("clean payload returns numeric balance unchanged", async () => {
     const pac = await buildAdapter({
-      account: { account_equity: "1000", available_to_spend: "800" },
+      account: { balance: "1000", account_equity: "1000", available_to_spend: "800", available_to_withdraw: "700", pending_interest: "0" },
       positions: [{ symbol: "BTC", side: "bid", amount: "0.5", entry_price: "50000", unrealized_pnl: "100" }],
     });
     const bal = await pac.getBalance();

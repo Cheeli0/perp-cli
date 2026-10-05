@@ -1,5 +1,6 @@
 import type { Strategy, StrategyContext, StrategyAction, EnrichedSnapshot } from "../strategy-types.js";
 import { registerStrategy } from "../strategy-registry.js";
+import { assertFundingArbLegs } from "./funding-arb-utils.js";
 
 /**
  * Basis arbitrage strategy.
@@ -39,6 +40,7 @@ export class BasisArbStrategy implements Strategy {
   private get holdingPeriodHours(): number { return Number(this._config.holdingPeriodHours ?? 24); }
 
   async init(ctx: StrategyContext, _snapshot: EnrichedSnapshot): Promise<void> {
+    assertFundingArbLegs(ctx);
     this._config = ctx.config;
     ctx.state.set("position", null as BasisPosition | null);
     ctx.log(`  [BASIS] Ready | threshold=${this.annualizedBasisThreshold}% holdingPeriod=${this.holdingPeriodHours}h size=${this.size}`);

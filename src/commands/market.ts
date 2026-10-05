@@ -2,15 +2,25 @@ import { Command } from "commander";
 import type { ExchangeAdapter } from "../exchanges/index.js";
 import { makeTable, formatUsd, formatPercent, printJson, jsonOk, jsonError, withJsonErrors } from "../utils.js";
 import chalk from "chalk";
-import { hasPacificaSdk, isDexCapable } from "../exchanges/capabilities.js";
+import { PerpError } from "../errors.js";
+import { midDecimal } from "../exchanges/precision.js";
+import { hasPacificaSdk, isDexCapable, klinesNeedAuth } from "../exchanges/capabilities.js";
+import { listVenuesWithRole } from "../exchanges/venue.js";
+import "../exchanges/venues/index.js";
 
-const EXCHANGES = ["pacifica", "hyperliquid", "lighter", "aster"] as const;
+/** Venues with an adapter (market-data-only venues have none — see `perp arb scan`). */
+const EXCHANGES = listVenuesWithRole("account").map(v => v.id);
+
+/** null = venue does not publish the value → "-" (never rendered as $0). */
+const usdOrDash = (v: string | null): string => (v === null ? chalk.gray("-") : `$${formatUsd(v)}`);
 
 export function registerMarketCommands(
   program: Command,
   getAdapter: () => Promise<ExchangeAdapter>,
   isJson: () => boolean,
   getAdapterForExchange?: (exchange: string) => Promise<ExchangeAdapter>,
+  /** Credentialed adapter of the selected venue — for market data the venue serves only to an authenticated account. */
+  getAccountAdapter?: () => Promise<ExchangeAdapter>,
 ) {
   const market = program.command("market").description("Market data commands");
 
@@ -22,19 +32,19 @@ export function registerMarketCommands(
       const explicitExchange = program.getOptionValueSource?.("exchange") === "cli";
 
       const HEADERS = ["Symbol", "Mark", "Index", "Funding", "24h Vol", "OI", "Max Lev"];
-      const marketRow = (m: { symbol: string; markPrice: string; indexPrice: string; fundingRate: string | null; volume24h: string; openInterest: string; maxLeverage: number }) => [
+      const marketRow = (m: { symbol: string; markPrice: string; indexPrice: string | null; fundingRate: string | null; volume24h: string | null; openInterest: string | null; maxLeverage: number }) => [
         chalk.white.bold(m.symbol),
         `$${formatUsd(m.markPrice)}`,
-        `$${formatUsd(m.indexPrice)}`,
+        usdOrDash(m.indexPrice),
         m.fundingRate != null ? formatPercent(m.fundingRate) : chalk.gray("N/A"),
-        `$${formatUsd(m.volume24h)}`,
-        `$${formatUsd(m.openInterest)}`,
+        usdOrDash(m.volume24h),
+        usdOrDash(m.openInterest),
         String(m.maxLeverage) + "x",
       ];
 
       // Multi-exchange mode
       if (!explicitExchange && getAdapterForExchange) {
-        const grouped: Record<string, { symbol: string; markPrice: string; indexPrice: string; fundingRate: string | null; volume24h: string; openInterest: string; maxLeverage: number }[]> = {};
+        const grouped: Record<string, { symbol: string; markPrice: string; indexPrice: string | null; fundingRate: string | null; volume24h: string | null; openInterest: string | null; maxLeverage: number }[]> = {};
         const errors: Record<string, string> = {};
 
         await Promise.all(EXCHANGES.map(async (ex) => {
@@ -111,15 +121,15 @@ export function registerMarketCommands(
     .action(async () => {
       const explicitExchange = program.getOptionValueSource?.("exchange") === "cli";
       const PRICE_HEADERS = ["Symbol", "Mark", "Index", "Funding"];
-      const priceRow = (m: { symbol: string; markPrice: string; indexPrice: string; fundingRate: string | null }) => [
+      const priceRow = (m: { symbol: string; markPrice: string; indexPrice: string | null; fundingRate: string | null }) => [
         chalk.white.bold(m.symbol),
         `$${formatUsd(m.markPrice)}`,
-        `$${formatUsd(m.indexPrice)}`,
+        usdOrDash(m.indexPrice),
         m.fundingRate != null ? formatPercent(m.fundingRate) : chalk.gray("N/A"),
       ];
 
       if (!explicitExchange && getAdapterForExchange) {
-        const grouped: Record<string, { symbol: string; markPrice: string; indexPrice: string; fundingRate: string | null }[]> = {};
+        const grouped: Record<string, { symbol: string; markPrice: string; indexPrice: string | null; fundingRate: string | null }[]> = {};
         const errors: Record<string, string> = {};
 
         await Promise.all(EXCHANGES.map(async (ex) => {
@@ -188,10 +198,10 @@ export function registerMarketCommands(
 
       console.log(chalk.cyan.bold(`\n  ${m.symbol} on ${adapter.name}\n`));
       console.log(`  Mark Price:     $${formatUsd(m.markPrice)}`);
-      console.log(`  Index Price:    $${formatUsd(m.indexPrice)}`);
+      console.log(`  Index Price:    ${usdOrDash(m.indexPrice)}`);
       console.log(`  Funding Rate:   ${m.fundingRate != null ? formatPercent(m.fundingRate) : chalk.gray("N/A")}`);
-      console.log(`  24h Volume:     $${formatUsd(m.volume24h)}`);
-      console.log(`  Open Interest:  $${formatUsd(m.openInterest)}`);
+      console.log(`  24h Volume:     ${usdOrDash(m.volume24h)}`);
+      console.log(`  Open Interest:  ${usdOrDash(m.openInterest)}`);
       console.log(`  Max Leverage:   ${m.maxLeverage}x`);
       console.log();
     });
@@ -305,18 +315,21 @@ export function registerMarketCommands(
     .description("Get mid price for a single symbol (fast)")
     .action(async (symbol: string) => {
       const sym = symbol.toUpperCase();
-      try {
+      // withJsonErrors: every failure (incl. an empty book) is an error envelope AND exit code 1.
+      await withJsonErrors(isJson(), async () => {
         const adapter = await getAdapter();
 
-        // Try orderbook mid (best bid + best ask) / 2
+        // Orderbook mid (best bid + best ask) / 2
         const book = await adapter.getOrderbook(sym);
         const bestBid = book.bids[0]?.[0];
         const bestAsk = book.asks[0]?.[0];
 
         if (!bestBid && !bestAsk) {
-          if (isJson()) return printJson(jsonError("SYMBOL_NOT_FOUND", `No orderbook data for ${sym}`));
-          console.log(chalk.red(`\n  No orderbook data for ${sym}.\n`));
-          return;
+          // The market exists (getOrderbook resolved it) but nobody quotes it: no price, not "unknown symbol".
+          throw new PerpError("PRICE_STALE", `${sym} orderbook on ${adapter.name} is empty (no bids and no asks) — no mid price`, {
+            exchange: adapter.name,
+            remediation: `The market has no liquidity right now; check: perp -e ${adapter.name} market book ${sym}, or pick a market with a two-sided book`,
+          });
         }
 
         const bid = Number(bestBid ?? 0);
@@ -326,7 +339,8 @@ export function registerMarketCommands(
 
         if (isJson()) return printJson(jsonOk({
           symbol: sym,
-          mid: mid.toString(),
+          // Exact decimal mid of the two quoted strings (float (bid + ask) / 2 prints artifacts).
+          mid: bestBid && bestAsk ? midDecimal(bestBid, bestAsk) : mid.toString(),
           bid: bestBid ?? null,
           ask: bestAsk ?? null,
           spread: spread.toFixed(6),
@@ -338,18 +352,7 @@ export function registerMarketCommands(
         if (bestAsk) console.log(`  Ask:    $${formatUsd(bestAsk)}`);
         console.log(`  Spread: ${spread.toFixed(4)}%`);
         console.log();
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (isJson()) {
-          const { classifyError } = await import("../errors.js");
-          const classified = classifyError(err);
-          return printJson(jsonError(classified.code, classified.message, {
-            status: classified.status,
-            retryable: classified.retryable,
-          }));
-        }
-        console.error(chalk.red(`Error: ${msg}`));
-      }
+      });
     });
 
   market
@@ -363,7 +366,9 @@ export function registerMarketCommands(
         interval: string,
         opts: { start?: string; end?: string }
       ) => {
-        const adapter = await getAdapter();
+        const publicAdapter = await getAdapter();
+        // A venue whose candles endpoint is authenticated (Ondo) is read with the registered key.
+        const adapter = getAccountAdapter !== undefined && klinesNeedAuth(publicAdapter) ? await getAccountAdapter() : publicAdapter;
         const now = Date.now();
         const startTime = opts.start ? parseInt(opts.start) : now - 24 * 60 * 60 * 1000;
         const endTime = opts.end ? parseInt(opts.end) : now;
@@ -397,6 +402,7 @@ export function registerMarketCommands(
         if (!(isDexCapable(adapter))) {
           if (isJson()) return printJson(jsonError("INVALID_PARAMS", "HIP-3 dexes are only available on Hyperliquid.", { remediation: "Re-run with -e hyperliquid." }));
           console.error(chalk.red("\n  HIP-3 dexes are only available on Hyperliquid. Use -e hyperliquid.\n"));
+          process.exitCode = 1;
           return;
         }
 

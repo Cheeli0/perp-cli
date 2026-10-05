@@ -12,6 +12,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { Command } from "commander";
+import { addRootSafetyOptions } from "../cli-flags.js";
 import { registerTradeCommands } from "../commands/trade.js";
 import { registerMarketCommands } from "../commands/market.js";
 import { registerAccountCommands } from "../commands/account.js";
@@ -32,9 +33,19 @@ vi.mock("../trade-validator.js", () => ({
   validateTrade: vi.fn().mockResolvedValue({ valid: true, checks: [], warnings: [] }),
 }));
 
+// Registered venue id: trade commands resolve the venue definition (capabilities, slippage
+// bound) from adapter.name; an unregistered name is UNKNOWN_VENUE before anything is sent.
+const DEFAULT_SLIPPAGE = { bps: 50, source: "default" };
+const entryOpts = { reduceOnly: false, slippage: DEFAULT_SLIPPAGE };
+/** BTC market with a 1e-9 lot so the "no precision loss" case is not floored away. */
+const BTC_MARKET = {
+  symbol: "BTC", markPrice: "100", indexPrice: "100", fundingRate: "0.0001", volume24h: "1", openInterest: "1",
+  maxLeverage: 20, sizeDecimals: 9, stepSize: "0.000000001", fundingHours: 1, marginTiers: null,
+};
+
 function mockAdapter(overrides?: Record<string, unknown>) {
   return {
-    name: "test-exchange",
+    name: "hyperliquid",
     marketOrder: vi.fn().mockResolvedValue({ orderId: "m1" }),
     limitOrder: vi.fn().mockResolvedValue({ orderId: "l1" }),
     stopOrder: vi.fn().mockResolvedValue({ orderId: "s1" }),
@@ -47,7 +58,7 @@ function mockAdapter(overrides?: Record<string, unknown>) {
     getBalance: vi.fn().mockResolvedValue({
       equity: "10000", available: "8000", marginUsed: "2000", unrealizedPnl: "0",
     }),
-    getMarkets: vi.fn().mockResolvedValue([]),
+    getMarkets: vi.fn().mockResolvedValue([BTC_MARKET]),
     getOrderbook: vi.fn().mockResolvedValue({
       bids: [["100", "1"]], asks: [["101", "1"]],
     }),
@@ -63,6 +74,7 @@ function mockAdapter(overrides?: Record<string, unknown>) {
 
 function createTradeProgram(adapter: ExchangeAdapter, json = false) {
   const program = new Command();
+  addRootSafetyOptions(program);
   program.exitOverride();
   program.configureOutput({ writeOut: () => {}, writeErr: () => {} });
   registerTradeCommands(program, async () => adapter, () => json);
@@ -151,15 +163,13 @@ describe("Command injection attempts", () => {
     const adapter = mockAdapter();
     const program = createTradeProgram(adapter, true);
 
-    const { logCalls } = await run(program, [
+    // BEHAVIOR CHANGE: a venue whose orders carry no client id (the mock is hyperliquid) refuses
+    // --client-id up front (CAPABILITY_UNSUPPORTED) instead of accepting and dropping it.
+    await expect(run(program, [
       "trade", "market", "BTC", "buy", "0.1",
       "--client-id", '"; DROP TABLE orders; --',
-    ]);
-
-    const output = getJsonOutput(logCalls);
-    // Must be valid JSON — no injection broke the envelope
-    expect(output).toBeDefined();
-    expect((output as Record<string, unknown>).ok).toBe(true);
+    ])).rejects.toMatchObject({ structured: { code: "CAPABILITY_UNSUPPORTED" } });
+    expect(adapter.marketOrder).not.toHaveBeenCalled();
   });
 });
 
@@ -168,11 +178,14 @@ describe("Command injection attempts", () => {
 // ══════════════════════════════════════════════════════════════
 
 describe("Extreme and malformed numeric values", () => {
-  it("size = 0: passed to adapter as-is (adapter decides validity)", async () => {
+  // BEHAVIOR CHANGE (design §13.3 validateOrderRequest / precision.floorSize, CHANGELOG
+  // "Entry sizes are floored"): malformed or sub-lot sizes are now rejected by the CLI BEFORE
+  // anything is sent (they used to be passed to the adapter "as-is"). Safer: assert not sent.
+  it("size = 0: rejected before sending (below the lot step)", async () => {
     const adapter = mockAdapter();
     const program = createTradeProgram(adapter);
-    await run(program, ["trade", "market", "BTC", "buy", "0"]);
-    expect(adapter.marketOrder).toHaveBeenCalledWith("BTC", "buy", "0");
+    await expect(run(program, ["trade", "market", "BTC", "buy", "0"])).rejects.toMatchObject({ structured: { code: "SIZE_TOO_SMALL" } });
+    expect(adapter.marketOrder).not.toHaveBeenCalled();
   });
 
   it("size = negative: Commander interprets '-1' as unknown option flag (known edge case)", async () => {
@@ -189,39 +202,40 @@ describe("Extreme and malformed numeric values", () => {
     expect(adapter.marketOrder).not.toHaveBeenCalled();
   });
 
-  it("size = NaN string: passed to adapter as-is", async () => {
+  it("size = NaN string: rejected before sending (not a plain decimal)", async () => {
     const adapter = mockAdapter();
     const program = createTradeProgram(adapter);
-    await run(program, ["trade", "market", "BTC", "buy", "NaN"]);
-    expect(adapter.marketOrder).toHaveBeenCalledWith("BTC", "buy", "NaN");
+    await expect(run(program, ["trade", "market", "BTC", "buy", "NaN"])).rejects.toThrow(/Not a plain decimal number/);
+    expect(adapter.marketOrder).not.toHaveBeenCalled();
   });
 
-  it("size = Infinity: passed to adapter as-is", async () => {
+  it("size = Infinity: rejected before sending (not a plain decimal)", async () => {
     const adapter = mockAdapter();
     const program = createTradeProgram(adapter);
-    await run(program, ["trade", "market", "BTC", "buy", "Infinity"]);
-    expect(adapter.marketOrder).toHaveBeenCalledWith("BTC", "buy", "Infinity");
+    await expect(run(program, ["trade", "market", "BTC", "buy", "Infinity"])).rejects.toThrow(/Not a plain decimal number/);
+    expect(adapter.marketOrder).not.toHaveBeenCalled();
   });
 
-  it("size = absurdly large number: no crash", async () => {
+  it("size = absurdly large number: no crash, sent exactly (no float rounding)", async () => {
     const adapter = mockAdapter();
     const program = createTradeProgram(adapter);
     await run(program, ["trade", "market", "BTC", "buy", "999999999999999999999"]);
-    expect(adapter.marketOrder).toHaveBeenCalledWith("BTC", "buy", "999999999999999999999");
+    expect(adapter.marketOrder).toHaveBeenCalledWith("BTC", "buy", "999999999999999999999", entryOpts);
   });
 
   it("size = tiny decimal: no precision loss as string", async () => {
     const adapter = mockAdapter();
     const program = createTradeProgram(adapter);
     await run(program, ["trade", "market", "BTC", "buy", "0.000000001"]);
-    expect(adapter.marketOrder).toHaveBeenCalledWith("BTC", "buy", "0.000000001");
+    expect(adapter.marketOrder).toHaveBeenCalledWith("BTC", "buy", "0.000000001", entryOpts);
   });
 
-  it("price = 0 in limit order: passed through", async () => {
+  // validateOrderRequest rejects non-positive prices before sending (design §10.10).
+  it.each(["0", "-1"])("price = %s in limit order: rejected, never sent", async (price) => {
     const adapter = mockAdapter();
     const program = createTradeProgram(adapter);
-    await run(program, ["trade", "limit", "BTC", "buy", "0", "1"]);
-    expect(adapter.limitOrder).toHaveBeenCalledWith("BTC", "buy", "0", "1");
+    await expect(run(program, ["trade", "limit", "BTC", "sell", "--", price, "1"])).rejects.toThrow(/price must be positive/);
+    expect(adapter.limitOrder).not.toHaveBeenCalled();
   });
 
   it("leverage = 0: doesn't crash", async () => {
@@ -411,14 +425,14 @@ describe("Invalid side parameter", () => {
     const adapter = mockAdapter();
     const program = createTradeProgram(adapter);
     await run(program, ["trade", "market", "BTC", "BUY", "0.1"]);
-    expect(adapter.marketOrder).toHaveBeenCalledWith("BTC", "buy", "0.1");
+    expect(adapter.marketOrder).toHaveBeenCalledWith("BTC", "buy", "0.1", entryOpts);
   });
 
   it("side = 'SELL' (uppercase) still works", async () => {
     const adapter = mockAdapter();
     const program = createTradeProgram(adapter);
     await run(program, ["trade", "market", "BTC", "SELL", "0.1"]);
-    expect(adapter.marketOrder).toHaveBeenCalledWith("BTC", "sell", "0.1");
+    expect(adapter.marketOrder).toHaveBeenCalledWith("BTC", "sell", "0.1", entryOpts);
   });
 
   it("side = 'long' triggers errorAndExit", async () => {

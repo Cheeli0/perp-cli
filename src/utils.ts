@@ -1,6 +1,7 @@
 import Table from "cli-table3";
 import chalk from "chalk";
 import { classifyError } from "./errors.js";
+import type { OrderResult } from "./exchanges/venue-types.js";
 
 export function symbolMatch(candidate: string, target: string): boolean {
   // Symmetric match: strip a trailing -PERP from BOTH sides before comparing.
@@ -8,7 +9,13 @@ export function symbolMatch(candidate: string, target: string): boolean {
   // "BTC-PERP" and the user may type either form, so matching must not depend
   // on which side carries the suffix.
   const strip = (s: string) => s.toUpperCase().replace(/-PERP$/, "");
-  return strip(candidate) === strip(target);
+  const c = strip(candidate);
+  const t = strip(target);
+  if (c === t) return true;
+  // A HIP-3 dex-scoped adapter reports "xyz:NVDA" while the user (with --dex xyz) types "NVDA".
+  // One-way only: a dex-prefixed user input never matches a bare venue symbol.
+  const colon = c.indexOf(":");
+  return colon > 0 && !t.includes(":") && c.slice(colon + 1) === t;
 }
 
 export function formatUsd(value: string | number): string {
@@ -142,6 +149,9 @@ function downsample(values: number[], targetLen: number): number[] {
 const _isNdjson = () => process.argv.includes("--ndjson");
 
 export function printJson(data: unknown): void {
+  // An error envelope always means a non-zero exit (scripts / agents key on the exit code too):
+  // commands that print `jsonError(...)` and return would otherwise exit 0 with ok:false.
+  if (data !== null && typeof data === "object" && (data as { ok?: unknown }).ok === false) process.exitCode = 1;
   // Sanitize all string values in output
   let output = sanitizeValue(data);
 
@@ -256,23 +266,82 @@ export async function withJsonErrors<T>(
   try {
     return await fn();
   } catch (err) {
-    const classified = classifyError(err, exchange);
-    if (isJson) {
-      console.log(JSON.stringify(jsonError(classified.code, classified.message, {
-        status: classified.status,
-        retryable: classified.retryable,
-        retryAfterMs: classified.retryAfterMs,
-        remediation: classified.remediation,
-        details: classified.details,
-      })));
-    } else {
-      console.error(chalk.red(`Error: ${classified.message}`));
-      if (classified.remediation) {
-        console.error(chalk.yellow(`Remediation: ${classified.remediation}`));
-      }
-    }
+    printCliError(err, isJson, exchange);
+    process.exitCode = 1; // printed, not swallowed: the command still exits non-zero
     return undefined;
   }
+}
+
+/**
+ * Central CLI error printer. JSON: the structured envelope incl. details and
+ * remediation. Human: the uniform "not supported" line for CAPABILITY_UNSUPPORTED
+ * (design §13.6) — `✗ <Venue>: <feature> not supported — <reason>. Alternative: <remediation>` —
+ * otherwise `Error: <message>` plus the remediation.
+ */
+export function printCliError(err: unknown, isJson: boolean, exchange?: string): void {
+  const classified = classifyError(err, exchange);
+  if (isJson) {
+    console.log(JSON.stringify(jsonError(classified.code, classified.message, {
+      status: classified.status,
+      retryable: classified.retryable,
+      retryAfterMs: classified.retryAfterMs,
+      remediation: classified.remediation,
+      details: classified.details,
+    })));
+    return;
+  }
+  const d = classified.details;
+  if (classified.code === "CAPABILITY_UNSUPPORTED" && d && typeof d.venue === "string" && typeof d.feature === "string" && typeof d.reason === "string") {
+    const alt = classified.remediation !== undefined ? ` Alternative: ${classified.remediation}` : "";
+    console.error(chalk.red(`✗ ${d.venue}: ${d.feature} not supported — ${d.reason}.`) + chalk.yellow(alt));
+    return;
+  }
+  console.error(chalk.red(`Error: ${classified.message}`));
+  if (classified.remediation) {
+    console.error(chalk.yellow(`Remediation: ${classified.remediation}`));
+  }
+}
+
+/**
+ * JSON payload of an order result (design §13.7): the uniform OrderResult (+ execution)
+ * with the venue's raw response duplicated under `legacy` for one release.
+ */
+export function orderResultJson(r: OrderResult & { remediation?: string | null }, extra?: Record<string, unknown>): Record<string, unknown> {
+  return { ...r, ...extra, legacy: r.venueRaw };
+}
+
+/** Human lines for an order result — one format for every venue (design §13.7). */
+export function formatOrderResult(r: OrderResult & { remediation?: string | null }): string[] {
+  const lines: string[] = [];
+  const statusColor = r.status === "filled" ? chalk.green
+    : r.status === "rejected" || r.status === "cancelled" ? chalk.red
+    : r.status === "partiallyFilled" ? chalk.yellow : chalk.white;
+  const fill = `filled ${r.filledSize ?? "unknown"}${r.avgPrice !== null ? ` @ ${r.avgPrice}` : ""}`;
+  lines.push(`  Status:     ${statusColor(r.status)} (${r.finality === "final" ? "final" : chalk.yellow("pending")}) — ${fill}`);
+  const ids: string[] = [];
+  if (r.orderId !== null) ids.push(`order ${r.orderId}`);
+  if (r.clientOrderId !== null) ids.push(`client id ${r.clientOrderId}`);
+  if (ids.length > 0) lines.push(`  Order:      ${ids.join(" · ")}`);
+  const e = r.execution;
+  const exec: string[] = [e.method];
+  if (e.slippageBps !== null) exec.push(`slippage ${Math.round(e.slippageBps * 100) / 100} bps${e.slippageSource !== null ? ` (${e.slippageSource})` : ""}`);
+  if (e.protectionPrice !== null) exec.push(`protection ${e.protectionPrice}${e.referencePrice !== null ? ` (ref ${e.referencePrice})` : ""}`);
+  else if (e.referencePrice !== null) exec.push(`ref ${e.referencePrice}`);
+  lines.push(`  Execution:  ${exec.join(" · ")}`);
+  if (e.tifRequested !== null || e.tifSent !== null) {
+    const tif = e.tifRequested !== null && e.tifSent !== null && e.tifRequested !== e.tifSent
+      ? `${e.tifRequested} → ${e.tifSent}` : (e.tifSent ?? e.tifRequested);
+    lines.push(`  TIF:        ${tif}${e.expiresAt !== null ? ` (expires ${new Date(e.expiresAt).toISOString()})` : ""}`);
+  }
+  if (e.builderFee !== null) {
+    const approved = e.builderFee.approvedMaxBps === null ? "" : `, approved max ${e.builderFee.approvedMaxBps} bps`;
+    const fee = e.builderFee.feeKind === "share" ? "fee share (you pay the normal fee, nothing extra)"
+      : e.builderFee.feeKind === "max" ? `up to ${e.builderFee.feeBps} bps (builder's own rate applies${approved})` : `${e.builderFee.feeBps} bps`;
+    lines.push(`  Builder:    ${fee} → ${e.builderFee.identity}`);
+  }
+  for (const n of e.notes) lines.push(chalk.gray(`  Note:       ${n}`));
+  if (r.remediation !== undefined && r.remediation !== null) lines.push(chalk.yellow(`  ${r.remediation}`));
+  return lines;
 }
 
 /**

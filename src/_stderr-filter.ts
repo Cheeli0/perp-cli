@@ -5,7 +5,6 @@
 if (process.argv.includes("--json") || process.argv.includes("--ndjson")) {
   const _suppressPatterns = [
     /'--chain evm' is deprecated/,
-    /\[hyperliquid\] Failed to load asset map/,
     /\[lighter\] Account index not available/,
     /Failed to initialize SymbolConversion/,
     /HyperliquidAPIError/,

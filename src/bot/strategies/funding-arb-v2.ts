@@ -1,12 +1,27 @@
 import type { Strategy, StrategyContext, StrategyAction, EnrichedSnapshot } from "../strategy-types.js";
 import type { ExchangeAdapter } from "../../exchanges/index.js";
 import { registerStrategy } from "../strategy-registry.js";
+import { isQuarantined, quarantineSymbol } from "../quarantine.js";
+import { closePerpVerified, isOutcomeUnknown, placePerpVerified, trimFirstLegToHedge } from "../perp-order.js";
+import { fillSizeString, sizeDecimalsOf } from "../../exchanges/spot-result.js";
+import { isPositionGone, assertFundingArbLegs } from "./funding-arb-utils.js";
 
 /**
- * Enhanced funding rate arbitrage (multi-exchange) v2.
+ * Enhanced funding rate arbitrage (multi-exchange) v2 — the LIVE "funding-arb-v2"
+ * strategy (registered by src/bot/engine.ts).
  * Auto-scans all available exchanges for funding rate divergence.
  * Position management: tracks entry spread, auto-closes when spread converges.
- * Wraps existing funding-arb logic but adds auto-close and multi-exchange scanning.
+ *
+ * Execution safety (design §12.3):
+ *  - legs are placed one at a time and verified by the position delta
+ *    (placePerpVerified); the short is sized to the long's VERIFIED fill, and a short
+ *    that fills less trims the long by this trade's excess (reduce-only, verified);
+ *    a definite short failure rolls the long back reduce-only;
+ *  - every close is reduce-only with the size actually opened (never re-derived from
+ *    the current price), so a retry can never open or flip a position;
+ *  - an unknown leg outcome, a failed rollback, repeated close failures, or a position
+ *    still open when the bot stops → the symbol is quarantined (persisted, global);
+ *  - quarantined symbols are skipped for entry and close.
  */
 
 interface ArbPosition {
@@ -16,7 +31,16 @@ interface ArbPosition {
   entrySpread: number; // annualized spread at entry
   entryTime: number;
   sizeUsd: number;
+  /** Base size opened on each leg (decimal string) — closes use exactly this, reduce-only. */
+  size: string;
+  /** Long leg already closed by an earlier attempt (only the short remains). */
+  longClosed: boolean;
+  /** Consecutive failed close attempts. */
+  closeFailures: number;
 }
+
+/** Consecutive failed closes before the symbol is quarantined. */
+const MAX_CLOSE_FAILURES = 3;
 
 export class FundingArbV2Strategy implements Strategy {
   readonly name = "funding-arb-v2";
@@ -43,6 +67,7 @@ export class FundingArbV2Strategy implements Strategy {
   private get scanIntervalSec(): number { return Number(this._config.scanIntervalSec ?? 60); }
 
   async init(ctx: StrategyContext, _snapshot: EnrichedSnapshot): Promise<void> {
+    assertFundingArbLegs(ctx);
     this._config = ctx.config;
     ctx.state.set("positions", [] as ArbPosition[]);
     ctx.state.set("lastScan", 0);
@@ -80,8 +105,9 @@ export class FundingArbV2Strategy implements Strategy {
           });
         }
         ratesByExchange.set(name, map);
-      } catch {
-        // Skip unavailable exchange
+      } catch (err) {
+        // Logged; this venue is left out of this scan (no close decision, no entry on it).
+        ctx.log(`  [ARB-V2] ${name} markets unavailable: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
 
@@ -89,6 +115,7 @@ export class FundingArbV2Strategy implements Strategy {
     const toClose: number[] = [];
     for (let i = 0; i < positions.length; i++) {
       const pos = positions[i];
+      if (isQuarantined(pos.symbol, ctx.log)) continue;
       const longRates = ratesByExchange.get(pos.longExchange);
       const shortRates = ratesByExchange.get(pos.shortExchange);
       if (!longRates || !shortRates) continue;
@@ -101,25 +128,7 @@ export class FundingArbV2Strategy implements Strategy {
 
       if (currentSpread <= this.closeSpread) {
         ctx.log(`  [ARB-V2] Auto-close ${pos.symbol}: spread ${currentSpread.toFixed(1)}% <= ${this.closeSpread}% (entry was ${pos.entrySpread.toFixed(1)}%)`);
-        // Close both legs
-        const longAdapter = adapters.get(pos.longExchange);
-        const shortAdapter = adapters.get(pos.shortExchange);
-        if (longAdapter && shortAdapter) {
-          const price = longInfo.price;
-          const size = price > 0 ? (pos.sizeUsd / price).toFixed(6) : "0";
-          try {
-            await Promise.all([
-              longAdapter.marketOrder(pos.symbol, "sell", size),
-              shortAdapter.marketOrder(pos.symbol, "buy", size),
-            ]);
-            ctx.log(`  [ARB-V2] Closed ${pos.symbol} (long ${pos.longExchange}, short ${pos.shortExchange})`);
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            ctx.log(`  [ARB-V2] Close failed for ${pos.symbol}: ${msg}`);
-            continue; // Don't mark as closed
-          }
-        }
-        toClose.push(i);
+        if (await this.closePosition(ctx, pos, adapters)) toClose.push(i);
       }
     }
 
@@ -152,6 +161,7 @@ export class FundingArbV2Strategy implements Strategy {
 
     for (const sym of allSymbols) {
       if (activeSymbols.has(sym)) continue;
+      if (isQuarantined(sym, ctx.log)) continue;
 
       let minRate = Infinity, maxRate = -Infinity;
       let minExchange = "", maxExchange = "";
@@ -190,12 +200,9 @@ export class FundingArbV2Strategy implements Strategy {
       if (!longAdapter || !shortAdapter || opp.price <= 0) continue;
 
       const size = (this.sizeUsd / opp.price).toFixed(6);
-      try {
-        ctx.log(`  [ARB-V2] Opening ${opp.symbol}: spread ${opp.spread.toFixed(1)}% (long ${opp.longExchange}, short ${opp.shortExchange})`);
-        await Promise.all([
-          longAdapter.marketOrder(opp.symbol, "buy", size),
-          shortAdapter.marketOrder(opp.symbol, "sell", size),
-        ]);
+      ctx.log(`  [ARB-V2] Opening ${opp.symbol}: spread ${opp.spread.toFixed(1)}% (long ${opp.longExchange}, short ${opp.shortExchange})`);
+      const opened = await this.openPosition(ctx, opp, size, longAdapter, shortAdapter);
+      if (opened !== null) {
         positions.push({
           symbol: opp.symbol,
           longExchange: opp.longExchange,
@@ -203,11 +210,11 @@ export class FundingArbV2Strategy implements Strategy {
           entrySpread: opp.spread,
           entryTime: now,
           sizeUsd: this.sizeUsd,
+          size: opened,
+          longClosed: false,
+          closeFailures: 0,
         });
         ctx.log(`  [ARB-V2] Position opened! (${positions.length}/${this.maxPositions})`);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        ctx.log(`  [ARB-V2] Execution failed: ${msg}`);
       }
     }
 
@@ -217,26 +224,160 @@ export class FundingArbV2Strategy implements Strategy {
     return positions.length > 0 || toOpen.length > 0 ? [{ type: "noop" }] : [];
   }
 
+  /**
+   * Close every tracked position (reduce-only, verified). A position that cannot be
+   * closed is never dropped silently: it is quarantined (persisted with what is open)
+   * so no bot / arb path touches it until a human resolves it.
+   */
   async onStop(ctx: StrategyContext): Promise<StrategyAction[]> {
     const positions = ctx.state.get("positions") as ArbPosition[];
     if (positions.length === 0) return [];
 
     const adapters = this.getAdapters(ctx);
+    const remaining: ArbPosition[] = [];
     for (const pos of positions) {
-      const longAdapter = adapters.get(pos.longExchange);
-      const shortAdapter = adapters.get(pos.shortExchange);
-      if (longAdapter && shortAdapter) {
-        try {
-          // Best-effort close all legs
-          await Promise.all([
-            longAdapter.cancelAllOrders(pos.symbol),
-            shortAdapter.cancelAllOrders(pos.symbol),
-          ]);
-        } catch { /* best effort */ }
+      if (isQuarantined(pos.symbol, ctx.log)) {
+        ctx.log(`  [ARB-V2] CRITICAL: ${pos.symbol} is quarantined — left open on stop; resolve manually (perp strategy quarantine)`);
+        remaining.push(pos);
+        continue;
+      }
+      ctx.log(`  [ARB-V2] Closing ${pos.symbol} on stop (${pos.size})`);
+      if (!(await this.closePosition(ctx, pos, adapters))) {
+        remaining.push(pos);
+        if (!isQuarantined(pos.symbol, ctx.log)) {
+          this.quarantine(pos, `still open when the bot stopped (long ${pos.longClosed ? "closed" : `${pos.size} on ${pos.longExchange}`}, short ${pos.size} on ${pos.shortExchange})`, ctx);
+        }
       }
     }
-    ctx.state.set("positions", []);
+    ctx.state.set("positions", remaining);
     return [{ type: "cancel_all" }];
+  }
+
+  private quarantine(pos: { symbol: string; longExchange: string; shortExchange: string }, reason: string, ctx: StrategyContext): void {
+    quarantineSymbol(this.name, pos.symbol, reason,
+      `Check ${pos.symbol} on ${pos.longExchange} and ${pos.shortExchange} (perp -e ${pos.longExchange} positions; perp -e ${pos.shortExchange} positions); close or re-hedge by hand, then: perp strategy quarantine-clear ${pos.symbol}`,
+      ctx.log);
+  }
+
+  /**
+   * Long then short, each verified; the short is sized to the long's verified fill and
+   * any excess the short did not cover is trimmed off the long (reduce-only, verified).
+   * A definite short failure rolls the long back reduce-only. Returns the hedged size
+   * (both legs), or null when nothing is open / the symbol was quarantined.
+   */
+  private async openPosition(
+    ctx: StrategyContext,
+    opp: { symbol: string; longExchange: string; shortExchange: string },
+    size: string,
+    longAdapter: ExchangeAdapter,
+    shortAdapter: ExchangeAdapter,
+  ): Promise<string | null> {
+    const errText = (e: unknown) => e instanceof Error ? e.message : String(e);
+    const dec = sizeDecimalsOf(size);
+    let longFilled: number;
+    try {
+      longFilled = (await placePerpVerified(longAdapter, opp.longExchange, opp.symbol, "buy", size)).filledSize;
+    } catch (err) {
+      if (isOutcomeUnknown(err)) this.quarantine(opp, `long leg ${size} on ${opp.longExchange} outcome unknown (${errText(err)}) — no short placed`, ctx);
+      else ctx.log(`  [ARB-V2] Execution failed (long leg): ${errText(err)}`);
+      return null;
+    }
+    const longOpen = fillSizeString(longFilled, dec);
+    let shortFilled: number;
+    try {
+      shortFilled = (await placePerpVerified(shortAdapter, opp.shortExchange, opp.symbol, "sell", longOpen)).filledSize;
+    } catch (err) {
+      const msg = errText(err);
+      if (isOutcomeUnknown(err)) {
+        // The short may exist: closing the long could leave a naked short.
+        this.quarantine(opp, `short leg ${longOpen} on ${opp.shortExchange} outcome unknown (${msg}); long ${longOpen} open on ${opp.longExchange} — not rolled back`, ctx);
+        return null;
+      }
+      ctx.log(`  [ARB-V2] Execution failed (short leg): ${msg} — rolling back the long (reduce-only)`);
+      try {
+        const rb = await closePerpVerified(longAdapter, opp.longExchange, opp.symbol, "sell", longOpen, { decimals: dec });
+        if (rb.residual > 0) {
+          this.quarantine(opp, `short leg failed (${msg}); the long rollback closed ${fillSizeString(rb.closed, dec)} of ${longOpen}, ${fillSizeString(rb.residual, dec)} still open${rb.note !== null ? ` (${rb.note})` : ""} — orphaned long on ${opp.longExchange}`, ctx);
+          return null;
+        }
+        ctx.log(`  [ARB-V2] Rollback OK: closed long ${longOpen} ${opp.symbol} on ${opp.longExchange}`);
+      } catch (rbErr) {
+        this.quarantine(opp, `short leg failed (${msg}) and the long rollback failed or is unconfirmed (${errText(rbErr)}) — orphaned long ${longOpen} on ${opp.longExchange}`, ctx);
+      }
+      return null;
+    }
+    const hedged = fillSizeString(shortFilled, dec);
+    try {
+      const trimmed = await trimFirstLegToHedge(longAdapter, opp.longExchange, opp.symbol, "buy", longFilled, shortFilled, dec);
+      if (trimmed !== "0") ctx.log(`  [ARB-V2] Short filled ${hedged} of ${longOpen} — trimmed long by ${trimmed} (reduce-only)`);
+    } catch (trimErr) {
+      this.quarantine(opp, `short filled ${hedged} of ${longOpen}; trimming the long's excess on ${opp.longExchange} failed or is unconfirmed (${errText(trimErr)}) — long ${longOpen} vs short ${hedged}`, ctx);
+      return null;
+    }
+    return hedged;
+  }
+
+  /**
+   * Close both legs reduce-only with the opened size, verified. Reduce-only makes a
+   * retry safe (a leg already flat is rejected, never re-opened), so a definite failure
+   * of the LONG close keeps the (still hedged) position for the next tick; MAX_CLOSE_FAILURES
+   * in a row, an unknown outcome, or a short close that definitely failed once the long is
+   * closed (naked short) quarantines it. Returns true when both legs are flat.
+   */
+  private async closePosition(ctx: StrategyContext, pos: ArbPosition, adapters: Map<string, ExchangeAdapter>): Promise<boolean> {
+    const longAdapter = adapters.get(pos.longExchange);
+    const shortAdapter = adapters.get(pos.shortExchange);
+    if (!longAdapter || !shortAdapter) {
+      ctx.log(`  [ARB-V2] Close ${pos.symbol}: adapter missing (${pos.longExchange}/${pos.shortExchange})`);
+      return false;
+    }
+    const errText = (e: unknown) => e instanceof Error ? e.message : String(e);
+    const failed = (why: string): boolean => {
+      pos.closeFailures++;
+      ctx.log(`  [ARB-V2] Close failed for ${pos.symbol}: ${why} (${pos.closeFailures}/${MAX_CLOSE_FAILURES})`);
+      if (pos.closeFailures >= MAX_CLOSE_FAILURES) this.quarantine(pos, `close failed ${pos.closeFailures} times in a row (last: ${why})`, ctx);
+      return false;
+    };
+
+    if (!pos.longClosed) {
+      try {
+        const lc = await closePerpVerified(longAdapter, pos.longExchange, pos.symbol, "sell", pos.size);
+        if (lc.residual > 0) {
+          this.quarantine(pos, `close of long on ${pos.longExchange} closed ${lc.closed} of ${pos.size}, ${lc.residual} still open${lc.note !== null ? ` (${lc.note})` : ""}; short ${pos.size} on ${pos.shortExchange} not closed`, ctx);
+          return false;
+        }
+        pos.longClosed = true;
+      } catch (err) {
+        const msg = errText(err);
+        if (isOutcomeUnknown(err)) {
+          this.quarantine(pos, `close of long ${pos.size} on ${pos.longExchange} outcome unknown (${msg})`, ctx);
+          return false;
+        }
+        if (!isPositionGone(err)) return failed(`long leg: ${msg}`);
+        pos.longClosed = true; // already flat
+      }
+    }
+    try {
+      const sc = await closePerpVerified(shortAdapter, pos.shortExchange, pos.symbol, "buy", pos.size);
+      if (sc.residual > 0) {
+        this.quarantine(pos, `the long is closed; close of short on ${pos.shortExchange} closed ${sc.closed} of ${pos.size}, ${sc.residual} still open${sc.note !== null ? ` (${sc.note})` : ""} — residual short unhedged`, ctx);
+        return false;
+      }
+    } catch (err) {
+      const msg = errText(err);
+      if (isOutcomeUnknown(err)) {
+        this.quarantine(pos, `close of short ${pos.size} on ${pos.shortExchange} outcome unknown (${msg}); the long is closed`, ctx);
+        return false;
+      }
+      if (!isPositionGone(err)) {
+        // The long is closed, so the short is naked: quarantine NOW — never carry a naked
+        // short across ticks waiting for MAX_CLOSE_FAILURES.
+        this.quarantine(pos, `long closed on ${pos.longExchange}; close of short ${pos.size} on ${pos.shortExchange} failed (${msg}) — naked short`, ctx);
+        return false;
+      }
+    }
+    ctx.log(`  [ARB-V2] Closed ${pos.symbol} (long ${pos.longExchange}, short ${pos.shortExchange})`);
+    return true;
   }
 
   private getAdapters(ctx: StrategyContext): Map<string, ExchangeAdapter> {

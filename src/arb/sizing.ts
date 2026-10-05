@@ -1,5 +1,3 @@
-import type { ExchangeAdapter } from "../exchanges/index.js";
-
 /**
  * Calculate the exact same size for both legs of an arb position,
  * respecting both exchanges' minimum order and size precision constraints.
@@ -11,7 +9,15 @@ export function computeMatchedSize(
   price: number,
   longExchange: string,
   shortExchange: string,
-  opts?: { longSizeDecimals?: number; shortSizeDecimals?: number; lotSize?: number },
+  opts?: {
+    longSizeDecimals?: number; shortSizeDecimals?: number; lotSize?: number;
+    /**
+     * The pair's minimum order value in USD from the venues' published market info (the larger of
+     * the two legs; 0 = neither venue publishes one). When given it is the ONLY minimum applied —
+     * the per-venue table below is for callers that have no market info at hand.
+     */
+    minNotional?: number;
+  },
 ): { size: string; notional: number } | null {
   if (price <= 0) return null;
 
@@ -36,10 +42,9 @@ export function computeMatchedSize(
 
   // Verify notional meets minimum for both exchanges
   const notional = roundedSize * price;
-  const minNotional = Math.max(
-    getMinNotional(longExchange),
-    getMinNotional(shortExchange),
-  );
+  const minNotional = opts?.minNotional !== undefined
+    ? opts.minNotional
+    : Math.max(getMinNotional(longExchange), getMinNotional(shortExchange));
 
   if (notional < minNotional) {
     // Try rounding UP instead
@@ -137,65 +142,4 @@ export function computeSpotPerpMatchedSize(
   }
 
   return { size: roundedSize.toFixed(szDecimals), notional };
-}
-
-/**
- * After both legs are submitted, verify actual fills match.
- * If there's a size mismatch, place a correction order on the larger side.
- *
- * @returns the corrected size, or null if already matched
- */
-export async function reconcileArbFills(
-  longAdapter: ExchangeAdapter,
-  shortAdapter: ExchangeAdapter,
-  symbol: string,
-  log?: (msg: string) => void,
-): Promise<{ matched: boolean; longSize: number; shortSize: number; correction?: string }> {
-  const [longPositions, shortPositions] = await Promise.all([
-    longAdapter.getPositions(),
-    shortAdapter.getPositions(),
-  ]);
-
-  const longPos = longPositions.find(p =>
-    p.symbol.replace("-PERP", "").toUpperCase() === symbol.toUpperCase() && p.side === "long"
-  );
-  const shortPos = shortPositions.find(p =>
-    p.symbol.replace("-PERP", "").toUpperCase() === symbol.toUpperCase() && p.side === "short"
-  );
-
-  const longSize = longPos ? Math.abs(Number(longPos.size)) : 0;
-  const shortSize = shortPos ? Math.abs(Number(shortPos.size)) : 0;
-
-  if (longSize === 0 && shortSize === 0) {
-    return { matched: true, longSize: 0, shortSize: 0 };
-  }
-
-  const diff = Math.abs(longSize - shortSize);
-  const maxSize = Math.max(longSize, shortSize);
-  const diffPct = maxSize > 0 ? (diff / maxSize) * 100 : 0;
-
-  // Allow 1% tolerance (rounding differences)
-  if (diffPct <= 1) {
-    return { matched: true, longSize, shortSize };
-  }
-
-  log?.(`[ARB] Size mismatch: long ${longSize} vs short ${shortSize} (diff: ${diff.toFixed(4)}, ${diffPct.toFixed(1)}%)`);
-
-  // Correct the larger side by reducing it
-  const correctionSize = diff.toFixed(6);
-  try {
-    if (longSize > shortSize) {
-      log?.(`[ARB] Correcting: sell ${correctionSize} ${symbol} on ${longAdapter.name} to match`);
-      await longAdapter.marketOrder(symbol, "sell", correctionSize);
-    } else {
-      log?.(`[ARB] Correcting: buy ${correctionSize} ${symbol} on ${shortAdapter.name} to match`);
-      await shortAdapter.marketOrder(symbol, "buy", correctionSize);
-    }
-    log?.(`[ARB] Sizes reconciled`);
-    return { matched: true, longSize: Math.min(longSize, shortSize), shortSize: Math.min(longSize, shortSize), correction: correctionSize };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    log?.(`[ARB] Correction failed: ${msg}`);
-    return { matched: false, longSize, shortSize };
-  }
 }

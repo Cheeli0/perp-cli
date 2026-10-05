@@ -50,8 +50,9 @@ perp --json -e <EX> trade market <SYM> buy <SIZE> --split   # split via flag
 
 # Limit / stop / TPSL
 perp --json -e <EX> trade limit <SYMBOL> <buy|sell> <PRICE> <SIZE>
-perp --json -e <EX> trade stop <SYMBOL> <SIDE> <SIZE> <STOP_PRICE>
-perp --json -e <EX> trade tpsl <SYMBOL> <SIDE> --tp <P> --sl <P>
+perp --json -e <EX> trade stop <SYMBOL> <SIDE> <SIZE> <STOP_PRICE>   # reduce-only by default; --no-reduce-only to open
+perp --json -e <EX> trade tpsl <SYMBOL> <long|short> --tp <P> --sl <P>   # positionSide = the open position's side
+perp --json -e <EX> trade buy <SYMBOL> <SIZE> --tp <P> --sl <P>         # entry protected by TP/SL (verified fill)
 
 # Order management
 perp --json -e <EX> trade edit <SYMBOL> <ORDER_ID> <PRICE> <SIZE>
@@ -179,7 +180,17 @@ perp --json funds deposit lighter cctp arbitrum <AMOUNT>    # CCTP (min 5 USDC)
 perp --json funds deposit lighter info                      # all Lighter deposit routes
 perp --json funds withdraw pacifica <AMOUNT>
 perp --json funds withdraw hyperliquid <AMOUNT>
-perp --json funds withdraw lighter <AMOUNT>
+perp --json funds withdraw lighter <AMOUNT>                 # -e lighter: USDC → Ethereum; -e lighter-rh: USDG → Robinhood Chain
+perp --json funds deposit lighter-rh <AMOUNT>               # USDG on Robinhood Chain (min 1, mainnet only)
+perp --json funds withdraw ondo <AMOUNT> --to <ADDRESS>     # USDC → Ethereum (address-book destination)
+perp --json funds withdraw arcus <AMOUNT>                   # USDG → the account owner (min 1)
+perp --json funds deposit qfex                              # prints the USDC / Arbitrum One deposit address (sends nothing)
+perp --json --dry-run funds withdraw qfex <AMOUNT> --to <0x>  # plan + local gate verdict (settings withdraw.qfex; user-only, terminal)
+perp --json -e qfex funds transfer <AMOUNT> primary --from <account-uuid>   # between your QFEX accounts
+perp --json funds deposit aster <AMOUNT> [--chain bsc|arbitrum] [--asset USDT|USDC]   # vault approve + deposit (mainnet; default BNB Chain USDT)
+perp --json funds withdraw aster <AMOUNT> [--chain bsc|arbitrum]   # USDT → the account's own address (mainnet; agent approved with --can-withdraw --ip-whitelist)
+perp --json funds deposit ondo <AMOUNT> [--chain arbitrum|ethereum] [--probe <AMT>]   # USDC transfer to the account's funding address (mainnet)
+perp --json funds address-book add ondo <MASTER_ADDRESS>    # SIWE challenge → Ondo withdrawal address book (own address only)
 perp --json funds transfer <AMOUNT> <ADDRESS>               # HL internal transfer (instant)
 perp --json funds info                                      # combined routes & limits
 ```
@@ -190,6 +201,10 @@ perp --json funds bridge chains                             # supported chains
 perp --json funds bridge quote --from <CHAIN> --to <CHAIN> --amount <AMT>
 perp --json funds bridge send --from <CHAIN> --to <CHAIN> --amount <AMT>
 perp --json funds bridge send --from <CHAIN> --to <CHAIN> --amount <AMT> --provider cctp
+# Relay swaps (chains: robinhood, arbitrum, bsc, base, solana as destination; EVM origin; OWS master signs; recipient = your own address)
+perp --json --dry-run funds bridge send --from robinhood --to arbitrum --from-asset USDG --to-asset USDC --amount <AMT>   # verified quote only
+perp --json funds bridge send --from robinhood --to solana --from-asset USDG --to-asset SOL --amount <AMT> --min-out <SOL>  # stable → native needs --min-out
+perp --json funds bridge send --from arbitrum --to robinhood --from-asset ETH --to-asset ETH --amount <ETH>                # native gas to Robinhood Chain
 perp --json funds bridge exchange --from <EX> --to <EX> --amount <AMT>   # between exchanges
 perp --json funds bridge status <ORDER_ID>
 ```
@@ -254,12 +269,10 @@ perp --json arb auto --dry-run                              # simulate
 ```bash
 perp --json wallet generate evm                # generate EVM wallet
 perp --json wallet generate solana             # generate Solana wallet
-perp --json wallet import [privateKey]         # import an existing key
-perp --json wallet set hl <KEY>                # set Hyperliquid key
-perp --json wallet set pac <KEY>               # set Pacifica key
-perp --json wallet set lt <KEY>                # set Lighter key (auto-generates API key)
-perp --json wallet set aster <API_KEY>         # set Aster API key
-perp --json wallet set hl <KEY> --default      # set + make default exchange
+printf '%s' "$KEY" | OWS_PASSPHRASE=<pp> perp --json wallet import --name <n> [--chain evm|solana|dual] [--mnemonic]   # import a key (stdin / hidden prompt; argv key, --evm/--solana <key>, --legacy rejected)
+printf '%s' "$KEY" | OWS_PASSPHRASE=<pp> perp --json wallet set hl   # import key (stdin / hidden prompt; argv key rejected) into OWS vault → active wallet
+perp --json wallet set pac --name pac          # Solana key, hidden prompt (TTY)
+perp --json wallet set hl --default            # also make hyperliquid the default exchange
 perp --json wallet show                        # public addresses for active wallet
 perp --json wallet list                        # all named wallets
 perp --json wallet use <name>                  # set active wallet
@@ -290,38 +303,65 @@ perp --json wallet agent approve <exchange> \
   [--can-perp|--no-perp] [--can-spot|--no-spot] [--can-withdraw|--no-withdraw] \
   [--rotate] \
   [--passphrase <pp>] \
-  [--builder <addr> --max-fee-rate <bps> --builder-name <name>] \
   [--ip-whitelist <list>] \
-  [--api-key-index <n>]                # Lighter slot 4-254
+  [--api-key-index <n>]                # Lighter slot 4-254 (default: first slot free locally AND on-chain)
+  [--force]                            # Lighter: overwrite an --api-key-index slot that already holds an on-chain key
 
-perp --json wallet agent list [exchange]
-perp --json wallet agent revoke <exchange> <agentName>
+# Import a key the USER created on the exchange WEBSITE (master wallet not needed here).
+# Key on stdin only (one line; ondo: key id + secret) — an argv key is rejected (INVALID_PARAMS).
+# Verified against the venue before storing (refused → nothing stored); pacifica → "unverified".
+printf '%s' "$AGENT_KEY" | perp --json wallet agent import <exchange> \
+  [--master-address <addr>]            # aster / pacifica / arcus: required; hyperliquid / lighter: cross-check
+  [--account-index <n>] [--api-key-index <n>]   # lighter / lighter-rh: required (arcus: optional cross-check)
+  [--account-id <uuid>]                # qfex: the account the key trades (default primary; required when piped — it confirms the binding)
+  [--agent-name <name>] [--expires-in <dur>] [--replace]
+# → data: { source: "imported", masterAddress, agentAddress|publicKey, accountIndex, apiKeyIndex,
+#           expiresAt|null, storage, verification: { status: "verified"|"unverified", method } }
+
+perp --json wallet agent list [exchange]          # rows carry source: "approved" | "imported"
+perp --json wallet agent revoke <exchange> <agentName> [--local-only]
+#   imported key: refused unless --local-only (deletes local key + record; still authorized on the
+#   exchange — revoke it on the website). --local-only on an approved agent = --force.
 perp --json wallet agent rotate <exchange> [oldAgentName]
+#   imported key: refused — create a new key on the website, then import --agent-name <name> --replace
 # verify uses --master/--master-address (HL) / --account-index (LT) / --passphrase (Aster/PAC).
 # Aster: returns NOT_IMPLEMENTED — DEX endpoint /fapi/v3/agent rejects identical sigs.
 perp --json wallet agent verify [exchange] [agentName] \
   [--master <name>] [--master-address <addr>] [--account-index <n>] [--passphrase <pp>]
 ```
 
+### Builder fees (`wallet builder`) — OFF by default
+```bash
+# Nothing is attached unless the user configures it explicitly (strict: format, cap, increment):
+perp --json settings set builder.<venue> <address|code>,<feeBps> --yes   # hyperliquid/aster: address; pacifica/ondo: code; --yes required non-interactively
+perp --json settings unset builder.<venue>
+perp --json wallet builder status [venue]           # support, config, venue approval, attaches?
+perp --json [--dry-run] wallet builder approve <venue> [--master <name>] [--yes]   # master-signed; y/N or --yes
+perp --json [--dry-run] wallet builder revoke <venue> [--master <name>] [--yes]    # pacifica / aster
+perp --no-builder trade market BTC buy 0.1          # never attach on this run
+# Caps: hyperliquid 10 bps (never HIP-3), pacifica 10 bps max (perp-cli cap; never spot), aster 10 bps (mainnet),
+# ondo 10 bps (no approval; also on position stops). lighter / lighter-rh / arcus → CAPABILITY_UNSUPPORTED.
+# Approval missing/unknown → order sent WITHOUT the fee; execution.notes says why. execution.builderFee records it.
+# No master on this computer → NO_SIGNER_AVAILABLE: approve on the venue website.
+```
+
 ### Exchange settings (`wallet manage`)
 ```bash
 perp --json wallet manage margin <SYMBOL> <cross|isolated>
 perp --json wallet manage account-mode [unified|standard|portfolio]   # Hyperliquid only; no arg = show current
-perp --json wallet manage sub create <name>
+perp --json wallet manage sub create <name>            # not supported (CAPABILITY_UNSUPPORTED): the subaccount wallet must co-sign — use the web app
 perp --json wallet manage sub list
-perp --json wallet manage sub transfer <from> <to> <amount>
-perp --json wallet manage lake create <symbol> <amount>
-perp --json wallet manage lake deposit <lakeId> <amount>
-perp --json wallet manage lake withdraw <lakeId> <amount>
-perp --json wallet manage builder approve <code> <maxFeeRate>
-perp --json wallet manage builder revoke <code>
-perp --json wallet manage builder list
-perp --json wallet manage builder overview
+perp --json wallet manage sub transfer <from> <to> <amount>   # <from> must be the signing account
+perp --json wallet manage lake create [--manager <address>] [--nickname <name>] [--initial-deposit <amount>]
+perp --json wallet manage lake deposit <lake> <amount>       # <lake> = vault address
+perp --json wallet manage lake withdraw <lake> <shares>      # shares to redeem, not USDC
+perp --json wallet manage builder overview                    # Pacifica builder-OWNER tools only (user approvals: wallet builder)
 perp --json wallet manage builder trades <code>
 perp --json wallet manage builder leaderboard <code>
 perp --json wallet manage builder update-fee <code> <feeRate>
 perp --json wallet manage referral claim <code>               # Pacifica
-perp --json wallet manage apikey create <name> <maxFeeRate>
+perp --json -e hyperliquid wallet manage referral set [code]  # HL / Lighter (-e lighter): signs + sends one referral action; supports --dry-run
+perp --json wallet manage apikey create
 perp --json wallet manage apikey list
 perp --json wallet manage apikey revoke <key>
 ```
@@ -428,11 +468,13 @@ perp alerts stop                              # stop background daemon
 ```bash
 perp --json settings show                     # show current CLI settings
 perp --json settings set <key> <value>        # set a CLI default
-perp --json settings referrals on|off         # toggle referral codes
+#   keys: default-exchange, defaultSlippageBps, slippageBps.<venue>, referralCodes.{hyperliquid,lighter},
+#         builder.<venue> "<address|code>,<feeBps>" (off unless set), bridge.debridgeAffiliate.{referralCode,fee}
+perp --json settings unset <key>              # slippageBps.<venue> | defaultSlippageBps | builder.<venue> | bridge.debridgeAffiliate
 perp --json settings fees show                # cached exchange fee table
 perp --json settings fees sync                # refresh fee cache
 perp --json settings env show                 # show ~/.perp/.env values
-perp --json settings env set <name> <value>
+perp --json settings env set <name> <value>   # non-secret values only (keys / *_PRIVATE_KEY / secrets → INVALID_PARAMS; use wallet set)
 perp --json settings env remove <name>
 perp --json settings env path                 # config file path
 ```
@@ -443,11 +485,22 @@ perp --json settings env path                 # config file path
 perp setup                                    # alias: perp init
 perp init
 
-# Agent-safe non-interactive variant (requires --passphrase or OWS_PASSPHRASE env):
+# Agent-safe non-interactive variant (writes settings; signs nothing by default):
 perp --json setup --non-interactive \
-  --wallet-name <name> \
-  --passphrase <pp> \
-  [--default-exchange <pacifica|hyperliquid|lighter|aster>]
+  (--wallet <existing-ows-wallet> | --wallet-name <new-name> --passphrase <pp>) \
+  [--network mainnet|testnet] [--venues <list>] [--default-venue <venue>] \
+  [--slippage-bps <n>] [--slippage <venue>=<bps> ...]
+# Agent registration (signs with the master wallet — get user consent first):
+#   --approve-agents --yes [--aster-can-spot] [--lighter-api-key-index <n>]
+#   [--lighter-rh-api-key-index <n>] [--arcus-account-index <0-9|255>]
+#   [--ondo-secret-stdin]   # Ondo key id + secret as 2 stdin lines; passphrase then via OWS_PASSPHRASE
+# Keys created on the exchange WEBSITES (no master wallet needed when every venue is imported —
+# then omit --wallet / --wallet-name; owsActiveWallet is left unchanged):
+#   --import-agents <venues> --yes   # subset of --venues; keys on stdin, ONE LINE PER VENUE IN THIS ORDER
+#                                    # (ondo: 2 lines — key id, then secret)
+#   [--master-address <venue>=<addr> ...] [--lighter-account-index <n>] [--lighter-api-key-index <n>]
+#   [--lighter-rh-account-index <n>] [--lighter-rh-api-key-index <n>] [--arcus-account-index <n>]
+#   agents[] entries: { venue, status: "imported", agentName, verification }
 ```
 
-For per-exchange key registration without the wizard, use `perp wallet set <ex> <key>` — also agent-safe.
+For per-exchange key registration without the wizard, use `printf '%s' "$KEY" | OWS_PASSPHRASE=<pp> perp wallet set <ex>` — also agent-safe (key on stdin, never argv).

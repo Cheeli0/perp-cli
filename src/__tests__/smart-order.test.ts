@@ -4,7 +4,8 @@ import type { ExchangeAdapter } from "../exchanges/interface.js";
 
 function mockAdapter(overrides: Partial<ExchangeAdapter> = {}): ExchangeAdapter {
   return {
-    name: "test",
+    // Registered venue id: the market fallback resolves its slippage bound from the venue (UNKNOWN_VENUE otherwise).
+    name: "hyperliquid",
     getMarkets: vi.fn(),
     getOrderbook: vi.fn().mockResolvedValue({
       bids: [["100.50", "10"], ["100.40", "20"], ["100.30", "15"]],
@@ -70,7 +71,7 @@ describe("smartOrder", () => {
     const result = await smartOrder(adapter, "BTC", "buy", "0.1", { fallback: true });
 
     expect(result.method).toBe("market_fallback");
-    expect(adapter.marketOrder).toHaveBeenCalledWith("BTC", "buy", "0.1", { reduceOnly: false });
+    expect(adapter.marketOrder).toHaveBeenCalledWith("BTC", "buy", "0.1", { reduceOnly: false, slippage: { bps: 50, source: "default" } });
   });
 
   it("throws by default when IOC limit fails (SSOT rule #2)", async () => {
@@ -212,7 +213,7 @@ describe("smartOrder", () => {
     const result = await smartOrder(adapter, "BTC", "sell", "0.1", { fallback: true });
 
     expect(result.method).toBe("market_fallback");
-    expect(adapter.marketOrder).toHaveBeenCalledWith("BTC", "sell", "0.1", { reduceOnly: false });
+    expect(adapter.marketOrder).toHaveBeenCalledWith("BTC", "sell", "0.1", { reduceOnly: false, slippage: { bps: 50, source: "default" } });
   });
 
   it("rounds tick size to eliminate floating-point noise", async () => {

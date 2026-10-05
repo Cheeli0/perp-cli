@@ -1,10 +1,15 @@
 import chalk from "chalk";
 import { listAgents } from "./agent-wallet/store.js";
+import { getVenue, listVenues } from "./exchanges/venue.js";
+import "./exchanges/venues/index.js";
 
-export const LANDING_EXCHANGES = ["pacifica", "hyperliquid", "lighter", "aster"] as const;
+/** Every registered venue, in registry order (SSOT: the venue registry). */
+export const LANDING_EXCHANGES: readonly string[] = listVenues().map(v => v.id);
 
 export type LandingExchangeStatus = {
-  exchange: typeof LANDING_EXCHANGES[number];
+  exchange: string;
+  /** Venue has no account API — rendered as market data only. */
+  marketDataOnly?: boolean;
   ok: boolean;
   equity: number;
   positions: number;
@@ -17,8 +22,9 @@ const ASTER_AGENT_REQUIRED_CODES = new Set([
   "AGENT_EXPIRED",
 ]);
 
-function exchangeLabel(exchange: LandingExchangeStatus["exchange"]): string {
-  return exchange === "pacifica" ? "Pacifica" : exchange === "hyperliquid" ? "Hyperliquid" : exchange === "lighter" ? "Lighter" : "Aster";
+/** Single-token label (display name without spaces: "Lighter RH" → "LighterRH") so columns stay one word per venue. */
+function exchangeLabel(exchange: string): string {
+  return getVenue(exchange).displayName.replace(/\s+/g, "");
 }
 
 export function asterAgentMissing(): boolean {
@@ -37,6 +43,10 @@ export function renderLandingExchangeLine(
     ASTER_AGENT_REQUIRED_CODES.has(status.errorCode)
   ) {
     return `    ${chalk.yellow("⚙")} ${chalk.cyan(exchangeLabel(status.exchange).padEnd(14))} ${chalk.yellow("agent required")} ${chalk.gray("→ perp wallet agent approve aster")}`;
+  }
+
+  if (status.marketDataOnly) {
+    return `    ${chalk.gray("◇")} ${chalk.cyan(exchangeLabel(status.exchange).padEnd(14))} ${chalk.gray("market data only")}`;
   }
 
   const icon = status.ok ? chalk.green("●") : chalk.red("○");

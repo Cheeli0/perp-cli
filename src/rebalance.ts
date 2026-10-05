@@ -1,5 +1,23 @@
 import type { ExchangeAdapter } from "./exchanges/index.js";
 import { PerpError } from "./errors.js";
+import { getVenue, tryResolveVenueId } from "./exchanges/venue.js";
+import "./exchanges/venues/index.js";
+
+/** Settlement chains with no withdraw → bridge → deposit route in this CLI (design §10.10). */
+const NO_ROUTE_CHAINS = new Set(["robinhood", "offchain"]);
+
+/** Throws NO_BRIDGE_ROUTE when the venue's funds live where no bridge route exists. */
+export function assertBridgeRoute(exchange: string): void {
+  const id = tryResolveVenueId(exchange);
+  if (id === null) return; // not a venue name — the existing "unknown route" handling applies
+  const def = getVenue(id);
+  const chain = def.networks.mainnet.settlementChain;
+  if (NO_ROUTE_CHAINS.has(chain)) {
+    throw new PerpError("NO_BRIDGE_ROUTE", `${def.displayName} settles on "${chain}"; cross-venue rebalancing has no route there`, {
+      remediation: `Exclude ${def.id} from --exchanges and move funds for it manually`,
+    });
+  }
+}
 
 /**
  * Cross-exchange rebalancing engine.
@@ -149,6 +167,8 @@ export function computeRebalancePlan(
       const moveAmt = Math.min(remaining, Math.abs(deficitAmt));
       if (moveAmt < minMove) continue;
 
+      assertBridgeRoute(fromEx);
+      assertBridgeRoute(toEx);
       moves.push({
         from: fromEx,
         to: toEx,
@@ -192,6 +212,8 @@ export function hasEnoughBalance(
  * Describe the bridge route for a rebalance move.
  */
 export function describeBridgeRoute(move: RebalanceMove): string {
+  assertBridgeRoute(move.from);
+  assertBridgeRoute(move.to);
   const from = EXCHANGE_CHAINS[move.from];
   const to = EXCHANGE_CHAINS[move.to];
   if (!from || !to) return `${move.from} → ${move.to} (unknown route)`;

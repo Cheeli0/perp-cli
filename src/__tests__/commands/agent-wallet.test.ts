@@ -9,6 +9,7 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from "fs";
 import { resolve } from "path";
 import os from "os";
 import { Command } from "commander";
+import { addRootSafetyOptions } from "../../cli-flags.js";
 
 // ── Stable temp-dir for settings I/O ──────────────────────────────────────
 
@@ -18,6 +19,8 @@ vi.stubEnv("HOME", TEST_HOME);
 // ── Mock OWS loader BEFORE any module imports ─────────────────────────────
 
 const mockOws = {
+  listWallets: vi.fn((): Array<{ name: string }> => []),
+  deleteWallet: vi.fn(),
   createWallet: vi.fn(),
   createPolicy: vi.fn(),
   createApiKey: vi.fn(),
@@ -53,6 +56,7 @@ const { loadSettings, saveSettings } = await import("../../settings.js");
 
 function makeProgram() {
   const prog = new Command();
+  addRootSafetyOptions(prog);
   prog.exitOverride(); // prevent process.exit in tests
   // Register `agent` as a subcommand of `wallet` to match the production
   // command tree post-consolidation (`perp wallet agent ...`).
@@ -465,7 +469,10 @@ describe("Test 8: agent revoke --force", () => {
     const jsonOutput = printed.find(p => p.includes('"ok"'));
     const parsed = JSON.parse(jsonOutput!);
     expect(parsed.ok).toBe(true);
-    expect(parsed.data.revoked).toBe(true);
+    // --force sends nothing: the key is NOT revoked on the venue and the output says so.
+    expect(parsed.data.revoked).toBe(false);
+    expect(parsed.data.localOnly).toBe(true);
+    expect(parsed.data.note).toMatch(/NOT revoked/);
 
     consoleSpy.mockRestore();
   });
@@ -691,7 +698,9 @@ describe("Test 14: No-prompts allowlist invariant", () => {
     // Allowlist: files that legitimately use readline for human-onboarding flows.
     // wallet.ts does NOT use readline (verified on HEAD). If it is added later,
     // update this allowlist — do NOT just add it without a review.
-    const allowlist = new Set(["agent.ts", "init.ts", "alerts.ts", "wallet.ts"]);
+    // builder.ts: the explicit y/N consent before a master-signed builder-fee approval / revoke.
+    // settings.ts: the explicit y/N consent before `settings set builder.<venue>` (TTY only; --yes / refused otherwise).
+    const allowlist = new Set(["agent.ts", "init.ts", "alerts.ts", "wallet.ts", "builder.ts", "settings.ts"]);
     const unexpected = files.filter(f => !allowlist.has(f));
     expect(unexpected).toHaveLength(0);
     // Core allowlisted files that must always use readline
@@ -786,49 +795,35 @@ describe("Test 16: Remediation field on every actionable error", () => {
 // Test 17: Optional builder approval
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe("Test 17: Optional builder approval", () => {
-  it("--builder set → approveBuilder POST sent BEFORE approveAgent POST", async () => {
+describe("Test 17: builder approval moved out of agent approve", () => {
+  it("--builder is refused with a pointer to `wallet builder approve` — nothing is signed or sent", async () => {
     setupOkOws();
-
-    const fetchCalls: string[] = [];
-    vi.stubGlobal("fetch", vi.fn().mockImplementation((url: string) => {
-      fetchCalls.push(url);
-      return Promise.resolve({
-        ok: true,
-        status: 200,
-        json: async () => ({ code: "000000" }),
-        text: async () => "ok",
-      });
-    }));
-
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
     Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
     vi.stubEnv("OWS_PASSPHRASE", "testpass");
 
-    const printed: string[] = [];
-    vi.spyOn(console, "log").mockImplementation((msg) => { printed.push(String(msg)); });
+    const out: string[] = [];
+    const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation((chunk: unknown) => { out.push(String(chunk)); return true; });
     const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("exit"); }) as never);
 
     const prog = makeProgram();
-    await prog.parseAsync([
+    await expect(prog.parseAsync([
       "node", "perp", "wallet", "agent", "approve", "aster",
-      "--master", "main",
-      "--agent-name", "perp-cli-aster",
-      "--expires-in", "90d",
-      "--passphrase", "testpass",
+      "--master", "main", "--passphrase", "testpass",
       "--builder", "0xBuilderAddr000000000000000000000000001",
       "--max-fee-rate", "5",
       "--json",
-    ]);
+    ])).rejects.toThrow("exit");
 
-    // approveBuilder URL should come BEFORE approveAgent URL
-    const builderIdx = fetchCalls.findIndex(u => u.includes("approveBuilder"));
-    const agentIdx = fetchCalls.findIndex(u => u.includes("approveAgent"));
-    expect(builderIdx).toBeGreaterThanOrEqual(0);
-    expect(agentIdx).toBeGreaterThanOrEqual(0);
-    expect(builderIdx).toBeLessThan(agentIdx);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    const env = JSON.parse(out.join("").trim().split("\n").pop()!);
+    expect(env.ok).toBe(false);
+    expect(env.error.code).toBe("INVALID_PARAMS");
+    expect(String(env.error.remediation)).toContain("perp wallet builder approve");
 
+    writeSpy.mockRestore();
     exitSpy.mockRestore();
-    vi.spyOn(console, "log").mockRestore();
   });
 });
 
@@ -1221,5 +1216,72 @@ describe("Test 25: rotate preserves old permissions when flags absent", () => {
     expect(newMeta!.permissions.canWithdraw).toBe(false);
 
     vi.spyOn(console, "log").mockRestore();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// approve vs an existing agent OWS wallet (name collision) and approve --rotate
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("Aster approve vs an existing agent OWS wallet", () => {
+  const agentWallet = {
+    id: "wallet-agent-id", name: "agent-aster-main",
+    accounts: [{ chainId: "eip155:56", address: "0xAgentAddr0000000000000000000000000000001", derivationPath: "m/44'/60'/0'/0/0" }],
+    createdAt: new Date().toISOString(),
+  };
+  const statefulWallets = (initial: string[]) => {
+    let wallets = initial.map(name => ({ name }));
+    const order: string[] = [];
+    mockOws.listWallets.mockImplementation(() => wallets);
+    mockOws.deleteWallet.mockImplementation((n: string) => { order.push(`delete:${n}`); wallets = wallets.filter(w => w.name !== n); });
+    mockOws.createWallet.mockImplementation((n: string) => {
+      if (wallets.some(w => w.name === n)) throw new Error(`wallet name already exists: '${n}'`);
+      order.push(`create:${n}`); wallets = [...wallets, { name: n }];
+      return agentWallet;
+    });
+    return order;
+  };
+  const expiredRecord = () => {
+    const m = makeAgentMeta("perp-cli-aster");
+    m.expiresAt = new Date(Date.now() - 1000).toISOString();
+    setAgent("aster", m);
+  };
+
+  afterEach(() => {
+    // mockImplementation survives vi.clearAllMocks(): restore the file-level defaults.
+    mockOws.listWallets.mockReset().mockImplementation(() => []);
+    mockOws.deleteWallet.mockReset();
+    mockOws.createWallet.mockReset();
+  });
+
+  it("approve without --rotate → INVALID_PARAMS telling the user to pass --rotate, never DUPLICATE_ORDER; nothing sent", async () => {
+    setupOkOws();
+    statefulWallets(["agent-aster-main"]);
+    expiredRecord();
+    stubFetchOk();
+    const out: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((c: string | Uint8Array) => { out.push(String(c)); return true; });
+    vi.spyOn(console, "log").mockImplementation((m) => { out.push(String(m)); });
+    vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("process.exit"); }) as never);
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    await expect(makeProgram().parseAsync(["node", "perp", "wallet", "agent", "approve", "aster", "--master", "main", "--agent-name", "perp-cli-aster", "--passphrase", "testpass", "--json"])).rejects.toThrow("process.exit");
+    const err = JSON.parse(out.find(l => l.includes('"ok":false'))!).error;
+    expect(err.code).toBe("INVALID_PARAMS");
+    expect(err.remediation).toContain("perp wallet agent approve aster --rotate");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("approve --rotate with an EXPIRED previous agent → the rotate path: old wallet deleted before the new one is created", async () => {
+    setupOkOws();
+    const order = statefulWallets(["agent-aster-main"]);
+    expiredRecord();
+    stubFetchOk();
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("process.exit"); }) as never);
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    await makeProgram().parseAsync(["node", "perp", "wallet", "agent", "approve", "aster", "--master", "main", "--agent-name", "perp-cli-aster", "--rotate", "--passphrase", "testpass", "--json"]);
+    expect(order).toEqual(["delete:agent-aster-main", "create:agent-aster-main"]);
+    expect(new Date(getAgent("aster", "perp-cli-aster")!.expiresAt).getTime()).toBeGreaterThan(Date.now());
   });
 });

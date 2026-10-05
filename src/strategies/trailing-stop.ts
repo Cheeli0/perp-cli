@@ -1,6 +1,11 @@
 import type { ExchangeAdapter } from "../exchanges/index.js";
+import { assertCanClosePositions } from "../exchanges/trading-v2.js";
 import { updateJobState } from "../jobs.js";
+import { invalidateCache } from "../cache.js";
 import { logExecution } from "../execution-log.js";
+import { PerpError } from "../errors.js";
+import { closePerpVerified } from "../bot/perp-order.js";
+import { isPositionGone } from "../bot/strategies/funding-arb-utils.js";
 
 export interface TrailingStopParams {
   symbol: string;
@@ -11,7 +16,8 @@ export interface TrailingStopParams {
 
 export interface TrailingStopResult {
   triggered: boolean;
-  reason: "triggered" | "cancelled" | "no_position";
+  /** position_gone = the position was closed / flipped before the trigger fired (nothing sent). */
+  reason: "triggered" | "cancelled" | "no_position" | "position_gone";
   peakPrice?: number;
   triggerPrice?: number;
   changePct?: number;
@@ -30,6 +36,9 @@ export async function runTrailingStop(
   const activationPrice = params.activationPrice;
   const startedAt = Date.now();
 
+  // Unattended: the close fires later, with nobody watching — refused up front on a gated venue.
+  assertCanClosePositions(adapter, `Trailing stop on ${adapter.name}`);
+
   // Auto-detect position side
   const positions = await adapter.getPositions();
   const pos = positions.find(p => {
@@ -46,6 +55,37 @@ export async function runTrailingStop(
   const positionSide = pos.side;
   const closeSide: "buy" | "sell" = positionSide === "long" ? "sell" : "buy";
   const posSize = pos.size;
+
+  /**
+   * At trigger time: re-read the position (it may have shrunk, grown, flipped or closed since
+   * start) and close exactly the live size, reduce-only and verified (closePerpVerified: one
+   * residual close). Returns the size closed, or null when the position is gone (nothing sent /
+   * the venue rejected a reduce-only close of a flat position). An unknown outcome (ORDER_PENDING)
+   * or a residual propagates as an error — never resubmitted.
+   */
+  const closeLive = async (): Promise<string | null> => {
+    invalidateCache("acct"); // size the reduce-only close from a fresh read, never a cached position
+    const live = (await adapter.getPositions()).find(p => {
+      const c = p.symbol.toUpperCase();
+      const t = symbol.toUpperCase();
+      return (c === t || c === `${t}-PERP` || c.replace(/-PERP$/, "") === t) && p.side === positionSide;
+    });
+    const liveSize = live === undefined ? null : live.size.replace(/^-/, "");
+    if (liveSize === null || !(Number(liveSize) > 0)) return null;
+    log(`[TRAIL] Closing ${positionSide} ${liveSize} ${symbol} (live size, reduce-only)...`);
+    try {
+      const c = await closePerpVerified(adapter, adapter.name, symbol, closeSide, liveSize);
+      if (c.residual > 0) {
+        throw new PerpError("ORDER_PARTIAL", `trailing stop closed ${c.closed} of ${liveSize} ${symbol}; ${c.residual} still open${c.note !== null ? ` (${c.note})` : ""}`, {
+          exchange: adapter.name, remediation: `Do NOT rerun blindly — check the ${symbol} position on ${adapter.name} and close the rest by hand`,
+        });
+      }
+    } catch (e) {
+      if (isPositionGone(e)) return null;
+      throw e;
+    }
+    return liveSize;
+  };
 
   log(`[TRAIL] ${symbol} ${positionSide} ${posSize} | Trail: ${trailPct}%${activationPrice ? ` | Activation: $${activationPrice}` : ""}`);
 
@@ -103,11 +143,14 @@ export async function runTrailingStop(
 
         if (dropPct >= trailPct) {
           log(`[TRAIL] TRIGGERED! Price dropped ${dropPct.toFixed(2)}% from peak $${peakPrice.toFixed(2)}`);
-          log(`[TRAIL] Closing ${positionSide} ${posSize} ${symbol}...`);
-          await adapter.marketOrder(symbol, closeSide, posSize);
+          const closedSize = await closeLive();
+          if (closedSize === null) {
+            log(`[TRAIL] ${symbol} ${positionSide} position is gone — nothing to close. Exiting.`);
+            return { triggered: false, reason: "position_gone", peakPrice, positionSide, runtime: (Date.now() - startedAt) / 1000 };
+          }
           logExecution({
             type: "market_order", exchange: adapter.name, symbol,
-            side: closeSide, size: posSize, status: "success", dryRun: false,
+            side: closeSide, size: closedSize, status: "success", dryRun: false,
             meta: { action: "trailing-stop", trailPct, peakPrice, triggerPrice: currentPrice },
           });
           return {
@@ -124,11 +167,14 @@ export async function runTrailingStop(
 
         if (risePct >= trailPct) {
           log(`[TRAIL] TRIGGERED! Price rose ${risePct.toFixed(2)}% from trough $${peakPrice.toFixed(2)}`);
-          log(`[TRAIL] Closing ${positionSide} ${posSize} ${symbol}...`);
-          await adapter.marketOrder(symbol, closeSide, posSize);
+          const closedSize = await closeLive();
+          if (closedSize === null) {
+            log(`[TRAIL] ${symbol} ${positionSide} position is gone — nothing to close. Exiting.`);
+            return { triggered: false, reason: "position_gone", peakPrice, positionSide, runtime: (Date.now() - startedAt) / 1000 };
+          }
           logExecution({
             type: "market_order", exchange: adapter.name, symbol,
-            side: closeSide, size: posSize, status: "success", dryRun: false,
+            side: closeSide, size: closedSize, status: "success", dryRun: false,
             meta: { action: "trailing-stop", trailPct, troughPrice: peakPrice, triggerPrice: currentPrice },
           });
           return {

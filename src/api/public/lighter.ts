@@ -1,4 +1,4 @@
-import { LIGHTER_API_URL } from "./urls.js";
+import { LIGHTER_API_URL, sharedApiNetwork } from "./urls.js";
 import { assertOk } from "./_http.js";
 import { withCache, TTL_MARKET } from "../../cache.js";
 
@@ -30,7 +30,7 @@ export function fetchLighterOrderBookDetails(): Promise<LighterMarketDetail[]> {
   // returned no markets" from "API down" otherwise. Row-level skipping is
   // applied for missing/invalid last_trade_price so we never publish a
   // 0 price downstream.
-  return withCache("pub:lt:orderBookDetails", TTL_MARKET, async () => {
+  return withCache(`pub:lt:${sharedApiNetwork()}:orderBookDetails`, TTL_MARKET, async () => {
     const res = await fetch(`${LIGHTER_API_URL}/api/v1/orderBookDetails`);
     await assertOk(res, "Lighter orderBookDetails");
     const json = await res.json() as Record<string, unknown>;
@@ -55,7 +55,7 @@ export function fetchLighterOrderBookDetailsRaw(): Promise<unknown> {
   // rejected Promise instead of being indistinguishable from "API returned no
   // markets". Non-2xx responses are also rejected so a 5xx JSON body cannot
   // fulfill as if it were valid data.
-  return withCache("pub:lt:orderBookDetails:raw", TTL_MARKET, async () => {
+  return withCache(`pub:lt:${sharedApiNetwork()}:orderBookDetails:raw`, TTL_MARKET, async () => {
     const res = await fetch(`${LIGHTER_API_URL}/api/v1/orderBookDetails`);
     await assertOk(res, "Lighter orderBookDetails");
     return res.json();
@@ -69,7 +69,7 @@ export function fetchLighterFundingRates(): Promise<LighterFundingEntry[]> {
   // documented as intermittent on Lighter's side — when missing, surface as
   // null so the consumer can apply the orderBookDetails fallback (a
   // documented price-source preference, NOT an error fallback).
-  return withCache("pub:lt:fundingRates", TTL_MARKET, async () => {
+  return withCache(`pub:lt:${sharedApiNetwork()}:fundingRates`, TTL_MARKET, async () => {
     const res = await fetch(`${LIGHTER_API_URL}/api/v1/funding-rates`);
     await assertOk(res, "Lighter funding-rates");
     const json = await res.json() as Record<string, unknown>;
@@ -100,7 +100,7 @@ export function fetchLighterFundingRates(): Promise<LighterFundingEntry[]> {
 
 export function fetchLighterFundingRatesRaw(): Promise<unknown> {
   // SSOT rule #2: error must propagate; see fetchLighterOrderBookDetailsRaw.
-  return withCache("pub:lt:fundingRates:raw", TTL_MARKET, async () => {
+  return withCache(`pub:lt:${sharedApiNetwork()}:fundingRates:raw`, TTL_MARKET, async () => {
     const res = await fetch(`${LIGHTER_API_URL}/api/v1/funding-rates`);
     await assertOk(res, "Lighter funding-rates");
     return res.json();

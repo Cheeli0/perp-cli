@@ -1,7 +1,14 @@
+import { assertCanClosePositions } from "./exchanges/trading-v2.js";
 import type { ExchangeAdapter } from "./exchanges/index.js";
 import { symbolMatch } from "./utils.js";
 import { logExecution } from "./execution-log.js";
 import { randomUUID } from "crypto";
+import { invalidateCache } from "./cache.js";
+import { PerpError, extractErrorMessage, isDefiniteOrderFailure, orderOutcomeUnknown } from "./errors.js";
+import { closePerpVerified, isOutcomeUnknown, placePerpVerified } from "./bot/perp-order.js";
+import { fillSizeString, sizeDecimalsOf } from "./exchanges/spot-result.js";
+import { quarantineSymbol } from "./bot/quarantine.js";
+import { resolveAdapterSlippage } from "./exchanges/slippage.js";
 
 export type PlanAction =
   | "market_order" | "limit_order" | "stop_order"
@@ -28,7 +35,12 @@ export interface ExecutionPlan {
 export interface StepResult {
   stepId: string;
   action: PlanAction;
-  status: "success" | "failed" | "skipped" | "rolled_back" | "dry_run";
+  /**
+   * pending = an order step whose outcome is unknown (ORDER_PENDING): the plan stopped, the
+   * symbol is quarantined, the step is never rolled back. rollback_failed = a completed step
+   * whose reversal was rejected / unconfirmed / partial (symbol quarantined).
+   */
+  status: "success" | "failed" | "skipped" | "rolled_back" | "cancelled" | "rollback_failed" | "pending" | "dry_run";
   result?: unknown;
   error?: { code: string; message: string };
   durationMs: number;
@@ -36,8 +48,11 @@ export interface StepResult {
 
 export interface PlanResult {
   planId: string;
-  status: "completed" | "partial" | "failed" | "dry_run";
+  /** pending = an order step's outcome is unknown; quarantined = a rollback left exposure (see `quarantined`). */
+  status: "completed" | "partial" | "failed" | "pending" | "quarantined" | "dry_run";
   steps: StepResult[];
+  /** Symbols quarantined by this run (unknown order outcome or failed rollback). */
+  quarantined: string[];
   totalDurationMs: number;
   timestamp: string;
 }
@@ -93,6 +108,9 @@ export function validatePlan(plan: unknown): { valid: boolean; errors: string[] 
 /**
  * Execute a plan step by step.
  */
+/** Plan actions that place orders (open or close positions). */
+const PLAN_ORDER_ACTIONS: ReadonlySet<string> = new Set(["market_order", "limit_order", "stop_order", "close_position"]);
+
 export async function executePlan(
   adapter: ExchangeAdapter,
   plan: ExecutionPlan,
@@ -104,6 +122,27 @@ export async function executePlan(
   const completedSteps = new Map<string, StepResult>();
   const dryRun = opts?.dryRun ?? false;
   const log = opts?.log ?? (() => {});
+  // A plan that places orders must be able to close them (rollback / close_position are
+  // reduce-only): refuse before the first step on a venue that cannot.
+  if (!dryRun && plan.steps.some(s => PLAN_ORDER_ACTIONS.has(s.action))) {
+    assertCanClosePositions(adapter, `Plan on ${adapter.name}`);
+  }
+  /** Order steps that completed, with their measured fill (market orders) for rollback. */
+  const placed = new Map<string, PlacedOrder>();
+  const quarantined = new Set<string>();
+  const finish = (status: PlanResult["status"]): PlanResult => ({
+    planId,
+    status: quarantined.size > 0 && status !== "pending" ? "quarantined" : status,
+    steps: results,
+    quarantined: [...quarantined],
+    totalDurationMs: Date.now() - startTime,
+    timestamp: new Date().toISOString(),
+  });
+  const quarantine = (symbol: string, reason: string) => {
+    quarantineSymbol("plan-execute", symbol, `plan ${planId}: ${reason}`,
+      `Check the ${symbol} position and open orders on ${adapter.name} (perp -e ${adapter.name} account positions / trade orders); fix by hand, then: perp strategy quarantine-clear ${symbol}`, log);
+    quarantined.add(symbol.toUpperCase());
+  };
 
   log(`[plan:${planId}] Starting ${plan.steps.length} steps (${dryRun ? "DRY RUN" : "LIVE"})`);
 
@@ -113,12 +152,14 @@ export async function executePlan(
     // Check dependency
     if (step.dependsOn) {
       const dep = completedSteps.get(step.dependsOn);
-      if (!dep || dep.status === "failed") {
+      // Only a dependency that actually succeeded (or was dry-run) lets the step run:
+      // failed / skipped / pending / rolled-back / missing all block it.
+      if (!dep || (dep.status !== "success" && dep.status !== "dry_run")) {
         const result: StepResult = {
           stepId: step.id,
           action: step.action,
           status: "skipped",
-          error: { code: "DEPENDENCY_FAILED", message: `Depends on ${step.dependsOn} which failed/missing` },
+          error: { code: "DEPENDENCY_FAILED", message: `Depends on ${step.dependsOn} which is ${dep ? dep.status : "missing"}` },
           durationMs: 0,
         };
         results.push(result);
@@ -142,7 +183,7 @@ export async function executePlan(
     }
 
     try {
-      const result = await executeStep(adapter, step, log);
+      const result = await executeStep(adapter, step, log, placed);
       const stepResult: StepResult = {
         stepId: step.id,
         action: step.action,
@@ -154,8 +195,29 @@ export async function executePlan(
       completedSteps.set(step.id, stepResult);
       log(`[plan:${planId}] Step ${step.id} (${step.action}): success (${stepResult.durationMs}ms)`);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = extractErrorMessage(err);
       const onFailure = step.onFailure ?? "abort";
+
+      if (ORDER_ACTIONS.has(step.action) && isOutcomeUnknown(err)) {
+        // The order may have been placed: never treat it as failed, never resubmit or roll it
+        // back. Stop the plan and quarantine the symbol (design §12.3).
+        const sym = String(step.params.symbol ?? "").toUpperCase();
+        log(`[plan:${planId}] Step ${step.id} (${step.action}): OUTCOME UNKNOWN — ${message}`);
+        quarantine(sym, `step ${step.id} (${step.action}) outcome unknown: ${message}`);
+        results.push({
+          stepId: step.id,
+          action: step.action,
+          status: "pending",
+          error: { code: "ORDER_PENDING", message },
+          durationMs: Date.now() - stepStart,
+        });
+        if (onFailure === "rollback") {
+          // Reverse completed steps on OTHER symbols only — the pending order's symbol is
+          // quarantined and left untouched (a reversal there could not be measured).
+          await rollbackSteps(adapter, results.filter(r => r.status === "success"), placed, sym, quarantine, log);
+        }
+        return finish("pending");
+      }
 
       log(`[plan:${planId}] Step ${step.id} (${step.action}): FAILED — ${message}`);
 
@@ -173,7 +235,7 @@ export async function executePlan(
 
       if (onFailure === "rollback") {
         log(`[plan:${planId}] Rolling back completed steps...`);
-        await rollbackSteps(adapter, results.filter(r => r.status === "success"), log);
+        await rollbackSteps(adapter, results.filter(r => r.status === "success"), placed, null, quarantine, log);
         results.push({
           stepId: step.id,
           action: step.action,
@@ -181,13 +243,7 @@ export async function executePlan(
           error: { code: "STEP_FAILED", message },
           durationMs: Date.now() - stepStart,
         });
-        return {
-          planId,
-          status: "failed",
-          steps: results,
-          totalDurationMs: Date.now() - startTime,
-          timestamp: new Date().toISOString(),
-        };
+        return finish("failed");
       }
 
       // abort
@@ -198,29 +254,63 @@ export async function executePlan(
         error: { code: "STEP_FAILED", message },
         durationMs: Date.now() - stepStart,
       });
-      return {
-        planId,
-        status: results.some(r => r.status === "success") ? "partial" : "failed",
-        steps: results,
-        totalDurationMs: Date.now() - startTime,
-        timestamp: new Date().toISOString(),
-      };
+      return finish(results.some(r => r.status === "success") ? "partial" : "failed");
     }
   }
 
-  return {
-    planId,
-    status: dryRun ? "dry_run" : "completed",
-    steps: results,
-    totalDurationMs: Date.now() - startTime,
-    timestamp: new Date().toISOString(),
-  };
+  return finish(dryRun ? "dry_run" : "completed");
+}
+
+/** Steps that send an order (a thrown non-definite error = outcome unknown). */
+const ORDER_ACTIONS: ReadonlySet<PlanAction> = new Set<PlanAction>(["market_order", "limit_order", "stop_order", "close_position"]);
+
+/** A completed order step: market orders carry the MEASURED fill (rollback size); limit / stop orders null. */
+interface PlacedOrder {
+  symbol: string;
+  side: "buy" | "sell";
+  filledSize: number | null;
+  decimals: number;
+  /** Venue order id of a resting (limit/stop) order; null when the venue response carried none. */
+  orderId: string | null;
+}
+
+/**
+ * Order id from a venue placement response: TradingV2 OrderResult.orderId, Aster/Binance
+ * `orderId`, Pacifica `order_id`, HL `response.data.statuses[0].resting.oid`, generic `id`.
+ * null when none is present (the rollback then refuses to guess).
+ */
+function extractOrderId(result: unknown): string | null {
+  if (result === null || typeof result !== "object") return null;
+  const r = result as Record<string, unknown>;
+  for (const k of ["orderId", "order_id", "oid", "id"]) {
+    const v = r[k];
+    if (typeof v === "string" && v.length > 0) return v;
+    if (typeof v === "number" && Number.isFinite(v)) return String(v);
+  }
+  const data = (r.data ?? (r.response as Record<string, unknown> | undefined)?.data) as Record<string, unknown> | undefined;
+  const statuses = data?.statuses as Array<Record<string, unknown>> | undefined;
+  for (const k of ["resting", "filled"]) { // HL: resting order, or a limit that filled immediately
+    const st = statuses?.[0]?.[k] as Record<string, unknown> | undefined;
+    if (st && (typeof st.oid === "number" || typeof st.oid === "string")) return String(st.oid);
+  }
+  if (data) return extractOrderId(data);
+  return null;
+}
+
+/** Limit / stop placement: a typed definite failure stays; anything else may have placed the order → ORDER_PENDING. */
+async function sendRestingOrder(adapter: ExchangeAdapter, what: string, send: () => Promise<unknown>): Promise<unknown> {
+  try {
+    return await send();
+  } catch (e) {
+    throw isDefiniteOrderFailure(e) ? e : orderOutcomeUnknown(adapter.name, what, e);
+  }
 }
 
 async function executeStep(
   adapter: ExchangeAdapter,
   step: PlanStep,
   log: (msg: string) => void,
+  placed: Map<string, PlacedOrder>,
 ): Promise<unknown> {
   const p = step.params;
   const symbol = String(p.symbol ?? "").toUpperCase();
@@ -229,20 +319,30 @@ async function executeStep(
 
   switch (step.action) {
     case "market_order": {
-      const result = await adapter.marketOrder(symbol, side, size);
-      logExecution({ type: "market_order", exchange: adapter.name, symbol, side, size, status: "success", dryRun: false, meta: { planStep: step.id, clientId: step.clientId } });
-      return result;
+      // Fill MEASURED as the position delta (ORDER_PENDING when unconfirmed) — the rollback
+      // reverses exactly this size.
+      const fill = await placePerpVerified(adapter, adapter.name, symbol, side, size);
+      placed.set(step.id, { symbol, side, filledSize: fill.filledSize, decimals: sizeDecimalsOf(size), orderId: null });
+      logExecution({ type: "market_order", exchange: adapter.name, symbol, side, size, status: "success", dryRun: false, meta: { planStep: step.id, clientId: step.clientId, filledSize: fill.filledSize } });
+      return fill.raw;
     }
     case "limit_order": {
       const price = String(p.price ?? "");
-      const result = await adapter.limitOrder(symbol, side, price, size);
+      const result = await sendRestingOrder(adapter, `limit ${side} ${size} ${symbol} @ ${price}`, () => adapter.limitOrder(symbol, side, price, size));
+      placed.set(step.id, { symbol, side, filledSize: null, decimals: sizeDecimalsOf(size), orderId: extractOrderId(result) });
       logExecution({ type: "limit_order", exchange: adapter.name, symbol, side, size, price, status: "success", dryRun: false, meta: { planStep: step.id, clientId: step.clientId } });
       return result;
     }
     case "stop_order": {
       const triggerPrice = String(p.triggerPrice ?? "");
       const limitPrice = p.limitPrice ? String(p.limitPrice) : undefined;
-      return adapter.stopOrder(symbol, side, size, triggerPrice, { limitPrice, reduceOnly: !!p.reduceOnly });
+      const result = await sendRestingOrder(adapter, `stop ${side} ${size} ${symbol} @ ${triggerPrice}`, () => adapter.stopOrder(symbol, side, size, triggerPrice, {
+        limitPrice, reduceOnly: !!p.reduceOnly,
+        // Market triggers carry the resolved bound (protection-priced on Lighter / Arcus; native triggers ignore it).
+        ...(limitPrice === undefined ? { slippage: resolveAdapterSlippage(adapter, null) } : {}),
+      }));
+      placed.set(step.id, { symbol, side, filledSize: null, decimals: sizeDecimalsOf(size), orderId: extractOrderId(result) });
+      return result;
     }
     case "cancel_order": {
       return adapter.cancelOrder(symbol, String(p.orderId ?? ""));
@@ -256,13 +356,22 @@ async function executeStep(
       return adapter.setLeverage(symbol, lev, mode);
     }
     case "close_position": {
+      invalidateCache("acct"); // size the reduce-only close from a fresh read, never a cached position
       const positions = await adapter.getPositions();
       const pos = positions.find(pp => symbolMatch(pp.symbol, symbol));
       if (!pos) throw new Error(`No position found for ${symbol}`);
       const closeSide = pos.side === "long" ? "sell" : "buy";
-      const result = await adapter.marketOrder(pos.symbol, closeSide as "buy" | "sell", pos.size);
-      logExecution({ type: "market_order", exchange: adapter.name, symbol, side: closeSide, size: pos.size, status: "success", dryRun: false, meta: { planStep: step.id, action: "close_position" } });
-      return result;
+      // Size from the live position (abs), reduce-only: a stale / repeated close can never open
+      // or flip a position — the venue rejects it instead. Fill measured (ORDER_PENDING when unconfirmed).
+      // A partial close (venue-final IOC partial fills are accepted, §13.10 #4) gets ONE residual
+      // close (closePerpVerified); a residual still open fails the step with ORDER_PARTIAL.
+      const liveSize = pos.size.replace(/^-/, "");
+      const c = await closePerpVerified(adapter, adapter.name, pos.symbol, closeSide, liveSize);
+      logExecution({ type: "market_order", exchange: adapter.name, symbol, side: closeSide, size: liveSize, status: c.residual > 0 ? "failed" : "success", dryRun: false, meta: { planStep: step.id, action: "close_position", reduceOnly: true, filledSize: c.closed, residual: c.residual } });
+      if (c.residual > 0) {
+        throw new PerpError("ORDER_PARTIAL", `close_position ${pos.symbol}: closed ${c.closed} of ${liveSize}, ${c.residual} still open${c.note !== null ? ` (${c.note})` : ""}`, { exchange: adapter.name });
+      }
+      return { symbol: pos.symbol, side: closeSide, size: liveSize, closed: c.closed };
     }
     case "wait": {
       const ms = Number(p.ms ?? 1000);
@@ -291,36 +400,56 @@ async function executeStep(
 }
 
 /**
- * Attempt to rollback completed steps by performing inverse operations.
+ * Reverse completed steps (reverse order). A filled market order is closed reduce-only for
+ * its MEASURED fill (closePerpVerified, residual handled); a limit / stop order's resting
+ * orders are cancelled on that step's symbol only. A reversal that is rejected, unconfirmed
+ * or partial marks the step rollback_failed and quarantines the symbol. Steps on
+ * `skipSymbol` (an order whose outcome is unknown) are left untouched.
  */
 async function rollbackSteps(
   adapter: ExchangeAdapter,
   completedSteps: StepResult[],
+  placed: Map<string, PlacedOrder>,
+  skipSymbol: string | null,
+  quarantine: (symbol: string, reason: string) => void,
   log: (msg: string) => void,
 ): Promise<void> {
-  // Rollback in reverse order
   for (let i = completedSteps.length - 1; i >= 0; i--) {
     const step = completedSteps[i];
+    const order = placed.get(step.stepId);
+    if (order === undefined) continue; // not an order step (cancel / leverage / checks / close_position): nothing to reverse
+    if (skipSymbol !== null && order.symbol === skipSymbol) {
+      log(`[rollback] Leaving ${step.stepId} (${order.symbol}) — the symbol has an order with unknown outcome (quarantined)`);
+      continue;
+    }
     try {
-      switch (step.action) {
-        case "market_order":
-        case "limit_order": {
-          // Close the position that was opened
-          // This is best-effort — market conditions may have changed
-          log(`[rollback] Attempting to reverse ${step.action} ${step.stepId}`);
-          // We'd need position info; just cancel any pending orders as safety measure
-          await adapter.cancelAllOrders().catch(() => {});
-          break;
+      if (order.filledSize !== null) {
+        const size = fillSizeString(order.filledSize, order.decimals);
+        if (!(Number(size) > 0)) continue;
+        const closeSide = order.side === "buy" ? "sell" : "buy";
+        log(`[rollback] Reversing ${step.stepId}: reduce-only ${closeSide} ${size} ${order.symbol}`);
+        const c = await closePerpVerified(adapter, adapter.name, order.symbol, closeSide, size, { decimals: order.decimals });
+        if (c.residual > 0) throw new Error(`closed ${c.closed}; ${c.residual} still open${c.note !== null ? ` (${c.note})` : ""}`);
+      } else {
+        // Resting limit / stop: cancel ONLY this step's order (never the user's other orders
+        // on the symbol). Any fill before the cancel is not reversed — the step is marked
+        // "cancelled" (not "rolled_back") and the log says to check the position.
+        if (order.orderId === null) {
+          throw new Error(`no order id was returned for ${step.stepId}; cancel it manually (perp trade cancel ${order.symbol} <orderId>)`);
         }
-        case "cancel_order":
-        case "cancel_all":
-          // Can't un-cancel, skip
-          break;
-        default:
-          break;
+        log(`[rollback] Cancelling ${step.stepId} order ${order.orderId} on ${order.symbol}`);
+        await adapter.cancelOrder(order.symbol, order.orderId);
+        log(`[rollback] ${step.stepId}: any partial fill before the cancel is NOT reversed — check ${order.symbol} position`);
+        step.status = "cancelled";
+        continue;
       }
+      step.status = "rolled_back";
     } catch (err) {
-      log(`[rollback] Failed to rollback step ${step.stepId}: ${err instanceof Error ? err.message : err}`);
+      const message = extractErrorMessage(err);
+      log(`[rollback] Failed to rollback step ${step.stepId}: ${message}`);
+      step.status = "rollback_failed";
+      step.error = { code: isOutcomeUnknown(err) ? "ORDER_PENDING" : "ROLLBACK_FAILED", message };
+      quarantine(order.symbol, `rollback of step ${step.stepId} (${step.action} ${order.side} ${order.symbol}) ${isOutcomeUnknown(err) ? "unconfirmed" : "failed"}: ${message}`);
     }
   }
 }

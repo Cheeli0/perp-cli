@@ -24,6 +24,8 @@ import { existsSync, mkdirSync, rmSync } from "fs";
 import { resolve } from "path";
 import os from "os";
 import { Command } from "commander";
+import { Readable } from "node:stream";
+import { addRootSafetyOptions } from "../../cli-flags.js";
 
 // ── Stable temp-dir for settings I/O ──────────────────────────────────────
 
@@ -57,6 +59,7 @@ const { registerWalletCommands } = await import("../../commands/wallet.js");
  */
 function makeProgramWithParentPassphrase() {
   const prog = new Command();
+  addRootSafetyOptions(prog);
   prog.exitOverride();
   prog.configureOutput({ writeErr: () => {}, writeOut: () => {} });
   // Mirror src/index.ts:83 — parent-level --passphrase flag.
@@ -154,13 +157,21 @@ describe("--passphrase parent/subcommand shadow fix (C5)", () => {
     const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
     // Use a syntactically valid EVM hex key (66 chars with 0x prefix) so the
-    // action reaches importWalletPrivateKey.
+    // action reaches importWalletPrivateKey. The key comes on stdin — never argv.
     const evmKey = "0x" + "1".repeat(64);
-    await prog.parseAsync([
-      "node", "perp", "wallet", "import", evmKey,
-      "--name", "imported",
-      "--passphrase", "JKL",
-    ]);
+    const realStdin = process.stdin;
+    const piped = Readable.from([`${evmKey}\n`]) as unknown as NodeJS.ReadStream;
+    Object.defineProperty(piped, "isTTY", { value: false });
+    Object.defineProperty(process, "stdin", { value: piped, configurable: true });
+    try {
+      await prog.parseAsync([
+        "node", "perp", "wallet", "import",
+        "--name", "imported",
+        "--passphrase", "JKL",
+      ]);
+    } finally {
+      Object.defineProperty(process, "stdin", { value: realStdin, configurable: true });
+    }
 
     expect(mockOws.importWalletPrivateKey).toHaveBeenCalledTimes(1);
     // signature: (name, key, passphrase, ...).

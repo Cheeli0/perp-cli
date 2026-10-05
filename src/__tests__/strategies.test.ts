@@ -22,9 +22,10 @@ vi.mock("../jobs.js", () => ({
 
 function mockAdapter(overrides?: Partial<Record<string, unknown>>) {
   return {
-    name: "test",
+    // Registered venue id: every market order resolves its slippage bound per venue (UNKNOWN_VENUE otherwise).
+    name: "hyperliquid",
     getMarkets: vi.fn().mockResolvedValue([
-      { symbol: "BTC", markPrice: "60000", indexPrice: "60000", fundingRate: "0.0001", volume24h: "1000000", openInterest: "500000", maxLeverage: 20 },
+      { symbol: "BTC", markPrice: "60000", indexPrice: "60000", fundingRate: "0.0001", volume24h: "1000000", openInterest: "500000", maxLeverage: 20, sizeDecimals: 5, stepSize: "0.00001", fundingHours: 1, marginTiers: null },
     ]),
     getBalance: vi.fn().mockResolvedValue({ equity: "10000", available: "8000", marginUsed: "2000", unrealizedPnl: "0" }),
     getPositions: vi.fn().mockResolvedValue([]),
@@ -125,6 +126,15 @@ describe("TWAP — runTWAP", () => {
     expect(slice2).toBeCloseTo(1 / 3, 4);
     // Last slice = remainder (handles dust)
     expect(slice1 + slice2 + slice3).toBeCloseTo(1.0, 6);
+  });
+
+  it("every slice states reduceOnly and carries the resolved slippage bound (design §13.2)", async () => {
+    const { runTWAP } = await import("../strategies/twap.js");
+    const adapter = mockAdapter();
+    await runTWAP(adapter, { symbol: "BTC", side: "sell", totalSize: 0.2, durationSec: 1, slices: 2, reduceOnly: true }, undefined, vi.fn());
+    for (const call of adapter.marketOrder.mock.calls) {
+      expect(call[3]).toEqual({ reduceOnly: true, slippage: { bps: 50, source: "default" } });
+    }
   });
 
   it("handles order errors without aborting (continues other slices)", async () => {
@@ -577,6 +587,31 @@ describe("DCA — runDCA", () => {
 // ══════════════════════════════════════════════
 // TWAP Slice Calculation (unit-level)
 // ══════════════════════════════════════════════
+
+describe("TWAP — avgPrice is the venue-reported fill price, never the protection price", () => {
+  const run = async (marketOrder: ReturnType<typeof vi.fn>) => {
+    const { runTWAP } = await import("../strategies/twap.js");
+    return runTWAP(mockAdapter({ marketOrder }), { symbol: "SOL", side: "buy", totalSize: 0.1, durationSec: 1, slices: 2 }, undefined, vi.fn());
+  };
+
+  it("Aster order objects: `price` is the IOC protection price (121.315), `avgPrice` the fill → 120.735", async () => {
+    // Live 2026-10-05: 2 slices filled at 120.735, the result said 121.315.
+    const r = await run(vi.fn().mockResolvedValue({ orderId: 1, status: "FILLED", price: "121.315", avgPrice: "120.735", executedQty: "0.05" }));
+    expect(r.avgPrice).toBe(120.735);
+  });
+
+  it("size-weighted over the slices, without float noise", async () => {
+    const r = await run(vi.fn()
+      .mockResolvedValueOnce({ avgPrice: "2723.81", price: "9999" })
+      .mockResolvedValueOnce({ response: { data: { statuses: [{ filled: { totalSz: "0.05", avgPx: "2723.83", oid: 1 } }] } } }));
+    expect(r.avgPrice).toBe(2723.82);
+  });
+
+  it("a slice whose result reports no fill price → null (not the sent price, not 0)", async () => {
+    expect((await run(vi.fn().mockResolvedValue({ orderId: "m1", price: "60000" }))).avgPrice).toBeNull();
+    expect((await run(vi.fn().mockResolvedValueOnce({ avgPrice: "120.7" }).mockResolvedValueOnce({ price: "121.3" }))).avgPrice).toBeNull();
+  });
+});
 
 describe("TWAP — slice calculation edge cases", () => {
   it("minimum 2 slices even for very short duration", async () => {

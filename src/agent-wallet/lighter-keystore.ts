@@ -20,6 +20,7 @@ import {
   readFileSync,
   writeFileSync,
   unlinkSync,
+  renameSync,
   chmodSync,
 } from "fs";
 import { resolve } from "path";
@@ -30,6 +31,7 @@ import {
   createDecipheriv,
 } from "node:crypto";
 import { PerpError } from "../errors.js";
+import { deleteVenueSecret, loadVenueSecret, saveVenueSecret, venueKeystorePath, writeKeystoreAtomic } from "./venue-keystore.js";
 
 const KDF_PARAMS = { dklen: 32, n: 65536, p: 1, r: 8 } as const;
 const SCRYPT_OPTS = { N: KDF_PARAMS.n, r: KDF_PARAMS.r, p: KDF_PARAMS.p, maxmem: 128 * 1024 * 1024 } as const;
@@ -92,8 +94,18 @@ export function saveLighterKey(
   privateKeyHex: string,
   passphrase: string,
 ): string {
-  const dir = ensureDir();
-  const path = resolve(dir, `${accountIndex}-${slot}.json`);
+  ensureDir();
+  return writeLighterKeyFile(lighterKeystorePath(accountIndex, slot), accountIndex, slot, privateKeyHex, passphrase);
+}
+
+function writeLighterKeyFile(
+  path: string,
+  accountIndex: number,
+  slot: number,
+  privateKeyHex: string,
+  passphrase: string,
+): string {
+  ensureDir();
 
   const cleanHex = stripHexPrefix(privateKeyHex).toLowerCase();
   if (!/^[0-9a-f]+$/.test(cleanHex) || cleanHex.length === 0) {
@@ -133,9 +145,7 @@ export function saveLighterKey(
     createdAt: new Date().toISOString(),
   };
 
-  writeFileSync(path, JSON.stringify(file, null, 2), { mode: 0o600 });
-  // Re-tighten in case writeFileSync overwrote an existing file with a looser umask
-  try { chmodSync(path, 0o600); } catch { /* non-fatal */ }
+  writeKeystoreAtomic(path, JSON.stringify(file, null, 2));
   return path;
 }
 
@@ -157,8 +167,10 @@ export function loadLighterKey(
   // before continuing. This is NOT a runtime fallback — it's a single-pass
   // upgrade path that runs at most once per install.
   migrateFromEnvIfPresent();
+  return readLighterKeyFile(lighterKeystorePath(accountIndex, slot), passphrase);
+}
 
-  const path = lighterKeystorePath(accountIndex, slot);
+function readLighterKeyFile(path: string, passphrase: string): string {
   if (!existsSync(path)) {
     throw new PerpError(
       "KEY_NOT_FOUND",
@@ -303,4 +315,113 @@ function clearEnvLegacyKeys(): void {
     out.push(line);
   }
   writeFileSync(ENV_FILE, out.join("\n"), { mode: 0o600 });
+}
+
+// ── Lighter-family (venue-aware) API ──
+//
+// The functions above ARE the "lighter" venue store (`~/.perp/lighter-agents/`,
+// original file format, env migration). "lighter-rh" keys live in the generic
+// venue keystore under `~/.perp/lighter-rh-agents/<accountIndex>-<slot>.json`
+// (design §10.4). The venue argument is required — there is no implied venue.
+
+export type LighterFamilyVenue = "lighter" | "lighter-rh";
+type KeystoreNetwork = "mainnet" | "testnet";
+
+const LIGHTER_RH_AGENTS_DIR = "lighter-rh-agents";
+const LIGHTER_RH_REMEDIATION = "perp wallet agent approve lighter-rh --rotate";
+
+function rhKeyName(accountIndex: number, slot: number): string {
+  if (!Number.isInteger(accountIndex) || accountIndex < 0 || !Number.isInteger(slot) || slot < 0) {
+    throw new PerpError("INVALID_PARAMS", `invalid Lighter RH keystore address: account ${accountIndex}, slot ${slot}`, {
+      remediation: LIGHTER_RH_REMEDIATION,
+    });
+  }
+  return `${accountIndex}-${slot}`;
+}
+
+/** Network-tagged keystore file name (`<network>-<accountIndex>-<slot>`). Account indexes are per network. */
+function taggedName(network: KeystoreNetwork, accountIndex: number, slot: number): string {
+  return `${network}-${rhKeyName(accountIndex, slot)}`;
+}
+
+/** Absolute (network-tagged) keystore path for a Lighter-family L2 key. */
+export function lighterFamilyKeystorePath(venue: LighterFamilyVenue, network: KeystoreNetwork, accountIndex: number, slot: number): string {
+  switch (venue) {
+    case "lighter": return resolve(lighterAgentsDir(), `${taggedName(network, accountIndex, slot)}.json`);
+    case "lighter-rh": return venueKeystorePath(LIGHTER_RH_AGENTS_DIR, taggedName(network, accountIndex, slot));
+  }
+}
+
+/** Pre-tagging path `<accountIndex>-<slot>` (no network). */
+function legacyFamilyKeystorePath(venue: LighterFamilyVenue, accountIndex: number, slot: number): string {
+  switch (venue) {
+    case "lighter": return lighterKeystorePath(accountIndex, slot);
+    case "lighter-rh": return venueKeystorePath(LIGHTER_RH_AGENTS_DIR, rhKeyName(accountIndex, slot));
+  }
+}
+
+/**
+ * One-time move of a pre-tagging `<accountIndex>-<slot>` file to the tagged path. Called only
+ * with the network of a network-TAGGED agent record (untagged records are refused upstream by
+ * agentNetworkOf → re-register), and approve refuses to reuse another network's account+slot,
+ * so the untagged file belongs to that record's network.
+ */
+function migrateUntaggedKeystore(venue: LighterFamilyVenue, network: KeystoreNetwork, accountIndex: number, slot: number): void {
+  const tagged = lighterFamilyKeystorePath(venue, network, accountIndex, slot);
+  if (existsSync(tagged)) return;
+  const legacy = legacyFamilyKeystorePath(venue, accountIndex, slot);
+  if (!existsSync(legacy)) return;
+  renameSync(legacy, tagged);
+  process.stderr.write(`[${venue}] keystore ${accountIndex}-${slot} tagged as ${network} (moved to ${tagged})\n`);
+}
+
+/** Encrypt + persist a Lighter-family L2 private key (hex) at its network-tagged path. Returns the absolute path. */
+export function saveLighterFamilyKey(
+  venue: LighterFamilyVenue,
+  network: KeystoreNetwork,
+  accountIndex: number,
+  slot: number,
+  privateKeyHex: string,
+  passphrase: string,
+): string {
+  switch (venue) {
+    case "lighter":
+      return writeLighterKeyFile(lighterFamilyKeystorePath(venue, network, accountIndex, slot), accountIndex, slot, privateKeyHex, passphrase);
+    case "lighter-rh": {
+      const cleanHex = stripHexPrefix(privateKeyHex).toLowerCase();
+      if (!/^[0-9a-f]+$/.test(cleanHex)) {
+        throw new PerpError("INVALID_PARAMS", "Lighter RH L2 private key must be hex", {
+          remediation: LIGHTER_RH_REMEDIATION,
+        });
+      }
+      return saveVenueSecret(LIGHTER_RH_AGENTS_DIR, taggedName(network, accountIndex, slot), cleanHex, passphrase);
+    }
+  }
+}
+
+/** Read + decrypt a Lighter-family L2 private key (hex, no 0x) for `network`. Throws on missing/corrupt/wrong passphrase. */
+export function loadLighterFamilyKey(
+  venue: LighterFamilyVenue,
+  network: KeystoreNetwork,
+  accountIndex: number,
+  slot: number,
+  passphrase: string,
+): string {
+  if (venue === "lighter") migrateFromEnvIfPresent();
+  migrateUntaggedKeystore(venue, network, accountIndex, slot);
+  switch (venue) {
+    case "lighter":
+      return readLighterKeyFile(lighterFamilyKeystorePath(venue, network, accountIndex, slot), passphrase);
+    case "lighter-rh":
+      return loadVenueSecret(LIGHTER_RH_AGENTS_DIR, taggedName(network, accountIndex, slot), passphrase, LIGHTER_RH_REMEDIATION);
+  }
+}
+
+/** Idempotent delete of the `network` key (after migrating an untagged file). Returns true if a file was removed. */
+export function deleteLighterFamilyKey(venue: LighterFamilyVenue, network: KeystoreNetwork, accountIndex: number, slot: number): boolean {
+  migrateUntaggedKeystore(venue, network, accountIndex, slot);
+  const path = lighterFamilyKeystorePath(venue, network, accountIndex, slot);
+  if (!existsSync(path)) return false;
+  unlinkSync(path);
+  return true;
 }

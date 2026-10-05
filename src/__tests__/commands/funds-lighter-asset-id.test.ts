@@ -1,7 +1,7 @@
 /**
  * Lighter asset-index defaults on the funds tree.
  *
- * The on-chain bridge takes `deposit(address _to, uint8 _assetIndex, uint8
+ * The on-chain bridge takes `deposit(address _to, uint16 _assetIndex, uint8
  * _routeType, uint256 _amount)`, and the Lighter deposit docs name
  * GET /api/v1/assetDetails as the source for `_assetIndex`. That registry is
  * `3 = USDC (l1_decimals 6)`, `2 = LIT (l1_decimals 18)`, `1 = ETH`.

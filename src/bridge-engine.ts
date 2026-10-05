@@ -10,6 +10,27 @@
  * for cross-exchange rebalancing in funding arb.
  */
 
+import { PerpError } from "./errors.js";
+import { loadSettings } from "./settings.js";
+import { getVenue, networkConfig } from "./exchanges/venue.js";
+import "./exchanges/venues/index.js";
+import { HL_USER_SIGNED } from "./exchanges/venues/hyperliquid.js";
+import type { Network } from "./exchanges/venue-types.js";
+
+/**
+ * Every route in this module is mainnet-only: the RPCs, USDC / CCTP contract
+ * addresses, Circle Iris, Relay and deBridge endpoints below are mainnet
+ * deployments with no testnet equivalent wired in. A testnet run must never
+ * sign or send through them (it would move real mainnet funds), so it throws
+ * NO_BRIDGE_ROUTE before any key is used.
+ */
+export function assertBridgeNetwork(network: Network): void {
+  if (network === "mainnet") return;
+  throw new PerpError("NO_BRIDGE_ROUTE", `Cross-chain bridging has no ${network} route — every bridge provider here (CCTP, Relay, deBridge) is wired to mainnet chains only`, {
+    remediation: "Run without -n testnet to bridge on mainnet, or fund testnet accounts from each venue's testnet faucet",
+  });
+}
+
 // ── Chain constants ──
 
 export const CHAIN_IDS = {
@@ -342,10 +363,7 @@ async function getHyperCoreCctpFees(
 
 const DLN_API = "https://dln.debridge.finance/v1.0/dln/order";
 
-// Builder/affiliate config — set via env vars or defaults
-const DEBRIDGE_REFERRAL_CODE = process.env.DEBRIDGE_REFERRAL_CODE ?? "";
-const DEBRIDGE_AFFILIATE_FEE_PERCENT = process.env.DEBRIDGE_AFFILIATE_FEE_PERCENT ?? ""; // e.g. "0.1" for 0.1%
-const DEBRIDGE_AFFILIATE_FEE_RECIPIENT = process.env.DEBRIDGE_AFFILIATE_FEE_RECIPIENT ?? "";
+// Affiliate / referral parameters: settings bridge.debridgeAffiliate only (ships absent → none sent).
 
 export interface BridgeQuote {
   provider: "debridge" | "cctp" | "relay";
@@ -448,9 +466,11 @@ export async function getDebridgeQuote(
  * Returns the TX hash after signing and submitting.
  */
 export async function executeDebridgeBridge(
+  network: Network,
   bridgeQuote: BridgeQuote,
   signerKey: string, // EVM private key or Solana private key (base58)
 ): Promise<BridgeResult> {
+  assertBridgeNetwork(network);
   const { srcChain, dstChain, amountIn, amountOut } = bridgeQuote;
   const { senderAddress, recipientAddress, amountRaw } = bridgeQuote.raw as {
     senderAddress: string; recipientAddress: string; amountRaw: string;
@@ -724,6 +744,7 @@ export async function getCctpQuote(
  *               If false (default), use standard finality (2000): cheaper but requires manual relay.
  */
 export async function executeCctpBridge(
+  network: Network,
   srcChain: string,
   dstChain: string,
   amountUsdc: number,
@@ -732,6 +753,7 @@ export async function executeCctpBridge(
   dstSignerKey?: string, // EVM key for receiveMessage (Solana→EVM) or Solana key for receiveMessage (EVM→Solana)
   fast: boolean = false,
 ): Promise<BridgeResult> {
+  assertBridgeNetwork(network);
   // HyperCore route: depositForBurnWithHook via CctpForwarder
   if (dstChain === "hyperliquid") {
     if (srcChain === "solana") {
@@ -741,7 +763,7 @@ export async function executeCctpBridge(
   }
   // HyperCore → EVM: sendToEvmWithData via HL exchange API
   if (srcChain === "hyperliquid") {
-    return executeCctpHyperCoreToEvm(dstChain, amountUsdc, signerKey, recipientAddress);
+    return executeCctpHyperCoreToEvm(network, dstChain, amountUsdc, signerKey, recipientAddress);
   }
   if (srcChain === "solana") {
     return executeCctpSolanaToEvm(dstChain, amountUsdc, signerKey, recipientAddress, dstSignerKey, fast);
@@ -931,12 +953,17 @@ const USDC_EIP712_VERSION: Record<string, string> = {
 // ── CCTP: HyperCore → EVM (sendToEvmWithData via HL exchange API) ──
 
 async function executeCctpHyperCoreToEvm(
+  network: Network,
   dstChain: string,
   amountUsdc: number,
   signerKey: string,
   recipientAddress: string,
 ): Promise<BridgeResult> {
+  assertBridgeNetwork(network);
   const { ethers, Signature: EthSig } = await import("ethers");
+  // HL environment + /exchange host from the venue definition (never a hardcoded "Mainnet").
+  const { hyperliquidChain } = HL_USER_SIGNED[network];
+  const hlExchangeUrl = `${networkConfig(getVenue("hyperliquid"), network).restUrl}/exchange`;
 
   const wallet = new ethers.Wallet(signerKey);
   const dstDomain = CCTP_DOMAINS[dstChain];
@@ -951,7 +978,7 @@ async function executeCctpHyperCoreToEvm(
   // Build action payload
   const action = {
     type: "sendToEvmWithData",
-    hyperliquidChain: "Mainnet",
+    hyperliquidChain,
     signatureChainId,
     token: "USDC",
     amount: String(amountUsdc),
@@ -988,7 +1015,7 @@ async function executeCctpHyperCoreToEvm(
   };
 
   const message = {
-    hyperliquidChain: "Mainnet",
+    hyperliquidChain,
     token: "USDC",
     amount: String(amountUsdc),
     sourceDex: "spot",
@@ -1004,7 +1031,7 @@ async function executeCctpHyperCoreToEvm(
   const sig = EthSig.from(sigHex);
 
   // Submit to HL exchange API
-  const resp = await fetch("https://api.hyperliquid.xyz/exchange", {
+  const resp = await fetch(hlExchangeUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -1717,15 +1744,9 @@ async function pollCctpV2Attestation(
 }
 
 // ── Relay Bridge API ──
-
-const RELAY_API = "https://api.relay.link";
-
-// Relay chain IDs (same as standard EVM chain IDs, Solana = 792703809)
-const RELAY_CHAIN_IDS: Record<string, number> = {
-  solana: 792703809,
-  arbitrum: 42161,
-  base: 8453,
-};
+// Quote verification, step validation and execution live in ./relay-swap.ts (generic assets,
+// EVM-origin deposits). These two functions are the USDC → USDC entry used by getAllQuotes /
+// executeBestBridge.
 
 export async function getRelayQuote(
   srcChain: string,
@@ -1734,135 +1755,60 @@ export async function getRelayQuote(
   senderAddress: string,
   recipientAddress: string,
 ): Promise<BridgeQuote> {
-  const srcChainId = RELAY_CHAIN_IDS[srcChain];
-  const dstChainId = RELAY_CHAIN_IDS[dstChain];
-  if (!srcChainId || !dstChainId) throw new Error(`Relay: unsupported chain ${srcChain} or ${dstChain}`);
-
-  const srcToken = USDC_ADDRESSES[srcChain];
-  const dstToken = USDC_ADDRESSES[dstChain];
-  if (!srcToken || !dstToken) throw new Error(`No USDC for ${srcChain} or ${dstChain}`);
-
-  const amountRaw = String(Math.round(amountUsdc * 1e6));
-
-  const body = {
-    user: senderAddress,
-    recipient: recipientAddress,
-    originChainId: srcChainId,
-    destinationChainId: dstChainId,
-    originCurrency: srcToken,
-    destinationCurrency: dstToken,
-    amount: amountRaw,
-    tradeType: "EXACT_INPUT",
-  };
-
-  const res = await fetch(`${RELAY_API}/quote`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+  const { quoteRelaySwap } = await import("./relay-swap.js");
+  // Verified locally (order id, depository, amounts, recipient) — see relay-swap.ts.
+  const q = await quoteRelaySwap({
+    from: srcChain, to: dstChain, fromAsset: "USDC", toAsset: "USDC",
+    amount: String(amountUsdc), sender: senderAddress, recipient: recipientAddress,
   });
-
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Relay quote failed: ${res.status} ${errText}`);
-  }
-
-  const data = await res.json() as Record<string, unknown>;
-  const details = data.details as Record<string, unknown> | undefined;
-  const fees = data.fees as Record<string, unknown> | undefined;
-
-  // SSOT rule #2: refuse to fabricate amountOut/fee from `0 || subtractFee`
-  // back-fill. If Relay didn't quote a real amount-out + relayer fee, the
-  // user's bridge cost is unknown — surface the gap.
-  const currencyOut = details?.currencyOut as Record<string, unknown> | undefined;
-  const amountFormattedRaw = currencyOut?.amountFormatted;
-  const amountOut = Number(amountFormattedRaw);
-  if (amountFormattedRaw === undefined || !Number.isFinite(amountOut)) {
-    throw new Error(
-      `Relay quote missing details.currencyOut.amountFormatted ` +
-      `(received ${JSON.stringify(amountFormattedRaw)}); refusing silent 0 fallback. ` +
-      `Raw details=${JSON.stringify(details)}`,
-    );
-  }
-
-  const relayerFee = fees?.relayer as Record<string, unknown> | undefined;
-  const feeUsdRaw = relayerFee?.amountUsd;
-  const feeUsd = Number(feeUsdRaw);
-  if (feeUsdRaw === undefined || !Number.isFinite(feeUsd)) {
-    throw new Error(
-      `Relay quote missing fees.relayer.amountUsd ` +
-      `(received ${JSON.stringify(feeUsdRaw)}); refusing silent 0 fallback. ` +
-      `Raw fees=${JSON.stringify(fees)}`,
-    );
-  }
-
-  // timeEstimate is telemetry only; default 30s is documented Relay median
-  // for healthy routes. Telemetry default, not error fallback.
-  const timeEstimateRaw = Number(details?.timeEstimate);
-  const timeEstimate = Number.isFinite(timeEstimateRaw) ? timeEstimateRaw : 30;
-
   return {
     provider: "relay",
     srcChain,
     dstChain,
     amountIn: amountUsdc,
-    amountOut,
-    fee: feeUsd,
-    estimatedTime: timeEstimate,
+    amountOut: Number(q.expectedOut),
+    fee: Number(q.fees.relayerUsd),
+    // timeEstimate is telemetry only; 30s is the documented Relay median for healthy routes.
+    estimatedTime: q.timeEstimateSec === null ? 30 : q.timeEstimateSec,
     gasIncluded: true,
     gasNote: "Relay solver handles destination execution",
-    raw: data,
+    raw: q,
   };
 }
 
+/**
+ * Execute a verified Relay USDC quote with a raw EVM key (legacy bridge callers). Only the
+ * verified approve (exact amount, pinned depository) + deposit are signed — never an unlimited
+ * approval, never an unchecked target. OWS wallets use `perp funds bridge send --provider relay`.
+ */
 export async function executeRelayBridge(
+  network: Network,
   bridgeQuote: BridgeQuote,
   signerKey: string,
 ): Promise<BridgeResult> {
-  const { srcChain, dstChain, amountIn, amountOut } = bridgeQuote;
-  const data = bridgeQuote.raw as Record<string, unknown>;
-
-  const steps = data.steps as Array<Record<string, unknown>> | undefined;
-  if (!steps || steps.length === 0) throw new Error("Relay: no steps in quote");
-
-  let txHash = "";
-
-  for (const step of steps) {
-    const kind = step.kind as string;
-    const items = step.items as Array<Record<string, unknown>> | undefined;
-    if (!items) continue;
-
-    for (const item of items) {
-      const itemData = item.data as Record<string, unknown> | undefined;
-      if (!itemData) continue;
-
-      if (kind === "transaction") {
-        if (srcChain === "solana") {
-          // Solana transaction
-          const txData = String(itemData.data ?? "");
-          if (txData) {
-            txHash = await submitSolanaTransaction({ data: txData } as Record<string, unknown>, signerKey);
-          }
-        } else {
-          // EVM transaction
-          txHash = await submitEvmTransaction(
-            { to: itemData.to, data: itemData.data, value: itemData.value ?? "0" },
-            signerKey,
-            srcChain,
-          );
-        }
-      }
-    }
+  assertBridgeNetwork(network);
+  const { executeRelaySwap, assertRelayMinOut } = await import("./relay-swap.js");
+  const q = bridgeQuote.raw as import("./relay-swap.js").RelaySwapQuote;
+  assertRelayMinOut(q, null);
+  if (!/^0x[0-9a-fA-F]{64}$/.test(signerKey)) {
+    throw new PerpError("NO_SIGNER_AVAILABLE", "This Relay bridge path signs with a raw EVM private key, and none was supplied", {
+      remediation: "With an OWS wallet use: perp funds bridge send --provider relay --from <chain> --to <chain> --amount <n>",
+    });
   }
-
-  if (!txHash) throw new Error("Relay: no transaction executed");
-
+  const { SigningKey, computeAddress } = await import("ethers");
+  const key = new SigningKey(signerKey);
+  if (computeAddress(key).toLowerCase() !== q.sender.toLowerCase()) {
+    throw new PerpError("INVALID_PARAMS", `The Relay quote was built for sender ${q.sender}, not the signing key's address ${computeAddress(key)} — nothing was sent`);
+  }
+  const res = await executeRelaySwap(network, q, async tx => key.sign(tx.unsignedHash).serialized);
   return {
     provider: "relay",
-    txHash,
-    srcChain,
-    dstChain,
-    amountIn,
-    amountOut,
+    txHash: res.depositTxHash,
+    srcChain: bridgeQuote.srcChain,
+    dstChain: bridgeQuote.dstChain,
+    amountIn: bridgeQuote.amountIn,
+    amountOut: bridgeQuote.amountOut,
+    ...(res.destinationTxHashes.length > 0 ? { receiveTxHash: res.destinationTxHashes[0] } : {}),
   };
 }
 
@@ -1920,6 +1866,7 @@ export async function getBestQuote(
  * @param provider - Optional: force a specific provider ("cctp" | "relay" | "debridge")
  */
 export async function executeBestBridge(
+  network: Network,
   srcChain: string,
   dstChain: string,
   amountUsdc: number,
@@ -1930,6 +1877,8 @@ export async function executeBestBridge(
   provider?: "cctp" | "relay" | "debridge",
   fast: boolean = false,
 ): Promise<BridgeResult> {
+  // Before quoting: a testnet run must not even look up mainnet routes to sign.
+  assertBridgeNetwork(network);
   let quote: BridgeQuote;
 
   if (provider) {
@@ -1946,14 +1895,14 @@ export async function executeBestBridge(
   }
 
   if (quote.provider === "cctp") {
-    return executeCctpBridge(srcChain, dstChain, amountUsdc, signerKey, recipientAddress, dstSignerKey, fast);
+    return executeCctpBridge(network, srcChain, dstChain, amountUsdc, signerKey, recipientAddress, dstSignerKey, fast);
   }
 
   if (quote.provider === "relay") {
-    return executeRelayBridge(quote, signerKey);
+    return executeRelayBridge(network, quote, signerKey);
   }
 
-  return executeDebridgeBridge(quote, signerKey);
+  return executeDebridgeBridge(network, quote, signerKey);
 }
 
 /**
@@ -1968,14 +1917,17 @@ export async function checkDebridgeStatus(orderId: string): Promise<Record<strin
 // ── Helpers ──
 
 /**
- * Append deBridge builder/affiliate params if configured via env vars:
- *   DEBRIDGE_REFERRAL_CODE, DEBRIDGE_AFFILIATE_FEE_PERCENT, DEBRIDGE_AFFILIATE_FEE_RECIPIENT
+ * Append deBridge referral / affiliate params when the user configured them in
+ * settings `bridge.debridgeAffiliate` (`perp settings set bridge.debridgeAffiliate.*`).
+ * Absent (the shipped state) → nothing is sent. No env var is read.
  */
 function appendDebridgeBuilderParams(params: URLSearchParams): void {
-  if (DEBRIDGE_REFERRAL_CODE) params.set("referralCode", DEBRIDGE_REFERRAL_CODE);
-  if (DEBRIDGE_AFFILIATE_FEE_PERCENT && DEBRIDGE_AFFILIATE_FEE_RECIPIENT) {
-    params.set("affiliateFeePercent", DEBRIDGE_AFFILIATE_FEE_PERCENT);
-    params.set("affiliateFeeRecipient", DEBRIDGE_AFFILIATE_FEE_RECIPIENT);
+  const aff = loadSettings().bridge.debridgeAffiliate;
+  if (aff === null) return;
+  if (aff.referralCode !== null) params.set("referralCode", aff.referralCode);
+  if (aff.feePercent !== null && aff.feeRecipient !== null) {
+    params.set("affiliateFeePercent", String(aff.feePercent));
+    params.set("affiliateFeeRecipient", aff.feeRecipient);
   }
 }
 

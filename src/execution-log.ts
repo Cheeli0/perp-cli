@@ -30,13 +30,20 @@ function genId(): string {
 
 /** Append an execution record to the log */
 export function logExecution(record: Omit<ExecutionRecord, "id" | "timestamp">): ExecutionRecord {
-  ensureDir();
   const full: ExecutionRecord = {
     id: genId(),
     timestamp: new Date().toISOString(),
     ...record,
   };
-  appendFileSync(LOG_FILE, JSON.stringify(full) + "\n", { mode: 0o600 });
+  // The log is a record OF an outcome, never part of it: a write failure (disk full, read-only
+  // home, permissions) must not turn a filled order into a thrown "failed" one. It is reported
+  // on stderr and the caller continues with the real result.
+  try {
+    ensureDir();
+    appendFileSync(LOG_FILE, JSON.stringify(full) + "\n", { mode: 0o600 });
+  } catch (e) {
+    process.stderr.write(`[perp] Warning: could not write the execution log (${LOG_FILE}): ${e instanceof Error ? e.message : String(e)} — the ${record.type} on ${record.exchange} was recorded as "${record.status}" in memory only\n`);
+  }
   return full;
 }
 

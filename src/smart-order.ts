@@ -16,6 +16,12 @@
  * - Saves 5-50+ bps vs raw market orders on thin books
  * - Predictable execution price
  *
+ * Order-outcome typing (design §12.3): every failure BEFORE the IOC is sent (orderbook read,
+ * empty book, unusable price), an explicit venue rejection embedded in the response, and an
+ * explicit IOC no-match (nothing filled, nothing rests) throw a definite ORDER_REJECTED
+ * (orderNotSent), so placePerpVerified does not quarantine a leg that never traded. Anything
+ * else the IOC call throws is rethrown unchanged (placePerpVerified measures it).
+ *
  * SSOT rule #2: silent fallback is forbidden. The opt-in `fallback: true` flag
  * is preserved for callers that explicitly want best-effort market substitution
  * after IOC reject, but the DEFAULT is `false` — failure must surface as a
@@ -23,6 +29,21 @@
  */
 
 import type { ExchangeAdapter } from "./exchanges/index.js";
+import { PerpError, orderNotSent } from "./errors.js";
+import { resolveAdapterSlippage, type ResolvedSlippage } from "./exchanges/slippage.js";
+
+/**
+ * IOC "no match" signalled explicitly in the venue response (nothing filled, nothing rests):
+ * a Binance-style terminal status (Aster: EXPIRED / CANCELED / REJECTED) with executedQty 0.
+ * HL embedded errors (incl. "could not immediately match") are caught by hasOrderError.
+ */
+function isIocNoMatch(result: unknown): boolean {
+  if (!result || typeof result !== "object") return false;
+  const r = result as Record<string, unknown>;
+  const status = typeof r.status === "string" ? r.status.toUpperCase() : "";
+  if (!["EXPIRED", "CANCELED", "CANCELLED", "REJECTED"].includes(status)) return false;
+  return r.executedQty !== undefined && Number(r.executedQty) === 0;
+}
 
 export interface SmartOrderOpts {
   /** Extra ticks of tolerance beyond best price. Default: 1 */
@@ -34,6 +55,8 @@ export interface SmartOrderOpts {
   fallback?: boolean;
   /** Reduce only flag for closing positions. Default: false */
   reduceOnly?: boolean;
+  /** Bound for the market fallback; omitted → resolveSlippage(venue, null). */
+  slippage?: ResolvedSlippage;
 }
 
 export interface SmartOrderResult {
@@ -147,14 +170,25 @@ export async function smartOrder(
 ): Promise<SmartOrderResult> {
   const { tickTolerance = 1, fallback = false, reduceOnly = false } = opts;
 
-  // 1. Fetch orderbook
-  const book = await adapter.getOrderbook(symbol);
+  const venue = adapter.name;
+  const what = `smart ${side} ${size} ${symbol}${reduceOnly ? " (reduce-only)" : ""}`;
+  const marketFallback = () => adapter.marketOrder(symbol, side, size, {
+    reduceOnly, slippage: opts.slippage ?? resolveAdapterSlippage(adapter, null),
+  });
+
+  // 1. Fetch orderbook (failure = nothing sent)
+  let book: Awaited<ReturnType<ExchangeAdapter["getOrderbook"]>>;
+  try {
+    book = await adapter.getOrderbook(symbol);
+  } catch (e) {
+    throw orderNotSent(venue, `${what} (orderbook read failed)`, e);
+  }
 
   // 2. Validate book has liquidity on the relevant side
   const relevantSide = side === "buy" ? book.asks : book.bids;
   if (relevantSide.length === 0) {
-    if (!fallback) throw new Error(`No ${side === "buy" ? "asks" : "bids"} in orderbook for ${symbol}`);
-    const result = await adapter.marketOrder(symbol, side, size, { reduceOnly });
+    if (!fallback) throw new PerpError("ORDER_REJECTED", `${venue} ${what} not sent: No ${side === "buy" ? "asks" : "bids"} in orderbook for ${symbol}`, { exchange: venue });
+    const result = await marketFallback();
     return { result, method: "market_fallback", price: "0", bestBookPrice: "0", tickSize: "0" };
   }
 
@@ -170,6 +204,9 @@ export async function smartOrder(
     : bestPrice - tick * tickTolerance;  // 1 tick below best bid
 
   const formattedPrice = limitPrice.toFixed(decimals);
+  if (!(Number.isFinite(bestPrice) && bestPrice > 0 && Number(formattedPrice) > 0)) {
+    throw new PerpError("ORDER_REJECTED", `${venue} ${what} not sent: unusable limit price ${formattedPrice} (best ${bestEntry[0]}, tick ${tick})`, { exchange: venue });
+  }
 
   // 5. Place IOC limit order at calculated price
   try {
@@ -185,7 +222,7 @@ export async function smartOrder(
     // result for a rejected order and treat the failure as success.
     if (hasOrderError(result)) {
       if (fallback) {
-        const fallbackResult = await adapter.marketOrder(symbol, side, size, { reduceOnly });
+        const fallbackResult = await marketFallback();
         return {
           result: fallbackResult,
           method: "market_fallback",
@@ -194,7 +231,14 @@ export async function smartOrder(
           tickSize: tick.toFixed(decimals),
         };
       }
-      throw new Error(`smartOrder: exchange rejected IOC limit (${describeOrderError(result)})`);
+      throw new PerpError("ORDER_REJECTED", `${venue} ${what}: exchange rejected IOC limit (${describeOrderError(result)})`, { exchange: venue });
+    }
+    if (isIocNoMatch(result)) {
+      if (fallback) {
+        const fallbackResult = await marketFallback();
+        return { result: fallbackResult, method: "market_fallback", price: formattedPrice, bestBookPrice: bestEntry[0], tickSize: tick.toFixed(decimals) };
+      }
+      throw new PerpError("ORDER_REJECTED", `${venue} ${what}: IOC limit ${formattedPrice} matched nothing (nothing rests)`, { exchange: venue });
     }
 
     return {
@@ -207,7 +251,7 @@ export async function smartOrder(
   } catch (err) {
     if (!fallback) throw err;
     // Fallback to raw market order for reliability
-    const result = await adapter.marketOrder(symbol, side, size, { reduceOnly });
+    const result = await marketFallback();
     return {
       result,
       method: "market_fallback",

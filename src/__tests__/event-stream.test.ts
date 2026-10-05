@@ -373,27 +373,34 @@ describe("startEventStream — non-finite numeric guards (Rule #2)", () => {
     warn.mockRestore();
   });
 
-  it("stays silent (no warn) when liquidationPrice is exactly 'N/A' — venue sentinel, not corruption", async () => {
-    // The guard explicitly preserves the 'N/A' sentinel as a non-warn case
-    // (event-stream.ts:132). Otherwise every non-positioned exchange would
-    // spam the console on every poll.
+  // CHANGELOG (Unreleased): "position fields are null when the venue does not publish them
+  // (liquidationPrice, …) instead of "0" / "N/A" / "-" strings". The old 'N/A' sentinel is
+  // now null: not corruption, so no per-poll non-finite warn — one notice per stream that
+  // liquidation warnings are unavailable, and never a Number(null) === 0 "price".
+  it("null liquidationPrice (venue does not report it): one notice per stream, no per-poll warn, no liquidation events", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const controller = new AbortController();
+    const events: Array<{ type: string }> = [];
+    let polls = 0;
 
     const adapter = mockAdapter({
       getPositions: vi.fn().mockImplementation(async () => {
-        controller.abort();
-        return [{ symbol: "BTC", side: "long", size: "1", entryPrice: "50000", unrealizedPnl: "0", liquidationPrice: "N/A", markPrice: "NaN" }];
+        if (++polls >= 3) controller.abort();
+        return [{ symbol: "BTC", side: "long", size: "1", entryPrice: "50000", unrealizedPnl: "0", liquidationPrice: null, markPrice: "NaN" }];
       }),
     });
 
     await startEventStream(adapter, {
       intervalMs: 1,
-      onEvent: () => {},
+      onEvent: (e) => { events.push(e as { type: string }); },
       signal: controller.signal,
     });
 
-    expect(warn).not.toHaveBeenCalled();
+    expect(polls).toBeGreaterThanOrEqual(2);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/does not report liquidation prices/));
+    expect(warn).not.toHaveBeenCalledWith(expect.stringMatching(/non-finite/));
+    expect(events.filter((e) => e.type === "liquidation_warning" || e.type === "margin_call")).toHaveLength(0);
     warn.mockRestore();
   });
 

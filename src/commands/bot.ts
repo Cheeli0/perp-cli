@@ -1,4 +1,7 @@
+import { parsePositiveDecimal } from "../errors.js";
 import { Command } from "commander";
+import { isDryRun, networkOf, supportsDryRun } from "../cli-flags.js";
+import { assertStrategySimulatable } from "../bot/engine.js";
 import chalk from "chalk";
 import { printJson, jsonOk, jsonError } from "../utils.js";
 import type { ExchangeAdapter } from "../exchanges/index.js";
@@ -28,12 +31,13 @@ export function registerStrategyCommands(
       const config = loadBotConfig(configPath);
 
       if (opts.background) {
-        const { startJob } = await import("../jobs.js");
+        const { startJob, jobSelectorsOf } = await import("../jobs.js");
         const job = startJob({
           strategy: `bot:${config.strategy.type}`,
           exchange: config.exchange,
           params: { config: configPath, name: config.name },
-          cliArgs: [`-e`, config.exchange, `start`, configPath],
+          venue: config.exchange, network: networkOf(program), dryRun: isDryRun(program), selectors: jobSelectorsOf(program),
+          cliArgs: [`strategy`, `start`, configPath],
         });
         if (isJson()) return printJson(jsonOk(job));
         printBotJobStarted(config.name, job.id);
@@ -46,7 +50,7 @@ export function registerStrategyCommands(
 
       const mode = resolveOutputMode(isJson, opts.headless);
       const log = makeLog();
-      await runBot(adapter, config, opts.jobId, log, undefined, mode);
+      await runBot(adapter, config, opts.jobId, log, undefined, mode, false);
     });
 
   // ── bot quick grid ──
@@ -83,9 +87,9 @@ export function registerStrategyCommands(
       });
 
       if (opts.background) {
-        const { startJob } = await import("../jobs.js");
+        const { startJob, jobSelectorsOf } = await import("../jobs.js");
         const cliArgs = [
-          `-e`, adapter.name, `quick-grid`, symbol.toUpperCase(),
+          `strategy`, `quick-grid`, symbol.toUpperCase(),
           `--range`, opts.range, `--grids`, opts.grids, `--size`, opts.size,
           `--side`, opts.side, `--max-drawdown`, opts.maxDrawdown,
           `--max-runtime`, opts.maxRuntime,
@@ -94,6 +98,7 @@ export function registerStrategyCommands(
         const job = startJob({
           strategy: `bot:grid`,
           exchange: adapter.name,
+          venue: adapter.name, network: networkOf(program), dryRun: isDryRun(program), selectors: jobSelectorsOf(program),
           params: { symbol: symbol.toUpperCase(), ...opts },
           cliArgs,
         });
@@ -104,7 +109,7 @@ export function registerStrategyCommands(
 
       const mode = resolveOutputMode(isJson, opts.headless);
       const log = makeLog();
-      await runBot(adapter, config, opts.jobId, log, undefined, mode);
+      await runBot(adapter, config, opts.jobId, log, undefined, mode, false);
     });
 
   // ── bot quick dca ──
@@ -128,7 +133,7 @@ export function registerStrategyCommands(
         exchange: adapter.name,
         symbol: symbol.toUpperCase(),
         side: side.toLowerCase(),
-        amount: parseFloat(amount),
+        amount: Number(parsePositiveDecimal(amount, "amount")),
         intervalSec: parseInt(interval),
         orders: parseInt(opts.orders),
         triggerDrop: opts.triggerDrop ? parseFloat(opts.triggerDrop) : undefined,
@@ -137,9 +142,9 @@ export function registerStrategyCommands(
       });
 
       if (opts.background) {
-        const { startJob } = await import("../jobs.js");
+        const { startJob, jobSelectorsOf } = await import("../jobs.js");
         const cliArgs = [
-          `-e`, adapter.name, `quick-dca`, symbol.toUpperCase(), side.toLowerCase(),
+          `strategy`, `quick-dca`, symbol.toUpperCase(), side.toLowerCase(),
           amount, interval, `--orders`, opts.orders, `--max-drawdown`, opts.maxDrawdown,
           ...(opts.priceLimit ? [`--price-limit`, opts.priceLimit] : []),
           ...(opts.triggerDrop ? [`--trigger-drop`, opts.triggerDrop] : []),
@@ -147,6 +152,7 @@ export function registerStrategyCommands(
         const job = startJob({
           strategy: `bot:dca`,
           exchange: adapter.name,
+          venue: adapter.name, network: networkOf(program), dryRun: isDryRun(program), selectors: jobSelectorsOf(program),
           params: { symbol: symbol.toUpperCase(), ...opts },
           cliArgs,
         });
@@ -157,7 +163,7 @@ export function registerStrategyCommands(
 
       const mode = resolveOutputMode(isJson, opts.headless);
       const log = makeLog();
-      await runBot(adapter, config, opts.jobId, log, undefined, mode);
+      await runBot(adapter, config, opts.jobId, log, undefined, mode, false);
     });
 
   // ── bot quick arb ──
@@ -223,9 +229,9 @@ export function registerStrategyCommands(
       };
 
       if (opts.background) {
-        const { startJob } = await import("../jobs.js");
+        const { startJob, jobSelectorsOf } = await import("../jobs.js");
         const cliArgs = [
-          `quick-arb`,
+          `strategy`, `quick-arb`,
           `--min-spread`, opts.minSpread, `--close-spread`, opts.closeSpread,
           `--size`, opts.size, `--max-positions`, opts.maxPositions,
           `--exchanges`, opts.exchanges, `--interval`, opts.interval,
@@ -234,6 +240,7 @@ export function registerStrategyCommands(
         const job = startJob({
           strategy: `bot:funding-arb`,
           exchange: "multi",
+          network: networkOf(program), dryRun: isDryRun(program), selectors: jobSelectorsOf(program),
           params: { ...opts },
           cliArgs,
         });
@@ -244,7 +251,7 @@ export function registerStrategyCommands(
 
       const mode = resolveOutputMode(isJson, opts.headless);
       const log = makeLog();
-      await runBot(primaryAdapter, config, opts.jobId, log, adapters, mode);
+      await runBot(primaryAdapter, config, opts.jobId, log, adapters, mode, false);
     });
 
   // ── bot delta-neutral ──
@@ -312,9 +319,9 @@ export function registerStrategyCommands(
       };
 
       if (opts.background) {
-        const { startJob } = await import("../jobs.js");
+        const { startJob, jobSelectorsOf } = await import("../jobs.js");
         const cliArgs = [
-          `delta-neutral`,
+          `strategy`, `delta-neutral`,
           `--min-rate`, opts.minRate, `--close-rate`, opts.closeRate,
           `--size`, opts.size, `--max-positions`, opts.maxPositions,
           `--leverage`, opts.leverage, `--exchanges`, opts.exchanges,
@@ -323,6 +330,7 @@ export function registerStrategyCommands(
         const job = startJob({
           strategy: `bot:delta-neutral`,
           exchange: "multi",
+          network: networkOf(program), dryRun: isDryRun(program), selectors: jobSelectorsOf(program),
           params: { ...opts },
           cliArgs,
         });
@@ -333,7 +341,7 @@ export function registerStrategyCommands(
 
       const mode = resolveOutputMode(isJson, opts.headless);
       const log = makeLog();
-      await runBot(primaryAdapter, config, opts.jobId, log, adapters, mode);
+      await runBot(primaryAdapter, config, opts.jobId, log, adapters, mode, false);
     });
 
   // ── bot preset list ──
@@ -411,11 +419,12 @@ export function registerStrategyCommands(
         config.exchange = primaryAdapter.name;
 
         if (opts.background) {
-          const { startJob } = await import("../jobs.js");
-          const cliArgs = [`preset`, name, sym];
+          const { startJob, jobSelectorsOf } = await import("../jobs.js");
+          const cliArgs = [`strategy`, `preset`, name, sym];
           const job = startJob({
             strategy: `bot:${preset.strategy}`,
             exchange: "multi",
+            network: networkOf(program), dryRun: isDryRun(program), selectors: jobSelectorsOf(program),
             params: { preset: name, symbol: sym },
             cliArgs,
           });
@@ -430,7 +439,7 @@ export function registerStrategyCommands(
           console.log(chalk.gray(`  ${preset.description}\n`));
         }
         const mode = resolveOutputMode(isJson, opts.headless);
-        await runBot(primaryAdapter, config, opts.jobId, log, adapters, mode);
+        await runBot(primaryAdapter, config, opts.jobId, log, adapters, mode, false);
         return;
       }
 
@@ -439,11 +448,12 @@ export function registerStrategyCommands(
       const config = preset.buildConfig(adapter.name, sym);
 
       if (opts.background) {
-        const { startJob } = await import("../jobs.js");
-        const cliArgs = [`preset`, name, sym];
+        const { startJob, jobSelectorsOf } = await import("../jobs.js");
+        const cliArgs = [`strategy`, `preset`, name, sym];
         const job = startJob({
           strategy: `bot:${preset.strategy}`,
           exchange: adapter.name,
+          venue: adapter.name, network: networkOf(program), dryRun: isDryRun(program), selectors: jobSelectorsOf(program),
           params: { preset: name, symbol: sym },
           cliArgs,
         });
@@ -458,7 +468,7 @@ export function registerStrategyCommands(
         console.log(chalk.gray(`  ${preset.description}\n`));
       }
       const mode = resolveOutputMode(isJson, opts.headless);
-      await runBot(adapter, config, opts.jobId, log, undefined, mode);
+      await runBot(adapter, config, opts.jobId, log, undefined, mode, false);
     });
 
   // ── bot list-strategies ──
@@ -476,6 +486,44 @@ export function registerStrategyCommands(
       for (const s of strategies) {
         console.log(`    ${chalk.white(s)}`);
       }
+      console.log();
+    });
+
+  // ── quarantine (design §12.3): positions the bot refuses to touch until a human clears them ──
+
+  bot
+    .command("quarantine")
+    .description("List quarantined symbols (unknown / unverified order outcome or unhedged leg) — blocked for every bot strategy, arb exec and arb auto (~/.perp/bot-quarantine.json)")
+    .action(async () => {
+      const { listQuarantine, QUARANTINE_FILE } = await import("../bot/quarantine.js");
+      const entries = listQuarantine();
+      if (isJson()) return printJson(jsonOk({ file: QUARANTINE_FILE, entries }));
+      if (entries.length === 0) {
+        console.log(chalk.gray("\n  No quarantined bot positions.\n"));
+        return;
+      }
+      console.log(chalk.red.bold(`\n  Quarantined symbols — blocked for all bots and arb paths (${QUARANTINE_FILE}):\n`));
+      for (const e of entries) {
+        console.log(`    ${chalk.white(`${e.strategy} ${e.symbol}`)} ${chalk.gray(e.time)}`);
+        console.log(`      ${e.reason}`);
+        console.log(chalk.yellow(`      ${e.remediation}`));
+      }
+      console.log(chalk.gray("\n  After resolving on the venue: perp strategy quarantine-clear <symbol> [--strategy <name>]\n"));
+    });
+
+  bot
+    .command("quarantine-clear <symbol>")
+    .description("Clear a quarantine after verifying / resolving the position on the venues manually (running bots pick it up on their next tick)")
+    .option("--strategy <name>", "Only entries recorded by this source (funding-arb, funding-arb-v2, spot-perp-arb, arb-exec, arb-close); default: all — the symbol stays blocked while any entry remains")
+    .action(async (symbol: string, opts: { strategy?: string }) => {
+      const { clearQuarantine } = await import("../bot/quarantine.js");
+      const removed = clearQuarantine(symbol, opts.strategy ?? null);
+      if (isJson()) return printJson(jsonOk({ symbol: symbol.toUpperCase(), removed }));
+      if (removed.length === 0) {
+        console.log(chalk.yellow(`\n  No quarantine entry for ${symbol.toUpperCase()}${opts.strategy ? ` (${opts.strategy})` : ""}.\n`));
+        return;
+      }
+      for (const e of removed) console.log(chalk.green(`\n  Cleared ${e.strategy} ${e.symbol}`));
       console.log();
     });
 
@@ -517,15 +565,16 @@ export function registerStrategyCommands(
       };
 
       if (opts.background) {
-        const { startJob } = await import("../jobs.js");
+        const { startJob, jobSelectorsOf } = await import("../jobs.js");
         const cliArgs = [
-          `-e`, adapter.name, `apex`, sym,
+          `strategy`, `apex`, sym,
           `--preset`, opts.preset, `--max-slots`, opts.maxSlots,
           `--daily-limit`, opts.dailyLimit,
         ];
         const job = startJob({
           strategy: `bot:apex`,
           exchange: adapter.name,
+          venue: adapter.name, network: networkOf(program), dryRun: isDryRun(program), selectors: jobSelectorsOf(program),
           params: { symbol: sym, ...opts },
           cliArgs,
         });
@@ -536,7 +585,7 @@ export function registerStrategyCommands(
 
       const mode = resolveOutputMode(isJson, opts.headless);
       const log = makeLog();
-      await runBot(adapter, config, opts.jobId, log, undefined, mode);
+      await runBot(adapter, config, opts.jobId, log, undefined, mode, false);
     });
 
   // ── bot reflect ──
@@ -579,9 +628,8 @@ export function registerStrategyCommands(
 
   // ── bot run <strategy> <symbol> ──
 
-  bot
-    .command("run [strategy] [symbol]")
-    .description("Run a strategy (use 'perp strategy list-strategies' to see all). Symbol optional for multi-symbol strategies.")
+  supportsDryRun(bot.command("run [strategy] [symbol]"))
+    .description("Run a strategy (use 'perp strategy list-strategies' to see all). Symbol optional for multi-symbol strategies. Supports --dry-run (actions logged, never sent; strategies that execute directly refuse it).")
     .option("--config <path>", "YAML/JSON config file")
     .option("--headless", "Run without TUI dashboard")
     .option("--param <key=value>", "Strategy parameter (repeatable)", (val: string, acc: string[]) => [...acc, val], [] as string[])
@@ -593,7 +641,8 @@ export function registerStrategyCommands(
     .action(async (strategyName: string | undefined, symbol: string | undefined, opts: {
       config?: string; headless?: boolean; param: string[];
       maxPositions?: string; size?: string; minSpread?: string; closeSpread?: string; exchanges?: string;
-    }) => {
+    }, cmd: Command) => {
+      const dryRun = isDryRun(cmd);
       if (!strategyName) {
         await import("../bot/engine.js");
         const { listStrategies: listStrats } = await import("../bot/strategy-registry.js");
@@ -608,6 +657,8 @@ export function registerStrategyCommands(
         return;
       }
       const sym = symbol?.toUpperCase() || "ALL";
+      // Refuse --dry-run for strategies that cannot simulate before any adapter is built.
+      if (dryRun) assertStrategySimulatable(strategyName);
 
       // Strategies that require an explicit symbol
       const symbolRequiredStrategies = [
@@ -708,7 +759,7 @@ export function registerStrategyCommands(
         }
       }
 
-      await runBot(adapter, config, undefined, log, extraAdapters, mode);
+      await runBot(adapter, config, undefined, log, extraAdapters, mode, dryRun);
     });
 
   // ── bot example ──
@@ -864,8 +915,9 @@ function registerRunSubcommands(
     .description("Run client-side TWAP (splits market orders over time)");
   twapCmd
     .option("-s, --slices <n>", "Number of slices (default: auto)")
+    .option("--reduce-only", "Reduce only (every slice)")
     .option("--job-id <id>", "Job ID (set automatically for background jobs)")
-    .action(async (symbol: string, side: string, size: string, duration: string, opts: { slices?: string; jobId?: string }) => {
+    .action(async (symbol: string, side: string, size: string, duration: string, opts: { slices?: string; reduceOnly?: boolean; jobId?: string }) => {
       const s = side.toLowerCase();
       if (s !== "buy" && s !== "sell") {
         console.error(chalk.red("Side must be buy or sell"));
@@ -879,6 +931,7 @@ function registerRunSubcommands(
         totalSize: parseFloat(size),
         durationSec: parseInt(duration),
         slices: opts.slices ? parseInt(opts.slices) : undefined,
+        reduceOnly: opts.reduceOnly === true,
       };
 
       const log = (msg: string) => {
@@ -904,7 +957,7 @@ function registerRunSubcommands(
     .option("--size-usd <usd>", "Position size per leg in USD (alternative)")
     .option("--symbols <list>", "Comma-separated symbol filter")
     .option("--interval <sec>", "Check interval in seconds", "60")
-    .option("--auto-execute", "Actually place trades (default: monitor only)")
+    .option("--auto-execute", "Actually place trades (default: monitor only). Legs are sequential and verified (long, then short sized to the long's fill); closes are reduce-only from the venue position size; an unknown outcome quarantines the symbol")
     .option("--max-positions <n>", "Max simultaneous positions", "3")
     .option("--exchanges <list>", "Comma-separated exchanges to use", "pacifica,hyperliquid,lighter,aster")
     .option("--auto-rebalance", "Trigger rebalance alerts when exchange balance is low")
@@ -1042,7 +1095,7 @@ function registerRunSubcommands(
       const params = {
         symbol: symbol.toUpperCase(),
         side: s as "buy" | "sell",
-        amountPerOrder: parseFloat(amount),
+        amountPerOrder: Number(parsePositiveDecimal(amount, "amount")),
         intervalSec: parseInt(interval),
         totalOrders: parseInt(opts.orders),
         priceLimit: opts.priceLimit ? parseFloat(opts.priceLimit) : undefined,

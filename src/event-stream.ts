@@ -33,7 +33,8 @@ interface PositionSnapshot {
   size: string;
   entryPrice: string;
   unrealizedPnl: string;
-  liquidationPrice: string;
+  /** null = venue reports no liquidation price for this position */
+  liquidationPrice: string | null;
 }
 
 interface OrderSnapshot {
@@ -66,6 +67,8 @@ export async function startEventStream(
   let prevOrders = new Map<string, OrderSnapshot>();
   let prevBalance: ExchangeBalance | null = null;
   let cycle = 0;
+  // One-time notice per stream (one adapter = one venue) when the venue reports no liquidation price.
+  let warnedNoLiquidationPrice = false;
 
   const poll = async () => {
     cycle++;
@@ -121,6 +124,15 @@ export async function startEventStream(
 
       // ── Liquidation warnings ──
       for (const p of positions) {
+        // No liquidation price from the venue → no distance to measure. Checked
+        // before Number() because Number(null) === 0 would look like a real price.
+        if (p.liquidationPrice === null) {
+          if (!warnedNoLiquidationPrice) {
+            warnedNoLiquidationPrice = true;
+            console.warn(`[event-stream] ${adapter.name} does not report liquidation prices (first: ${p.symbol}) — liquidation warnings are unavailable for this venue`);
+          }
+          continue;
+        }
         const mark = Number(p.markPrice);
         const liq = Number(p.liquidationPrice);
         // Rule #2: a NaN mark or liq would silently fail the `> 0` checks
@@ -135,12 +147,10 @@ export async function startEventStream(
         // false, silently skipping the alert without surfacing the
         // payload break. Add an explicit "" check to the rejection bucket.
         if (p.markPrice === "" || p.liquidationPrice === "" || !Number.isFinite(mark) || !Number.isFinite(liq)) {
-          if (p.liquidationPrice !== "N/A") {
-            console.warn(`[event-stream] non-finite mark/liquidation for ${p.symbol} on ${adapter.name} (mark=${p.markPrice}, liq=${p.liquidationPrice}) — skipping liquidation distance check`);
-          }
+          console.warn(`[event-stream] non-finite mark/liquidation for ${p.symbol} on ${adapter.name} (mark=${p.markPrice}, liq=${p.liquidationPrice}) — skipping liquidation distance check`);
           continue;
         }
-        if (mark > 0 && liq > 0 && p.liquidationPrice !== "N/A") {
+        if (mark > 0 && liq > 0) {
           const distancePct = Math.abs(mark - liq) / mark * 100;
           if (distancePct < 3) {
             emit({

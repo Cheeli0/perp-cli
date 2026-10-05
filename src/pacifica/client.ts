@@ -1,5 +1,7 @@
-import { MAINNET_REST, BUILDER_CODE, type Network, getNetworkConfig } from "./constants.js";
+import { MAINNET_REST, type Network, getNetworkConfig } from "./constants.js";
 import { buildSignedRequest, buildAgentSignedRequest } from "./signing.js";
+import { PerpError, extractErrorMessage, orderNotSent, orderOutcomeUnknown, sendFailure } from "../errors.js";
+import { invalidateCache } from "../cache.js";
 import type {
   MarketInfo,
   PriceInfo,
@@ -33,17 +35,30 @@ import type {
 
 type SignMessageFn = (message: Uint8Array) => Promise<Uint8Array>;
 
+/** Per-request timeout of a POST (fetch + body read). */
+export const PACIFICA_POST_TIMEOUT_MS = 15_000;
+
+/**
+ * Account-setting writes whose HTTP 4xx is the venue's explicit refusal (nothing changed).
+ * docs.pacifica.fi (api-documentation/api/rest-api):
+ *   account/update-leverage:      "Status 400: Invalid request parameters" — {"error": "Invalid leverage", "code": 400}
+ *   orders/create-position-tp-sl: "Status 400: Bad request" — {"error": "Position not found", "code": 400}
+ * Both pages list only "Status 500: Internal server error" besides.
+ */
+const DEFINITE_4XX_PATHS: ReadonlySet<string> = new Set(["/positions/tpsl", "/account/leverage"]);
+
+/** POST endpoints that only read (signed listings): a failure there is an ordinary read error. */
+const READ_POST_PATHS: ReadonlySet<string> = new Set(["/account/subaccount/list", "/agent/list", "/account/api_keys"]);
+
 export interface PacificaClientConfig {
   network?: Network;
   baseUrl?: string;
   apiKey?: string;
-  builderCode?: string;
 }
 
 export class PacificaClient {
   private baseUrl: string;
   private apiKey?: string;
-  private builderCode: string;
   /**
    * Agent-wallet pubkey for the current request signer, set by the adapter when an
    * agent wallet (not the master) is signing. When present, signed bodies carry the
@@ -64,16 +79,20 @@ export class PacificaClient {
     account: string,
     signMessage: SignMessageFn,
   ): Promise<Record<string, unknown>> {
-    return this.requestAgentWallet
-      ? buildAgentSignedRequest(operationType, payload, account, this.requestAgentWallet, signMessage)
-      : buildSignedRequest(operationType, payload, account, signMessage);
+    try {
+      return await (this.requestAgentWallet
+        ? buildAgentSignedRequest(operationType, payload, account, this.requestAgentWallet, signMessage)
+        : buildSignedRequest(operationType, payload, account, signMessage));
+    } catch (e) {
+      // Signing failed before any request was sent: definitely not placed (never ORDER_PENDING).
+      throw orderNotSent("pacifica", operationType, e);
+    }
   }
 
   constructor(config: PacificaClientConfig = {}) {
     this.baseUrl =
       config.baseUrl || getNetworkConfig(config.network).restUrl;
     this.apiKey = config.apiKey;
-    this.builderCode = config.builderCode || BUILDER_CODE;
   }
 
   private headers(): Record<string, string> {
@@ -102,24 +121,74 @@ export class PacificaClient {
     return json as T;
   }
 
+  /**
+   * Signed POST. Every path except the listing reads (READ_POST_PATHS) is an account write: once
+   * the request is on the wire a connection reset / timeout / 5xx / unreadable body leaves the
+   * outcome unknown → ORDER_PENDING (sendFailure), never a retryable network error. No connection
+   * at all → not sent. A 4xx is the venue's refusal and keeps the plain `POST <path> failed
+   * (<status>): <body>` error the adapters map (422 business codes) — except on
+   * DEFINITE_4XX_PATHS, where it is a definite ACTION_REJECTED (429 stays the plain error →
+   * RATE_LIMITED). A fetch timeout (PACIFICA_POST_TIMEOUT_MS) on a write is ORDER_PENDING too;
+ * on a listing read a timeout is TIMEOUT and any other transport failure EXCHANGE_UNREACHABLE.
+   */
   private async post<T>(path: string, body: Record<string, unknown>): Promise<T> {
-    const res = await fetch(`${this.baseUrl}${path}`, {
-      method: "POST",
-      headers: this.headers(),
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`POST ${path} failed (${res.status}): ${text}`);
+    const write = !READ_POST_PATHS.has(path);
+    const what = `POST ${path}`;
+    const remediation = `Do NOT resubmit — the request may have been executed. Check open orders, positions and balances first: perp -e pacifica account orders / portfolio`;
+    try {
+      let res: Response;
+      let text: string;
+      try {
+        res = await fetch(`${this.baseUrl}${path}`, {
+          method: "POST",
+          headers: this.headers(),
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(PACIFICA_POST_TIMEOUT_MS),
+        });
+        text = await res.text();
+      } catch (e) {
+        if (write) throw sendFailure("pacifica", what, e, remediation);
+        // Signed listing read: nothing can have been executed — an ordinary retryable read failure.
+        const timedOut = e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError");
+        throw new PerpError(timedOut ? "TIMEOUT" : "EXCHANGE_UNREACHABLE",
+          `Pacifica ${what} ${timedOut ? `timed out after ${PACIFICA_POST_TIMEOUT_MS} ms` : `failed: ${extractErrorMessage(e)}`} (read-only listing; nothing was changed)`, {
+            exchange: "pacifica",
+            remediation: "Retry; if it keeps failing check the network and Pacifica's status",
+          });
+      }
+      if (write && res.status >= 500) {
+        throw orderOutcomeUnknown("pacifica", what, new Error(`HTTP ${res.status}: ${text.slice(0, 200)}`), remediation);
+      }
+      if (!res.ok) {
+        if (DEFINITE_4XX_PATHS.has(path) && res.status >= 400 && res.status < 500 && res.status !== 429) {
+          throw new PerpError("ACTION_REJECTED", `Pacifica ${what} refused (HTTP ${res.status}, nothing was changed): ${text.slice(0, 300)}`, {
+            exchange: "pacifica",
+            httpStatus: res.status,
+            remediation: "The venue rejected the request — fix the parameters named in the message and retry",
+          });
+        }
+        throw new Error(`POST ${path} failed (${res.status}): ${text}`);
+      }
+      try {
+        return JSON.parse(text) as T;
+      } catch (e) {
+        if (!write) throw e;
+        throw orderOutcomeUnknown("pacifica", what, new Error(`unreadable response (HTTP ${res.status}): ${text.slice(0, 200)}`), remediation);
+      }
+    } finally {
+      // Every POST is an account write (order / cancel / TP/SL / leverage / transfer): drop the
+      // shared acct: disk cache so no later read serves the pre-write positions / orders.
+      invalidateCache("acct");
     }
-    return res.json();
   }
 
-  private addBuilderCode(payload: Record<string, unknown>): Record<string, unknown> {
-    if (this.builderCode) {
-      return { ...payload, builder_code: this.builderCode };
-    }
-    return payload;
+  /**
+   * `builder_code` is attached only when the caller passes one — the adapter decides
+   * (settings builder.pacifica + confirmed approval, src/exchanges/builder-fee.ts).
+   * null = no builder code (the default, and always for spot: err 108).
+   */
+  private withBuilderCode(payload: Record<string, unknown>, builderCode: string | null): Record<string, unknown> {
+    return builderCode === null ? payload : { ...payload, builder_code: builderCode };
   }
 
   // ==================== PUBLIC ENDPOINTS ====================
@@ -170,7 +239,7 @@ export class PacificaClient {
     return this.get("/account", { account });
   }
 
-  async getAccountSettings(account: string): Promise<AccountSettings[]> {
+  async getAccountSettings(account: string): Promise<AccountSettings> {
     return this.get("/account/settings", { account });
   }
 
@@ -250,9 +319,10 @@ export class PacificaClient {
   async createMarketOrder(
     params: MarketOrderParams,
     account: string,
-    signMessage: SignMessageFn
+    signMessage: SignMessageFn,
+    builderCode: string | null,
   ): Promise<unknown> {
-    const payload = this.addBuilderCode({ ...params });
+    const payload = this.withBuilderCode({ ...params }, builderCode);
     const body = await this.signedBody("create_market_order", payload, account, signMessage);
     return this.post("/orders/create_market", body);
   }
@@ -260,9 +330,10 @@ export class PacificaClient {
   async createLimitOrder(
     params: LimitOrderParams,
     account: string,
-    signMessage: SignMessageFn
+    signMessage: SignMessageFn,
+    builderCode: string | null,
   ): Promise<unknown> {
-    const payload = this.addBuilderCode({ ...params });
+    const payload = this.withBuilderCode({ ...params }, builderCode);
     const body = await this.signedBody("create_order", payload, account, signMessage);
     return this.post("/orders/create", body);
   }
@@ -270,12 +341,11 @@ export class PacificaClient {
   async createStopOrder(
     params: StopOrderParams,
     account: string,
-    signMessage: SignMessageFn
+    signMessage: SignMessageFn,
+    builderCode: string | null,
   ): Promise<unknown> {
-    // builder_code applies to ALL order-creation endpoints (changelog
-    // 2026-04-23), stop orders included. It was attached on market/limit/TWAP
-    // but not here, so every stop order lost the referral attribution.
-    const payload = this.addBuilderCode({ ...params });
+    // builder_code applies to every order-creation endpoint, stop orders included (builder-program docs).
+    const payload = this.withBuilderCode({ ...params }, builderCode);
     const body = await this.signedBody("create_stop_order", payload, account, signMessage);
     return this.post("/orders/stop/create", body);
   }
@@ -316,13 +386,13 @@ export class PacificaClient {
     return this.post("/orders/stop/cancel", body);
   }
 
+  /** create_twap_order documents no builder_code, so a TWAP never carries one (builder-fee.ts). */
   async createTWAP(
     params: TWAPParams,
     account: string,
-    signMessage: SignMessageFn
+    signMessage: SignMessageFn,
   ): Promise<unknown> {
-    const payload = this.addBuilderCode({ ...params });
-    const body = await this.signedBody("create_twap_order", payload, account, signMessage);
+    const body = await this.signedBody("create_twap_order", { ...params }, account, signMessage);
     return this.post("/orders/twap/create", body);
   }
 
@@ -338,11 +408,11 @@ export class PacificaClient {
   async setTPSL(
     params: TPSLParams,
     account: string,
-    signMessage: SignMessageFn
+    signMessage: SignMessageFn,
+    builderCode: string | null,
   ): Promise<unknown> {
-    // Same referral gap as createStopOrder: position TP/SL creates orders and
-    // therefore carries builder_code too.
-    const payload = this.addBuilderCode({ ...params });
+    // Position TP/SL creates orders and therefore takes builder_code too (POST /positions/tpsl).
+    const payload = this.withBuilderCode({ ...params }, builderCode);
     const body = await this.signedBody("set_position_tpsl", payload, account, signMessage);
     return this.post("/positions/tpsl", body);
   }
@@ -376,29 +446,12 @@ export class PacificaClient {
 
   // ==================== SUBACCOUNT ====================
 
-  async createSubaccount(
-    subaccountName: string,
-    account: string,
-    signMessage: SignMessageFn
-  ): Promise<unknown> {
-    // Step 1: Initiate
-    const initiateBody = await this.signedBody(
-      "subaccount_initiate",
-      { subaccount_name: subaccountName },
-      account,
-      signMessage
-    );
-    await this.post("/account/subaccount/create", initiateBody);
-
-    // Step 2: Confirm
-    const confirmBody = await this.signedBody(
-      "subaccount_confirm",
-      { subaccount_name: subaccountName },
-      account,
-      signMessage
-    );
-    return this.post("/account/subaccount/create", confirmBody);
-  }
+  // POST /account/subaccount/create is not implemented. Docs (rest-api/subaccounts/create-subaccount):
+  // "Both the main account and subaccount must sign to establish the relationship." — the body is
+  // {main_account, subaccount, main_signature, sub_signature, timestamp, expiry_window}; the
+  // subaccount keypair signs {account: <main>} ("subaccount_initiate") and the main account signs
+  // {signature: <sub_signature>} ("subaccount_confirm") (python-sdk rest/create_subaccount.py).
+  // perp-cli has no second (subaccount) keypair source, so `manage sub create` is gated.
 
   async listSubaccounts(
     account: string,
@@ -465,18 +518,16 @@ export class PacificaClient {
 
   // ==================== API KEYS ====================
 
+  /**
+   * API Config Key (rate-limit key). Docs (api/rate-limits/api-config-keys): the request body is
+   * account / signature / timestamp / expiry_window only; python-sdk rest/api_config_keys.py signs
+   * type "create_api_key" with `signature_payload = {}`.
+   */
   async createApiKey(
-    name: string,
-    maxFeeRate: string,
     account: string,
     signMessage: SignMessageFn
   ): Promise<unknown> {
-    const body = await this.signedBody(
-      "create_api_key",
-      { name, max_fee_rate: maxFeeRate },
-      account,
-      signMessage
-    );
+    const body = await this.signedBody("create_api_key", {}, account, signMessage);
     return this.post("/account/api_keys/create", body);
   }
 
@@ -509,7 +560,12 @@ export class PacificaClient {
     account: string,
     signMessage: SignMessageFn
   ): Promise<unknown> {
-    const body = await this.signedBody("create_lake", params, account, signMessage);
+    // Optional fields are omitted, not sent as null (the signed payload must equal the body).
+    const payload: Record<string, string> = {};
+    if (params.manager !== null) payload.manager = params.manager;
+    if (params.nickname !== null) payload.nickname = params.nickname;
+    if (params.initial_deposit !== null) payload.initial_deposit = params.initial_deposit;
+    const body = await this.signedBody("create_lake", payload, account, signMessage);
     return this.post("/lake/create", body);
   }
 

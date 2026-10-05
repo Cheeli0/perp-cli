@@ -10,6 +10,7 @@ import { existsSync, mkdirSync, rmSync } from "fs";
 import { resolve } from "path";
 import os from "os";
 import { Command } from "commander";
+import { addRootSafetyOptions } from "../../cli-flags.js";
 import { Keypair } from "@solana/web3.js";
 
 // ── Stable temp-dir for settings I/O ──────────────────────────────────────
@@ -42,6 +43,8 @@ const FAKE_SIG_HEX = "1aee1548148536475582711c39958806646195b294c0bbc0d52ed8aae7
                     "5240c82244cf8e1e0d4387d107ef558090bae5d6a603235750e93ee0be1b1bbf";
 
 const mockOws = {
+  listWallets: vi.fn((): Array<{ name: string }> => []),
+  deleteWallet: vi.fn(),
   createWallet: vi.fn(),
   createPolicy: vi.fn(),
   createApiKey: vi.fn(),
@@ -75,6 +78,7 @@ import { buildBindAgentMessage, buildRevokeAgentMessage, buildRevokeAllAgentsMes
 
 function makeProgram() {
   const prog = new Command();
+  addRootSafetyOptions(prog);
   prog.exitOverride();
   // Register `agent` as a subcommand of `wallet` to match the production
   // command tree post-consolidation (`perp wallet agent ...`).
@@ -529,7 +533,7 @@ function makeSolanaSigner(address: string) {
 describe("Test 10: PacificaAdapter Tier 1 selection", () => {
   it("agent + master + PK all set → activeSignerTier === 'agent'", () => {
     // Adapter created with a real keypair (Tier 3 PK)
-    const adapter = new PacificaAdapter(Keypair.generate(), "mainnet", "PERPCLI", true);
+    const adapter = new PacificaAdapter(Keypair.generate(), "mainnet", true);
     // Tier 2: master signer
     adapter.setSigner(makeSolanaSigner("MasterPacBase58Address1111111111111111111111") as never);
     // Tier 1: agent
@@ -544,7 +548,7 @@ describe("Test 10: PacificaAdapter Tier 1 selection", () => {
 
 describe("Test 11: PacificaAdapter --no-agent bypass (AC-32)", () => {
   it("setNoAgent(true) → Tier 1 skipped even when agent is set", () => {
-    const adapter = new PacificaAdapter(Keypair.generate(), "mainnet", "PERPCLI", true);
+    const adapter = new PacificaAdapter(Keypair.generate(), "mainnet", true);
     adapter.setSigner(makeSolanaSigner("MasterPacBase58Address1111111111111111111111") as never);
     adapter.setAgentSigner(
       makePacAgentMeta(),
@@ -558,15 +562,15 @@ describe("Test 11: PacificaAdapter --no-agent bypass (AC-32)", () => {
 describe("Test 12: PacificaAdapter NO_SIGNER_AVAILABLE", () => {
   it("no agent, no master, hasRealKey=false → activeSignerTier is null (read-only)", () => {
     // hasRealKey=false → no Tier 3 PK
-    const adapter = new PacificaAdapter(Keypair.generate(), "mainnet", "PERPCLI", false);
+    const adapter = new PacificaAdapter(Keypair.generate(), "mainnet", false);
     expect(adapter.isReadOnly).toBe(true);
     expect(adapter.activeSignerTier).toBeNull();
   });
 });
 
-describe("Test 13: PacificaAdapter AGENT_EXPIRED with fallback", () => {
-  it("expired agent + master available → falls through to master", () => {
-    const adapter = new PacificaAdapter(Keypair.generate(), "mainnet", "PERPCLI", false);
+describe("Test 13: PacificaAdapter AGENT_EXPIRED — no silent fall-through to the master", () => {
+  const expiredAdapter = () => {
+    const adapter = new PacificaAdapter(Keypair.generate(), "mainnet", false);
     const expiredMeta = makePacAgentMeta();
     expiredMeta.expiresAt = new Date(Date.now() - 1000).toISOString();
     adapter.setAgentSigner(
@@ -574,7 +578,85 @@ describe("Test 13: PacificaAdapter AGENT_EXPIRED with fallback", () => {
       makeSolanaSigner("AgentPacBase58Address11111111111111111111111") as never,
     );
     adapter.setSigner(makeSolanaSigner("MasterPacBase58Address1111111111111111111111") as never);
+    return adapter;
+  };
+
+  it("expired agent + master available → AGENT_EXPIRED with the re-approve remediation", () => {
+    const adapter = expiredAdapter();
+    expect(adapter.activeSignerTier).toBeNull();
+    let err: unknown;
+    try { (adapter as unknown as { _resolveSigner(): unknown })._resolveSigner(); } catch (e) { err = e; }
+    expect((err as { structured: { code: string; remediation: string } }).structured.code).toBe("AGENT_EXPIRED");
+    expect((err as { structured: { code: string; remediation: string } }).structured.remediation).toContain("perp wallet agent approve pacifica");
+  });
+
+  it("--no-agent → the master signer is used", () => {
+    const adapter = expiredAdapter();
+    adapter.setNoAgent(true);
     expect(adapter.activeSignerTier).toBe("master");
+  });
+});
+
+describe("PAC approve vs an existing agent OWS wallet (the live `wallet name already exists` case)", () => {
+  afterEach(() => {
+    // mockImplementation survives vi.clearAllMocks(): restore the file-level defaults.
+    mockOws.listWallets.mockReset().mockImplementation(() => []);
+    mockOws.deleteWallet.mockReset();
+    mockOws.createWallet.mockReset();
+  });
+
+  const statefulWallets = (initial: string[]) => {
+    let wallets = initial.map(name => ({ name }));
+    const order: string[] = [];
+    mockOws.listWallets.mockImplementation(() => wallets);
+    mockOws.deleteWallet.mockImplementation((n: string) => { order.push(`delete:${n}`); wallets = wallets.filter(w => w.name !== n); });
+    mockOws.createWallet.mockImplementation((n: string) => {
+      if (wallets.some(w => w.name === n)) throw new Error(`wallet name already exists: '${n}'`);
+      order.push(`create:${n}`); wallets = [...wallets, { name: n }];
+      return MOCK_AGENT_WALLET;
+    });
+    return order;
+  };
+  const expiredRecord = () => {
+    const m = makePacAgentMeta("perp-cli-pac");
+    m.expiresAt = new Date(Date.now() - 1000).toISOString();
+    setAgent("pacifica", m);
+  };
+
+  it("approve without --rotate → INVALID_PARAMS telling the user to pass --rotate, never DUPLICATE_ORDER; nothing signed or sent", async () => {
+    setupOkOws();
+    statefulWallets([MOCK_AGENT_WALLET.name]);
+    expiredRecord();
+    stubPacFetchOk();
+    const out: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((c: string | Uint8Array) => { out.push(String(c)); return true; });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("process.exit"); }) as never);
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    await expect(makeProgram().parseAsync(["node", "perp", "wallet", "agent", "approve", "pacifica", "--master", "main", "--passphrase", "testpass", "--json"])).rejects.toThrow("process.exit");
+    const err = JSON.parse(out.find(l => l.includes('"ok":false'))!).error;
+    expect(err.code).toBe("INVALID_PARAMS");
+    expect(err.remediation).toContain("perp wallet agent approve pacifica --rotate");
+    expect(fetch).not.toHaveBeenCalled();
+    expect(mockOws.signMessage).not.toHaveBeenCalled();
+  });
+
+  it("approve --rotate with an EXPIRED previous agent → revoke, delete the old wallet, create, bind (same path as `rotate`)", async () => {
+    setupOkOws();
+    const order = statefulWallets([MOCK_AGENT_WALLET.name]);
+    expiredRecord();
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ success: true }), text: async () => JSON.stringify({ success: true }) });
+    vi.stubGlobal("fetch", fetchMock);
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("process.exit"); }) as never);
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    await makeProgram().parseAsync(["node", "perp", "wallet", "agent", "approve", "pacifica", "--master", "main", "--rotate", "--passphrase", "testpass", "--json"]);
+    expect(order).toEqual([`delete:${MOCK_AGENT_WALLET.name}`, `create:${MOCK_AGENT_WALLET.name}`]);
+    const urls = fetchMock.mock.calls.map(c => String(c[0]));
+    expect(urls.findIndex(u => u.includes("/agent/revoke"))).toBeGreaterThanOrEqual(0);
+    expect(urls.findIndex(u => u.includes("/agent/revoke"))).toBeLessThan(urls.findIndex(u => u.includes("/agent/bind")));
+    expect(new Date(getAgent("pacifica", "perp-cli-pac")!.expiresAt).getTime()).toBeGreaterThan(Date.now());
   });
 });
 

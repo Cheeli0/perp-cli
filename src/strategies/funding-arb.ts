@@ -1,6 +1,8 @@
-import type { ExchangeAdapter } from "../exchanges/index.js";
+import { assertCanClosePositions } from "../exchanges/trading-v2.js";
+import { MAX_PRICE_DEVIATION_PCT, type ExchangeAdapter } from "../exchanges/index.js";
 import { symbolMatch, logSettledRejections } from "../utils.js";
 import { updateJobState } from "../jobs.js";
+import { invalidateCache } from "../cache.js";
 import { fetchAllBalances, computeRebalancePlan, hasEnoughBalance, type ExchangeBalanceSnapshot } from "../rebalance.js";
 import { checkArbLiquidity } from "../liquidity.js";
 import { computeAnnualSpread, toHourlyRate } from "../funding.js";
@@ -8,7 +10,14 @@ import {
   fetchPacificaPrices, fetchHyperliquidMeta,
   fetchLighterOrderBookDetails, fetchLighterFundingRates,
 } from "../shared-api.js";
-import { computeMatchedSize, reconcileArbFills } from "../arb-sizing.js";
+import { computeMatchedSize } from "../arb-sizing.js";
+import { closePerpPairVerified, openPerpPairVerified } from "../commands/arb-auto.js";
+import { closePerpVerified, isOutcomeUnknown, rejectedLotSize } from "../bot/perp-order.js";
+import { isQuarantined, quarantineSymbol } from "../bot/quarantine.js";
+import { isPositionGone, matchSymbol } from "../bot/strategies/funding-arb-utils.js";
+
+/** Quarantine source for `perp strategy funding-arb` (src/bot/quarantine.ts). */
+const SOURCE = "funding-arb-cli";
 
 export interface FundingArbParams {
   minSpread: number;       // minimum annual spread % to trigger entry
@@ -93,12 +102,24 @@ async function fetchAllRates(): Promise<FundingRate[]> {
 
 // annualize: use computeAnnualSpread from funding.ts for cross-exchange comparison
 
+/**
+ * `perp strategy funding-arb` loop. With autoExecute (design §12.3):
+ *  - entry = openPerpPairVerified (long, then the short sized to the long's VERIFIED fill;
+ *    definite short failure → reduce-only rollback; unknown outcome → quarantine). A lot-size
+ *    rejection is never resubmitted blindly: the long is re-sized only when it was definitely
+ *    not placed; a rejected short is placed once at the lot-floored verified long fill;
+ *  - close / max-drawdown close = closePerpPairVerified with the venue position size strings
+ *    (reduce-only, verified, one residual close, quarantine on unknown / unhedged);
+ *  - quarantined symbols (src/bot/quarantine.ts) are never entered or closed.
+ */
+
 export async function runFundingArb(
   adapters: Map<string, ExchangeAdapter>,
   params: FundingArbParams,
   jobId?: string,
   log: (msg: string) => void = console.log,
 ): Promise<void> {
+  for (const a of adapters.values()) assertCanClosePositions(a, `Funding arb on ${a.name}`);
   const maxPos = params.maxPositions ?? 3;
   const closeSpread = params.closeSpread ?? 5;
   const positions: ArbPosition[] = [];
@@ -149,29 +170,18 @@ export async function runFundingArb(
           log(`[ARB] CLOSE signal: ${pos.symbol} spread ${currentSpread.toFixed(1)}% <= ${closeSpread}%`);
 
           if (params.autoExecute) {
-            const longAdapter = adapters.get(pos.longExchange);
-            const shortAdapter = adapters.get(pos.shortExchange);
-
-            if (longAdapter && shortAdapter) {
-              try {
-                await Promise.all([
-                  longAdapter.marketOrder(pos.symbol, "sell", pos.size),
-                  shortAdapter.marketOrder(pos.symbol, "buy", pos.size),
-                ]);
-                log(`[ARB] CLOSED ${pos.symbol} — both legs unwound`);
-
-                // Estimate P&L from funding collected
-                const hoursOpen = (Date.now() - pos.openedAt) / (1000 * 60 * 60);
-                // entrySpread is annualized %; convert to per-hour rate
-                const hourlySpreadRate = pos.entrySpread / 100 / (24 * 365);
-                const estimatedFunding = hourlySpreadRate * hoursOpen * Number(pos.size) * pos.entryPrices.long;
-                log(`[ARB] Est. funding P&L: ~$${estimatedFunding.toFixed(2)} (${hoursOpen.toFixed(1)}h open)`);
-              } catch (err) {
-                const msg = err instanceof Error ? err.message : String(err);
-                log(`[ARB] Close error: ${msg}`);
-                continue; // don't remove position if close failed
-              }
+            if (isQuarantined(pos.symbol, log)) {
+              log(`[ARB] ${pos.symbol} is quarantined — not closing (perp strategy quarantine)`);
+              continue;
             }
+            const closed = await closeArbPosition(pos, adapters, log);
+            if (!closed) continue; // still open (failed) or quarantined — keep tracking
+            // Estimate P&L from funding collected
+            const hoursOpen = (Date.now() - pos.openedAt) / (1000 * 60 * 60);
+            // entrySpread is annualized %; convert to per-hour rate
+            const hourlySpreadRate = pos.entrySpread / 100 / (24 * 365);
+            const estimatedFunding = hourlySpreadRate * hoursOpen * Number(pos.size) * pos.entryPrices.long;
+            log(`[ARB] Est. funding P&L: ~$${estimatedFunding.toFixed(2)} (${hoursOpen.toFixed(1)}h open)`);
           }
 
           positions.splice(i, 1);
@@ -186,10 +196,13 @@ export async function runFundingArb(
           if (totalPnl < -params.maxDrawdown) {
             log(`[ARB] MAX DRAWDOWN hit: uPnL $${totalPnl.toFixed(2)} < -$${params.maxDrawdown}`);
             log(`[ARB] Closing all ${positions.length} positions...`);
-            await closeAllPositions(positions, adapters, log);
+            const stillOpen = await closeAllPositions(positions, adapters, log);
             positions.length = 0;
+            positions.push(...stillOpen);
           }
-        } catch { /* non-critical */ }
+        } catch (err) {
+          log(`[ARB] Drawdown check failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
       }
 
       // ── Phase 3: Balance check + rebalance trigger ──
@@ -224,6 +237,7 @@ export async function runFundingArb(
           if (symbolRates.length < 2) continue;
           if (positions.find((p) => symbolMatch(p.symbol, symbol))) continue;
           if (positions.length >= maxPos) break;
+          if (params.autoExecute && isQuarantined(symbol, log)) continue;
 
           // Only consider exchanges we have adapters for
           const available = symbolRates.filter((r) => adapters.has(r.exchange));
@@ -233,6 +247,12 @@ export async function runFundingArb(
           const lowest = available[0];
           const highest = available[available.length - 1];
           if (lowest.exchange === highest.exchange) continue;
+          // Same ticker on two venues is not proof of the same asset: the chosen pair must agree on price.
+          const pairGapPct = Math.abs(lowest.markPrice - highest.markPrice) / ((lowest.markPrice + highest.markPrice) / 2) * 100;
+          if (!(pairGapPct <= MAX_PRICE_DEVIATION_PCT)) {
+            if (cycleCount === 1) log(`[ARB] Skip ${symbol} ${lowest.exchange}↔${highest.exchange}: mark gap ${pairGapPct.toFixed(1)}% > ${MAX_PRICE_DEVIATION_PCT}% (likely a different asset)`);
+            continue;
+          }
 
           const annualSpread = computeAnnualSpread(highest.fundingRate, highest.exchange, lowest.fundingRate, lowest.exchange);
 
@@ -272,54 +292,44 @@ export async function runFundingArb(
                 }
               }
 
-              try {
-                log(`[ARB] Opening: ${matched.size} ${symbol} on both legs ($${matched.notional.toFixed(0)}/leg, slippage ~${liq.longSlippage.toFixed(2)}%/${liq.shortSlippage.toFixed(2)}%)...`);
-                try {
-                  await Promise.all([
-                    longAdapter.marketOrder(symbol, "buy", matched.size),
-                    shortAdapter.marketOrder(symbol, "sell", matched.size),
-                  ]);
-                } catch (orderErr) {
-                  const errMsg = orderErr instanceof Error ? orderErr.message : String(orderErr);
-                  const lotMatch = errMsg.match(/not a multiple of lot size (\d+(?:\.\d+)?)/);
-                  if (lotMatch) {
-                    const lotSize = parseFloat(lotMatch[1]);
-                    log(`[ARB] Lot size ${lotSize} detected, recalculating...`);
-                    matched = computeMatchedSize(liq.adjustedSizeUsd, highest.markPrice, longEx, shortEx, { lotSize });
-                    if (!matched) { log(`[ARB] Skip ${symbol}: can't meet lot size ${lotSize}`); continue; }
-                    log(`[ARB] Retry: ${matched.size} ${symbol} ($${matched.notional.toFixed(0)}/leg)`);
-                    await Promise.all([
-                      longAdapter.marketOrder(symbol, "buy", matched.size),
-                      shortAdapter.marketOrder(symbol, "sell", matched.size),
-                    ]);
-                  } else {
-                    throw orderErr;
-                  }
-                }
-
-                // Verify fills match, correct if needed
-                try {
-                  const recon = await reconcileArbFills(longAdapter, shortAdapter, symbol, log);
-                  if (!recon.matched) {
-                    log(`[ARB] WARNING: fills not matched after correction attempt`);
-                  }
-                } catch { /* non-critical */ }
-
-                positions.push({
-                  symbol,
-                  longExchange: longEx,
-                  shortExchange: shortEx,
-                  size: matched.size,
-                  entrySpread: annualSpread,
-                  openedAt: Date.now(),
-                  entryPrices: { long: lowest.markPrice, short: highest.markPrice },
-                });
-
-                log(`[ARB] OPENED ${symbol} delta-neutral (${positions.length}/${maxPos})`);
-              } catch (err) {
-                const msg = err instanceof Error ? err.message : String(err);
-                log(`[ARB] Entry error: ${msg}`);
+              log(`[ARB] Opening: ${matched.size} ${symbol} — long ${longEx} then short ${shortEx}, each verified ($${matched.notional.toFixed(0)}/leg, slippage ~${liq.longSlippage.toFixed(2)}%/${liq.shortSlippage.toFixed(2)}%)...`);
+              const openPair = (size: string) => openPerpPairVerified({
+                source: SOURCE, sym: symbol,
+                longAdapter, longExch: longEx, longSym: symbol,
+                shortAdapter, shortExch: shortEx, shortSym: symbol,
+                size, smart: false, log, shortLotRetry: true,
+              });
+              let res = await openPair(matched.size);
+              if (res.status === "not_opened" && res.rolledBack === null && res.lotSize !== null) {
+                // The LONG was definitely rejected for lot size (nothing placed): recompute once.
+                const lotSize = res.lotSize;
+                log(`[ARB] Lot size ${lotSize} on ${longEx} — recalculating (nothing was placed)`);
+                matched = computeMatchedSize(liq.adjustedSizeUsd, highest.markPrice, longEx, shortEx, { lotSize });
+                if (!matched) { log(`[ARB] Skip ${symbol}: can't meet lot size ${lotSize}`); continue; }
+                log(`[ARB] Retry: ${matched.size} ${symbol} ($${matched.notional.toFixed(0)}/leg)`);
+                res = await openPair(matched.size);
               }
+              if (res.status === "quarantined") {
+                log(`[ARB] Entry ${symbol} QUARANTINED: ${res.reason} — exposure: ${res.exposure}`);
+                continue;
+              }
+              if (res.status === "not_opened") {
+                log(`[ARB] Entry error ${symbol}: ${res.reason}${res.rolledBack !== null ? ` (long ${res.rolledBack} rolled back)` : ""}`);
+                continue;
+              }
+              if (res.trimmed !== "0") log(`[ARB] Short filled ${res.hedged} — trimmed the long by ${res.trimmed} (reduce-only)`);
+
+              positions.push({
+                symbol,
+                longExchange: longEx,
+                shortExchange: shortEx,
+                size: res.hedged,
+                entrySpread: annualSpread,
+                openedAt: Date.now(),
+                entryPrices: { long: lowest.markPrice, short: highest.markPrice },
+              });
+
+              log(`[ARB] OPENED ${symbol} delta-neutral ${res.hedged}/leg (${positions.length}/${maxPos})`);
             }
           }
         }
@@ -365,26 +375,95 @@ export async function runFundingArb(
   log(`[ARB] Funding rate arbitrage stopped. Positions: ${positions.length}`);
 }
 
+/** Venue position size string for one leg (abs, as the venue reports it), or null when flat. Read errors propagate. */
+async function venueLegSize(adapter: ExchangeAdapter, symbol: string, side: "long" | "short"): Promise<string | null> {
+  invalidateCache("acct"); // the reduce-only close is sized from this read: never a cached position
+  const p = (await adapter.getPositions()).find(x => matchSymbol(x.symbol, symbol) && x.side === side);
+  if (p === undefined) return null;
+  const abs = p.size.replace(/^-/, "");
+  return Number(abs) > 0 ? abs : null;
+}
+
+/**
+ * Close one tracked pair: reduce-only, verified, legs sequential (closePerpPairVerified), each
+ * sized from the venue's own position size string, capped at the tracked size (never rounded
+ * up, never another position's size). A leg already gone → the other leg alone (reduce-only,
+ * verified, one residual close). Unknown outcome / unhedged residual → quarantined. Returns
+ * true only when this pair is flat.
+ */
+async function closeArbPosition(pos: ArbPosition, adapters: Map<string, ExchangeAdapter>, log: (msg: string) => void): Promise<boolean> {
+  const longAdapter = adapters.get(pos.longExchange);
+  const shortAdapter = adapters.get(pos.shortExchange);
+  if (!longAdapter || !shortAdapter) {
+    log(`[ARB] Close ${pos.symbol}: adapter missing (${pos.longExchange}/${pos.shortExchange}) — left open`);
+    return false;
+  }
+  const cap = (venue: string | null): string | null => (venue === null ? null : Number(venue) > Number(pos.size) ? pos.size : venue);
+  let longSize: string | null;
+  let shortSize: string | null;
+  try {
+    [longSize, shortSize] = await Promise.all([
+      venueLegSize(longAdapter, pos.symbol, "long").then(cap),
+      venueLegSize(shortAdapter, pos.symbol, "short").then(cap),
+    ]);
+  } catch (err) {
+    log(`[ARB] Close ${pos.symbol}: position read failed (${err instanceof Error ? err.message : String(err)}) — nothing sent, retry next cycle`);
+    return false;
+  }
+  if (longSize === null && shortSize === null) {
+    log(`[ARB] ${pos.symbol}: both legs already flat — removing from tracking`);
+    return true;
+  }
+  if (longSize !== null && shortSize !== null) {
+    const res = await closePerpPairVerified({
+      source: SOURCE, sym: pos.symbol,
+      longAdapter, longExch: pos.longExchange, longSym: pos.symbol, longSize,
+      shortAdapter, shortExch: pos.shortExchange, shortSym: pos.symbol, shortSize,
+      smart: false, log,
+    });
+    if (res.status === "closed") { log(`[ARB] CLOSED ${pos.symbol} — both legs unwound (long ${longSize}, short ${shortSize})`); return true; }
+    if (res.status === "failed") { log(`[ARB] Close error ${pos.symbol}: ${res.reason} — hedge intact`); return false; }
+    log(`[ARB] Close ${pos.symbol} QUARANTINED: ${res.reason}`);
+    return false;
+  }
+  // One leg is gone (liquidated / closed elsewhere): close the orphan leg alone.
+  const [adapter, venue, side, size, leg] = longSize !== null
+    ? [longAdapter, pos.longExchange, "sell" as const, longSize, "long"]
+    : [shortAdapter, pos.shortExchange, "buy" as const, shortSize as string, "short"];
+  log(`[ARB] ${pos.symbol}: the other leg is gone — closing the orphaned ${leg} ${size} on ${venue} (reduce-only)`);
+  const q = (reason: string): false => {
+    quarantineSymbol(SOURCE, pos.symbol, reason,
+      `Check ${pos.symbol} on ${pos.longExchange} and ${pos.shortExchange}; close by hand, then: perp strategy quarantine-clear ${pos.symbol}`, log);
+    return false;
+  };
+  try {
+    const c = await closePerpVerified(adapter, venue, pos.symbol, side, size);
+    if (c.residual > 0) return q(`orphaned ${leg} close on ${venue} closed ${c.closed} of ${size}, ${c.residual} still open${c.note !== null ? ` (${c.note})` : ""}`);
+  } catch (err) {
+    if (!isOutcomeUnknown(err) && isPositionGone(err)) return true;
+    return q(`orphaned ${leg} ${size} on ${venue}: close ${isOutcomeUnknown(err) ? "outcome unknown" : "failed"} (${err instanceof Error ? err.message : String(err)}) — unhedged`);
+  }
+  log(`[ARB] Closed orphaned ${leg} ${size} ${pos.symbol} on ${venue}`);
+  return true;
+}
+
+/** Emergency close of every tracked pair (verified, reduce-only). Returns the pairs still open. */
 async function closeAllPositions(
   positions: ArbPosition[],
   adapters: Map<string, ExchangeAdapter>,
   log: (msg: string) => void,
-): Promise<void> {
+): Promise<ArbPosition[]> {
+  const stillOpen: ArbPosition[] = [];
   for (const pos of positions) {
-    const longAdapter = adapters.get(pos.longExchange);
-    const shortAdapter = adapters.get(pos.shortExchange);
-    if (!longAdapter || !shortAdapter) continue;
-
-    try {
-      await Promise.all([
-        longAdapter.marketOrder(pos.symbol, "sell", pos.size),
-        shortAdapter.marketOrder(pos.symbol, "buy", pos.size),
-      ]);
-      log(`[ARB] Emergency closed ${pos.symbol}`);
-    } catch (err) {
-      log(`[ARB] Failed to close ${pos.symbol}: ${err instanceof Error ? err.message : err}`);
+    if (isQuarantined(pos.symbol, log)) {
+      log(`[ARB] ${pos.symbol} is quarantined — left open (perp strategy quarantine)`);
+      stillOpen.push(pos);
+      continue;
     }
+    if (await closeArbPosition(pos, adapters, log)) log(`[ARB] Emergency closed ${pos.symbol}`);
+    else stillOpen.push(pos);
   }
+  return stillOpen;
 }
 
 function sleep(ms: number): Promise<void> {

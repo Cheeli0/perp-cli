@@ -4,7 +4,7 @@
 [![npm downloads](https://img.shields.io/npm/dw/perp-cli.svg)](https://www.npmjs.com/package/perp-cli)
 [![license](https://img.shields.io/npm/l/perp-cli.svg)](https://github.com/hypurrquant/perp-cli/blob/main/LICENSE)
 
-Multi-DEX perpetual futures CLI — **Pacifica** (Solana), **Hyperliquid** (HyperEVM), **Lighter** (Ethereum), **Aster** (BNB Chain).
+Multi-DEX perpetual futures CLI — **Pacifica** (Solana), **Hyperliquid** (HyperEVM), **Lighter** (Ethereum), **Aster** (BNB Chain), **Lighter RH** (Robinhood chain), **Ondo Perps** (off-chain), **Arcus** (Robinhood chain), **QFEX** (off-chain, TradFi perps).
 
 ```bash
 npm install -g perp-cli       # global install
@@ -16,7 +16,7 @@ npx -y perp-cli --json portfolio
 
 ## Features
 
-- **4 Exchanges** — trade, bridge, arbitrage across Pacifica, Hyperliquid, Lighter, Aster
+- **8 Venues** — trade on Pacifica, Hyperliquid, Lighter, Aster, Lighter RH, Ondo Perps, Arcus, QFEX (bridge / perp-perp arb cover the original four)
 - **Funding Rate Arb** — perp-perp + spot-perp scan & one-command dual-leg execution
 - **Portfolio** — single call returns balances, positions, risk level across all exchanges
 - **Funds** — deposit, withdraw, transfer, multi-provider bridge (cctp/relay/debridge), inter-exchange rebalance — all in one group
@@ -27,14 +27,25 @@ npx -y perp-cli --json portfolio
 ## Setup
 
 ```bash
-# Set exchange keys
-perp wallet set pac <SOLANA_KEY>     # Pacifica
-perp wallet set hl <EVM_KEY>         # Hyperliquid
-perp wallet set lt <EVM_KEY>         # Lighter (API key auto-generated)
-perp wallet set aster <API_KEY>      # Aster (BNB Chain)
+# Import an exchange key into the encrypted OWS vault and make it the active wallet.
+# The key is read from a hidden prompt or stdin — never argv (shell history), never ~/.perp/.env.
+perp wallet set hl                   # Hyperliquid (EVM) — hidden prompt
+pbpaste | OWS_PASSPHRASE="$PP" perp wallet set pac --name pac   # Pacifica (Solana) — piped
+# The active wallet serves every venue; one EVM key covers HL / Lighter / Aster.
+# Lighter trading also needs: perp wallet agent approve lighter
 
-# Or interactive setup wizard
+# Or the interactive setup wizard (all 7 venues): picks / creates / imports an OWS
+# vault wallet, network, venues, registers agent wallets (y/N confirmation before
+# any signature — never moves funds), explains + sets the slippage bound, and the
+# default venue. It never writes keys to ~/.perp/.env.
 perp setup
+
+# Scriptable (CI / agents) — writes settings only, signs nothing:
+perp --json setup --non-interactive --wallet <ows-wallet> --venues hyperliquid,aster \
+  --network testnet --default-venue hyperliquid --slippage-bps 50 --slippage aster=80
+# Add agent registration explicitly (Ondo key id + secret via stdin only):
+OWS_PASSPHRASE=<pp> perp --json setup --non-interactive --wallet <ows-wallet> \
+  --venues hyperliquid,arcus --approve-agents --yes --arcus-account-index 0
 
 # Verify
 perp wallet show
@@ -43,6 +54,132 @@ perp wallet show
 Same EVM key works for both Hyperliquid and Lighter.
 
 > **Lighter API Key Index:** Indexes 0–3 are reserved by Lighter's frontend (web/mobile). perp-cli defaults to index `4`. Override with `LIGHTER_API_KEY_INDEX` env var, or use `perp wallet agent approve lighter --api-key-index <n>` for managed agent slots. Valid range: 4–254.
+
+### Lighter RH, Ondo Perps, Arcus
+
+These venues have no `wallet set` private-key path — register an agent / API key instead:
+
+```bash
+perp wallet agent approve lighter-rh                  # Lighter RH L2 slot key (USDG collateral, Robinhood chain)
+printf '%s\n%s\n' "$KEY_ID" "$SECRET" | perp wallet agent approve ondo   # Ondo HMAC key id + secret, stdin only
+perp wallet agent approve arcus --master <ows-wallet> # Arcus Ed25519 API key (OWS wallet agent-arcus-<master>)
+perp wallet agent verify [lighter-rh|ondo|arcus]      # no venue = verify every configured venue
+```
+
+### No master wallet on this computer — import a key created on the exchange website
+
+Create the agent / API key on the venue's website, then import it. The master wallet never has to be
+on this machine; it is identified only by its public address. The key is read from a hidden prompt or
+stdin (never argv) and **checked against the venue before anything is stored** — a refused check stores
+nothing; a venue that cannot be checked without the master is reported as `unverified`, never as verified.
+
+```bash
+perp -n testnet wallet agent import hyperliquid                    # API wallet key; master read from HL (userRole)
+pbpaste | perp wallet agent import aster --master-address 0xYOU     # signer key; signed /fapi/v3/balance check (works on Aster testnet too)
+perp wallet agent import pacifica --master-address <SOL account>   # agent key; UNVERIFIED (Pacifica lists bindings only master-signed)
+perp wallet agent import lighter --account-index 123 --api-key-index 5   # slot key; auth token accepted for that slot
+perp wallet agent import arcus --master-address 0xOWNER            # Ed25519 key; public key listed ACTIVE for the owner
+printf '%s\n%s\n' "$KEY_ID" "$SECRET" | perp wallet agent import ondo
+printf '%s\n%s\n' "$PUBLIC_KEY" "$SECRET" | perp wallet agent import qfex --account-id <uuid>   # QFEX: import only (keys are created on the website, 2FA)
+perp wallet agent list                                              # SOURCE column: approved | imported
+
+# Setup without any master wallet: one stdin line per --import-agents venue, in order (ondo: 2 lines)
+printf '%s\n%s\n' "$HL_AGENT_KEY" "$LT_KEY" | perp --json setup --non-interactive \
+  --venues hyperliquid,lighter --import-agents hyperliquid,lighter --yes \
+  --lighter-account-index 123 --lighter-api-key-index 5
+```
+
+Trading works with the imported key. **Deposits, withdrawals, transfers, bridge, referral set and agent
+approvals need the master**: without it they fail with `NO_SIGNER_AVAILABLE` ("do it on the exchange
+website, or add the master with `perp wallet import`"). The CLI cannot revoke or rotate an imported key —
+revoke it on the website; `perp wallet agent revoke <venue> <name> --local-only` removes the local copy,
+and `wallet agent import <venue> --agent-name <name> --replace` swaps in a new website-created key.
+`perp setup` offers the same choice per venue: approve with this computer's master wallet, or import a
+website-created key (Step 1 can skip the master wallet).
+
+Secrets are stored once (see `docs/SSOT_RULES.md` Rule #3): Lighter RH → `~/.perp/lighter-rh-agents/`, Ondo → `~/.perp/ondo-agents/<keyId>.json`, Arcus → OWS wallet `agent-arcus-<master>`; imported EVM / Solana / Ed25519 keys → OWS wallet `agent-{hl,aster,pac,arcus}-import-<name>` (empty passphrase, like approved agent wallets), imported Lighter keys → the network-tagged Lighter keystore. A missing wallet/key now fails with `KEY_NOT_FOUND` / `NO_SIGNER_AVAILABLE` instead of silently falling back to read-only.
+
+## Venues
+
+| Venue | `-e` id (aliases) | Trading | Notes |
+|-------|-------------------|---------|-------|
+| Pacifica | `pacifica` (`pac`) | yes | Solana |
+| Hyperliquid | `hyperliquid` (`hl`) | yes | HyperEVM; HIP-3 dexes via `--dex` |
+| Lighter | `lighter` (`lt`) | yes | Ethereum L2 |
+| Aster | `aster` (`ast`) | yes | BNB Chain; funding interval is per symbol |
+| Lighter RH | `lighter-rh` (`lrh`, `rh`) | yes | Lighter engine on the Robinhood chain, USDG collateral |
+| Ondo Perps | `ondo` (`ondo-perps`) | yes | Off-chain engine; limit TIF GTC (default) / IOC / ALO; restricted: US, PA |
+| QFEX | `qfex` (`qf`) | yes (see **QFEX** below) | Custodial, off-chain engine; equities / indices / commodities, cross margin, USDC; limit TIF GTC (default) / IOC / FOK / ALO; testnet = QFEX UAT; restricted: US, GB, ES and others |
+| Arcus | `arcus` | yes | Robinhood chain, USDG collateral; limit TIF GTC (default, sent as GTT) / IOC / FOK / ALO; restricted: US, CA, GB; **access whitelist** — unlisted addresses are rejected (request access at arcus.xyz) |
+
+- **Time in force:** `trade limit` defaults to `GTC` on every venue (common names `GTC | IOC | FOK | ALO`; a TIF the venue does not offer → `CAPABILITY_UNSUPPORTED`). Lighter post-only (`ALO`) is disabled until verified on the venue.
+- **TP/SL on an entry:** `trade market|buy|sell|limit ... --tp <px> --sl <px>` means the same on every venue — *protect this entry's verified fill*. The direction is checked before anything is sent (long: tp > reference > sl; short: the reverse; reference = mark for market entries, the limit price for limit entries). Ondo attaches the legs to the order; Arcus sends an entry+TP/SL batch; Hyperliquid / Lighter / Aster verify the entry fill, then place reduce-only TP/SL trigger orders sized to it (only market or `--tif IOC` entries — a resting entry → `CAPABILITY_UNSUPPORTED`); Pacifica verifies the fill, then sets position TP/SL (refused if the symbol already has a position or TP/SL — never overwritten). Entry outcome unknown → `ORDER_PENDING` and **no** TP/SL (the position may be unprotected); entry filled but a leg failed → `ORDER_PARTIAL` (not retryable) with the entry result and which legs were placed — do not re-enter, finish with `trade tpsl`.
+- **TP/SL on a position:** `trade tpsl <SYM> <long|short> --tp <px> --sl <px> [--tp-limit <px>] [--size <n>]` — the argument is the **position's** side (buy/sell no longer accepted), checked against the live position; legs are reduce-only and sized to the live position (or `--size`).
+- **Stop orders are reduce-only by default** on every venue (`trade stop`); pass `--no-reduce-only` to let a stop open or flip a position. Lighter / Arcus market triggers execute as a limit at trigger ± the slippage bound (`--slippage-bps` or settings) and may stay unfilled in a fast move; other venues use native market triggers (`--slippage-bps` → `CAPABILITY_UNSUPPORTED`).
+- **Order edit:** `trade edit` keeps the order's TIF. Pacifica: post-only (ALO) orders are edited natively; GTC / TOB orders placed by perp-cli (TIF recorded in the client order id) are cancelled and replaced with the remaining open size; orders whose TIF is unknown → `CAPABILITY_UNSUPPORTED` (pass `--tif`).
+- **Slippage bound:** every market-type order (entry, close, spot) is bounded by one value: `--slippage-bps <n>` → `settings.slippageBps.<venue>` → `settings.defaultSlippageBps` (shipped default 50, shown in `perp settings show`; change with `perp settings set defaultSlippageBps <n>`). Values outside 1..venue max (Arcus 1000) are rejected before sending.
+- **Restricted regions:** creating a signing adapter for a venue with restricted regions (Ondo, Arcus, QFEX) prints a one-time stderr notice; it never blocks — check the venue terms yourself.
+- **Aggregate views** (`portfolio`, `account positions/orders`, `risk`, `history`, `wallet agent verify`, MCP `portfolio`) cover every account venue with configured credentials.
+
+### QFEX
+
+QFEX is custodial: there is no wallet signature. The only credential is an **API key created on the QFEX website** (Developer Settings, 2FA), imported with `perp wallet agent import qfex` (public key + secret via hidden prompt / stdin; stored encrypted in `~/.perp/qfex-agents/`). The import resolves the **one account UUID** the key trades (primary, or `--account-id <uuid>`), shows it and stores nothing until you confirm it (piped: pass `--account-id` equal to it). Create the trading key **without** the "Deposit and withdraw" permission.
+
+```bash
+perp -n testnet wallet agent import qfex              # QFEX UAT (api.qfex.io); y/N on the resolved account
+perp -e qfex market list                              # public: /refdata + market-data snapshot
+perp -e qfex trade limit AAPL buy 320 0.01            # GTC: "accepted" after the ACK; "open" once listed (trade status)
+perp -e qfex trade market AAPL buy 0.01               # IOC LIMIT at mark ± slippage (never the venue's unbounded MARKET)
+perp -e qfex trade status c:<id> --symbol AAPL        # by the generated client order id
+perp funds deposit qfex                               # prints the USDC / Arbitrum One deposit address; you send the funds
+```
+
+What perp-cli **refuses on QFEX for now** (uniform `CAPABILITY_UNSUPPORTED`; each is lifted only after the listed UAT check in `docs/TEST-PLAN.md` passes):
+
+| Refused | Why | Do instead |
+|---|---|---|
+| Every reduce-only order: `trade close` / `close-all` / `flatten` / `reduce` / `stop` / `tpsl`, `--tp` / `--sl`, MCP `trade_close` | The `reduce_only` wire format is undocumented and the venue may ignore the flag — a "reduce-only" order would then open or flip a position (Q2) | Close with a plain opposite order (`trade market AAPL sell <size>`) or on the QFEX web app |
+| `trade edit` | A modify returns a new order id and cannot be tied to the order safely (Q5) | `trade cancel`, then place again |
+| `--client-id` | Client ids are not unique on the venue; perp-cli only trusts ids it generates | Omit it (the generated id is reported) |
+| Markets not quoted in USD (`SKHYNIX-KRW`, …) | Sizing, risk limits and notionals assume USD | QFEX web app |
+| Funding arb / funding bots with QFEX as a leg; QFEX in `arb scan` rankings | The funding rate's unit is unverified and equity funding accrues only part of the week (Q4) | View only: `perp arb scan --rates --include-unverified` |
+
+Order outcomes are never guessed: an IOC / market order is final only on a venue terminal frame (nothing filled → `ORDER_REJECTED`, `reason: iocNoFill`); anything unclear after the order was sent is `ORDER_PENDING` with the `c:<id>` to check — never resubmit. perp-cli never enables QFEX cancel-on-disconnect, but **another connection of the same user that enabled it (e.g. the official QFEX CLI) cancels all of the account's orders when that connection drops**.
+
+**Withdrawals** are authorized by the API key alone, so they are off until you set a local gate in an interactive terminal (no `--yes`, refused under `--json` / pipes / MCP): `perp settings set withdraw.qfex <address[+address…]>,<maxPerTx>,<maxPerDay>`, then `perp funds withdraw qfex <amount> --to <allowlisted address>` (`--dry-run` shows the plan and the gate verdict). The gate guards against mistakes and misdirected automation — it is **not** a defence against key theft; that defence is a trading key without the withdraw permission. QFEX itself documents that withdrawals need 2FA on the web app, so the API may refuse. Subaccounts: `perp -e qfex funds transfer <amount> primary --from <account uuid>`.
+
+### Spot trading
+
+Spot support is declared per venue (`VenueDefinition.spot`) and every spot command, portfolio view and bot goes through one factory. Symbols are `BASE/QUOTE`; a bare base (`ETH`) uses the venue's first quote asset.
+
+| Venue | Account model | Quote | Limit / book / cancel | Spot↔perp transfer |
+|-------|---------------|-------|-----------------------|--------------------|
+| Hyperliquid | runtime (unified accounts share USDC with perp; standard accounts are separate) | USDC | yes | yes (no-op on unified accounts) |
+| Lighter / Lighter RH | separate | USDC / USDG | yes | yes |
+| Aster | separate (`sapi` spot account) | USDT, USD1 (bare base → USDT) | yes | yes |
+| Pacifica | **unified** — spot shares the perp account | USDC | yes | no (not needed) |
+| Ondo Perps | separate (spot wallet ↔ margin) | USDC | yes | yes |
+| Arcus | **wallet** — on-chain swaps from your master EVM wallet (router, Permit2) | USDG | no (market swaps only) | no |
+
+```bash
+perp --json -e <EX> trade spot-buy <SYM> <SIZE> [--slippage-bps <n>] [--yes]
+perp --json -e <EX> trade spot-sell <SYM> <SIZE> [--slippage-bps <n>] [--yes]
+perp --json -e <EX> trade spot-limit <SYM> <buy|sell> <PRICE> <SIZE> [--tif GTC|IOC|ALO]
+perp --json -e <EX> trade spot-cancel <SYM> <ORDER_ID>
+perp --json -e <EX> trade spot-orders [SYM]
+perp --json -e <EX> trade spot-transfer <to-spot|to-perp> <AMOUNT>   # moves the venue's first quote asset
+perp --json -e <EX> trade spot-balance
+```
+
+- **Unsupported operations fail loudly** with `CAPABILITY_UNSUPPORTED` (e.g. `spot-limit` / `spot-cancel` / `spot-orders` / `spot-transfer` on Arcus).
+- **`spot-transfer` on a shared-balance account** (Pacifica, Hyperliquid unified) succeeds as a no-op with `execution.method: "sharedAccount"` (nothing needs to move); a real move reports `execution.method: "transfer"`.
+- **Slippage:** same rule as perps — `--slippage-bps <n>` → `settings.slippageBps.<venue>` → `settings.defaultSlippageBps` (shipped 50).
+- **Pacifica:** spot buys spend the shared USDC perp margin and reduce perp available margin (a warning is printed before the first buy). Pacifica `getMarkets()` (perp) no longer lists the `SOL-USDC` spot market.
+- **Aster:** an agent signer needs spot permission — `perp wallet agent rotate aster --can-spot` (or `perp wallet agent approve aster --can-spot`); otherwise spot orders fail with `POLICY_DENIED`.
+- **Arcus:** swaps go through `router.spot.arcus.xyz` and settle on the Robinhood chain from the master EVM wallet (`--ows` / active OWS wallet; none → `NO_SIGNER_AVAILABLE`). Spot needs only the master wallet — no Arcus perp agent key; perp orders / account reads without one fail with `AGENT_NOT_REGISTERED` (`perp wallet agent approve arcus`). Listing Arcus spot markets is slow (~80 s, one router `/price` per token) — use `spot-buy` / `spot-sell` directly. Tokens without EIP-2612 permit need a one-time on-chain `approve(Permit2)` that costs Robinhood Chain ETH gas — pass `--yes` to allow it. Results show `status`, `finality`, `receivedToken` and a remediation; a `pending` result means the swap was submitted — **do not resubmit**.
+- **Results:** spot orders print the normalized result (status, finality, filled size, average price, received token, remediation). `spot-buy` / `spot-sell` add an `execution` record on every venue (method, slippage bps + source, protection price and reference where the venue path computes one). `spot-cancel` returns one `SpotOrderResult` shape on every venue (a Lighter cancel is `pending` until `spot-orders` confirms it); `spot-orders` lists the same columns on every venue (Hyperliquid included).
+- **Portfolio / landing:** spot value is added on top of perp equity except balances marked `shared` (Pacifica USDC, Hyperliquid unified USDC). Tokens without a spot price are excluded from totals with a stderr warning (never valued at 0).
+- **Bots and arb** (`funding-arb`, `spot-perp-arb`, `arb exec spot:<venue>`, `arb close`, `arb scan --mode spot-perp`) only use spot venues with a separate (or runtime) spot balance **and** a spot↔perp transfer: hyperliquid, lighter, lighter-rh, aster, ondo. Pacifica (shared margin) and Arcus (on-chain swaps) are refused with `CAPABILITY_UNSUPPORTED`; trade them manually with `trade spot-*`.
 
 ## Command Groups
 
@@ -56,15 +193,30 @@ Same EVM key works for both Hyperliquid and Lighter.
 | `strategy` | 19 bot algorithms (grid, dca, twap, APEX, REFLECT, presets) + nested scripted plans |
 | `funds` | Deposit, withdraw, transfer, cross-chain bridge (multi-provider), inter-exchange rebalance |
 | `risk` | Risk limits, liquidation distance, guardrails |
-| `wallet` | Multi-wallet management, agent wallets (`wallet agent ...`), margin mode / subaccount / API keys (`wallet manage ...`), on-chain balances |
+| `wallet` | Multi-wallet management, agent wallets (`wallet agent ...`), builder fees (`wallet builder ...`, off by default), margin mode / subaccount / API keys (`wallet manage ...`), on-chain balances |
 | `history` | Execution log, PnL, performance breakdown |
 | `portfolio` | Cross-exchange unified overview (replaces former `account balance` / `status` / `dashboard`) |
-| `health` | Adapter health check across all 4 DEX |
-| `settings` | CLI settings (referrals, defaults, fees) |
+| `health` | Adapter health check: ping every venue's REST endpoint (connectivity + latency) |
+| `settings` | CLI settings (referrals, defaults, fees, builder fees, deBridge affiliate) |
 | `backtest` | Strategy backtesting |
 | `background` | Background process supervisor (tmux sessions for strategies, alerts, etc.) |
 | `alerts` | Funding rate alerts (Telegram / Discord) with background daemon |
-| `setup` | Interactive setup wizard (alias: `init`) |
+| `setup` | Setup wizard: OWS wallet, venues, agent wallets, slippage, default venue (alias: `init`; `--non-interactive` for scripts) |
+
+### Builder fees (off by default)
+
+perp-cli attaches **no** builder fee unless you configure one and the venue approval is confirmed:
+
+```bash
+perp settings set builder.hyperliquid 0xBuilder…,1   # <address|code>,<feeBps> — strict: format, venue cap; asks y/N (or --yes)
+perp wallet builder status                            # per venue: supported? configured? approved? attached?
+perp --dry-run wallet builder approve hyperliquid     # plan only
+perp wallet builder approve hyperliquid               # master-signed, asks y/N (or --yes)
+perp --no-builder trade market BTC buy 0.1            # skip it for one command
+perp settings unset builder.hyperliquid               # off again
+```
+
+Supported: hyperliquid (≤ 10 bps, not on HIP-3 dexes), pacifica (≤ 10 bps max, not on spot), aster (≤ 10 bps, mainnet), ondo (≤ 10 bps, no approval step), qfex (`perp settings set builder.qfex <uuid>` — a **fee share**: your fills are attributed to the builder code and you pay the normal fee, nothing extra; the code rides on the trading connection; mainnet only). Lighter / Lighter RH / Arcus: unsupported. If the approval is missing or cannot be read, the order is sent **without** the fee and the result's `execution.notes` says why; `execution.builderFee` shows what was attached.
 
 ## Core Commands
 
@@ -89,7 +241,9 @@ perp --json -e <EX> trade close <SYM>
 perp --json -e <EX> trade flatten                    # close ALL positions on exchange
 perp --json -e <EX> trade reduce <SYM> 50            # reduce position by 50%
 perp --json -e <EX> trade cancel <SYM>               # cancel by symbol (or orderId)
-perp --json -e <EX> trade tpsl <SYM> long            # set take-profit / stop-loss
+perp --json -e <EX> trade buy <SYM> <SIZE> --tp <PX> --sl <PX>  # entry protected by TP/SL
+perp --json -e <EX> trade tpsl <SYM> long --tp <PX> --sl <PX>   # TP/SL on an open position (long|short)
+perp --json -e <EX> trade stop <SYM> sell <SIZE> <PX>            # reduce-only stop (default)
 perp --json -e <EX> trade leverage <SYM> <N>
 
 # Account
@@ -126,9 +280,19 @@ perp --json arb history                              # past arb trade performanc
 # Funds (deposit, withdraw, transfer, bridge, rebalance)
 perp --json funds deposit hyperliquid 100
 perp --json funds withdraw pacifica 50
+perp --json funds deposit lighter-rh 10                # USDG on Robinhood Chain (approve + deposit, mainnet)
+perp --json -e lighter-rh funds withdraw lighter 10    # USDG → Robinhood Chain
+perp --json --dry-run funds withdraw ondo 10 --to <ADDRESS>   # plan only, nothing sent
+perp --json funds deposit aster 8                      # USDT → Aster vault on BNB Chain (--chain arbitrum / --asset USDC; mainnet)
+perp --json funds withdraw aster 8 --chain bsc         # USDT → your own address (agent needs --can-withdraw --ip-whitelist)
+perp --json funds deposit ondo 12 --probe 2            # USDC transfer to your Ondo funding address (Arbitrum; --chain ethereum)
+perp --json funds address-book add ondo <MASTER_ADDR>  # SIWE challenge → Ondo withdrawal address book
+perp --json funds withdraw arcus 10                   # to the Arcus account owner
 perp --json funds transfer 100 <ADDRESS>             # HL internal transfer (instant)
 perp --json funds bridge quote --from solana --to arbitrum --amount 100
 perp --json funds bridge send --from solana --to arbitrum --amount 100   # auto-cheapest provider
+perp --json --dry-run funds bridge send --from robinhood --to solana --from-asset USDG --to-asset SOL --amount 15   # Relay quote only
+perp --json funds bridge send --from robinhood --to bsc --from-asset USDG --to-asset USDT --amount 15               # Relay swap, OWS master signs
 perp --json funds bridge exchange --from pacifica --to hyperliquid --amount 100
 perp --json funds rebalance check                    # balances across exchanges
 perp --json funds rebalance plan                     # compute optimal moves
@@ -155,6 +319,9 @@ perp --json strategy plan execute <FILE> --dry-run   # dry-run scripted plan
 perp background list                                 # list running jobs
 perp background stop <ID>                            # stop a job
 perp background logs <ID> -f                         # follow logs
+# Jobs inherit -n, --dry-run, -e, --ows, -w, --no-agent, --dex and never receive keys via argv/env:
+# they read the OWS vault / agent keystores / ~/.perp/.env themselves. -k, --passphrase, --ows-key or a
+# shell-exported key / OWS_PASSPHRASE is refused — register an agent (perp wallet agent approve <venue>).
 
 ```
 
@@ -194,6 +361,8 @@ perp-cli includes a full-featured MCP server (18 tools, 3 resources, 2 prompts) 
 
 **No API keys required for market data** — explore prices, orderbooks, funding rates, and arb opportunities without any setup. Add keys only when you want to trade.
 
+**Network:** set `PERP_NETWORK=testnet` in the server env to serve testnet (validated; unset = mainnet); every result reports `meta.network`. `trade_execute` / `trade_close` place real orders through the same local risk gate as `perp trade` (no override over MCP), refuse non-reduce-only orders on quarantined symbols, and are written to the execution log.
+
 ```json
 {
   "mcpServers": {
@@ -205,14 +374,11 @@ perp-cli includes a full-featured MCP server (18 tools, 3 resources, 2 prompts) 
 }
 ```
 
-Optional: add keys for trading and account data:
+For trading and account data, run `perp setup` first: the MCP server reads the same OWS vault wallet and agent keystores as the CLI. Never put private keys in the MCP config. Select the network with `PERP_NETWORK` (`mainnet` | `testnet`; unset = mainnet, invalid values stop the server):
 ```json
 {
   "env": {
-    "PACIFICA_PRIVATE_KEY": "your-solana-key",
-    "HYPERLIQUID_PRIVATE_KEY": "your-evm-key",
-    "LIGHTER_PRIVATE_KEY": "your-evm-key",
-    "ASTER_API_KEY": "your-api-key"
+    "PERP_NETWORK": "testnet"
   }
 }
 ```

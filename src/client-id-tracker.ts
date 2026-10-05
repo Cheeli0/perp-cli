@@ -32,8 +32,15 @@ export function generateClientId(prefix?: string): string {
 
 /** Log a client order ID record */
 export function logClientId(record: ClientIdRecord): void {
-  ensureDir();
-  appendFileSync(CLIENT_IDS_FILE, JSON.stringify(record) + "\n", { mode: 0o600 });
+  try {
+    ensureDir();
+    appendFileSync(CLIENT_IDS_FILE, JSON.stringify(record) + "\n", { mode: 0o600 });
+  } catch (e) {
+    // Before the order is sent ("pending") a failed write stops the order. Afterwards the order
+    // already has an outcome: a tracking-file failure is warned, never thrown as an order failure.
+    if (record.status === "pending") throw e;
+    process.stderr.write(`[perp] Warning: could not record client id ${record.clientOrderId} as "${record.status}" (${e instanceof Error ? e.message : String(e)})\n`);
+  }
 }
 
 /** Look up a client order ID */

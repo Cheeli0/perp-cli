@@ -190,3 +190,39 @@ describe("computeSpotPerpMatchedSize", () => {
     expect(computeSpotPerpMatchedSize(0.005, 100, "hyperliquid", "hyperliquid", 2, 2)).toBeNull();
   });
 });
+
+// ── Venue-published minimums (arb exec) ──
+import { pairOrderMinimums, venueOrderMinimums } from "../commands/arb-auto.js";
+
+describe("arb exec minimum = the venues' published minimum, not a fixed $10", () => {
+  it("live case: $6.30 of SOL on aster + arcus ($5 each) is sized, not refused", () => {
+    const min = pairOrderMinimums([
+      { exchange: "aster", minSize: "0.01", minNotional: "5" },
+      { exchange: "arcus", minSize: null, minNotional: "5" },
+    ]);
+    expect(min).toMatchObject({ minNotional: 5, minSize: 0.01, describe: "aster: $5, size 0.01; arcus: $5" });
+    const sized = computeMatchedSize(6.3, 121.06, "aster", "arcus", { longSizeDecimals: 2, shortSizeDecimals: 2, minNotional: min.minNotional });
+    expect(sized).toEqual({ size: "0.05", notional: 0.05 * 121.06 });
+    // The fixed table (no market info at hand) still refuses it — that was the bug on this path.
+    expect(computeMatchedSize(6.3, 121.06, "aster", "arcus", { longSizeDecimals: 2, shortSizeDecimals: 2 })).toBeNull();
+  });
+
+  it("the pair minimum is the larger leg's; below it → null; a venue that publishes none adds nothing", () => {
+    const min = pairOrderMinimums([{ exchange: "hyperliquid", minSize: null, minNotional: "10" }, { exchange: "aster", minSize: null, minNotional: "5" }]);
+    expect(min.minNotional).toBe(10);
+    expect(computeMatchedSize(6.3, 121.06, "hyperliquid", "aster", { longSizeDecimals: 2, shortSizeDecimals: 2, minNotional: min.minNotional })).toBeNull();
+    expect(pairOrderMinimums([{ exchange: "ondo", minSize: null, minNotional: null }, { exchange: "qfex", minSize: null, minNotional: null }]))
+      .toMatchObject({ minNotional: 0, minSize: 0, describe: "ondo: none published; qfex: none published" });
+  });
+
+  it("venueOrderMinimums reads the venue market row; an unlisted market throws SYMBOL_NOT_FOUND (no assumed minimum)", async () => {
+    const adapter = {
+      name: "arcus",
+      // TradingV2 shape so tradingV2Of returns the adapter itself.
+      getVenueMarkets: async () => [{ symbol: "SOL", minSize: null, minNotional: "5" }],
+      placeOrder: async () => ({}), cancelByRef: async () => ({}), getOrderStatus: async () => ({}),
+    };
+    expect(await venueOrderMinimums(adapter as never, "sol", "mainnet")).toEqual({ minSize: null, minNotional: "5" });
+    await expect(venueOrderMinimums(adapter as never, "DOGE", "mainnet")).rejects.toMatchObject({ structured: { code: "SYMBOL_NOT_FOUND" } });
+  });
+});

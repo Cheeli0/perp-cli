@@ -1,47 +1,78 @@
 /**
- * Funding rate normalization.
+ * Funding rate normalization (design §10.1, §10.13 #1).
  *
- * Exchange funding rate periods:
- * - Hyperliquid: per 1 HOUR (settles every 1h)
- * - Pacifica: per 1 HOUR (settles every 1h)
- * - Lighter: per 8 HOURS (API returns 8h rate, settles every 1h)
+ * The number of hours one quoted rate covers (the funding BASIS) comes from the
+ * venue definition — `VenueDefinition.fundingRateBasis`, read through
+ * `fundingBasisOf(ref)`. Settlement timing is a separate concept (arb/utils.ts).
  *
- * HIP-3 deployed dexes on Hyperliquid use 8h funding periods.
- *
- * To compare rates across exchanges, we normalize everything to
- * a per-hour basis, then annualize from there.
+ * A venue ref is a venue id/alias, or "hl:<dex>" for Hyperliquid HIP-3 dexes
+ * (those resolve to the Hyperliquid core basis — current behavior preserved).
+ * Unknown refs throw UNKNOWN_VENUE; per-market venues
+ * have no single hours value — use the market's basis with the `*ByBasis`
+ * variants below.
  */
+
+import { PerpError } from "../errors.js";
+import { fundingBasisOf, parseVenueRef } from "../exchanges/venue.js";
+import { rateToHourly, type FundingRateBasis } from "../exchanges/venue-types.js";
+import { ensureVenuesRegistered } from "../exchanges/venues/index.js";
 
 /** Funding periods per year by convention */
 const HOURLY_PERIODS = 24 * 365;   // 8760
 
-/** How many hours each exchange's rate covers */
-const EXCHANGE_FUNDING_HOURS: Record<string, number> = {
-  hyperliquid: 1,
-  pacifica: 1,
-  lighter: 8,
-  aster: 8,
-};
-
 /**
- * Get funding period in hours for an exchange.
- * HIP-3 deployed dexes (not in the map) default to 1h (API returns hourly).
- * HL and PAC are 1h, Lighter API returns 8h rates.
+ * Funding basis of a venue ref. Unknown refs (e.g. a stale value in persisted
+ * arb/bot state) surface as UNKNOWN_VENUE with remediation instead of an
+ * anonymous crash deep inside a strategy loop.
  */
-export function getFundingHours(exchange: string): number {
-  return EXCHANGE_FUNDING_HOURS[exchange.toLowerCase()] ?? 1;
+export function venueFundingBasis(ref: string): FundingRateBasis {
+  ensureVenuesRegistered();
+  try {
+    parseVenueRef(ref);
+  } catch (err) {
+    if (err instanceof PerpError && err.structured.code === "UNKNOWN_VENUE") {
+      throw new PerpError("UNKNOWN_VENUE", `Cannot normalize funding for unknown venue reference "${ref}"`, {
+        remediation: "Use a registered venue id (or hl:<dex> for HIP-3). If the value came from persisted state "
+          + "(~/.perp/arb-state.json or a bot state file), fix or remove that entry.",
+      });
+    }
+    throw err;
+  }
+  return fundingBasisOf(ref);
 }
 
-/** Convert a raw funding rate to per-hour rate */
-export function toHourlyRate(rate: number, exchange: string): number {
-  const hours = EXCHANGE_FUNDING_HOURS[exchange.toLowerCase()] ?? 1;
-  return rate / hours;
+/**
+ * Hours one quoted funding rate covers for a venue ref.
+ * Throws INVALID_PARAMS for per-market or annualized venues — use the market's basis.
+ */
+export function getFundingHours(ref: string): number {
+  const basis = venueFundingBasis(ref);
+  if (basis.kind !== "perHours") {
+    throw new PerpError("INVALID_PARAMS", `Funding basis of "${ref}" is annualized, not a number of hours`, {
+      remediation: "Use the market's fundingRateBasis with toHourlyRateByBasis()",
+    });
+  }
+  return basis.hours;
+}
+
+/** Convert a raw quoted rate to a per-hour rate using an explicit (market) basis. */
+export function toHourlyRateByBasis(rate: number, basis: FundingRateBasis): number {
+  return rateToHourly(rate, basis);
+}
+
+/** Convert a raw funding rate to per-hour rate using the venue's basis. */
+export function toHourlyRate(rate: number, ref: string): number {
+  return rateToHourly(rate, venueFundingBasis(ref));
 }
 
 /** Annualize a raw rate from a specific exchange */
 export function annualizeRate(rate: number, exchange: string): number {
-  const hourlyRate = toHourlyRate(rate, exchange);
-  return hourlyRate * HOURLY_PERIODS * 100; // as percentage
+  return annualizeHourlyRate(toHourlyRate(rate, exchange));
+}
+
+/** Annualize a raw rate quoted on an explicit (market) basis */
+export function annualizeRateByBasis(rate: number, basis: FundingRateBasis): number {
+  return annualizeHourlyRate(toHourlyRateByBasis(rate, basis));
 }
 
 /** Annualize an already-normalized hourly rate (no exchange conversion needed) */
@@ -81,7 +112,7 @@ export function computeSignedAnnualSpread(
 /**
  * Estimate hourly funding payment for a position.
  * @param rate - raw funding rate from the exchange
- * @param exchange - exchange name
+ * @param exchange - venue ref
  * @param positionUsd - position notional in USD
  * @param side - "long" or "short" (longs pay positive rate, shorts receive)
  * @returns hourly payment in USD (positive = you pay, negative = you receive)
@@ -90,7 +121,13 @@ export function estimateHourlyFunding(
   rate: number, exchange: string,
   positionUsd: number, side: "long" | "short",
 ): number {
-  const hourlyRate = toHourlyRate(rate, exchange);
+  return estimateHourlyFundingFromHourly(toHourlyRate(rate, exchange), positionUsd, side);
+}
+
+/** Same as estimateHourlyFunding, from an already-normalized hourly rate. */
+export function estimateHourlyFundingFromHourly(
+  hourlyRate: number, positionUsd: number, side: "long" | "short",
+): number {
   // Long pays positive funding, short receives positive funding
   const multiplier = side === "long" ? 1 : -1;
   return hourlyRate * positionUsd * multiplier;

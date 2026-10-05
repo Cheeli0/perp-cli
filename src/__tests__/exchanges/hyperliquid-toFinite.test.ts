@@ -27,6 +27,7 @@ async function buildAdapter(stateOrPos: {
   payload: unknown;
   mode?: "standard" | "unified" | "portfolio";
   spotPayload?: unknown;
+  collateralToken?: number;
 }) {
   const { HyperliquidAdapter } = await import("../../exchanges/hyperliquid.js");
   const hl = new HyperliquidAdapter(undefined, false);
@@ -40,6 +41,9 @@ async function buildAdapter(stateOrPos: {
     vi.fn().mockResolvedValue(stateOrPos.payload);
   (hl as unknown as { _getSpotClearinghouseState: () => Promise<unknown> })._getSpotClearinghouseState =
     vi.fn().mockResolvedValue(stateOrPos.spotPayload ?? { balances: [] });
+  // Collateral token index (meta.collateralToken) — USDC = 0 unless overridden.
+  (hl as unknown as { _getCollateralToken: () => Promise<number> })._getCollateralToken =
+    vi.fn().mockResolvedValue(stateOrPos.collateralToken ?? 0);
   return hl;
 }
 
@@ -229,7 +233,7 @@ describe("HyperliquidAdapter.getBalance — unified mode spot-USDC guards", () =
       },
       spotPayload: {
         balances: [
-          { coin: "USDC-SPOT", total: "1000", hold: "100" },
+          { coin: "USDC", token: 0, total: "1000", hold: "100" },
         ],
       },
     });
@@ -247,7 +251,7 @@ describe("HyperliquidAdapter.getBalance — unified mode spot-USDC guards", () =
         withdrawable: "0", assetPositions: [],
       },
       spotPayload: {
-        balances: [{ coin: "USDC-SPOT", total: "NaN", hold: "0" }],
+        balances: [{ coin: "USDC", token: 0, total: "NaN", hold: "0" }],
       },
     });
     await expect(hl.getBalance()).rejects.toThrow(/spotBalance.USDC.total.*not a finite/);
@@ -262,7 +266,7 @@ describe("HyperliquidAdapter.getBalance — unified mode spot-USDC guards", () =
         withdrawable: "0", assetPositions: [],
       },
       spotPayload: {
-        balances: [{ coin: "USDC-SPOT", total: "1000", hold: "" }],
+        balances: [{ coin: "USDC", token: 0, total: "1000", hold: "" }],
       },
     });
     await expect(hl.getBalance()).rejects.toThrow(/spotBalance.USDC.hold.*empty string/);
@@ -284,8 +288,8 @@ describe("HyperliquidAdapter.getBalance — portfolio mode collateral filter gua
       },
       spotPayload: {
         balances: [
-          { coin: "USDC-SPOT", total: "500", hold: "0" },
-          { coin: "HYPE", total: "10", hold: "0" },
+          { coin: "USDC", token: 0, total: "500", hold: "0" },
+          { coin: "HYPE", token: 150, total: "10", hold: "0" },
         ],
       },
     });
@@ -304,8 +308,8 @@ describe("HyperliquidAdapter.getBalance — portfolio mode collateral filter gua
       },
       spotPayload: {
         balances: [
-          { coin: "USDC-SPOT", total: "500", hold: "0" },
-          { coin: "HYPE", total: "NaN", hold: "0" },
+          { coin: "USDC", token: 0, total: "500", hold: "0" },
+          { coin: "HYPE", token: 150, total: "NaN", hold: "0" },
         ],
       },
     });
@@ -322,37 +326,39 @@ describe("HyperliquidAdapter.getBalance — portfolio mode collateral filter gua
       },
       spotPayload: {
         balances: [
-          { coin: "USDC-SPOT", total: "500", hold: "0" },
-          { coin: "BTC", total: "", hold: "0" },
+          { coin: "USDC", token: 0, total: "500", hold: "0" },
+          { coin: "BTC", token: 197, total: "", hold: "0" },
         ],
       },
     });
     await expect(hl.getBalance()).rejects.toThrow(/spotBalance.BTC.total.*empty string/);
   });
 
-  it("portfolio mode: USDC-prefix balances are exempt from the filter (USDC-SPOT, USDC-PERP, etc.)", async () => {
-    // Filter at hyperliquid.ts:512 skips `coin.startsWith("USDC")` before
-    // calling parseFiniteVenueNumber — so a NaN USDC-PERP entry should NOT
-    // throw via the filter (it's already excluded from non-USDC scan).
+  it("collateral is matched by token index (meta.collateralToken), not by coin name", async () => {
+    const payload = {
+      marginSummary: { totalMarginUsed: "0" }, crossMarginSummary: {},
+      withdrawable: "0", assetPositions: [],
+    };
+    const balances = [
+      { coin: "USDT0", token: 268, total: "999", hold: "9" },
+      { coin: "USDC", token: 0, total: "500", hold: "0" },
+    ];
+    const native = await buildAdapter({ type: "balance", mode: "unified", payload, spotPayload: { balances } });
+    expect((await native.getBalance()).equity).toBe("500");
+    // A dex whose collateral token is USDT0 (index 268) reads that row.
+    const usdtDex = await buildAdapter({ type: "balance", mode: "unified", payload, spotPayload: { balances }, collateralToken: 268 });
+    const b = await usdtDex.getBalance();
+    expect(b.equity).toBe("999");
+    expect(b.available).toBe("990");
+  });
+
+  it("unified mode with no collateral row → equity 0 (venue omits zero balances)", async () => {
     const hl = await buildAdapter({
-      type: "balance",
-      mode: "portfolio",
-      payload: {
-        marginSummary: { totalMarginUsed: "0" }, crossMarginSummary: {},
-        withdrawable: "0", assetPositions: [],
-      },
-      spotPayload: {
-        balances: [
-          { coin: "USDC-SPOT", total: "500", hold: "0" },
-          // NaN here would throw if the filter incorrectly entered the
-          // parseFiniteVenueNumber branch for USDC-prefixed coins. The
-          // current filter correctly skips USDC-* upfront so this is a no-op.
-          { coin: "USDC-PERP", total: "NaN", hold: "0" },
-        ],
-      },
+      type: "balance", mode: "unified",
+      payload: { marginSummary: { totalMarginUsed: "0" }, crossMarginSummary: {}, withdrawable: "0", assetPositions: [] },
+      spotPayload: { balances: [{ coin: "HYPE", token: 150, total: "3", hold: "0" }] },
     });
-    const bal = await hl.getBalance();
-    expect(bal.equity).toBe("500");
+    expect((await hl.getBalance()).equity).toBe("0");
   });
 });
 
@@ -373,6 +379,7 @@ describe("HyperliquidAdapter portfolio-mode collateral warning", () => {
     adapter._dex = undefined;
     adapter._getAbstractionMode = vi.fn().mockResolvedValue("portfolio");
     adapter._getSpotClearinghouseState = vi.fn().mockResolvedValue({ balances });
+    adapter._getCollateralToken = vi.fn().mockResolvedValue(0);
     adapter._getClearinghouseState = vi.fn().mockResolvedValue({
       marginSummary: {}, crossMarginSummary: {}, assetPositions: [],
     });
@@ -393,17 +400,17 @@ describe("HyperliquidAdapter portfolio-mode collateral warning", () => {
 
   it("warns about USDT collateral (previously invisible)", async () => {
     const out = await warningsFor([
-      { coin: "USDC", total: "100", hold: "0" },
-      { coin: "USDT", total: "500", hold: "0" },
+      { coin: "USDC", token: 0, total: "100", hold: "0" },
+      { coin: "USDT", token: 268, total: "500", hold: "0" },
     ]);
     expect(out).toMatch(/USDT=500/);
   });
 
   it("still warns about HYPE and BTC collateral", async () => {
     const out = await warningsFor([
-      { coin: "USDC", total: "100", hold: "0" },
-      { coin: "HYPE", total: "10", hold: "0" },
-      { coin: "BTC", total: "1", hold: "0" },
+      { coin: "USDC", token: 0, total: "100", hold: "0" },
+      { coin: "HYPE", token: 150, total: "10", hold: "0" },
+      { coin: "BTC", token: 197, total: "1", hold: "0" },
     ]);
     expect(out).toMatch(/HYPE=10/);
     expect(out).toMatch(/BTC=1/);
@@ -411,8 +418,8 @@ describe("HyperliquidAdapter portfolio-mode collateral warning", () => {
 
   it("does not treat USDH as collateral — it is not an eligible asset", async () => {
     const out = await warningsFor([
-      { coin: "USDC", total: "100", hold: "0" },
-      { coin: "USDH", total: "999", hold: "0" },
+      { coin: "USDC", token: 0, total: "100", hold: "0" },
+      { coin: "USDH", token: 360, total: "999", hold: "0" },
     ]);
     expect(out).not.toMatch(/USDH/);
   });

@@ -55,6 +55,16 @@ vi.mock("../../exchanges/lighter-spot.js", () => ({
   })),
 }));
 
+// ── Mock configured-venue discovery ────────────────────────────────────────
+// Default scope = "all venues with configured credentials" (listConfiguredAccountVenues).
+// Tests run with an isolated HOME (helpers/isolate-home.ts), so pin the configured
+// set to the 4 legacy venues instead of depending on the developer's real keys.
+
+vi.mock("../../config.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../config.js")>()),
+  listConfiguredAccountVenues: vi.fn(async () => ["pacifica", "hyperliquid", "lighter", "aster"]),
+}));
+
 // ── Mock dashboard (runServe path not tested here) ─────────────────────────
 
 vi.mock("../../dashboard/index.js", () => ({

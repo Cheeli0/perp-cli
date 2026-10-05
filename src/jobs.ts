@@ -1,8 +1,15 @@
-import { execSync, spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { execFileSync, execSync, spawn } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomBytes } from "node:crypto";
+import type { Command } from "commander";
+import { parse as parseDotenv } from "dotenv";
+import type { Network } from "./exchanges/venue-types.js";
+import { PerpError } from "./errors.js";
+import { QFEX_AUTOMATION_VERIFIED, QFEX_REDUCE_ONLY_WIRE, qfexAutomationGate, qfexReduceOnlyGate } from "./exchanges/qfex/signing.js";
+import { startRefusal } from "./exchanges/trading-v2.js";
+import { scrubSecretEnv, secretEnvNamesIn } from "./secret-env.js";
 
 const JOBS_DIR = join(homedir(), ".perp", "jobs");
 const LOGS_DIR = join(homedir(), ".perp", "logs");
@@ -20,8 +27,29 @@ export interface JobEntry {
 }
 
 function ensureDirs() {
-  mkdirSync(JOBS_DIR, { recursive: true });
-  mkdirSync(LOGS_DIR, { recursive: true });
+  mkdirSync(JOBS_DIR, { recursive: true, mode: 0o700 });
+  mkdirSync(LOGS_DIR, { recursive: true, mode: 0o700 });
+}
+
+/**
+ * tmux session names we create: "perp-<hex id>" (jobs) / "perp-alerts-<base36>" (alerts).
+ * A name read back from a job file is validated before it reaches tmux (review L6) — tmux is
+ * also invoked without a shell (execFileSync), so a tampered name can never run a command.
+ */
+const TMUX_SESSION_RE = /^perp-[A-Za-z0-9_-]{1,64}$/;
+export function assertTmuxSessionName(name: string): string {
+  if (!TMUX_SESSION_RE.test(name)) {
+    throw new PerpError("INVALID_PARAMS", `Invalid tmux session name ${JSON.stringify(name)}`, {
+      remediation: "Job files under ~/.perp/jobs must hold a perp-<id> session name; remove the corrupted job: perp background remove <id>",
+    });
+  }
+  return name;
+}
+
+/** Write a job/log file owner-only (0600) — they hold strategy params and order logs. */
+function writePrivate(path: string, data: string, flag: "w" | "a"): void {
+  writeFileSync(path, data, { mode: 0o600, flag });
+  chmodSync(path, 0o600);
 }
 
 function jobFile(id: string) {
@@ -38,7 +66,7 @@ function genId(): string {
 
 function hasTmux(): boolean {
   try {
-    execSync("which tmux", { stdio: "ignore" });
+    execSync("which tmux", { stdio: "ignore", env: scrubSecretEnv(process.env) });
     return true;
   } catch {
     return false;
@@ -46,17 +74,23 @@ function hasTmux(): boolean {
 }
 
 function tmuxSessionExists(name: string): boolean {
+  const session = assertTmuxSessionName(name);
   try {
-    execSync(`tmux has-session -t ${name} 2>/dev/null`, { stdio: "ignore" });
+    execFileSync("tmux", ["has-session", "-t", session], { stdio: "ignore", env: scrubSecretEnv(process.env) });
     return true;
   } catch {
     return false;
   }
 }
 
+/** Kill a tmux session by (validated) name, without a shell. */
+export function killTmuxSession(name: string): void {
+  execFileSync("tmux", ["kill-session", "-t", assertTmuxSessionName(name)], { stdio: "ignore", env: scrubSecretEnv(process.env) });
+}
+
 export function saveJob(job: JobEntry): void {
   ensureDirs();
-  writeFileSync(jobFile(job.id), JSON.stringify(job, null, 2));
+  writePrivate(jobFile(job.id), JSON.stringify(job, null, 2), "w");
 }
 
 export function loadJob(id: string): JobEntry | null {
@@ -82,15 +116,118 @@ export function listJobs(): JobEntry[] {
 import { readdirSync } from "node:fs";
 
 /**
- * Start a job in a tmux background session.
- * Returns the job entry.
+ * Root flags that pick WHICH account / market a command uses. A background child
+ * must run with the same ones as its parent (otherwise it silently trades another
+ * wallet, skips the agent, or another HIP-3 dex). Only non-secret selectors are
+ * forwarded; the child resolves the credentials themselves (OWS vault / agent keystores).
  */
-export function startJob(opts: {
+export interface JobRootSelectors {
+  /** --ows <name> */
+  ows: string | null;
+  /** -w, --wallet <name> */
+  wallet: string | null;
+  /** --no-agent */
+  noAgent: boolean;
+  /** --dex <name> (Hyperliquid HIP-3) */
+  dex: string | null;
+  /** --no-builder (no builder fee on this run's orders) */
+  noBuilder: boolean;
+}
+
+const SECRET_HANDOFF_REMEDIATION =
+  "Background jobs never receive key material. Import the master key into the OWS vault (perp wallet set <exchange>) " +
+  "and select it with --ows/-w, and register an agent (perp wallet agent approve <venue>) — agent keys sign without the " +
+  "master passphrase. Keys in ~/.perp/.env are re-read by the job itself.";
+
+/**
+ * The parent's root selectors, read from the root program. Throws INVALID_PARAMS when the
+ * parent was given key material on argv (-k / --passphrase / --ows-key): it cannot be handed
+ * to the child (argv and env are visible in the process list), and the child would otherwise
+ * sign with a different account or fail on the passphrase.
+ */
+export function jobSelectorsOf(cmd: Command): JobRootSelectors {
+  let root = cmd;
+  while (root.parent) root = root.parent;
+  const o = root.opts() as { ows?: string; wallet?: string; agent?: boolean; builder?: boolean; dex?: string; privateKey?: string; passphrase?: string; owsKey?: string };
+  const secretFlags = [
+    ...(o.privateKey !== undefined ? ["-k/--private-key"] : []),
+    ...(o.passphrase !== undefined ? ["--passphrase"] : []),
+    ...(o.owsKey !== undefined ? ["--ows-key"] : []),
+  ];
+  if (secretFlags.length > 0) {
+    throw new PerpError("INVALID_PARAMS", `--background cannot hand ${secretFlags.join(", ")} to the background job`, {
+      remediation: `Drop ${secretFlags.join(", ")}. ${SECRET_HANDOFF_REMEDIATION}`,
+    });
+  }
+  return {
+    ows: o.ows ?? null,
+    wallet: o.wallet ?? null,
+    // Commander's --no-agent sets opts.agent === false.
+    noAgent: o.agent === false,
+    dex: o.dex ?? null,
+    // Commander's --no-builder sets opts.builder === false.
+    noBuilder: o.builder === false,
+  };
+}
+
+/** Options for a background job: `cliArgs` is the child's full command (path + args), e.g. ["strategy", "grid", "BTC"]. */
+export interface StartJobOpts {
   strategy: string;
   exchange: string;
   params: Record<string, unknown>;
+  /** Root `-e` for the child (omit for multi-venue commands). */
+  venue?: string;
+  /** The parent's validated `-n` — the child always runs on the same network. */
+  network: Network;
+  /** The parent's root `--dry-run` — inherited by the child. */
+  dryRun: boolean;
+  /** The parent's account / market selectors (jobSelectorsOf) — inherited by the child. */
+  selectors: JobRootSelectors;
   cliArgs: string[];
-}): JobEntry {
+}
+
+/**
+ * The child's argv after `node <cli>`: root flags first (`-n`, `--dry-run`, `-e`,
+ * `--ows`, `-w`, `--no-agent`, `--dex`, `--no-builder`), then the real command path + args, then
+ * `--job-id`. Every target command must exist in buildProgram() and declare
+ * `--job-id` (regression-tested).
+ */
+export function jobArgv(opts: StartJobOpts, id: string): string[] {
+  const sel = opts.selectors;
+  return [
+    "-n", opts.network,
+    ...(opts.dryRun ? ["--dry-run"] : []),
+    ...(opts.venue !== undefined ? ["-e", opts.venue] : []),
+    ...(sel.ows !== null ? ["--ows", sel.ows] : []),
+    ...(sel.wallet !== null ? ["-w", sel.wallet] : []),
+    ...(sel.noAgent ? ["--no-agent"] : []),
+    ...(sel.dex !== null ? ["--dex", sel.dex] : []),
+    ...(sel.noBuilder ? ["--no-builder"] : []),
+    ...opts.cliArgs,
+    "--job-id", id,
+  ];
+}
+
+const shQuote = (a: string): string => `'${a.replace(/'/g, "'\\''")}'`;
+
+/**
+ * Start a job in a tmux background session.
+ * Returns the job entry.
+ */
+export function startJob(opts: StartJobOpts): JobEntry {
+  // A background job trades unattended: refuse to start one on QFEX while its reduce-only
+  // (closing) orders are gated — it could open a position it cannot close — or while automation
+  // is unverified there (no stop orders: no protective exit). Dry runs send nothing.
+  if (!opts.dryRun) {
+    for (const v of new Set([opts.venue, opts.exchange])) {
+      if (v === undefined || v.toLowerCase() !== "qfex") continue;
+      const what = `Background job "${opts.strategy}"`;
+      const reduceOnly = qfexReduceOnlyGate(QFEX_REDUCE_ONLY_WIRE);
+      if (reduceOnly !== null) throw startRefusal(what, "it could open a position it cannot close", reduceOnly);
+      const automation = qfexAutomationGate(QFEX_AUTOMATION_VERIFIED);
+      if (automation !== null) throw startRefusal(what, "it would trade unattended", automation);
+    }
+  }
   if (!hasTmux()) {
     throw new Error("tmux is required for background jobs. Install with: brew install tmux");
   }
@@ -100,15 +237,8 @@ export function startJob(opts: {
   const session = `perp-${id}`;
   const log = logFile(id);
 
-  // Build the command — re-invoke ourselves with `run` subcommand
-  const nodeCmd = process.argv[0];
-  const cliPath = process.argv[1];
-  const envVars = buildEnvString();
-  const args = opts.cliArgs.join(" ");
-  const cmd = `${envVars} ${nodeCmd} ${cliPath} run ${opts.strategy} ${args} --job-id ${id} 2>&1 | tee -a ${log}`;
-
-  // Create tmux session
-  execSync(`tmux new-session -d -s ${session} '${cmd.replace(/'/g, "'\\''")}'`);
+  // Re-invoke ourselves with the real command (jobArgv) — no key material on argv or env.
+  launchTmuxChild(session, jobArgv(opts, id), log, true);
 
   const job: JobEntry = {
     id,
@@ -133,8 +263,8 @@ export function stopJob(id: string): boolean {
 
   if (tmuxSessionExists(job.tmuxSession)) {
     try {
-      execSync(`tmux kill-session -t ${job.tmuxSession}`);
-    } catch { /* already dead */ }
+      killTmuxSession(job.tmuxSession);
+    } catch { /* exited between has-session and kill-session */ }
   }
 
   job.status = "stopped";
@@ -166,20 +296,48 @@ export function removeJob(id: string): boolean {
 }
 
 /**
- * Build env string to pass through to tmux session.
+ * Secret env vars the parent holds that the child could NOT re-read itself (i.e. not
+ * from ~/.perp/.env). Handing them over would put key material on the child's env;
+ * dropping them would make the child sign with a different account — so refuse.
  */
-function buildEnvString(): string {
-  const keys = [
-    // L2 agent key now lives in ~/.perp/lighter-agents/*.json (SSOT Rule #3),
-    // accountIndex/apiKeyIndex live in settings.agents.lighter — none need env passthrough.
-    "LIGHTER_PRIVATE_KEY",
-    "PRIVATE_KEY", "pk",
-    "PACIFICA_BUILDER_CODE", "NEXT_PUBLIC_BUILDER_CODE",
-    "HL_REFERRAL_CODE", "LIGHTER_REFERRAL_CODE",
-  ];
-  const parts: string[] = [];
-  for (const k of keys) {
-    if (process.env[k]) parts.push(`${k}='${process.env[k]!.replace(/'/g, "'\"'\"'")}'`);
+function shellOnlySecrets(env: NodeJS.ProcessEnv): string[] {
+  const envFile = join(process.env.HOME || homedir(), ".perp", ".env");
+  const fromFile = existsSync(envFile) ? parseDotenv(readFileSync(envFile, "utf-8")) : {};
+  return secretEnvNamesIn(env).filter((k) => {
+    const v = env[k];
+    return v !== undefined && v !== "" && fromFile[k] !== v;
+  });
+}
+
+/**
+ * The tmux shell command for a child: `env -u <secret>... node cli <argv>`.
+ * `env -u` removes secrets the tmux server's global environment may carry (a server started
+ * earlier from another shell). Only variable NAMES of secrets ever appear on the command line.
+ */
+export function childShellCommand(nodeCmd: string, cliPath: string, argv: string[], log: string | null, env: NodeJS.ProcessEnv): string {
+  const unset = secretEnvNamesIn(env).flatMap((k) => ["-u", k]);
+  // No config env passthrough: builder fees come from settings.json (read by the child) only.
+  const parts = ["env", ...unset, nodeCmd, cliPath, ...argv].map(shQuote).join(" ");
+  return log === null ? parts : `${parts} 2>&1 | tee -a ${shQuote(log)}`;
+}
+
+/**
+ * Launch `node <cli> <argv>` in a detached tmux session. The child never receives key
+ * material: every secret var is stripped from the tmux client's env (a fresh tmux server
+ * inherits it) and from the session command (`env -u`). `needsCredentials`: the child
+ * signs, so a shell-only secret env var (one the child cannot re-read from ~/.perp/.env)
+ * is refused with INVALID_PARAMS instead of silently switching the child's account.
+ */
+export function launchTmuxChild(session: string, argv: string[], log: string | null, needsCredentials: boolean): void {
+  const shellOnly = needsCredentials ? shellOnlySecrets(process.env) : [];
+  if (shellOnly.length > 0) {
+    throw new PerpError("INVALID_PARAMS", `--background cannot hand ${shellOnly.join(", ")} (set in the shell environment) to the background job`, {
+      remediation: `Unset ${shellOnly.join(", ")}. ${SECRET_HANDOFF_REMEDIATION}`,
+    });
   }
-  return parts.join(" ");
+  assertTmuxSessionName(session);
+  // The log is created owner-only BEFORE tee appends to it (tee would create it 0644).
+  if (log !== null) writePrivate(log, "", "a");
+  const cmd = childShellCommand(process.argv[0], process.argv[1], argv, log, process.env);
+  execFileSync("tmux", ["new-session", "-d", "-s", session, cmd], { env: scrubSecretEnv(process.env) });
 }

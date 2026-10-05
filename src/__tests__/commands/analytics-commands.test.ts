@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { Command } from "commander";
 import { registerHistoryCommands } from "../../commands/history.js";
+import { addRootSafetyOptions } from "../../cli-flags.js";
 import type { ExchangeAdapter } from "../../exchanges/interface.js";
 
 // ── Mocks ──
@@ -72,6 +73,13 @@ vi.mock("../../arb/state.js", () => ({
   })),
 }));
 
+// Default exchange list = venues with configured credentials. HOME is isolated in
+// tests (helpers/isolate-home.ts), so pin the configured set explicitly.
+vi.mock("../../config.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../config.js")>()),
+  listConfiguredAccountVenues: vi.fn(async () => ["pacifica", "hyperliquid", "lighter"]),
+}));
+
 // ── Mock adapter ──
 
 const now = Date.now();
@@ -137,6 +145,8 @@ async function run(args: string[]) {
 beforeEach(() => {
   output = "";
   program = new Command();
+  // Root -n / --dry-run (history reads the per-network arb state via networkOf).
+  addRootSafetyOptions(program);
   program.option("--json", "JSON output");
   const isJson = () => program.opts().json ?? false;
   const getAdapter = async (ex: string) => mockAdapter(ex);

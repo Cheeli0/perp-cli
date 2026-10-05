@@ -5,9 +5,30 @@
 
 import type { StrategyContext } from "../strategy-types.js";
 import type { ExchangeAdapter } from "../../exchanges/index.js";
-import type { SpotAdapter } from "../../exchanges/spot-interface.js";
+import type { SpotAdapter, SpotMarketInfo } from "../../exchanges/spot-interface.js";
+import type { VenueMarket } from "../../exchanges/venue-types.js";
 import { getFundingHours } from "../../funding.js";
+import { sharedApiNetwork } from "../../api/public/urls.js";
 import { annualizeHourlyRate } from "../../funding/normalize.js";
+import { fetchPerpMarketsForMatching, matchSpotPerp, transferQuoteToPerp, transferQuoteToSpot } from "../../exchanges/spot-factory.js";
+import { PerpError, extractErrorMessage } from "../../errors.js";
+import { assertFundingArbVenue, tryResolveVenueId } from "../../exchanges/venue.js";
+import "../../exchanges/venues/index.js";
+
+/**
+ * Funding strategies refuse a venue whose funding rate is unverified as a leg (design §14.12
+ * #6): every adapter of the run (primary + extraAdapters) is checked when the strategy starts.
+ * Adapter names that are not registered venues (test doubles) are not venues and are skipped.
+ */
+export function assertFundingArbLegs(ctx: StrategyContext): void {
+  const names = new Set<string>([ctx.adapter.name]);
+  const extra = ctx.state.get("extraAdapters") as Map<string, ExchangeAdapter> | undefined;
+  if (extra !== undefined) for (const a of extra.values()) names.add(a.name);
+  for (const name of names) {
+    if (tryResolveVenueId(name.split(":")[0]) === null) continue;
+    assertFundingArbVenue(name);
+  }
+}
 
 // ── Type aliases ──
 
@@ -34,71 +55,71 @@ export function buildAdapterMap(ctx: StrategyContext): Map<string, ExchangeAdapt
   return adapters;
 }
 
-const spotAdapterCache = new Map<string, SpotAdapter>();
+// ── Transfer helpers (§12.4 #4) ──
+// Spot adapters come from the factory (src/exchanges/spot-factory.ts, getBotSpotAdapter).
 
-/** Get or create a spot adapter for a given exchange name + perp adapter instance. */
-export async function getSpotAdapter(name: string, adapter: ExchangeAdapter): Promise<SpotAdapter | null> {
-  const cached = spotAdapterCache.get(name);
-  if (cached) return cached;
-  try {
-    let spot: SpotAdapter | null = null;
-    if (name === "hyperliquid") {
-      const { HyperliquidSpotAdapter } = await import("../../exchanges/hyperliquid-spot.js");
-      const { HyperliquidAdapter } = await import("../../exchanges/hyperliquid.js");
-      if (adapter instanceof HyperliquidAdapter) {
-        const instance = new HyperliquidSpotAdapter(adapter);
-        await instance.init();
-        spot = instance;
-      }
-    } else if (name === "lighter") {
-      const { LighterSpotAdapter } = await import("../../exchanges/lighter-spot.js");
-      const { LighterAdapter } = await import("../../exchanges/lighter.js");
-      if (adapter instanceof LighterAdapter) {
-        const instance = new LighterSpotAdapter(adapter);
-        await instance.init();
-        spot = instance;
-      }
-    }
-    if (spot) spotAdapterCache.set(name, spot);
-    return spot;
-  } catch { /* not supported */ }
-  return null;
+/**
+ * Move the spot venue's quote asset (quoteAssets[0]) perp → spot. Returns false when
+ * spot shares perp margin (no-op — callers must not log "Transferred"); throws when
+ * the venue has no transfer.
+ */
+export async function transferUsdcToSpot(spotAdapter: SpotAdapter, amount: number): Promise<boolean> {
+  return transferQuoteToSpot(spotAdapter, amount);
 }
 
-// ── Transfer helpers ──
-
-/** Transfer USDC from perp to spot account (exchange-specific). */
-export async function transferUsdcToSpot(spotAdapter: SpotAdapter, exchangeName: string, amount: number): Promise<void> {
-  if (exchangeName === "hyperliquid") {
-    const { HyperliquidSpotAdapter } = await import("../../exchanges/hyperliquid-spot.js");
-    if (spotAdapter instanceof HyperliquidSpotAdapter) {
-      await spotAdapter.transferUsdcToSpot(amount);
-      return;
-    }
-  } else if (exchangeName === "lighter") {
-    const { LighterSpotAdapter } = await import("../../exchanges/lighter-spot.js");
-    if (spotAdapter instanceof LighterSpotAdapter) {
-      await spotAdapter.transferUsdcToSpot(amount);
-      return;
-    }
-  }
+/** Spot → perp counterpart of transferUsdcToSpot. */
+export async function transferUsdcToPerp(spotAdapter: SpotAdapter, amount: number): Promise<boolean> {
+  return transferQuoteToPerp(spotAdapter, amount);
 }
 
-/** Transfer USDC from spot to perp account (exchange-specific). */
-export async function transferUsdcToPerp(spotAdapter: SpotAdapter, exchangeName: string, amount: number): Promise<void> {
-  if (exchangeName === "hyperliquid") {
-    const { HyperliquidSpotAdapter } = await import("../../exchanges/hyperliquid-spot.js");
-    if (spotAdapter instanceof HyperliquidSpotAdapter) {
-      await spotAdapter.transferUsdcToPerp(amount);
-      return;
+// ── Spot ↔ perp matching (§12.4 #6) ──
+
+/**
+ * Bot spot↔perp candidates: spot bases on `spotVenue` matched to each perp venue by
+ * canonical symbol + price-deviation guard (`matchSpotPerp`). Bare-ticker equality is
+ * not enough. Bot positions store one symbol and derive the perp leg with
+ * `getPerpSymbol(base)`, so a canonical pair whose perp symbol differs from the spot
+ * base (e.g. UBTC ↔ BTC) is reported and skipped rather than traded under the wrong
+ * perp symbol. Returns perp venue → matched spot bases (upper-case).
+ *
+ * `perpMarketsCache` lets one scan reuse each perp venue's public market fetch.
+ * A perp venue whose markets cannot be fetched is logged and gets no candidates.
+ */
+export async function botSpotPerpMatches(
+  spotVenue: string,
+  spotMarkets: readonly SpotMarketInfo[],
+  perpVenues: readonly string[],
+  perpMarketsCache: Map<string, Promise<VenueMarket[]>>,
+  log: (msg: string) => void,
+): Promise<Map<string, Set<string>>> {
+  const out = new Map<string, Set<string>>();
+  for (const perpVenue of perpVenues) {
+    let pending = perpMarketsCache.get(perpVenue);
+    if (pending === undefined) {
+      pending = fetchPerpMarketsForMatching(perpVenue);
+      perpMarketsCache.set(perpVenue, pending);
     }
-  } else if (exchangeName === "lighter") {
-    const { LighterSpotAdapter } = await import("../../exchanges/lighter-spot.js");
-    if (spotAdapter instanceof LighterSpotAdapter) {
-      await spotAdapter.transferUsdcToPerp(amount);
-      return;
+    let perpMarkets: VenueMarket[];
+    try {
+      perpMarkets = await pending;
+    } catch (e) {
+      log(`spot↔perp matching: ${perpVenue} perp markets unavailable (${e instanceof Error ? e.message : String(e)}) — no ${perpVenue} candidates this scan`);
+      out.set(perpVenue, new Set());
+      continue;
     }
+    const matches = matchSpotPerp(spotVenue, spotMarkets, perpVenue, perpMarkets, log, sharedApiNetwork());
+    const bases = new Set<string>();
+    const aliased: string[] = [];
+    for (const m of matches.values()) {
+      if (getPerpSymbol(m.spotBase, perpVenue) === m.perpSymbol.toUpperCase()) bases.add(m.spotBase);
+      else aliased.push(`${m.spotBase}↔${m.perpSymbol}`);
+    }
+    if (aliased.length > 0) {
+      log(`spot↔perp matching ${spotVenue}→${perpVenue}: ${aliased.length} canonical pair(s) with a different perp symbol skipped (bot positions use one symbol): ${aliased.join(", ")}`);
+    }
+    out.set(perpVenue, bases);
   }
+  return out;
 }
 
 // ── Rate / symbol helpers ──
@@ -138,102 +159,6 @@ export async function getPriceEstimate(perpAdapter: ExchangeAdapter, perpSymbol:
   }
 }
 
-// ── Position recovery ──
-
-export interface RecoveredPosition {
-  symbol: string;
-  mode: "spot-perp" | "perp-perp";
-  longExchange: string;
-  shortExchange: string;
-  size: string;
-}
-
-/** Recover arb positions from exchange state (perp-perp + spot-perp, same + cross exchange). */
-export async function recoverArbPositions(
-  adapters: Map<string, ExchangeAdapter>,
-  log: (msg: string) => void,
-): Promise<RecoveredPosition[]> {
-  const positionsByExchange = new Map<string, { symbol: string; side: string; size: string }[]>();
-  for (const [name, a] of adapters) {
-    try {
-      const positions = await a.getPositions();
-      positionsByExchange.set(name, positions.map(p => ({ symbol: p.symbol.toUpperCase(), side: p.side, size: p.size })));
-    } catch { /* skip */ }
-  }
-
-  const recovered: RecoveredPosition[] = [];
-  const used = new Set<string>();
-
-  // Cross-exchange perp-perp
-  for (const [exA, posA] of positionsByExchange) {
-    for (const pA of posA) {
-      const keyA = `${exA}:${pA.symbol}`;
-      if (used.has(keyA)) continue;
-      for (const [exB, posB] of positionsByExchange) {
-        if (exA === exB) continue;
-        for (const pB of posB) {
-          const keyB = `${exB}:${pB.symbol}`;
-          if (used.has(keyB) || pA.symbol !== pB.symbol || pA.side === pB.side) continue;
-          const longEx = pA.side === "long" ? exA : exB;
-          const shortEx = pA.side === "short" ? exA : exB;
-          recovered.push({ symbol: pA.symbol, mode: "perp-perp", longExchange: longEx, shortExchange: shortEx, size: pA.side === "long" ? pA.size : pB.size });
-          used.add(keyA); used.add(keyB); break;
-        }
-        if (used.has(keyA)) break;
-      }
-    }
-  }
-
-  // Same-exchange spot-perp hedges
-  for (const [name, a] of adapters) {
-    try {
-      const spotAdapter = await getSpotAdapter(name, a);
-      if (!spotAdapter) continue;
-      const bals = await spotAdapter.getSpotBalances();
-      const nonUsdc = bals.filter(b => Number(b.total) > 0 && !b.token.toUpperCase().startsWith("USDC"));
-      if (nonUsdc.length === 0) continue;
-      for (const perp of positionsByExchange.get(name) ?? []) {
-        const perpKey = `${name}:${perp.symbol}`;
-        if (used.has(perpKey)) continue;
-        const base = perp.symbol.replace(/-PERP$/, "").toUpperCase();
-        const spotBal = nonUsdc.find(b => b.token.toUpperCase().replace(/-SPOT$/, "") === base);
-        if (spotBal && perp.side === "short") {
-          recovered.push({ symbol: base, mode: "spot-perp", longExchange: `${name}-spot`, shortExchange: name, size: perp.size });
-          used.add(perpKey);
-          log(`  Recovered spot-perp: ${base} ${name}-spot<>${name}`);
-        }
-      }
-    } catch { /* no spot */ }
-  }
-
-  // Cross-exchange spot-perp
-  for (const [spotExName, spotExAdapter] of adapters) {
-    try {
-      const spotAdapter = await getSpotAdapter(spotExName, spotExAdapter);
-      if (!spotAdapter) continue;
-      const bals = await spotAdapter.getSpotBalances();
-      const nonUsdc = bals.filter(b => Number(b.total) > 0 && !b.token.toUpperCase().startsWith("USDC"));
-      for (const bal of nonUsdc) {
-        const base = bal.token.toUpperCase().replace(/-SPOT$/, "");
-        for (const [perpExName, perpPositions] of positionsByExchange) {
-          if (perpExName === spotExName) continue;
-          for (const perp of perpPositions) {
-            const perpKey = `${perpExName}:${perp.symbol}`;
-            if (used.has(perpKey)) continue;
-            if (perp.symbol.replace(/-PERP$/, "").toUpperCase() === base && perp.side === "short") {
-              recovered.push({ symbol: base, mode: "spot-perp", longExchange: `${spotExName}-spot`, shortExchange: perpExName, size: perp.size });
-              used.add(perpKey);
-              log(`  Recovered cross spot-perp: ${base} ${spotExName}-spot<>${perpExName}`);
-            }
-          }
-        }
-      }
-    } catch { /* no spot */ }
-  }
-
-  return recovered;
-}
-
 // ── Shared scoring types & helpers ──
 
 export interface FundingScore {
@@ -245,19 +170,46 @@ export interface FundingScore {
   payments: number;
 }
 
-/** Returns true if a reduceOnly rejection indicates the position is already gone. */
-export function isPositionGone(msg: string): boolean {
-  return msg.includes("ReduceOnly") || msg.includes("reduceOnly") || msg.includes("-2022");
+/**
+ * true when a reduce-only close was rejected because there is no position left to reduce.
+ * Prefers the typed signal: placePerpVerified's ORDER_REJECTED with details.reduceOnlyFlat
+ * (flat before and after the order — "(no X position to reduce)"). Venue texts that carry the
+ * same meaning are matched too: HL "Reduce only order would increase position", Aster -2022
+ * / "ReduceOnly Order is rejected". Only ever applied to a DEFINITE rejection (an
+ * ORDER_PENDING outcome is never "gone").
+ */
+export function isPositionGone(e: unknown): boolean {
+  if (e instanceof PerpError) {
+    if (e.structured.code === "ORDER_PENDING") return false;
+    if (e.structured.code === "ORDER_REJECTED" && e.structured.details?.reduceOnlyFlat === true) return true;
+  }
+  const msg = typeof e === "string" ? e : extractErrorMessage(e);
+  return /position to reduce\)/.test(msg)
+    || /reduce only order would increase position/i.test(msg)
+    || msg.includes("ReduceOnly") || msg.includes("reduceOnly") || msg.includes("-2022");
 }
 
-/** Compute funding period in hours from history timestamps. Falls back to static map. */
-export function computeFundingHoursFromHistory(history: { time: number }[]): number {
-  if (history.length < 2) return getFundingHours("unknown"); // fallback to 1
-  const times = history.map(h => h.time).sort((a, b) => a - b);
-  let totalInterval = 0;
-  for (let i = 1; i < times.length; i++) totalInterval += times[i] - times[i - 1];
-  const avgIntervalH = totalInterval / (times.length - 1) / 3600000;
-  return avgIntervalH < 1.5 ? 1 : avgIntervalH < 5 ? 4 : 8;
+/** Adapters that publish a per-symbol funding basis (Aster: GET /fapi/v3/fundingInfo). */
+interface PerSymbolFundingHours {
+  getFundingHours(symbol: string): Promise<number | undefined>;
+}
+
+function hasPerSymbolFundingHours(adapter: ExchangeAdapter): adapter is ExchangeAdapter & PerSymbolFundingHours {
+  return typeof (adapter as Partial<PerSymbolFundingHours>).getFundingHours === "function";
+}
+
+/**
+ * Funding basis (hours one quoted rate covers) for a market: the market's own
+ * value when the venue publishes one per symbol, else the venue definition.
+ * History timestamp spacing is settlement timing, never the basis (§10.13 #2).
+ * @returns null when the venue publishes per-symbol values and this symbol has none
+ */
+async function marketFundingHours(adapter: ExchangeAdapter, exchangeName: string, symbol: string): Promise<number | null> {
+  if (hasPerSymbolFundingHours(adapter)) {
+    const hours = await adapter.getFundingHours(symbol);
+    return hours === undefined ? null : hours;
+  }
+  return getFundingHours(exchangeName);
 }
 
 /** Score a symbol's funding rate using history. Returns null if insufficient data. */
@@ -271,11 +223,14 @@ export async function scoreFunding(
   const key = `${exchangeName}:${symbol}`;
   const cached = cache?.get(key);
   if (cached && Date.now() - cached.ts < 10 * 60 * 1000) return cached.score;
+  // Outside the try: an unknown venue is a configuration error, not "no score".
+  const venueHours = hasPerSymbolFundingHours(adapter) ? null : getFundingHours(exchangeName);
   try {
+    const fH = venueHours !== null ? venueHours : await marketFundingHours(adapter, exchangeName, symbol);
+    if (fH === null) return null; // per-symbol basis unknown — the hourly rate would be a guess
     const history = await adapter.getFundingHistory(symbol, periods);
     if (history.length < 2) return null;
     const rates = history.map(h => parseFloat(h.rate));
-    const fH = computeFundingHoursFromHistory(history);
     const avgRate = rates.reduce((s, r) => s + r, 0) / rates.length;
     const consistency = rates.filter(r => r > 0).length / rates.length;
     const annualized = annualizeHourlyRate(avgRate / fH);
@@ -285,44 +240,40 @@ export async function scoreFunding(
   } catch { return null; }
 }
 
-/** Fetch funding rates from an exchange adapter. */
+/**
+ * Fetch funding rates from an exchange adapter. Failures propagate — callers
+ * record them per venue (an empty list would read as "venue has no markets").
+ */
 export async function fetchRates(
   adapter: ExchangeAdapter,
   exchangeName: string,
 ): Promise<{ symbol: string; rate: number; price: number; sizeDecimals?: number; maxLeverage?: number; fundingHours?: number }[]> {
-  try {
-    const markets = await adapter.getMarkets();
-    const withRates = markets.filter(m => m.fundingRate != null);
+  const markets = await adapter.getMarkets();
+  const withRates = markets.filter(m => m.fundingRate != null);
 
-    // Bootstrap aster funding hours lazily
-    if (exchangeName === "aster" && "getFundingHours" in adapter) {
-      const aster = adapter as unknown as { getFundingHours(sym: string): Promise<number> };
-      const uncached = withRates.filter(m => {
-        const c = (adapter as any)?._fundingHoursCache?.get?.(m.symbol);
-        return c === undefined;
-      });
-      for (const m of uncached.slice(0, 20)) {
-        m.fundingHours = await aster.getFundingHours(m.symbol);
-      }
-    }
-
-    // For non-aster exchanges, set fundingHours from static map if not already set
-    if (exchangeName !== "aster") {
-      const defaultFH = getFundingHours(exchangeName);
-      for (const m of withRates) { if (m.fundingHours == null) m.fundingHours = defaultFH; }
-    }
-
-    return withRates
-      .filter(m => m.fundingHours != null) // skip aster symbols with unknown funding period
-      .map(m => ({
-        symbol: m.symbol,
-        rate: parseFloat(m.fundingRate!),
-        price: parseFloat(m.markPrice),
-        sizeDecimals: m.sizeDecimals,
-        maxLeverage: m.maxLeverage,
-        fundingHours: m.fundingHours,
-      }));
-  } catch {
-    return [];
+  // fundingHours = basis (§10.13 #7): market value first, then the venue definition.
+  // Per-symbol venues (Aster) load their whole table in one call; symbols it
+  // does not list stay null and are skipped below.
+  for (const m of withRates) {
+    if (m.fundingHours !== null) continue;
+    m.fundingHours = await marketFundingHours(adapter, exchangeName, m.symbol);
   }
+
+  const result: { symbol: string; rate: number; price: number; sizeDecimals: number; maxLeverage: number; fundingHours: number }[] = [];
+  for (const m of withRates) {
+    // Skip aster symbols with unknown funding period — the hourly rate would be a guess.
+    if (m.fundingHours === null) continue;
+    // Skip markets whose size precision the venue does not publish — a leg could
+    // not be sized to the venue's lot, and substituting a static guess mis-sizes it.
+    if (m.sizeDecimals === null) continue;
+    result.push({
+      symbol: m.symbol,
+      rate: parseFloat(m.fundingRate!),
+      price: parseFloat(m.markPrice),
+      sizeDecimals: m.sizeDecimals,
+      maxLeverage: m.maxLeverage,
+      fundingHours: m.fundingHours,
+    });
+  }
+  return result;
 }

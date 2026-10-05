@@ -1,4 +1,5 @@
 import { Command } from "commander";
+import { listConfiguredAccountVenues } from "../config.js";
 import chalk from "chalk";
 import type { ExchangeAdapter } from "../exchanges/index.js";
 import { printJson, jsonOk, makeTable, formatUsd, withJsonErrors } from "../utils.js";
@@ -74,7 +75,6 @@ export async function runHealthCheck(isJson: () => boolean): Promise<void> {
       console.log(`\n  Overall: ${overall}\n`);
 }
 
-const EXCHANGES = ["pacifica", "hyperliquid", "lighter", "aster"] as const;
 
 export function registerRiskCommands(
   program: Command,
@@ -87,12 +87,12 @@ export function registerRiskCommands(
   risk
     .command("status")
     .description("Assess current risk across all exchanges")
-    .option("--exchange <exchanges>", "Comma-separated exchanges (default: all)")
+    .option("--exchange <exchanges>", "Comma-separated exchanges (default: all with configured credentials)")
     .action(async (opts: { exchange?: string }) => {
       await withJsonErrors(isJson(), async () => {
         const exchanges = opts.exchange
           ? opts.exchange.split(",").map(e => e.trim())
-          : [...EXCHANGES];
+          : await listConfiguredAccountVenues();
 
         const balances: { exchange: string; balance: Awaited<ReturnType<ExchangeAdapter['getBalance']>> }[] = [];
         const positions: { exchange: string; position: Awaited<ReturnType<ExchangeAdapter['getPositions']>>[number] }[] = [];
@@ -149,6 +149,9 @@ export function registerRiskCommands(
             ? chalk.red
             : chalk.green;
           console.log(`  Min Liq Distance:     ${ldColor(`${assessment.metrics.minLiquidationDistancePct.toFixed(1)}%`)}`);
+        }
+        for (const { exchange, position: p } of positions.filter(x => x.position.liquidationPrice === null)) {
+          console.log(`  Liq Price ${exchange}:${p.symbol}: ${chalk.yellow("unknown (venue does not report)")} — not in Min Liq Distance`);
         }
 
         if (assessment.violations.length > 0) {
@@ -257,12 +260,12 @@ export function registerRiskCommands(
     .description("Pre-trade risk check (for agents)")
     .requiredOption("--notional <usd>", "Order notional value in USD")
     .requiredOption("--leverage <n>", "Order leverage")
-    .option("--exchange <exchanges>", "Comma-separated exchanges (default: all)")
+    .option("--exchange <exchanges>", "Comma-separated exchanges (default: all with configured credentials)")
     .action(async (opts: { notional: string; leverage: string; exchange?: string }) => {
       await withJsonErrors(isJson(), async () => {
         const exchanges = opts.exchange
           ? opts.exchange.split(",").map(e => e.trim())
-          : [...EXCHANGES];
+          : await listConfiguredAccountVenues();
 
         const balances: { exchange: string; balance: Awaited<ReturnType<ExchangeAdapter['getBalance']>> }[] = [];
         const positions: { exchange: string; position: Awaited<ReturnType<ExchangeAdapter['getPositions']>>[number] }[] = [];
@@ -300,12 +303,12 @@ export function registerRiskCommands(
     .command("liquidation-distance")
     .description("Show % distance from liquidation price for all positions")
     .alias("liq-dist")
-    .option("--exchange <exchanges>", "Comma-separated exchanges (default: all)")
+    .option("--exchange <exchanges>", "Comma-separated exchanges (default: all with configured credentials)")
     .action(async (opts: { exchange?: string }) => {
       await withJsonErrors(isJson(), async () => {
         const exchanges = opts.exchange
           ? opts.exchange.split(",").map(e => e.trim())
-          : [...EXCHANGES];
+          : await listConfiguredAccountVenues();
 
         const positions: { exchange: string; position: Awaited<ReturnType<ExchangeAdapter['getPositions']>>[number] }[] = [];
 
@@ -334,10 +337,15 @@ export function registerRiskCommands(
 
         const limits = loadRiskLimits();
         const distances = getLiquidationDistances(positions, limits);
+        // Positions whose venue reports no liquidation price are listed explicitly, never dropped.
+        const unknownLiq = positions
+          .filter(({ position: p }) => p.liquidationPrice === null)
+          .map(({ exchange, position: p }) => ({ exchange, symbol: p.symbol, side: p.side, markPrice: Number(p.markPrice), liquidationPrice: null }));
 
         if (isJson()) {
           return printJson(jsonOk({
             positions: distances,
+            unknownLiquidation: unknownLiq,
             limits: {
               minLiquidationDistance: limits.minLiquidationDistance,
             },
@@ -365,6 +373,18 @@ export function registerRiskCommands(
           ];
         });
 
+        for (const u of unknownLiq) {
+          rows.push([
+            chalk.white(u.exchange),
+            chalk.white.bold(u.symbol),
+            u.side === "long" ? chalk.green("LONG") : chalk.red("SHORT"),
+            `$${formatUsd(u.markPrice)}`,
+            chalk.yellow("unknown (venue does not report)"),
+            chalk.gray("n/a"),
+            chalk.yellow("UNKNOWN"),
+          ]);
+        }
+
         console.log(makeTable(
           ["Exchange", "Symbol", "Side", "Mark Price", "Liq Price", "Distance", "Status"],
           rows,
@@ -389,7 +409,7 @@ export function registerRiskCommands(
 
   program
     .command("health")
-    .description("Adapter health check across all 4 DEX")
+    .description("Adapter health check: ping venue REST endpoints (connectivity + latency)")
     .action(async () => {
       await runHealthCheck(isJson);
     });

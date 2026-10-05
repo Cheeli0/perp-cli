@@ -1,4 +1,4 @@
-import { HYPERLIQUID_API_URL } from "./urls.js";
+import { HYPERLIQUID_API_URL, sharedApiNetwork } from "./urls.js";
 import { assertOk } from "./_http.js";
 import { withCache, TTL_MARKET } from "../../cache.js";
 
@@ -28,7 +28,7 @@ async function hlPost(type: string): Promise<unknown> {
 export function fetchHyperliquidMeta(): Promise<HyperliquidAsset[]> {
   // SSOT rule #2: error must propagate. Row-level skipping handles missing
   // markPx / funding so a 0 doesn't reach downstream comparisons.
-  return withCache("pub:hl:metaAndAssetCtxs", TTL_MARKET, async () => {
+  return withCache(`pub:hl:${sharedApiNetwork()}:metaAndAssetCtxs`, TTL_MARKET, async () => {
     const json = await hlPost("metaAndAssetCtxs") as unknown[];
     const universe = ((json[0] ?? {}) as Record<string, unknown>).universe ?? [];
     const ctxs = (json[1] ?? []) as Record<string, unknown>[];
@@ -50,7 +50,7 @@ export function fetchHyperliquidMetaRaw(): Promise<unknown> {
   // `.catch(() => null)` so a network failure surfaces as a rejected Promise.
   // Callers should wrap with Promise.allSettled to keep multi-DEX comparisons
   // running when one DEX is down.
-  return withCache("pub:hl:metaAndAssetCtxs:raw", TTL_MARKET, () =>
+  return withCache(`pub:hl:${sharedApiNetwork()}:metaAndAssetCtxs:raw`, TTL_MARKET, () =>
     hlPost("metaAndAssetCtxs"),
   );
 }
@@ -77,7 +77,7 @@ export function parseHyperliquidMetaRaw(raw: unknown): { rates: Map<string, numb
 
 export function fetchHyperliquidAllMidsRaw(): Promise<unknown> {
   // SSOT rule #2: error must propagate; see fetchHyperliquidMetaRaw.
-  return withCache("pub:hl:allMids:raw", TTL_MARKET, () =>
+  return withCache(`pub:hl:${sharedApiNetwork()}:allMids:raw`, TTL_MARKET, () =>
     hlPost("allMids"),
   );
 }

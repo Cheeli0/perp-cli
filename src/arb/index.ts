@@ -1,5 +1,5 @@
 // arb/ barrel — public API
-export { computeMatchedSize, computeSpotPerpMatchedSize, reconcileArbFills } from "./sizing.js";
+export { computeMatchedSize, computeSpotPerpMatchedSize } from "./sizing.js";
 export {
   SETTLEMENT_SCHEDULES,
   getLastSettlement,

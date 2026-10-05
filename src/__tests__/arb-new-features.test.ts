@@ -382,8 +382,8 @@ describe("ArbDaemonState with lastSuccessfulScanTime", () => {
     const testTimestamp = "2025-06-15T14:30:00.000Z";
     state.lastSuccessfulScanTime = testTimestamp;
 
-    saveArbState(state);
-    const loaded = loadArbState();
+    saveArbState("mainnet", state);
+    const loaded = loadArbState("mainnet");
 
     expect(loaded).not.toBeNull();
     expect(loaded!.lastSuccessfulScanTime).toBe(testTimestamp);
@@ -396,16 +396,16 @@ describe("ArbDaemonState with lastSuccessfulScanTime", () => {
     });
     const ts1 = "2025-06-15T10:00:00.000Z";
     state.lastSuccessfulScanTime = ts1;
-    saveArbState(state);
+    saveArbState("mainnet", state);
 
     // Simulate daemon updating lastSuccessfulScanTime
-    const loaded = loadArbState()!;
+    const loaded = loadArbState("mainnet")!;
     const ts2 = "2025-06-15T11:00:00.000Z";
     loaded.lastSuccessfulScanTime = ts2;
     loaded.lastScanTime = ts2;
-    saveArbState(loaded);
+    saveArbState("mainnet", loaded);
 
-    const reloaded = loadArbState()!;
+    const reloaded = loadArbState("mainnet")!;
     expect(reloaded.lastSuccessfulScanTime).toBe(ts2);
     expect(reloaded.lastScanTime).toBe(ts2);
   });

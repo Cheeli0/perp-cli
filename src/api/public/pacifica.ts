@@ -1,4 +1,4 @@
-import { PACIFICA_API_URL } from "./urls.js";
+import { PACIFICA_API_URL, sharedApiNetwork } from "./urls.js";
 import { assertOk } from "./_http.js";
 import { withCache, TTL_MARKET } from "../../cache.js";
 
@@ -15,7 +15,7 @@ interface PacificaAsset {
 export function fetchPacificaPrices(): Promise<PacificaAsset[]> {
   // SSOT rule #2: error must propagate. Row-level skipping is applied for
   // missing/invalid mark or funding so a 0 doesn't reach downstream paths.
-  return withCache("pub:pac:prices", TTL_MARKET, async () => {
+  return withCache(`pub:pac:${sharedApiNetwork()}:prices`, TTL_MARKET, async () => {
     const res = await fetch(PACIFICA_API_URL);
     await assertOk(res, "Pacifica prices");
     const json = await res.json();
@@ -42,7 +42,7 @@ export function fetchPacificaPricesRaw(): Promise<unknown> {
   // Callers should wrap with Promise.allSettled to keep multi-DEX comparisons
   // running when one DEX is down. Non-2xx responses are also rejected so a
   // 5xx JSON body cannot fulfill as if it were valid data.
-  return withCache("pub:pac:prices:raw", TTL_MARKET, async () => {
+  return withCache(`pub:pac:${sharedApiNetwork()}:prices:raw`, TTL_MARKET, async () => {
     const res = await fetch(PACIFICA_API_URL);
     await assertOk(res, "Pacifica prices");
     return res.json();

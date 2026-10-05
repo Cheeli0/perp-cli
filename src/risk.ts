@@ -107,7 +107,7 @@ export function getLiquidationDistances(
 ): LiquidationDistanceInfo[] {
   const lim = limits ?? loadRiskLimits();
   return positions
-    .filter(({ position: p }) => p.liquidationPrice !== "N/A" && Number(p.liquidationPrice) > 0)
+    .filter(({ position: p }) => p.liquidationPrice !== null && Number(p.liquidationPrice) > 0)
     .map(({ exchange, position: p }) => {
       const markPrice = Number(p.markPrice);
       const liquidationPrice = Number(p.liquidationPrice);

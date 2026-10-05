@@ -1,5 +1,8 @@
+import { assertCanClosePositions } from "../exchanges/trading-v2.js";
 import type { ExchangeAdapter } from "../exchanges/index.js";
+import { resolveAdapterSlippage } from "../exchanges/slippage.js";
 import type { BotConfig } from "./config.js";
+import { PerpError } from "../errors.js";
 import { getMarketSnapshot, evaluateAllConditions, type MarketSnapshot } from "./conditions.js";
 import { updateJobState } from "../jobs.js";
 import { getStrategy } from "./strategy-registry.js";
@@ -77,14 +80,70 @@ class TuiEmitter {
   }
 }
 
+/**
+ * Strategies that place/close orders themselves (multi-leg executors, spot legs) instead of
+ * returning StrategyActions — the engine cannot simulate them, so --dry-run is refused.
+ */
+export const NON_SIMULATABLE_STRATEGIES: ReadonlySet<string> = new Set([
+  "funding-arb", "funding-arb-v2", "funding-auto", "spot-perp-arb",
+]);
+
+/**
+ * ExchangeAdapter methods a --dry-run bot may call: pure reads (plus resolveSymbol, a local
+ * lookup). Allowlist, not blocklist (review L4): any other method — every venue write, and any
+ * write added to an adapter later — throws, so a dry-run can never reach the venue's write path.
+ */
+export const ADAPTER_READ_METHODS: ReadonlySet<string> = new Set([
+  "getMarkets", "getOrderbook", "getRecentTrades", "getFundingHistory", "getKlines",
+  "getBalance", "getPositions", "getOpenOrders", "getOrderHistory", "getTradeHistory", "getFundingPayments",
+  "getFundingHours", "resolveSymbol",
+]);
+
+/** Throw INVALID_PARAMS if `strategyType` cannot run under --dry-run (checked before any adapter call). */
+export function assertStrategySimulatable(strategyType: string): void {
+  if (!NON_SIMULATABLE_STRATEGIES.has(strategyType.toLowerCase())) return;
+  throw new PerpError("INVALID_PARAMS", `Strategy "${strategyType}" executes orders directly and cannot simulate under --dry-run`, {
+    remediation: "Run it without --dry-run on a small size, or backtest it: perp backtest --help",
+  });
+}
+
+/** Wrap an adapter so only allowlisted reads run; every other method throws (defense in depth for --dry-run bots). */
+export function dryRunAdapter(adapter: ExchangeAdapter): ExchangeAdapter {
+  return new Proxy(adapter, {
+    get(target, prop, receiver) {
+      const v = Reflect.get(target, prop, receiver);
+      if (typeof v !== "function") return v;
+      if (typeof prop === "string" && ADAPTER_READ_METHODS.has(prop)) {
+        return (v as (...a: unknown[]) => unknown).bind(target);
+      }
+      return () => {
+        throw new PerpError("INVALID_PARAMS", `--dry-run bot attempted ${String(prop)}() on ${target.name} — only read methods are allowed under --dry-run; blocked`, {
+          remediation: "This strategy cannot simulate; run it without --dry-run",
+        });
+      };
+    },
+  });
+}
+
 export async function runBot(
   adapter: ExchangeAdapter,
   config: BotConfig,
-  jobId?: string,
-  log: BotLog = defaultLog,
-  extraAdapters?: Map<string, ExchangeAdapter>, // for funding-arb (multi-exchange)
-  mode: BotOutputMode = "headless",
+  jobId: string | undefined,
+  log: BotLog,
+  extraAdapters: Map<string, ExchangeAdapter> | undefined, // for funding-arb (multi-exchange)
+  mode: BotOutputMode,
+  /** Global --dry-run: strategy actions are logged, never sent; non-simulatable strategies are refused. */
+  isDryRun: boolean,
 ): Promise<{ fills: number; totalPnl: number; runtime: number }> {
+  if (isDryRun) {
+    assertStrategySimulatable(config.strategy.type);
+    adapter = dryRunAdapter(adapter);
+    if (extraAdapters) extraAdapters = new Map([...extraAdapters].map(([k, a]) => [k, dryRunAdapter(a)]));
+  } else {
+    // A bot must be able to close what it opens: refuse before the first order.
+    assertCanClosePositions(adapter, `Bot "${config.strategy.type}" on ${adapter.name}`);
+    for (const a of extraAdapters?.values() ?? []) assertCanClosePositions(a, `Bot "${config.strategy.type}" on ${a.name}`);
+  }
   const state: BotState = {
     phase: "monitoring",
     startTime: Date.now(),
@@ -120,8 +179,6 @@ export async function runBot(
     strategyCtx.state.set("extraAdapters", extraAdapters);
   }
   strategyCtx.state.set("riskConfig", config.risk);
-
-  const isDryRun = false; // TODO: wire up from config when dry-run mode is added
 
   let running = true;
 
@@ -396,7 +453,7 @@ export async function runBot(
     }
 
     // Cleanup: cancel any remaining orders
-    if (state.strategyActive) {
+    if (state.strategyActive && !isDryRun) {
       effectiveLog(`  Cleaning up orders...`);
       try { await adapter.cancelAllOrders(config.symbol); } catch { /* best effort */ }
     }
@@ -431,7 +488,7 @@ async function executeActions(
   symbol: string,
   actions: StrategyAction[],
   log: BotLog,
-  dryRun = false,
+  dryRun: boolean,
 ) {
   for (const action of actions) {
     if (dryRun) {
@@ -441,7 +498,7 @@ async function executeActions(
     switch (action.type) {
       case "place_order":
         if (action.orderType === "market") {
-          await adapter.marketOrder(symbol, action.side, action.size);
+          await adapter.marketOrder(symbol, action.side, action.size, { reduceOnly: action.reduceOnly === true, slippage: resolveAdapterSlippage(adapter, null) });
         } else {
           await adapter.limitOrder(symbol, action.side, action.price, action.size, {
             reduceOnly: action.reduceOnly,
@@ -568,67 +625,56 @@ async function fetchExchangeBalances(
   return results;
 }
 
+const _spotPriceWarned = new Set<string>();
+
 async function fetchSpotPositions(
   adapter: ExchangeAdapter,
 ): Promise<import("./tui/index.js").Position[]> {
-  const name = adapter.name.toLowerCase();
-  if (name !== "hyperliquid" && name !== "lighter") return [];
-
+  // Bot scope (§12.4 #3): only separate/runtime spot venues with transfer.
+  const { getBotSpotAdapter, isSpotQuoteAsset, spotNetworkOf, spotTokenBase } = await import("../exchanges/spot-factory.js");
+  const { getVenue } = await import("../exchanges/venue.js");
+  let raw: import("../exchanges/spot-interface.js").SpotBalance[];
+  let markets: import("../exchanges/spot-interface.js").SpotMarketInfo[];
+  let net: import("../exchanges/venue-types.js").Network;
   try {
-    if (name === "hyperliquid") {
-      const { HyperliquidSpotAdapter } = await import("../exchanges/hyperliquid-spot.js");
-      const { HyperliquidAdapter } = await import("../exchanges/hyperliquid.js");
-      if (!(adapter instanceof HyperliquidAdapter)) return [];
-      const hlSpot = new HyperliquidSpotAdapter(adapter);
-      await hlSpot.init();
-      const [raw, markets] = await Promise.all([hlSpot.getSpotBalances(), hlSpot.getSpotMarkets()]);
-      const priceMap = new Map(markets.map(m => [m.baseToken.toUpperCase(), m.markPrice]));
-      const strip = (t: string) => t.replace(/-SPOT$/i, "").toUpperCase();
-      const hlPositions: import("./tui/index.js").Position[] = [];
-      for (const b of raw) {
-        if (Number(b.total) <= 0) continue;
-        const base = strip(b.token);
-        const markPrice = priceMap.get(base) ?? "0";
-        if (base === "USDC" || markPrice === "0") continue;
-        const total = Number(b.total);
-        const entryNtl = b.entryNtl ? Number(b.entryNtl) : 0;
-        const avgEntry = (entryNtl > 0 && total > 0) ? (entryNtl / total) : 0;
-        const mark = Number(markPrice);
-        const uPnL = avgEntry > 0 ? (mark - avgEntry) * total : 0;
-        hlPositions.push({
-          symbol: base, side: "spot", size: b.total,
-          entryPrice: avgEntry > 0 ? avgEntry.toPrecision(5) : "—",
-          markPrice,
-          unrealizedPnl: avgEntry > 0 ? uPnL.toFixed(2) : "—",
-          exchange: adapter.name,
-        });
-      }
-      return hlPositions;
-    }
-
-    if (name === "lighter") {
-      const { LighterAdapter } = await import("../exchanges/lighter.js");
-      const { LighterSpotAdapter } = await import("../exchanges/lighter-spot.js");
-      if (!(adapter instanceof LighterAdapter)) return [];
-      const ltSpot = new LighterSpotAdapter(adapter);
-      await ltSpot.init();
-      const [raw, markets] = await Promise.all([ltSpot.getSpotBalances(), ltSpot.getSpotMarkets()]);
-      const priceMap = new Map(markets.map(m => [m.baseToken.toUpperCase(), m.markPrice]));
-      const ltPositions: import("./tui/index.js").Position[] = [];
-      for (const b of raw) {
-        if (Number(b.total) <= 0) continue;
-        const base = b.token.toUpperCase();
-        const markPrice = priceMap.get(base) ?? "0";
-        if (base === "USDC" || base === "USDC_SPOT" || markPrice === "0") continue;
-        ltPositions.push({ symbol: base, side: "spot", size: b.total, entryPrice: "—", markPrice, unrealizedPnl: "—", exchange: adapter.name });
-      }
-      return ltPositions;
-    }
-  } catch {
-    // Spot adapter unavailable — skip silently
+    const spot = await getBotSpotAdapter(adapter.name, adapter);
+    if (spot === null) return [];
+    net = spotNetworkOf(spot);
+    [raw, markets] = await Promise.all([spot.getSpotBalances(), spot.getSpotMarkets()]);
+  } catch (e) {
+    // Display-only path: surface the failure instead of hiding it, keep the TUI alive.
+    process.stderr.write(`[warn] ${adapter.name} spot positions unavailable: ${e instanceof Error ? e.message : String(e)}\n`);
+    return [];
   }
-
-  return [];
+  const def = getVenue(adapter.name);
+  const priceMap = new Map(markets.map(m => [m.baseToken.toUpperCase(), m.markPrice]));
+  const out: import("./tui/index.js").Position[] = [];
+  for (const b of raw) {
+    if (Number(b.total) <= 0 || isSpotQuoteAsset(def, net, b.token)) continue;
+    const base = spotTokenBase(b.token);
+    const markPrice = priceMap.get(base);
+    if (markPrice === undefined || markPrice === null || !(Number(markPrice) > 0)) {
+      // Unknown price: excluded (never valued at 0) — surfaced once per token.
+      const k = `${def.id}:${base}`;
+      if (!_spotPriceWarned.has(k)) {
+        _spotPriceWarned.add(k);
+        process.stderr.write(`[warn] ${def.displayName} spot ${base}: no market price — excluded from spot positions\n`);
+      }
+      continue;
+    }
+    const total = Number(b.total);
+    const entryNtl = b.entryNtl ? Number(b.entryNtl) : 0;
+    const avgEntry = (entryNtl > 0 && total > 0) ? (entryNtl / total) : 0;
+    const uPnL = avgEntry > 0 ? (Number(markPrice) - avgEntry) * total : 0;
+    out.push({
+      symbol: base, side: "spot", size: b.total,
+      entryPrice: avgEntry > 0 ? avgEntry.toPrecision(5) : "—",
+      markPrice,
+      unrealizedPnl: avgEntry > 0 ? uPnL.toFixed(2) : "—",
+      exchange: adapter.name,
+    });
+  }
+  return out;
 }
 
 async function fetchAllPositions(

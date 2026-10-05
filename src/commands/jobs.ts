@@ -1,9 +1,10 @@
 import { Command } from "commander";
-import { listJobs, stopJob, removeJob, loadJob, logFile, startJob } from "../jobs.js";
+import { listJobs, stopJob, removeJob, loadJob, logFile, startJob, assertTmuxSessionName } from "../jobs.js";
 import { printJson, jsonOk } from "../utils.js";
 import chalk from "chalk";
 import { existsSync, readFileSync } from "node:fs";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
+import { scrubSecretEnv } from "../secret-env.js";
 
 export function registerBackgroundCommands(
   program: Command,
@@ -69,7 +70,7 @@ export function registerBackgroundCommands(
     .command("logs <id>")
     .description("Show logs for a job")
     .option("-f, --follow", "Follow log output (tail -f)")
-    .option("-n, --lines <n>", "Number of lines to show", "50")
+    .option("--lines <n>", "Number of lines to show", "50")
     .action((id: string, opts: { follow?: boolean; lines: string }) => {
       const log = logFile(id);
       if (!existsSync(log)) {
@@ -82,12 +83,12 @@ export function registerBackgroundCommands(
         const job = loadJob(id);
         if (job?.status === "running") {
           try {
-            execSync(`tmux attach-session -t ${job.tmuxSession}`, { stdio: "inherit" });
+            execFileSync("tmux", ["attach-session", "-t", assertTmuxSessionName(job.tmuxSession)], { stdio: "inherit", env: scrubSecretEnv(process.env) });
             return;
           } catch { /* fall through to tail */ }
         }
         try {
-          execSync(`tail -f ${log}`, { stdio: "inherit" });
+          execFileSync("tail", ["-f", log], { stdio: "inherit", env: scrubSecretEnv(process.env) });
         } catch { /* ctrl-c */ }
       } else {
         const content = readFileSync(log, "utf-8");

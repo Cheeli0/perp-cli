@@ -1,4 +1,5 @@
 import { Command } from "commander";
+import { isDryRun, supportsDryRun } from "../cli-flags.js";
 import chalk from "chalk";
 import { formatUsd, makeTable, printJson, jsonOk } from "../utils.js";
 import type { ExchangeAdapter } from "../exchanges/index.js";
@@ -9,13 +10,15 @@ import {
   estimateMoveTime,
   type RebalanceMove,
 } from "../rebalance.js";
-import { EXCHANGE_TO_CHAIN, executeBestBridge } from "../bridge-engine.js";
+import { EXCHANGE_TO_CHAIN, assertBridgeNetwork, executeBestBridge } from "../bridge-engine.js";
+import type { Network } from "../exchanges/venue-types.js";
 import { loadPrivateKey, parseSolanaKeypair, type Exchange } from "../config.js";
 
 export function registerFundsRebalanceCommands(
   parent: Command,
   getAdapterForExchange: (exchange: string) => Promise<ExchangeAdapter>,
-  isJson: () => boolean
+  isJson: () => boolean,
+  getNetwork: () => Network,
 ) {
   const rebalance = parent.command("rebalance").description("Cross-exchange balance management");
 
@@ -146,19 +149,21 @@ export function registerFundsRebalanceCommands(
 
   // ── rebalance execute ──
 
-  rebalance
-    .command("execute")
-    .description("Execute rebalancing (withdraw → bridge → deposit)")
+  supportsDryRun(rebalance.command("execute"))
+    .description("Execute rebalancing (withdraw → bridge → deposit; supports --dry-run)")
     .option("--exchanges <list>", "Comma-separated exchanges", "pacifica,hyperliquid,lighter,aster")
     .option("--min-move <usd>", "Minimum move amount ($)", "50")
     .option("--reserve <usd>", "Keep at least this much per exchange ($)", "20")
-    .option("--dry-run", "Show what would happen without executing")
     .option("--withdraw-only", "Only execute withdrawals (manual bridge + deposit)")
     .option("--auto-bridge", "Auto-bridge via deBridge DLN (withdraw → bridge in one step)")
     .action(async (opts: {
       exchanges: string; minMove: string; reserve: string;
-      dryRun?: boolean; withdrawOnly?: boolean; autoBridge?: boolean;
-    }) => {
+      withdrawOnly?: boolean; autoBridge?: boolean;
+    }, cmd: Command) => {
+      const dryRun = isDryRun(cmd);
+      // --auto-bridge signs mainnet-only bridge routes: refuse -n testnet up front,
+      // before any withdrawal is sent (not after, as a per-move bridge_failed).
+      if (opts.autoBridge && !dryRun) assertBridgeNetwork(getNetwork());
       const exchangeNames = opts.exchanges.split(",").map((e) => e.trim());
       const adapters = new Map<string, ExchangeAdapter>();
 
@@ -194,7 +199,7 @@ export function registerFundsRebalanceCommands(
       for (const move of plan.moves) {
         if (!isJson()) console.log(chalk.white.bold(`  $${move.amount} ${move.from} → ${move.to}`));
 
-        if (opts.dryRun) {
+        if (dryRun) {
           if (!isJson()) console.log(chalk.yellow("    [DRY RUN] Skipped.\n"));
           moveResults.push({ from: move.from, to: move.to, amount: move.amount, status: "dry_run" });
           continue;
@@ -241,7 +246,7 @@ export function registerFundsRebalanceCommands(
             );
 
             const result = await executeBestBridge(
-              srcChain, dstChain, move.amount, signerKey, senderAddress, recipientAddress, dstSignerKey,
+              getNetwork(), srcChain, dstChain, move.amount, signerKey, senderAddress, recipientAddress, dstSignerKey,
             );
 
             if (!isJson()) {

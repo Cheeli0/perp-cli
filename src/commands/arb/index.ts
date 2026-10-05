@@ -1,19 +1,25 @@
 import { Command } from "commander";
+import { isDryRun, networkOf, supportsDryRun } from "../../cli-flags.js";
 import chalk from "chalk";
 import { makeTable, formatUsd, formatPnl, printJson, jsonOk, logSettledRejections } from "../../utils.js";
 import { SPOT_PERP_TOKEN_MAP, type ExchangeAdapter, type ExchangePosition, type SpotBalance } from "../../exchanges/index.js";
 import { readExecutionLog, logExecution, type ExecutionRecord } from "../../execution-log.js";
-import { toHourlyRate, computeAnnualSpread } from "../../funding.js";
+import { toHourlyRate } from "../../funding.js";
 import {
   fetchPacificaPrices, fetchHyperliquidMeta,
   fetchLighterOrderBookDetails, fetchLighterFundingRates,
 } from "../../shared-api.js";
 import { computeBasisRisk } from "../../arb-utils.js";
-import { smartOrder } from "../../smart-order.js";
 import { removePosition as persistRemovePosition, getPositions as getArbStatePositions, loadArbState } from "../../arb-state.js";
 import { fetchAllBalances, computeRebalancePlan } from "../../rebalance.js";
 import { EXCHANGE_TO_CHAIN, getBestQuote } from "../../bridge-engine.js";
 import { computeEnhancedStats, type ArbTradeForStats } from "../../arb-history-stats.js";
+import { listBotSpotVenues, nonQuoteSpotBalances, requireSpotAdapter, spotNetworkOf } from "../../exchanges/spot-factory.js";
+import { listConfiguredAccountVenues } from "../../config.js";
+import { closePerpPairVerified, handleSpotClose } from "../arb-auto.js";
+import { quarantineEntryFor } from "../../bot/quarantine.js";
+import { PerpError, classifyError, parsePositiveDecimal } from "../../errors.js";
+import { listVenuesWithRole, resolveVenueId } from "../../exchanges/venue.js";
 
 // ── Types ──
 
@@ -103,7 +109,43 @@ interface ArbHistoryTrade {
 
 import { DEFAULT_TAKER_FEE as TAKER_FEE } from "../../constants.js";
 
-const EXCHANGES = ["hyperliquid", "lighter", "pacifica"];
+/**
+ * Venues an arb leg can sit on: every registered trading venue with a configured
+ * credential source (registry order). Never a hard-coded list — a venue added to the
+ * registry is covered by `arb status` / `arb close` without touching this file.
+ */
+export async function listArbVenues(): Promise<string[]> {
+  const configured = await listConfiguredAccountVenues(); // registers the venues
+  const trading = new Set<string>(listVenuesWithRole("trading").map(v => v.id));
+  return configured.filter(v => trading.has(v));
+}
+
+/**
+ * Positions of every venue in `venues`. A venue whose adapter cannot be built or whose
+ * positions read fails is an error (Rule #2): an unread venue is not "no positions" —
+ * a hidden leg would make a live pair look closed.
+ */
+export async function readArbVenuePositions(
+  venues: readonly string[],
+  getAdapter: (exchange: string) => Promise<ExchangeAdapter>,
+): Promise<{ exchange: string; position: ExchangePosition }[]> {
+  const out: { exchange: string; position: ExchangePosition }[] = [];
+  for (const exchange of venues) {
+    let positions: ExchangePosition[];
+    try {
+      positions = await (await getAdapter(exchange)).getPositions();
+    } catch (e) {
+      const c = classifyError(e, exchange);
+      throw new PerpError(c.code as ConstructorParameters<typeof PerpError>[0], `Cannot read positions on ${exchange}: ${c.message}`, {
+        exchange,
+        venuesChecked: [...venues],
+        remediation: `Arb pairs are detected from every configured venue's positions, so none may be skipped. Check the venue: perp account positions -e ${exchange}`,
+      });
+    }
+    for (const position of positions) out.push({ exchange, position });
+  }
+  return out;
+}
 
 function formatDuration(ms: number): string {
   const hours = Math.floor(ms / (1000 * 60 * 60));
@@ -115,8 +157,13 @@ function formatDuration(ms: number): string {
   return `${minutes}m`;
 }
 
-async function fetchFundingRatesMap(): Promise<Map<string, { exchange: string; rate: number; markPrice: number }[]>> {
-  const rateMap = new Map<string, { exchange: string; rate: number; markPrice: number }[]>();
+/** hourly rate of a rate entry: the entry's own interval (Aster, per symbol) or the venue basis. */
+function entryHourly(e: { exchange: string; rate: number; fundingHours: number | null }): number {
+  return e.fundingHours !== null ? e.rate / e.fundingHours : toHourlyRate(e.rate, e.exchange);
+}
+
+async function fetchFundingRatesMap(): Promise<Map<string, { exchange: string; rate: number; markPrice: number; fundingHours: number | null }[]>> {
+  const rateMap = new Map<string, { exchange: string; rate: number; markPrice: number; fundingHours: number | null }[]>();
 
   // SSOT rule #2: each DEX is independent. allSettled keeps the comparison
   // alive when one DEX errors out, while rejection reasons get logged to
@@ -127,18 +174,26 @@ async function fetchFundingRatesMap(): Promise<Map<string, { exchange: string; r
     fetchLighterOrderBookDetails(),
     fetchLighterFundingRates(),
     fetch("https://fapi.asterdex.com/fapi/v1/premiumIndex").then(r => r.json()) as Promise<Array<Record<string, unknown>>>,
+    fetch("https://fapi.asterdex.com/fapi/v3/fundingInfo").then(r => r.json()) as Promise<Array<Record<string, unknown>>>,
   ]);
-  logSettledRejections(settled, ["pacifica", "hyperliquid", "lighter:orderbook", "lighter:funding", "aster:premiumIndex"], "arb");
+  logSettledRejections(settled, ["pacifica", "hyperliquid", "lighter:orderbook", "lighter:funding", "aster:premiumIndex", "aster:fundingInfo"], "arb");
   const pacAssets = settled[0].status === "fulfilled" ? settled[0].value : [];
   const hlAssets = settled[1].status === "fulfilled" ? settled[1].value : [];
   const ltDetails = settled[2].status === "fulfilled" ? settled[2].value : [];
   const ltFunding = settled[3].status === "fulfilled" ? settled[3].value : [];
-  const asterPremiums = settled[4].status === "fulfilled" ? settled[4].value : [];
+  // Aster funding basis is per symbol: a rate is usable only with its fundingInfo interval.
+  const asterPremiums = settled[4].status === "fulfilled" && settled[5].status === "fulfilled" ? settled[4].value : [];
+  const asterInfo = settled[5].status === "fulfilled" ? settled[5].value : [];
+  const asterHours = new Map<string, number>();
+  for (const row of Array.isArray(asterInfo) ? asterInfo : []) {
+    const h = Number(row.fundingIntervalHours);
+    if (typeof row.symbol === "string" && Number.isFinite(h) && h > 0) asterHours.set(row.symbol, h);
+  }
 
-  const addRate = (sym: string, exchange: string, rate: number, markPrice: number) => {
+  const addRate = (sym: string, exchange: string, rate: number, markPrice: number, fundingHours: number | null = null) => {
     if (!sym) return;
     if (!rateMap.has(sym)) rateMap.set(sym, []);
-    rateMap.get(sym)!.push({ exchange, rate, markPrice });
+    rateMap.get(sym)!.push({ exchange, rate, markPrice, fundingHours });
   };
 
   for (const p of pacAssets) addRate(p.symbol, "pacifica", p.funding, p.mark);
@@ -174,10 +229,39 @@ async function fetchFundingRatesMap(): Promise<Map<string, { exchange: string; r
     const fundingRate = Number(p.lastFundingRate);
     const markPrice = Number(p.markPrice);
     if (!Number.isFinite(fundingRate) || !Number.isFinite(markPrice) || markPrice <= 0) continue;
-    addRate(rawSym.replace(/USDT$/, ""), "aster", fundingRate, markPrice);
+    const hours = asterHours.get(rawSym);
+    if (hours === undefined) continue; // not in /fapi/v3/fundingInfo → cannot normalize
+    addRate(rawSym.replace(/USDT$/, ""), "aster", fundingRate, markPrice, hours);
   }
 
   return rateMap;
+}
+
+/**
+ * State-file entries the venues do not confirm: no live pair with the same symbol and
+ * legs. `arb status` reports them apart from the live pairs (the venue is the source of truth).
+ */
+export function staleArbStateEntries(
+  persisted: ReadonlyArray<{ id: string; symbol: string; longExchange: string; shortExchange: string; entryTime: string; mode?: "perp-perp" | "spot-perp"; spotExchange?: string }>,
+  livePerpPerp: ReadonlyArray<{ symbol: string; longExchange: string; shortExchange: string }>,
+  liveSpotPerp: ReadonlyArray<{ symbol: string; spotExchange: string; perpExchange: string }>,
+): { id: string; symbol: string; mode: "perp-perp" | "spot-perp"; longExchange: string; shortExchange: string; entryTime: string; reason: string }[] {
+  const out: ReturnType<typeof staleArbStateEntries> = [];
+  for (const st of persisted) {
+    const sym = st.symbol.toUpperCase();
+    const live = st.mode === "spot-perp"
+      ? liveSpotPerp.some(p => p.symbol === sym && p.perpExchange === st.shortExchange)
+      : livePerpPerp.some(p => p.symbol === sym && p.longExchange === st.longExchange && p.shortExchange === st.shortExchange);
+    if (live) continue;
+    out.push({
+      id: st.id, symbol: sym, mode: st.mode === "spot-perp" ? "spot-perp" : "perp-perp",
+      longExchange: st.longExchange, shortExchange: st.shortExchange, entryTime: st.entryTime,
+      reason: st.mode === "spot-perp"
+        ? `no ${sym} perp short on ${st.shortExchange}`
+        : `no ${sym} long on ${st.longExchange} with a short on ${st.shortExchange}`,
+    });
+  }
+  return out;
 }
 
 function findArbEntryForPair(symbol: string, longExchange?: string, shortExchange?: string): ExecutionRecord | null {
@@ -206,7 +290,7 @@ function getCurrentSpreadForSymbol(
   symbol: string,
   longExchange: string,
   shortExchange: string,
-  rateMap: Map<string, { exchange: string; rate: number; markPrice: number }[]>,
+  rateMap: Map<string, { exchange: string; rate: number; markPrice: number; fundingHours: number | null }[]>,
 ): number | null {
   const rates = rateMap.get(symbol.toUpperCase());
   if (!rates) return null;
@@ -215,7 +299,7 @@ function getCurrentSpreadForSymbol(
   const shortRate = rates.find(r => r.exchange === shortExchange);
   if (!longRate || !shortRate) return null;
 
-  return computeAnnualSpread(shortRate.rate, shortRate.exchange, longRate.rate, longRate.exchange);
+  return Math.abs(entryHourly(shortRate) - entryHourly(longRate)) * 24 * 365 * 100;
 }
 
 // ── Registration ──
@@ -241,25 +325,18 @@ export function registerArbManageCommands(
       // Fetch positions from all exchanges
       const allPositions: { exchange: string; symbol: string; side: "long" | "short"; size: number; entryPrice: number; markPrice: number; unrealizedPnl: number; leverage: number }[] = [];
 
-      for (const exName of EXCHANGES) {
-        try {
-          const adapter = await getAdapterForExchange(exName);
-          const positions = await adapter.getPositions();
-          for (const p of positions) {
-            allPositions.push({
-              exchange: exName,
-              symbol: p.symbol.replace("-PERP", "").toUpperCase(),
-              side: p.side,
-              size: Math.abs(Number(p.size)),
-              entryPrice: Number(p.entryPrice),
-              markPrice: Number(p.markPrice),
-              unrealizedPnl: Number(p.unrealizedPnl),
-              leverage: p.leverage,
-            });
-          }
-        } catch {
-          // exchange not configured, skip
-        }
+      const venuesChecked = await listArbVenues();
+      for (const { exchange, position: p } of await readArbVenuePositions(venuesChecked, getAdapterForExchange)) {
+        allPositions.push({
+          exchange,
+          symbol: p.symbol.replace("-PERP", "").toUpperCase(),
+          side: p.side,
+          size: Math.abs(Number(p.size)),
+          entryPrice: Number(p.entryPrice),
+          markPrice: Number(p.markPrice),
+          unrealizedPnl: Number(p.unrealizedPnl),
+          leverage: p.leverage,
+        });
       }
 
       // Group by symbol to detect arb pairs
@@ -273,7 +350,7 @@ export function registerArbManageCommands(
       const arbPairs: ArbPairPosition[] = [];
 
       // Fetch current funding rates for spread calculation
-      let rateMap: Map<string, { exchange: string; rate: number; markPrice: number }[]>;
+      let rateMap: Map<string, { exchange: string; rate: number; markPrice: number; fundingHours: number | null }[]>;
       try {
         rateMap = await fetchFundingRatesMap();
       } catch {
@@ -388,36 +465,22 @@ export function registerArbManageCommands(
 
       // Collect spot balances per exchange
       const spotBalancesByExchange = new Map<string, SpotBalance[]>();
-      const SPOT_EXCHANGES = ["hyperliquid", "lighter"];
-
-      for (const exName of SPOT_EXCHANGES) {
+      // Bot/arb spot scope (§12.4 #3): configured venues with a separate spot balance + transfer.
+      const configuredVenues = new Set<string>(await listConfiguredAccountVenues());
+      for (const def of listBotSpotVenues()) {
+        if (!configuredVenues.has(def.id)) continue;
         try {
-          const adapter = await getAdapterForExchange(exName);
-          if (exName === "hyperliquid") {
-            const { HyperliquidSpotAdapter } = await import("../../exchanges/hyperliquid-spot.js");
-            const hlSpot = new HyperliquidSpotAdapter(adapter as import("../../exchanges/hyperliquid.js").HyperliquidAdapter);
-            await hlSpot.init();
-            const balances = await hlSpot.getSpotBalances();
-            spotBalancesByExchange.set(exName, balances.filter(b => {
-              const base = b.token.replace(/-SPOT$/i, "").toUpperCase();
-              return base !== "USDC" && Number(b.total) > 0;
-            }));
-          } else if (exName === "lighter") {
-            const { LighterSpotAdapter } = await import("../../exchanges/lighter-spot.js");
-            const ltSpot = new LighterSpotAdapter(adapter as import("../../exchanges/lighter.js").LighterAdapter);
-            await ltSpot.init();
-            const balances = await ltSpot.getSpotBalances();
-            spotBalancesByExchange.set(exName, balances.filter(b =>
-              b.token !== "USDC" && b.token !== "USDC_SPOT" && Number(b.total) > 0
-            ));
-          }
-        } catch {
-          // exchange not configured or no spot support
+          const adapter = await getAdapterForExchange(def.id);
+          const spot = await requireSpotAdapter(def.id, adapter);
+          spotBalancesByExchange.set(def.id, nonQuoteSpotBalances(def, spotNetworkOf(spot), await spot.getSpotBalances()));
+        } catch (e) {
+          process.stderr.write(`[warn] ${def.displayName} spot balances unavailable: ${e instanceof Error ? e.message : String(e)}\n`);
         }
       }
 
       // Load persisted arb state for spot-perp entries
-      const persistedSpotPerp = getArbStatePositions().filter(p => p.mode === "spot-perp");
+      const persistedAll = getArbStatePositions(networkOf(program));
+      const persistedSpotPerp = persistedAll.filter(p => p.mode === "spot-perp");
       const persistedSymbols = new Set(persistedSpotPerp.map(p => p.symbol.toUpperCase()));
 
       // Match: spot balance + perp short on same symbol (different or same exchange)
@@ -458,7 +521,7 @@ export function registerArbManageCommands(
             const rates = rateMap.get(perpSymbol);
             const perpRate = rates?.find(r => r.exchange === shortPos.exchange);
             const fundingRate = perpRate?.rate ?? 0;
-            const hourlyRate = fundingRate ? toHourlyRate(fundingRate, shortPos.exchange) : 0;
+            const hourlyRate = perpRate && fundingRate ? entryHourly(perpRate) : 0;
             const annualPct = hourlyRate * 8760 * 100;
 
             const perpNotional = shortPos.size * shortPos.markPrice;
@@ -540,7 +603,7 @@ export function registerArbManageCommands(
         const holdDurationMs = Date.now() - new Date(persisted.entryTime).getTime();
         const rates = rateMap.get(sym);
         const perpRate = rates?.find(r => r.exchange === persisted.shortExchange);
-        const hourlyRate = perpRate ? toHourlyRate(perpRate.rate, persisted.shortExchange) : 0;
+        const hourlyRate = perpRate ? entryHourly(perpRate) : 0;
         const perpNotional = shortPos.size * shortPos.markPrice;
 
         spotPerpPositions.push({
@@ -569,6 +632,11 @@ export function registerArbManageCommands(
         });
       }
 
+      // State vs venue: the venue is the source of truth. A pair is reported only when the
+      // venues show its legs; the state file contributes entry time / funding to a pair that
+      // is live. State entries with no live counterpart are listed apart, never as positions.
+      const staleStateEntries = staleArbStateEntries(persistedAll, arbPairs, spotPerpPositions);
+
       // ── JSON output ──
       if (isJson()) {
         const totalNotionalPP = arbPairs.reduce((s, p) => s + (p.longPosition.notionalUsd + p.shortPosition.notionalUsd) / 2, 0);
@@ -580,6 +648,8 @@ export function registerArbManageCommands(
         return printJson(jsonOk({
           perpPerpPairs: arbPairs,
           spotPerpPairs: spotPerpPositions,
+          venuesChecked,
+          staleStateEntries,
           aggregate: {
             perpPerpCount: arbPairs.length,
             spotPerpCount: spotPerpPositions.length,
@@ -595,8 +665,11 @@ export function registerArbManageCommands(
         }));
       }
 
+      for (const st of staleStateEntries) {
+        console.log(chalk.yellow(`  Stale state entry (not on the venue, not counted): ${st.symbol} ${st.mode} ${st.longExchange}/${st.shortExchange} since ${st.entryTime}`));
+      }
       if (arbPairs.length === 0 && spotPerpPositions.length === 0) {
-        console.log(chalk.gray("  No open arb positions found.\n"));
+        console.log(chalk.gray(`  No open arb positions found on ${venuesChecked.join(", ")}.\n`));
         return;
       }
 
@@ -722,20 +795,31 @@ export function registerArbManageCommands(
 
   // ── arb close ──
 
-  arb
-    .command("close <symbol>")
-    .description("Manually close an arb position on both exchanges")
-    .option("--dry-run", "Show what would happen without executing")
+  supportsDryRun(arb.command("close <symbol>"))
+    .description("Manually close an arb position on both exchanges (supports --dry-run)")
     .option("--pair <pair>", "Specify arb pair as longExchange:shortExchange (e.g. pacifica:hyperliquid)")
     .option("--smart", "Smart execution: IOC limit at best bid/ask + 1 tick (reduces slippage)")
-    .option("--spot-exch <exchange>", "Override spot exchange for spot-perp close (hl or lt)")
+    .option("--spot-exch <exchange>", "Override spot exchange for spot-perp close (a bot spot venue: hl, lt, lrh, aster, ondo)")
     .option("--perp-exch <exchange>", "Override perp exchange for spot-perp close")
-    .action(async (symbol: string, opts: { dryRun?: boolean; pair?: string; smart?: boolean; spotExch?: string; perpExch?: string }) => {
+    .option("--force", "Act on a quarantined symbol (after checking its positions by hand)")
+    .action(async (symbol: string, opts: { pair?: string; smart?: boolean; spotExch?: string; perpExch?: string; force?: boolean }, cmd: Command) => {
       const sym = symbol.toUpperCase();
-      const dryRun = !!opts.dryRun || process.argv.includes("--dry-run");
+      const dryRun = isDryRun(cmd);
+
+      // Global quarantine (design §12.3): an unknown / unhedged outcome was recorded for
+      // this symbol. A human may still close it, but only knowingly (--force).
+      const quarantined = quarantineEntryFor(sym, (m) => console.error(chalk.red(m)));
+      if (quarantined !== null) {
+        if (!opts.force && !dryRun) {
+          throw new PerpError("RISK_VIOLATION", `${sym} is quarantined (${quarantined.strategy}: ${quarantined.reason})`, {
+            remediation: `${quarantined.remediation}. To close it anyway after checking the positions: perp arb close ${sym} --force`,
+          });
+        }
+        if (!isJson()) console.error(chalk.yellow(`  WARNING: ${sym} is quarantined (${quarantined.strategy}: ${quarantined.reason})${opts.force ? " — proceeding (--force)" : ""}. The quarantine is NOT cleared by this close: perp strategy quarantine-clear ${sym}`));
+      }
 
       // Check if this is a spot-perp position (auto-detect from arb state)
-      const arbState = loadArbState();
+      const arbState = loadArbState(networkOf(program));
       const statePos = arbState?.positions?.find(p => p.symbol.toUpperCase() === sym && p.mode === "spot-perp");
       if (statePos) {
         // ── Inline spot-perp close logic ──
@@ -750,147 +834,16 @@ export function registerArbManageCommands(
           return;
         }
 
-        // Load spot adapter
-        const { HyperliquidSpotAdapter } = await import("../../exchanges/hyperliquid-spot.js");
-        const { LighterSpotAdapter } = await import("../../exchanges/lighter-spot.js");
-        let spotAdapter: import("../../exchanges/spot-interface.js").SpotAdapter;
-        if (spotExch === "hyperliquid") {
-          const hlAdapter = await getAdapterForExchange("hyperliquid") as import("../../exchanges/hyperliquid.js").HyperliquidAdapter;
-          const hlSpot = new HyperliquidSpotAdapter(hlAdapter);
-          await hlSpot.init();
-          spotAdapter = hlSpot;
-        } else {
-          const ltAdapter = await getAdapterForExchange("lighter") as import("../../exchanges/lighter.js").LighterAdapter;
-          const ltSpot = new LighterSpotAdapter(ltAdapter);
-          await ltSpot.init();
-          spotAdapter = ltSpot;
+        if (dryRun) {
+          // Dry-run: nothing is sold, bought or transferred.
+          const plan = { status: "simulated", dryRun: true, sent: false, mode: "spot-perp", symbol: sym, spotExchange: spotExch, perpExchange: perpExch, longSize: statePos.longSize, shortSize: statePos.shortSize };
+          if (isJson()) return printJson(jsonOk(plan));
+          console.log(chalk.cyan(`  [DRY-RUN] Would close spot-perp ${sym}: sell spot on ${spotExch} + buy back the perp short on ${perpExch}`));
+          return;
         }
-
-        const perpAdapter = await getAdapterForExchange(perpExch);
-        const spotSymbol = `${sym}/USDC`;
-
-        // Find how much to close
-        const perpPositions = await perpAdapter.getPositions();
-        const perpPos = perpPositions.find(p =>
-          p.symbol.replace("-PERP", "").toUpperCase() === sym && p.side === "short"
-        );
-        if (!perpPos) {
-          const msg = `No short perp position found for ${sym} on ${perpExch}`;
-          if (isJson()) return printJson(jsonOk({ error: msg }));
-          console.log(chalk.red(`  ${msg}`)); return;
-        }
-
-        const closeSize = perpPos.size;
-        if (!isJson()) {
-          console.log(chalk.cyan(`\n  Closing Spot+Perp Arb: ${sym}`));
-          console.log(chalk.gray(`    SPOT  ${spotExch}: sell ${closeSize}`));
-          console.log(chalk.gray(`    PERP  ${perpExch}: buy  ${closeSize} (close short)`));
-          console.log(chalk.gray(`    Executing...\n`));
-        }
-
-        // Same exchange -> sequential (nonce collision), different -> parallel
-        let spotResult: PromiseSettledResult<unknown>;
-        let perpResult: PromiseSettledResult<unknown>;
-        if (spotExch === perpExch) {
-          spotResult = await spotAdapter.spotMarketOrder(spotSymbol, "sell", closeSize)
-            .then(r => ({ status: "fulfilled" as const, value: r }))
-            .catch(e => ({ status: "rejected" as const, reason: e }));
-          perpResult = await perpAdapter.marketOrder(sym, "buy", closeSize)
-            .then(r => ({ status: "fulfilled" as const, value: r }))
-            .catch(e => ({ status: "rejected" as const, reason: e }));
-        } else {
-          [spotResult, perpResult] = await Promise.allSettled([
-            spotAdapter.spotMarketOrder(spotSymbol, "sell", closeSize),
-            perpAdapter.marketOrder(sym, "buy", closeSize),
-          ]);
-        }
-
-        const spotOk = spotResult.status === "fulfilled";
-        const perpOk = perpResult.status === "fulfilled";
-
-        if (spotOk && perpOk) {
-          // Post-close fill verification
-          let closeVerified = true;
-          const closeWarnings: string[] = [];
-          try {
-            await new Promise(r => setTimeout(r, 800));
-            const spotBals = await spotAdapter.getSpotBalances();
-            const spotTokenBal = spotBals.find(b => b.token.toUpperCase().startsWith(sym));
-            const remainingSpotAmt = Number(spotTokenBal?.total ?? 0);
-            const closedSize = parseFloat(closeSize);
-            if (remainingSpotAmt > closedSize * 0.5) {
-              closeVerified = false;
-              closeWarnings.push(`Spot sell may not have filled: still have ${remainingSpotAmt.toFixed(6)} ${sym} (expected ~0)`);
-            }
-            const perpPositionsAfter = await perpAdapter.getPositions();
-            const remainingPerpPos = perpPositionsAfter.find(p =>
-              p.symbol.replace("-PERP", "").toUpperCase() === sym && p.side === "short"
-            );
-            if (remainingPerpPos && Number(remainingPerpPos.size) > closedSize * 0.5) {
-              closeVerified = false;
-              closeWarnings.push(`Perp short still open: ${remainingPerpPos.size} ${sym} on ${perpExch} (expected closed)`);
-            }
-          } catch (verifyErr) {
-            closeWarnings.push(`Close verification failed: ${verifyErr instanceof Error ? verifyErr.message : String(verifyErr)}`);
-          }
-
-          if (closeWarnings.length > 0 && !isJson()) {
-            for (const w of closeWarnings) console.log(chalk.yellow(`  Warning: ${w}`));
-          }
-
-          persistRemovePosition(sym);
-          logExecution({
-            type: "arb_close", exchange: `spot:${spotExch}+${perpExch}`,
-            symbol: sym, side: "exit", size: closeSize,
-            status: closeVerified ? "success" : "unverified", dryRun: false,
-            meta: { mode: "spot-perp", ...(closeWarnings.length > 0 && { warnings: closeWarnings }) },
-          });
-
-          // Return spot USDC proceeds back to perp account
-          if (spotExch === "lighter") {
-            try {
-              const ltSpot = spotAdapter as import("../../exchanges/lighter-spot.js").LighterSpotAdapter;
-              const bals = await ltSpot.getSpotBalances();
-              const usdcBal = bals.find(b => b.token === "USDC");
-              const leftover = Number(usdcBal?.available ?? 0);
-              if (leftover > 0.01) {
-                await ltSpot.transferUsdcToPerp(leftover);
-                if (!isJson()) console.log(chalk.gray(`  Returned ~$${leftover.toFixed(2)} USDC spot->perp on Lighter`));
-              }
-            } catch { /* non-critical */ }
-          } else if (spotExch === "hyperliquid") {
-            try {
-              const hlSpot = spotAdapter as import("../../exchanges/hyperliquid-spot.js").HyperliquidSpotAdapter;
-              const bals = await hlSpot.getSpotBalances();
-              const usdcBal = bals.find(b => b.token.startsWith("USDC"));
-              const leftover = Number(usdcBal?.available ?? 0);
-              if (leftover > 1) await hlSpot.transferUsdcToPerp(Math.floor(leftover));
-            } catch { /* non-critical */ }
-          }
-
-          const closeResult = {
-            status: closeVerified ? "closed" : "closed_unverified",
-            mode: "spot-perp", symbol: sym, size: closeSize,
-            ...(closeWarnings.length > 0 && { warnings: closeWarnings }),
-          };
-          if (isJson()) return printJson(jsonOk(closeResult));
-          if (closeVerified) {
-            console.log(chalk.green(`  CLOSED (verified): ${sym} ${closeSize} units`));
-          } else {
-            console.log(chalk.yellow(`  CLOSED (unverified): ${sym} ${closeSize} units -- check positions manually`));
-          }
-          console.log(chalk.green(`    SPOT  ${spotExch}: sold`));
-          console.log(chalk.green(`    PERP  ${perpExch}: bought (closed short)\n`));
-        } else {
-          const errors: string[] = [];
-          if (!spotOk) errors.push(`Spot sell failed: ${(spotResult as PromiseRejectedResult).reason}`);
-          if (!perpOk) errors.push(`Perp buy failed: ${(perpResult as PromiseRejectedResult).reason}`);
-          const result = { status: "partial_close", symbol: sym, spotOk, perpOk, errors };
-          if (isJson()) return printJson(jsonOk(result));
-          console.log(chalk.red(`  Close partially failed:`));
-          for (const e of errors) console.log(chalk.red(`    ${e}`));
-          console.log(chalk.yellow(`  Manual intervention may be needed.\n`));
-        }
+        // One implementation for spot-perp close (fill-checked legs, §12.4 #5): arb-auto's handler.
+        if (handleSpotClose === undefined) throw new Error("spot-perp close handler is not registered (registerArbAutoCommands not called)");
+        await handleSpotClose(sym, { spotExch, perpExch }, getAdapterForExchange, isJson);
         return;
       }
 
@@ -902,30 +855,23 @@ export function registerArbManageCommands(
       }
 
       // Find positions for this symbol across all exchanges
-      const allPositions: { exchange: string; symbol: string; rawSymbol: string; side: "long" | "short"; size: number; entryPrice: number; markPrice: number; unrealizedPnl: number }[] = [];
+      const allPositions: { exchange: string; symbol: string; rawSymbol: string; side: "long" | "short"; size: number; sizeRaw: string; entryPrice: number; markPrice: number; unrealizedPnl: number }[] = [];
 
-      for (const exName of EXCHANGES) {
-        try {
-          const adapter = await getAdapterForExchange(exName);
-          const positions = await adapter.getPositions();
-          for (const p of positions) {
-            const normalized = p.symbol.replace("-PERP", "").toUpperCase();
-            if (normalized === sym) {
-              allPositions.push({
-                exchange: exName,
-                symbol: normalized,
-                rawSymbol: p.symbol,
-                side: p.side,
-                size: Math.abs(Number(p.size)),
-                entryPrice: Number(p.entryPrice),
-                markPrice: Number(p.markPrice),
-                unrealizedPnl: Number(p.unrealizedPnl),
-              });
-            }
-          }
-        } catch {
-          // exchange not configured, skip
-        }
+      const venuesChecked = await listArbVenues();
+      for (const { exchange, position: p } of await readArbVenuePositions(venuesChecked, getAdapterForExchange)) {
+        const normalized = p.symbol.replace("-PERP", "").toUpperCase();
+        if (normalized !== sym) continue;
+        allPositions.push({
+          exchange,
+          symbol: normalized,
+          rawSymbol: p.symbol,
+          side: p.side,
+          size: Math.abs(Number(p.size)),
+          sizeRaw: String(p.size).trim().replace(/^[-+]/, ""), // venue's own size string, used verbatim for the close
+          entryPrice: Number(p.entryPrice),
+          markPrice: Number(p.markPrice),
+          unrealizedPnl: Number(p.unrealizedPnl),
+        });
       }
 
       // Find all possible arb pairs (long on one exchange, short on another)
@@ -943,7 +889,12 @@ export function registerArbManageCommands(
       let shortPos: typeof allPositions[0] | undefined;
 
       if (opts.pair) {
-        const [longEx, shortEx] = opts.pair.split(":");
+        const parts = opts.pair.split(":");
+        if (parts.length !== 2 || parts[0] === "" || parts[1] === "") {
+          throw new PerpError("INVALID_PARAMS", `--pair must be longExchange:shortExchange, got "${opts.pair}"`, { remediation: `Example: perp arb close ${sym} --pair aster:arcus` });
+        }
+        const longEx: string = resolveVenueId(parts[0]);
+        const shortEx: string = resolveVenueId(parts[1]);
         const match = possiblePairs.find(p => p.long.exchange === longEx && p.short.exchange === shortEx);
         if (match) {
           longPos = match.long;
@@ -954,40 +905,28 @@ export function registerArbManageCommands(
         shortPos = possiblePairs[0].short;
       } else if (possiblePairs.length > 1) {
         // Multiple pairs found — require explicit --pair selection
-        const msg = `Multiple arb pairs found for ${sym}. Use --pair to specify which one to close.`;
-        if (isJson()) {
-          return printJson(jsonOk({
-            error: msg,
-            pairs: possiblePairs.map(p => ({
-              arbPairId: `${sym}:${p.long.exchange}:${p.short.exchange}`,
-              longExchange: p.long.exchange,
-              shortExchange: p.short.exchange,
-              longSize: p.long.size,
-              shortSize: p.short.size,
-            })),
-          }));
-        }
-        console.log(chalk.red(`  ${msg}\n`));
-        console.log(chalk.white("  Available pairs:"));
-        for (const p of possiblePairs) {
-          console.log(chalk.gray(`    --pair ${p.long.exchange}:${p.short.exchange}  (long ${p.long.size} / short ${p.short.size})`));
-        }
-        console.log();
-        return;
+        throw new PerpError("INVALID_PARAMS", `Multiple arb pairs found for ${sym}. Use --pair to specify which one to close.`, {
+          pairs: possiblePairs.map(p => ({
+            arbPairId: `${sym}:${p.long.exchange}:${p.short.exchange}`,
+            longExchange: p.long.exchange,
+            shortExchange: p.short.exchange,
+            longSize: p.long.size,
+            shortSize: p.short.size,
+          })),
+          remediation: `Pick one: ${possiblePairs.map(p => `--pair ${p.long.exchange}:${p.short.exchange}`).join(" | ")}`,
+        });
       }
 
       if (!longPos || !shortPos) {
-        const msg = `No arb pair found for ${sym}. Need long and short on different exchanges.`;
-        if (isJson()) return printJson(jsonOk({ error: msg, positions: allPositions }));
-        console.log(chalk.red(`  ${msg}`));
-        if (allPositions.length > 0) {
-          console.log(chalk.gray(`  Found ${allPositions.length} position(s) but no matching arb pair:`));
-          for (const p of allPositions) {
-            console.log(chalk.gray(`    ${p.side.toUpperCase()} ${p.exchange} size=${p.size}`));
-          }
-        }
-        console.log();
-        return;
+        const found = allPositions.map(p => `${p.side} ${p.sizeRaw} on ${p.exchange}`).join(", ");
+        throw new PerpError("POSITION_NOT_FOUND", `No arb pair found for ${sym}${opts.pair ? ` on ${opts.pair}` : ""}. Need long and short on different exchanges.`, {
+          symbol: sym,
+          venuesChecked,
+          positions: allPositions.map(p => ({ exchange: p.exchange, side: p.side, size: p.sizeRaw })),
+          remediation: allPositions.length > 0
+            ? `${sym} positions found: ${found}. Close a single leg with: perp trade close ${sym} -e <exchange>`
+            : `No ${sym} position on ${venuesChecked.join(", ")}. See the live pairs: perp arb status`,
+        });
       }
 
       // Calculate estimated PnL
@@ -1011,6 +950,7 @@ export function registerArbManageCommands(
       if (dryRun) {
         const result = {
           dryRun: true,
+          sent: false,
           symbol: sym,
           longExchange: longPos.exchange,
           shortExchange: shortPos.exchange,
@@ -1031,81 +971,35 @@ export function registerArbManageCommands(
         return;
       }
 
-      // Execute close on both exchanges with retry
-      const MAX_RETRIES = 2;
-      const results: { exchange: string; action: string; status: string; error?: string; retries: number }[] = [];
-
-      async function closeWithRetry(
-        exchange: string,
-        rawSymbol: string,
-        side: "buy" | "sell",
-        size: number,
-        label: string,
-      ) {
-        let lastError = "";
-        for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-          try {
-            const adapter = await getAdapterForExchange(exchange);
-            if (opts.smart) {
-              await smartOrder(adapter, rawSymbol, side, String(size), { reduceOnly: true });
-            } else {
-              await adapter.marketOrder(rawSymbol, side, String(size));
-            }
-            results.push({ exchange, action: `${side} (close ${label})`, status: "success", retries: attempt });
-            if (!isJson()) console.log(chalk.green(`  Closed ${label} on ${exchange}: ${side.toUpperCase()} ${size} ${sym}${opts.smart ? " (smart)" : ""}${attempt > 0 ? ` (retry ${attempt})` : ""}`));
-            return;
-          } catch (err) {
-            lastError = err instanceof Error ? err.message : String(err);
-            if (attempt < MAX_RETRIES) {
-              if (!isJson()) console.log(chalk.yellow(`  Retry ${attempt + 1}/${MAX_RETRIES} for ${label} on ${exchange}...`));
-              await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
-            }
-          }
+      // Close the legs sequentially (long, then short), reduce-only and verified, each
+      // sized from the venue's own position size. No retries: a definite failure of the
+      // long close changes nothing; an unknown outcome or a leg left open after the
+      // other closed quarantines the symbol (design §12.3).
+      const results: { exchange: string; action: string; status: string; error?: string }[] = [];
+      const closeRes = await closePerpPairVerified({
+        source: "arb-close", sym,
+        longAdapter: await getAdapterForExchange(longPos.exchange), longExch: longPos.exchange, longSym: longPos.rawSymbol, longSize: longPos.sizeRaw,
+        shortAdapter: await getAdapterForExchange(shortPos.exchange), shortExch: shortPos.exchange, shortSym: shortPos.rawSymbol, shortSize: shortPos.sizeRaw,
+        smart: !!opts.smart,
+        log: (m) => console.error(chalk.red(m)),
+      });
+      if (closeRes.status === "closed") {
+        results.push({ exchange: longPos.exchange, action: "sell (close long)", status: "success" });
+        results.push({ exchange: shortPos.exchange, action: "buy (close short)", status: "success" });
+        if (!isJson()) {
+          console.log(chalk.green(`  Closed long on ${longPos.exchange}: SELL ${longPos.sizeRaw} ${sym} (reduce-only, verified${opts.smart ? ", smart" : ""})`));
+          console.log(chalk.green(`  Closed short on ${shortPos.exchange}: BUY ${shortPos.sizeRaw} ${sym} (reduce-only, verified${opts.smart ? ", smart" : ""})`));
         }
-        results.push({ exchange, action: `${side} (close ${label})`, status: "failed", error: lastError, retries: MAX_RETRIES });
-        if (!isJson()) console.error(chalk.red(`  Failed to close ${label} on ${exchange}: ${lastError}`));
+      } else {
+        results.push({ exchange: `${longPos.exchange}+${shortPos.exchange}`, action: "close", status: closeRes.status, error: closeRes.reason });
+        if (!isJson()) console.error(chalk.red(`  ${closeRes.status === "quarantined" ? "QUARANTINED" : "Close failed (nothing changed, both legs open)"}: ${closeRes.reason}`));
       }
-
-      // Close both legs concurrently
-      await Promise.all([
-        closeWithRetry(longPos.exchange, longPos.rawSymbol, "sell", longPos.size, "long"),
-        closeWithRetry(shortPos.exchange, shortPos.rawSymbol, "buy", shortPos.size, "short"),
-      ]);
-
-      const allSuccess = results.every(r => r.status === "success");
-      const anySuccess = results.some(r => r.status === "success");
-
-      // Verify positions are actually closed
-      let verification: { exchange: string; remainingSize: number; closed: boolean }[] | undefined;
-      if (anySuccess) {
-        verification = [];
-        for (const r of results) {
-          if (r.status !== "success") continue;
-          try {
-            const adapter = await getAdapterForExchange(r.exchange);
-            const positions = await adapter.getPositions();
-            const remaining = positions.find(p =>
-              p.symbol.replace("-PERP", "").toUpperCase() === sym
-            );
-            verification.push({
-              exchange: r.exchange,
-              remainingSize: remaining ? Math.abs(Number(remaining.size)) : 0,
-              closed: !remaining || Math.abs(Number(remaining.size)) < 0.0001,
-            });
-          } catch {
-            verification.push({ exchange: r.exchange, remainingSize: -1, closed: false });
-          }
-        }
-
-        const notClosed = verification.filter(v => !v.closed);
-        if (notClosed.length > 0 && !isJson()) {
-          console.log(chalk.yellow(`\n  Warning: Position may not be fully closed on: ${notClosed.map(v => v.exchange).join(", ")}`));
-        }
-      }
+      const allSuccess = closeRes.status === "closed";
 
       // Remove from persisted daemon state (so daemon doesn't try to re-close)
       if (allSuccess) {
-        try { persistRemovePosition(sym); } catch { /* state may not exist */ }
+        // No catch (Rule #2): an absent state file is a no-op; a wrong-network/unreadable one must surface.
+        persistRemovePosition(networkOf(program), sym);
       }
 
       // Log to execution log
@@ -1136,21 +1030,20 @@ export function registerArbManageCommands(
           symbol: sym,
           longExchange: longPos.exchange,
           shortExchange: shortPos.exchange,
-          status: allSuccess ? "success" : anySuccess ? "partial" : "failed",
+          status: allSuccess ? "success" : closeRes.status,
           unrealizedPnl: totalUpnl,
           estimatedFees: totalFees,
           netPnl,
           results,
-          verification,
         }));
       }
 
-      if (!allSuccess && anySuccess) {
-        console.log(chalk.yellow(`\n  Warning: Partial close — one leg failed. Manual intervention may be needed.\n`));
+      if (closeRes.status === "quarantined") {
+        console.log(chalk.red.bold(`\n  ${sym} quarantined — a leg may still be open. Check both venues by hand.\n`));
       } else if (allSuccess) {
         console.log(chalk.green(`\n  Arb position ${sym} closed successfully.\n`));
       } else {
-        console.log(chalk.red(`\n  Failed to close arb position ${sym}. Both legs failed.\n`));
+        console.log(chalk.red(`\n  Failed to close arb position ${sym}. Both legs are still open (hedged).\n`));
       }
     });
 
@@ -1481,18 +1374,18 @@ export function registerArbManageCommands(
       console.log(chalk.gray(`  Run 'perp arb auto --help' for all options.\n`));
     });
 
-  arb
-    .command("rebalance")
-    .description("Cross-exchange balance rebalancing for arb")
+  // Plan-only (never moves funds) — --dry-run only labels the plan.
+  supportsDryRun(arb.command("rebalance"))
+    .description("Cross-exchange balance rebalancing plan for arb (read-only; execute with perp funds rebalance execute)")
     .option("--check", "Show current balance distribution")
     .option("--target <ratio>", "Target distribution ratio (e.g., '50:50' for 2 exchanges, '33:33:33' for 3)")
     .option("--amount <usd>", "Total amount to rebalance")
-    .option("--dry-run", "Show plan without executing")
     .option("--exchanges <list>", "Comma-separated exchanges", "lighter,pacifica,hyperliquid")
     .action(async (opts: {
       check?: boolean; target?: string; amount?: string;
-      dryRun?: boolean; exchanges: string;
-    }) => {
+      exchanges: string;
+    }, cmd: Command) => {
+      const dryRun = isDryRun(cmd);
       const exchangeNames = opts.exchanges.split(",").map(e => e.trim());
       const adapters = new Map<string, ExchangeAdapter>();
 
@@ -1594,7 +1487,7 @@ export function registerArbManageCommands(
       // If --amount specified, scale moves proportionally
       let moves = plan.moves;
       if (opts.amount) {
-        const requestedAmount = parseFloat(opts.amount);
+        const requestedAmount = Number(parsePositiveDecimal(opts.amount, "--amount"));
         const totalMoveAmount = moves.reduce((s, m) => s + m.amount, 0);
         if (totalMoveAmount > 0) {
           const scale = Math.min(1, requestedAmount / totalMoveAmount);
@@ -1635,7 +1528,7 @@ export function registerArbManageCommands(
 
       if (isJson()) {
         return printJson(jsonOk({
-          status: opts.dryRun ? "dry_run" : "planned",
+          status: dryRun ? "dry_run" : "planned",
           target: weights,
           moves: moveDetails,
           snapshots,
@@ -1679,7 +1572,7 @@ export function registerArbManageCommands(
       const totalFees = moveDetails.reduce((s, m) => s + m.bridgeFee, 0);
       console.log(chalk.gray(`  Total bridge fees: ~$${totalFees.toFixed(2)}`));
 
-      if (opts.dryRun) {
+      if (dryRun) {
         console.log(chalk.yellow("\n  [DRY RUN] No transfers executed.\n"));
       } else {
         console.log(chalk.yellow("\n  To execute, use: perp funds rebalance execute --auto-bridge\n"));
@@ -1701,23 +1594,15 @@ export function registerArbManageCommands(
     // Fetch positions to identify arb pairs
     const fundingPositions: { exchange: string; symbol: string; side: "long" | "short"; size: number; markPrice: number }[] = [];
 
-    for (const exName of EXCHANGES) {
-      try {
-        const adapter = await getAdapter(exName);
-        const positions = await adapter.getPositions();
-        for (const p of positions) {
-          const normalized = p.symbol.replace("-PERP", "").toUpperCase();
-          fundingPositions.push({
-            exchange: exName,
-            symbol: normalized,
-            side: p.side,
-            size: Math.abs(Number(p.size)),
-            markPrice: Number(p.markPrice),
-          });
-        }
-      } catch {
-        // exchange not configured
-      }
+    const fundingVenues = await listArbVenues();
+    for (const { exchange, position: p } of await readArbVenuePositions(fundingVenues, getAdapter)) {
+      fundingPositions.push({
+        exchange,
+        symbol: p.symbol.replace("-PERP", "").toUpperCase(),
+        side: p.side,
+        size: Math.abs(Number(p.size)),
+        markPrice: Number(p.markPrice),
+      });
     }
 
     // Identify arb pairs (long on one exchange, short on another)
@@ -1750,7 +1635,7 @@ export function registerArbManageCommands(
     const allPayments: FundingPaymentRow[] = [];
     const cutoff = Date.now() - periodDays * 24 * 60 * 60 * 1000;
 
-    for (const exName of EXCHANGES) {
+    for (const exName of fundingVenues) {
       try {
         const adapter = await getAdapter(exName);
         const payments = await adapter.getFundingPayments(200);
@@ -1765,8 +1650,9 @@ export function registerArbManageCommands(
             payment: typeof p.payment === "string" ? parseFloat(p.payment) : Number(p.payment),
           });
         }
-      } catch {
-        // exchange not configured or no payments
+      } catch (e) {
+        // Reported, not hidden: this venue's payments are missing from the totals below.
+        process.stderr.write(`[warn] ${exName} funding payments unavailable (left out of the totals): ${e instanceof Error ? e.message : String(e)}\n`);
       }
     }
 

@@ -1,5 +1,9 @@
+import { assertCanClosePositions } from "../exchanges/trading-v2.js";
 import type { ExchangeAdapter } from "../exchanges/index.js";
+import { resolveAdapterSlippage } from "../exchanges/slippage.js";
 import { updateJobState } from "../jobs.js";
+import { reportedAvgFillPrice } from "../exchanges/ioc-outcome.js";
+import { formatComputedPrice } from "../exchanges/precision.js";
 
 export interface TWAPParams {
   symbol: string;
@@ -8,6 +12,7 @@ export interface TWAPParams {
   durationSec: number;
   slices?: number;       // default: duration / 30 (one slice every 30s)
   maxSlippage?: number;  // % slippage tolerance per slice, default 1
+  reduceOnly?: boolean;
 }
 
 export interface TWAPState {
@@ -15,7 +20,11 @@ export interface TWAPState {
   remaining: number;
   slicesDone: number;
   totalSlices: number;
-  avgPrice: number;
+  /**
+   * Size-weighted average of the venue-reported FILL prices of the slices; null while any
+   * filled slice has no reported fill price (never the limit / slippage-protection price).
+   */
+  avgPrice: number | null;
   errors: number;
   startedAt: number;
   lastSliceAt: number;
@@ -27,6 +36,7 @@ export async function runTWAP(
   jobId?: string,
   log: (msg: string) => void = console.log,
 ): Promise<TWAPState> {
+  assertCanClosePositions(adapter, `TWAP on ${adapter.name}`);
   const totalSlices = params.slices || Math.max(Math.floor(params.durationSec / 30), 2);
   const sliceSize = params.totalSize / totalSlices;
   const intervalMs = (params.durationSec * 1000) / totalSlices;
@@ -36,7 +46,7 @@ export async function runTWAP(
     remaining: params.totalSize,
     slicesDone: 0,
     totalSlices,
-    avgPrice: 0,
+    avgPrice: null,
     errors: 0,
     startedAt: Date.now(),
     lastSliceAt: 0,
@@ -47,6 +57,7 @@ export async function runTWAP(
   log(`[TWAP] Exchange: ${adapter.name}`);
 
   let totalCost = 0;
+  let everySlicePriced = true;
 
   for (let i = 0; i < totalSlices; i++) {
     if (i > 0) {
@@ -66,22 +77,22 @@ export async function runTWAP(
         params.symbol,
         params.side,
         String(thisSlice),
-      ) as Record<string, unknown>;
+        { reduceOnly: params.reduceOnly === true, slippage: resolveAdapterSlippage(adapter, null) },
+      );
 
       state.slicesDone++;
       state.filled += thisSlice;
       state.remaining = params.totalSize - state.filled;
       state.lastSliceAt = Date.now();
 
-      // Try to extract fill price from result
-      const fillPrice = Number(result?.price ?? result?.avg_price ?? result?.fill_price ?? 0);
-      if (fillPrice > 0) {
-        totalCost += thisSlice * fillPrice;
-        state.avgPrice = totalCost / state.filled;
-      }
+      // The venue-reported fill price only: the result's `price` is the protection price that was sent.
+      const fillPrice = reportedAvgFillPrice(result);
+      if (fillPrice === null) everySlicePriced = false;
+      else totalCost += thisSlice * Number(fillPrice);
+      state.avgPrice = everySlicePriced ? Number(formatComputedPrice(totalCost / state.filled)) : null;
 
       const pct = ((state.filled / params.totalSize) * 100).toFixed(1);
-      log(`[TWAP] Filled ${state.filled.toFixed(6)}/${params.totalSize} (${pct}%)${state.avgPrice > 0 ? ` avg $${state.avgPrice.toFixed(4)}` : ""}`);
+      log(`[TWAP] Filled ${state.filled.toFixed(6)}/${params.totalSize} (${pct}%)${state.avgPrice !== null ? ` avg $${state.avgPrice}` : ""}`);
 
       // Update job state file if running as background job
       if (jobId) {

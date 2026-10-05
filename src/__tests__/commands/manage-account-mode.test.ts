@@ -166,7 +166,8 @@ describe("wallet manage account-mode standard", () => {
     expect(body.action.abstraction).toBe("disabled"); // "standard" → "disabled"
     expect(body.action.hyperliquidChain).toBe("Mainnet");
     expect(body.action.signatureChainId).toBe("0xa4b1");
-    expect(body.action.user).toBe("0xMasterHLAddr0000000000000000000000000001");
+    // hyperliquid-python-sdk user_set_abstraction: user is the lower-cased master address.
+    expect(body.action.user).toBe("0xMasterHLAddr0000000000000000000000000001".toLowerCase());
     expect(typeof body.action.nonce).toBe("number");
     expect(body.nonce).toBe(body.action.nonce);
     expect(body.signature.r).toBeTruthy();
@@ -181,9 +182,13 @@ describe("wallet manage account-mode standard", () => {
     expect(parsed.primaryType).toBe("HyperliquidTransaction:UserSetAbstraction");
     expect(parsed.types["HyperliquidTransaction:UserSetAbstraction"]).toEqual([
       { name: "hyperliquidChain", type: "string" },
+      { name: "user", type: "address" },
       { name: "abstraction", type: "string" },
       { name: "nonce", type: "uint64" },
     ]);
+    // `user` is part of the signed struct (USER_SET_ABSTRACTION_SIGN_TYPES); leaving it out makes
+    // HL recover a different signer.
+    expect(parsed.message.user).toBe(body.action.user);
     expect(parsed.domain.chainId).toBe(42161);
     expect(parsed.domain.name).toBe("HyperliquidSignTransaction");
     expect(parsed.message.abstraction).toBe("disabled");

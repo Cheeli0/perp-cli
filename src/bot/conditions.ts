@@ -5,7 +5,7 @@ export interface MarketSnapshot {
   price: number;
   high24h: number;
   low24h: number;
-  volume24h: number;
+  volume24h: number;     // NaN if the venue does not publish 24h volume (same convention as rsi)
   fundingRate: number;
   volatility24h: number; // (high - low) / price * 100
   rsi: number;           // 14-period RSI from 1h candles (NaN if insufficient data)
@@ -70,8 +70,11 @@ export async function getMarketSnapshot(
   }
 
   const price = parseFloat(m.markPrice);
-  const fundingRate = parseFloat(m.fundingRate ?? "0");
-  const volume24h = parseFloat(m.volume24h);
+  // Unknown funding (venue publishes none, e.g. QFEX) → NaN, never 0: a 0 would satisfy
+  // "funding below X" conditions on a rate nobody reported. NaN makes every comparison false.
+  const fundingRate = m.fundingRate === null ? NaN : parseFloat(m.fundingRate);
+  // Unknown volume → NaN, never 0: a 0 would read as "no liquidity" to volume conditions.
+  const volume24h = m.volume24h === null ? NaN : parseFloat(m.volume24h);
 
   // Try to get kline data for 24h high/low + RSI
   let high24h = price;

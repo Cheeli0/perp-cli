@@ -235,6 +235,7 @@ function connect() {
 
 // ── Helpers ──
 function fmt(v, d=2) { const n=Number(v)||0; return n.toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d}); }
+function usdOrDash(v, d=2) { return v==null ? '-' : '$'+fmt(v,d); }
 function pnlClass(v) { return Number(v)>=0?'pnl-pos':'pnl-neg'; }
 function pnlSign(v) { const n=Number(v)||0; return n>=0?'+$'+fmt(Math.abs(n)):'-$'+fmt(Math.abs(n)); }
 function rateClass(v) { const n=Number(v)||0; return n>0?'rate-positive':n<0?'rate-negative':'rate-neutral'; }
@@ -311,7 +312,7 @@ function renderPanels(exchanges) {
         const notional = Math.abs(Number(p.size)) * Number(p.markPrice);
         const margin = p.leverage > 0 ? notional / p.leverage : notional;
         const roe = margin > 0 ? (Number(p.unrealizedPnl) / margin * 100) : 0;
-        return \`<tr>\${isHL?\`<td style="color:var(--purple);font-size:11px">\${dex}</td>\`:''}<td>\${sym}</td><td class="side-\${p.side}">\${p.side.toUpperCase()}</td><td>\${p.size}</td><td>$\${fmt(p.entryPrice)}</td><td>$\${fmt(p.markPrice)}</td><td>\${p.liquidationPrice==='N/A'?'N/A':'$'+fmt(p.liquidationPrice)}</td><td style="color:var(--muted)">$\${fmt(notional)}</td><td class="\${pnlClass(p.unrealizedPnl)}">\${pnlSign(p.unrealizedPnl)}</td><td class="\${pnlClass(p.unrealizedPnl)}">\${roe>=0?'+':''}\${fmt(roe,1)}%</td><td>\${p.leverage}x</td></tr>\`;
+        return \`<tr>\${isHL?\`<td style="color:var(--purple);font-size:11px">\${dex}</td>\`:''}<td>\${sym}</td><td class="side-\${p.side}">\${p.side.toUpperCase()}</td><td>\${p.size}</td><td>$\${fmt(p.entryPrice)}</td><td>$\${fmt(p.markPrice)}</td><td>\${(p.liquidationPrice==null||p.liquidationPrice==='N/A')?'-':'$'+fmt(p.liquidationPrice)}</td><td style="color:var(--muted)">$\${fmt(notional)}</td><td class="\${pnlClass(p.unrealizedPnl)}">\${pnlSign(p.unrealizedPnl)}</td><td class="\${pnlClass(p.unrealizedPnl)}">\${roe>=0?'+':''}\${fmt(roe,1)}%</td><td>\${p.leverage}x</td></tr>\`;
       }).join('')}</tbody></table>\`:'<div class="empty-msg">No open positions</div>'}
       <div class="section-title">Open Orders (\${filteredOrders.length})</div>
       \${filteredOrders.length?\`<table><thead><tr>\${isHL?'<th>DEX</th>':''}<th>Symbol</th><th>Side</th><th>Type</th><th>Price</th><th>Size</th><th>Filled</th><th>Status</th></tr></thead><tbody>\${filteredOrders.map(o=>{
@@ -320,7 +321,7 @@ function renderPanels(exchanges) {
         return \`<tr>\${isHL?\`<td style="color:var(--purple);font-size:11px">\${dex}</td>\`:''}<td>\${sym}</td><td class="side-\${o.side}">\${o.side.toUpperCase()}</td><td>\${o.type}</td><td>$\${fmt(o.price)}</td><td>\${o.size}</td><td>\${o.filled}</td><td>\${o.status}</td></tr>\`;
       }).join('')}</tbody></table>\`:'<div class="empty-msg">No open orders</div>'}
       <div class="section-title">Markets (Top 10)</div>
-      \${ex.topMarkets.length?\`<table><thead><tr><th>Symbol</th><th>Mark</th><th>Index</th><th>Funding</th><th>24h Vol</th><th>OI</th><th>Max Lev</th></tr></thead><tbody>\${ex.topMarkets.map(m=>{const fr=Number(m.fundingRate);return\`<tr><td>\${m.symbol}</td><td>$\${fmt(m.markPrice)}</td><td>$\${fmt(m.indexPrice)}</td><td class="\${rateClass(fr)}">\${(fr*100).toFixed(4)}%</td><td>$\${fmt(m.volume24h,0)}</td><td>$\${fmt(m.openInterest,0)}</td><td>\${m.maxLeverage}x</td></tr>\`;}).join('')}</tbody></table>\`:'<div class="empty-msg">No market data</div>'}
+      \${ex.topMarkets.length?\`<table><thead><tr><th>Symbol</th><th>Mark</th><th>Index</th><th>Funding</th><th>24h Vol</th><th>OI</th><th>Max Lev</th></tr></thead><tbody>\${ex.topMarkets.map(m=>{const fr=Number(m.fundingRate);return\`<tr><td>\${m.symbol}</td><td>$\${fmt(m.markPrice)}</td><td>\${usdOrDash(m.indexPrice)}</td><td class="\${rateClass(fr)}">\${(fr*100).toFixed(4)}%</td><td>\${usdOrDash(m.volume24h,0)}</td><td>\${usdOrDash(m.openInterest,0)}</td><td>\${m.maxLeverage}x</td></tr>\`;}).join('')}</tbody></table>\`:'<div class="empty-msg">No market data</div>'}
     </div>\`;
   }).join('');
 
@@ -346,9 +347,10 @@ function renderPanels(exchanges) {
 function renderArb() {
   if (!arbData) { $('#arb-table').innerHTML='<div class="empty-msg">Loading arb data...</div>'; return; }
 
-  // Status
+  // Status (hover shows the venue's error message)
+  const escapeHtml = (v) => String(v).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]);
   const statusHtml = Object.entries(arbData.exchangeStatus||{}).map(([ex,st])=>
-    \`<span class="exchange-status"><span class="dot-sm \${st==='ok'?'dot-ok':'dot-err'}"></span>\${ex}</span>\`
+    \`<span class="exchange-status" title="\${escapeHtml((arbData.exchangeErrors||{})[ex]||'')}"><span class="dot-sm \${st==='ok'?'dot-ok':'dot-err'}"></span>\${ex}</span>\`
   ).join('');
   $('#arb-status').innerHTML = statusHtml;
 

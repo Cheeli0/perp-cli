@@ -4,6 +4,8 @@
 import { describe, it, expect, vi } from "vitest";
 
 // ── BUG 1: HL editOrder preserves original side ──
+// modifyOrder now also carries the original order's TIF (design §13.10 #10: "HL modifyOrder의
+// tif: \"Gtc\" 하드코딩 → 원 주문 tif 전달 (frontendOpenOrders)"), so fixtures carry `tif`.
 describe("BUG 1: HL editOrder preserves side", () => {
   // editOrder reads the RAW frontendOpenOrders record (not the mapped
   // getOpenOrders, which hardcodes type:"limit" and drops reduceOnly).
@@ -19,22 +21,41 @@ describe("BUG 1: HL editOrder preserves side", () => {
 
   it("editOrder passes existing order side (sell) to modifyOrder", async () => {
     const adapter = await mkAdapter([
-      { oid: 42, coin: "ETH", side: "A", limitPx: "3000", sz: "0.1", isTrigger: false, reduceOnly: false },
+      { oid: 42, coin: "ETH", side: "A", limitPx: "3000", sz: "0.1", isTrigger: false, reduceOnly: false, tif: "Gtc" },
     ]);
 
     await adapter.editOrder("ETH", "42", "3100", "0.1");
 
-    expect(adapter.modifyOrder).toHaveBeenCalledWith("ETH", 42, "sell", "3100", "0.1", { reduceOnly: false });
+    expect(adapter.modifyOrder).toHaveBeenCalledWith("ETH", 42, "sell", "3100", "0.1", { reduceOnly: false, tif: "Gtc" });
   });
 
   it("editOrder preserves reduceOnly across the modify", async () => {
     const adapter = await mkAdapter([
-      { oid: 42, coin: "ETH", side: "A", limitPx: "3000", sz: "0.1", isTrigger: false, reduceOnly: true },
+      { oid: 42, coin: "ETH", side: "A", limitPx: "3000", sz: "0.1", isTrigger: false, reduceOnly: true, tif: "Gtc" },
     ]);
 
     await adapter.editOrder("ETH", "42", "3100", "0.1");
 
-    expect(adapter.modifyOrder).toHaveBeenCalledWith("ETH", 42, "sell", "3100", "0.1", { reduceOnly: true });
+    expect(adapter.modifyOrder).toHaveBeenCalledWith("ETH", 42, "sell", "3100", "0.1", { reduceOnly: true, tif: "Gtc" });
+  });
+
+  it("editOrder preserves a post-only (Alo) TIF instead of re-placing it as Gtc", async () => {
+    const adapter = await mkAdapter([
+      { oid: 42, coin: "ETH", side: "B", limitPx: "3000", sz: "0.1", isTrigger: false, reduceOnly: false, tif: "Alo" },
+    ]);
+
+    await adapter.editOrder("ETH", "42", "3100", "0.1");
+
+    expect(adapter.modifyOrder).toHaveBeenCalledWith("ETH", 42, "buy", "3100", "0.1", { reduceOnly: false, tif: "Alo" });
+  });
+
+  it("editOrder refuses (CAPABILITY_UNSUPPORTED) when the order's TIF is unknown — never guesses Gtc", async () => {
+    const adapter = await mkAdapter([
+      { oid: 42, coin: "ETH", side: "A", limitPx: "3000", sz: "0.1", isTrigger: false, reduceOnly: false },
+    ]);
+
+    await expect(adapter.editOrder("ETH", "42", "3100", "0.1")).rejects.toMatchObject({ structured: { code: "CAPABILITY_UNSUPPORTED" } });
+    expect(adapter.modifyOrder).not.toHaveBeenCalled();
   });
 
   it("editOrder FAILS CLOSED when the order is not among the open orders", async () => {
@@ -62,6 +83,8 @@ describe("BUG 1: HL editOrder preserves side", () => {
 });
 
 describe("HL modifyOrder surfaces per-order rejections", () => {
+  // modifyOrder requires opts { reduceOnly, tif } (the original order's attributes).
+  const OPTS = { reduceOnly: false, tif: "Gtc" };
   const mkAdapter = async (sendResult: unknown) => {
     const mod = await import("../exchanges/hyperliquid.js");
     const adapter = Object.create(mod.HyperliquidAdapter.prototype);
@@ -80,7 +103,7 @@ describe("HL modifyOrder surfaces per-order rejections", () => {
       response: { type: "order", data: { statuses: [{ error: "Order would immediately match" }] } },
     });
 
-    await expect(adapter.modifyOrder("ETH", 42, "buy", "3100", "0.1")).rejects.toThrow(
+    await expect(adapter.modifyOrder("ETH", 42, "buy", "3100", "0.1", OPTS)).rejects.toThrow(
       /rejected: Order would immediately match/
     );
   });
@@ -88,44 +111,63 @@ describe("HL modifyOrder surfaces per-order rejections", () => {
   it("throws when the response carries no per-order status at all", async () => {
     const adapter = await mkAdapter({ status: "ok", response: { type: "order", data: { statuses: [] } } });
 
-    await expect(adapter.modifyOrder("ETH", 42, "buy", "3100", "0.1")).rejects.toThrow(
+    await expect(adapter.modifyOrder("ETH", 42, "buy", "3100", "0.1", OPTS)).rejects.toThrow(
       /no order status in response/
     );
+  });
+
+  it("sends the original reduceOnly + tif on the modify wire (never a hardcoded Gtc)", async () => {
+    const ok = { status: "ok", response: { type: "order", data: { statuses: [{ resting: { oid: 43 } }] } } };
+    const adapter = await mkAdapter(ok);
+
+    await adapter.modifyOrder("ETH", 42, "sell", "3100", "0.1", { reduceOnly: true, tif: "Alo" });
+    const order = adapter._signAndSendAction.mock.calls[0][0].modifies[0].order;
+    expect(order.r).toBe(true);
+    expect(order.t).toEqual({ limit: { tif: "Alo" } });
   });
 
   it("returns the result when the modify actually rests", async () => {
     const ok = { status: "ok", response: { type: "order", data: { statuses: [{ resting: { oid: 43 } }] } } };
     const adapter = await mkAdapter(ok);
 
-    await expect(adapter.modifyOrder("ETH", 42, "buy", "3100", "0.1")).resolves.toEqual(ok);
+    await expect(adapter.modifyOrder("ETH", 42, "buy", "3100", "0.1", OPTS)).resolves.toEqual(ok);
   });
 });
 
-// ── BUG 2: Lighter getMarkPrice throws on 0 ──
-describe("BUG 2: Lighter getMarkPrice throws on zero", () => {
-  it("marketOrder throws when mark price is 0", async () => {
+// ── BUG 2: Lighter market order never prices off a zero / missing reference ──
+// The reference price is now the orderbook mid (design §13.2, LIGHTER_REFERENCE_PRICE_SOURCE):
+// a book missing a side → PRICE_STALE, and the order is NOT signed or sent (definite, pre-send).
+describe("BUG 2: Lighter marketOrder refuses without a usable reference price", () => {
+  const build = async (book: unknown) => {
     const mod = await import("../exchanges/lighter.js");
-    const LighterAdapter = mod.LighterAdapter;
-
-    // Create mock adapter that simulates getMarkPrice returning 0
-    const adapter = Object.create(LighterAdapter.prototype);
+    const adapter = Object.create(mod.LighterAdapter.prototype);
+    adapter.name = "lighter";
     adapter._readOnly = false;
     adapter._signer = {};
     adapter._marketMap = new Map([["BTC", 0]]);
     adapter._marketDecimals = new Map([["BTC", { size: 4, price: 2 }]]);
     adapter.ensureSigner = vi.fn();
+    adapter.ensureMarketMap = vi.fn();
     adapter.getNextNonce = vi.fn().mockResolvedValue(1);
     adapter.getMarketIndex = vi.fn().mockReturnValue(0);
-    adapter.toTicks = vi.fn().mockReturnValue({ baseAmount: 10000, priceTicks: 0 });
+    adapter.restGet = vi.fn().mockResolvedValue(book);
+    adapter.signOrder = vi.fn();
+    adapter.sendTx = vi.fn();
+    return adapter;
+  };
+  const opts = { reduceOnly: false, slippage: { bps: 50, source: "default" as const } };
 
-    // Mock restGet to return 0 mark price
-    adapter.restGet = vi.fn().mockResolvedValue({
-      order_book_details: [{ symbol: "BTC", last_trade_price: 0 }],
-    });
+  it("rejects (not sent) when the book has no bids — nothing signed or sent", async () => {
+    const adapter = await build({ bids: [], asks: [{ price: "100" }] });
+    await expect(adapter.marketOrder("BTC", "buy", "0.001", opts)).rejects.toThrow(/orderbook has no bids/);
+    expect(adapter.signOrder).not.toHaveBeenCalled();
+    expect(adapter.sendTx).not.toHaveBeenCalled();
+  });
 
-    await expect(adapter.marketOrder("BTC", "buy", "0.001")).rejects.toThrow(
-      /Cannot determine mark price/
-    );
+  it("treats zero-priced levels as missing (never a 0 reference price)", async () => {
+    const adapter = await build({ bids: [{ price: "0" }], asks: [{ price: "0" }] });
+    await expect(adapter.marketOrder("BTC", "buy", "0.001", opts)).rejects.toMatchObject({ structured: { code: "PRICE_STALE" } });
+    expect(adapter.sendTx).not.toHaveBeenCalled();
   });
 });
 
@@ -156,26 +198,32 @@ describe("BUG 4: cancelAllOrders respects symbol filter", () => {
     expect(adapter.cancelOrder).toHaveBeenCalledWith("SOL", "3");
   });
 
-  it("Pacifica cancelAllOrders cancels all when no symbol", async () => {
+  // CHANGELOG: "Pacifica cancel-all per-order" — never the venue `cancel_all` with
+  // all_symbols:true (it would also cancel SPOT orders); each listed perp order is cancelled
+  // by id so the result carries per-order proof.
+  it("Pacifica cancelAllOrders with no symbol cancels each open perp order by id (never all_symbols)", async () => {
     const mod = await import("../exchanges/pacifica.js");
     const PacificaAdapter = mod.PacificaAdapter;
 
     const adapter = Object.create(PacificaAdapter.prototype);
     adapter._hasRealKey = true;
+    adapter.ensureSigner = vi.fn();
     adapter.client = {
       cancelAllOrders: vi.fn().mockResolvedValue({ ok: true }),
       setRequestAgentWallet: vi.fn(),
     };
-    adapter.account = "test-account";
-    adapter.signMessage = vi.fn();
+    adapter.getOpenOrders = vi.fn().mockResolvedValue([
+      { orderId: "1", symbol: "SOL", side: "buy", price: "100", size: "1", filled: "0", status: "open", type: "limit" },
+      { orderId: "2", symbol: "BTC", side: "sell", price: "50000", size: "0.01", filled: "0", status: "open", type: "limit" },
+    ]);
+    adapter.cancelOrder = vi.fn().mockResolvedValue({ success: true });
 
     await adapter.cancelAllOrders();
 
-    expect(adapter.client.cancelAllOrders).toHaveBeenCalledWith(
-      { all_symbols: true, exclude_reduce_only: false },
-      "test-account",
-      expect.any(Function),
-    );
+    expect(adapter.cancelOrder).toHaveBeenCalledTimes(2);
+    expect(adapter.cancelOrder).toHaveBeenCalledWith("SOL", "1");
+    expect(adapter.cancelOrder).toHaveBeenCalledWith("BTC", "2");
+    expect(adapter.client.cancelAllOrders).not.toHaveBeenCalled();
   });
 
   it("Lighter cancelAllOrders filters by symbol", async () => {
@@ -190,6 +238,7 @@ describe("BUG 4: cancelAllOrders respects symbol filter", () => {
       { orderId: "20", symbol: "BTC", side: "sell", price: "50000", size: "0.01", filled: "0", status: "open", type: "limit" },
     ]);
     adapter.cancelOrder = vi.fn().mockResolvedValue({ ok: true });
+    adapter.awaitTxExecuted = vi.fn().mockResolvedValue(undefined); // each cancel is polled to executed
 
     await adapter.cancelAllOrders("ETH");
 

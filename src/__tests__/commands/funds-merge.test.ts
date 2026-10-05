@@ -24,6 +24,7 @@ import { existsSync, mkdirSync, rmSync } from "fs";
 import { resolve } from "path";
 import os from "os";
 import { Command } from "commander";
+import { addRootSafetyOptions, honorsDryRun } from "../../cli-flags.js";
 
 // ── Stable temp-dir for settings I/O ──────────────────────────────────────
 
@@ -38,6 +39,7 @@ const { registerFundsCommands } = await import("../../commands/funds.js");
 
 function makeProgram() {
   const prog = new Command();
+  addRootSafetyOptions(prog);
   prog.exitOverride();
   // Tolerate stray text on stderr/stdout from action handlers without
   // polluting test output (we only inspect topology, not behavior).
@@ -101,10 +103,13 @@ describe("funds merge — top-level commands consolidated under funds", () => {
     const send = bridge.commands.find((c) => c.name() === "send");
     expect(send).toBeTruthy();
     const optionLongFlags = send!.options.map((o) => o.long).filter(Boolean);
-    // Required + provider selection + dry-run + fast finality
+    // Required + provider selection + fast finality. --dry-run is the ROOT flag only (a local
+    // copy would be swallowed by the root → live send); the command opts into it instead.
     expect(optionLongFlags).toEqual(expect.arrayContaining([
-      "--from", "--to", "--amount", "--provider", "--dry-run", "--fast",
+      "--from", "--to", "--amount", "--provider", "--fast",
     ]));
+    expect(optionLongFlags).not.toContain("--dry-run");
+    expect(honorsDryRun(send!)).toBe(true);
   });
 
   it("`funds bridge exchange` accepts the multi-provider option set", () => {
@@ -136,9 +141,10 @@ describe("funds merge — top-level commands consolidated under funds", () => {
     expect(execute).toBeTruthy();
     const optionLongFlags = execute!.options.map((o) => o.long).filter(Boolean);
     expect(optionLongFlags).toEqual(expect.arrayContaining([
-      "--exchanges", "--min-move", "--reserve",
-      "--dry-run", "--withdraw-only", "--auto-bridge",
+      "--exchanges", "--min-move", "--reserve", "--withdraw-only", "--auto-bridge",
     ]));
+    expect(optionLongFlags).not.toContain("--dry-run");
+    expect(honorsDryRun(execute!)).toBe(true);
   });
 
   it("`funds deposit` retains pacifica / hyperliquid / lighter handlers", () => {
@@ -148,17 +154,17 @@ describe("funds merge — top-level commands consolidated under funds", () => {
     expect(deposit).toBeTruthy();
     const depositSubs = deposit!.commands.map((c) => c.name()).sort();
     expect(depositSubs).toEqual(expect.arrayContaining([
-      "pacifica", "hyperliquid", "lighter",
+      "pacifica", "hyperliquid", "lighter", "lighter-rh",
     ]));
   });
 
-  it("`funds withdraw` retains pacifica / hyperliquid / lighter handlers", () => {
+  it("`funds withdraw` has a handler per venue (ondo/arcus wired, aster = uniform unsupported)", () => {
     const prog = makeProgram();
     const funds = prog.commands.find((c) => c.name() === "funds")!;
     const withdraw = funds.commands.find((c) => c.name() === "withdraw");
     expect(withdraw).toBeTruthy();
     const withdrawSubs = withdraw!.commands.map((c) => c.name()).sort();
-    expect(withdrawSubs).toEqual(["hyperliquid", "lighter", "pacifica"]);
+    expect(withdrawSubs).toEqual(["arcus", "aster", "hyperliquid", "lighter", "ondo", "pacifica", "qfex"]);
   });
 });
 

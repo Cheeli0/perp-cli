@@ -7,6 +7,7 @@
  */
 
 import { Command } from "commander";
+import { isDryRun, supportsDryRun } from "../cli-flags.js";
 import chalk from "chalk";
 import type { ExchangeAdapter } from "../exchanges/index.js";
 import { HyperliquidAdapter } from "../exchanges/hyperliquid.js";
@@ -169,16 +170,13 @@ export function registerOutcomeCommands(
 
   // ── outcome buy / sell ───────────────────────────────────────────────────
   for (const action of ["buy", "sell"] as const) {
-    outcome
-      .command(`${action} <outcome> <side> <usd>`)
-      .description(`${action === "buy" ? "Buy" : "Sell"} a side of an outcome (USDH notional)`)
+    supportsDryRun(outcome.command(`${action} <outcome> <side> <usd>`))
+      .description(`${action === "buy" ? "Buy" : "Sell"} a side of an outcome (USDH notional; supports --dry-run)`)
       .option("--limit <px>", "Limit price (default: aggressive Ioc at top of book)")
       .option("--tif <tif>", "Time-in-force: gtc | ioc | alo (default: ioc for market, gtc for limit)")
-      .option("--dry-run", "Print the order action without sending")
-      .action(async (outcomeArg: string, sideArg: string, usdArg: string, opts: { limit?: string; tif?: string; dryRun?: boolean }, command) => {
-        // Merge globals so the parent program's --dry-run flag isn't shadowed
-        // by this subcommand's local options (commander v13 behavior).
-        const merged = (command?.optsWithGlobals?.() ?? opts) as { limit?: string; tif?: string; dryRun?: boolean };
+      .action(async (outcomeArg: string, sideArg: string, usdArg: string, opts: { limit?: string; tif?: string }, command: Command) => {
+        // --dry-run is the root flag (never re-declared here — the root would swallow it).
+        const merged = { ...opts, dryRun: isDryRun(command) };
         const adapter = await getOutcomeAdapter();
         const { outcome: outcomeId, side } = await resolveOutcomeSide(adapter, outcomeArg, sideArg);
         const usd = Number(usdArg);
@@ -229,7 +227,7 @@ export function registerOutcomeCommands(
         }
 
         if (merged.dryRun) {
-          if (isJson()) return printJson(jsonOk({ dryRun: true, order: orderInfo }));
+          if (isJson()) return printJson(jsonOk({ dryRun: true, sent: false, order: orderInfo }));
           console.log(chalk.yellow(`\n  [dry-run] ${action.toUpperCase()} outcome=${outcomeId} side=${side} ${size}@${price} (notional ~$${orderInfo.notional} USDH, tif=${tifNorm})\n`));
           return;
         }

@@ -1,0 +1,438 @@
+{
+ "usdgToArbUsdc": {
+  "steps": [
+   {
+    "id": "approve",
+    "kind": "transaction",
+    "requestId": "0x1791132230534de59407c859f1d4c74935ae641f9636f0685a251a9b092f60ab",
+    "items": [
+     {
+      "status": "incomplete",
+      "data": {
+       "from": "0xabf20312dB7A6e807765ee7522E7d8c8DBB637D3",
+       "to": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+       "data": "0x095ea7b30000000000000000000000004cd00e387622c35bddb9b4c962c136462338bc310000000000000000000000000000000000000000000000000000000000e4e1c0",
+       "value": "0",
+       "chainId": 4663,
+       "gas": "79215",
+       "maxFeePerGas": "28008400",
+       "maxPriorityFeePerGas": "0"
+      }
+     }
+    ]
+   },
+   {
+    "id": "deposit",
+    "kind": "transaction",
+    "requestId": "0x1791132230534de59407c859f1d4c74935ae641f9636f0685a251a9b092f60ab",
+    "items": [
+     {
+      "status": "incomplete",
+      "data": {
+       "from": "0xabf20312dB7A6e807765ee7522E7d8c8DBB637D3",
+       "to": "0x4cd00e387622c35bddb9b4c962c136462338bc31",
+       "data": "0xe8017952000000000000000000000000abf20312db7a6e807765ee7522e7d8c8dbb637d30000000000000000000000005fc5360d0400a0fd4f2af552add042d716f1d1680000000000000000000000000000000000000000000000000000000000e4e1c054dc0f0143e184ecf1737f4a1e4087863e6b2ddd56061fb13c818e0928bf7e10",
+       "value": "0",
+       "chainId": 4663,
+       "gas": "84269",
+       "maxFeePerGas": "28008400",
+       "maxPriorityFeePerGas": "0"
+      }
+     }
+    ]
+   }
+  ],
+  "fees": {
+   "gas": {
+    "amountUsd": "0.006377"
+   },
+   "relayer": {
+    "amountUsd": "0.027800"
+   },
+   "relayerGas": {
+    "amountUsd": "0.003303"
+   },
+   "relayerService": {
+    "amountUsd": "0.024498"
+   },
+   "app": {
+    "amountUsd": "0"
+   }
+  },
+  "details": {
+   "currencyIn": {
+    "currency": {
+     "chainId": 4663,
+     "address": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+     "symbol": "USDG",
+     "decimals": 6
+    },
+    "amount": "15000000",
+    "amountUsd": "14.998500",
+    "minimumAmount": "15000000"
+   },
+   "currencyOut": {
+    "currency": {
+     "chainId": 42161,
+     "address": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+     "symbol": "USDC",
+     "decimals": 6
+    },
+    "amount": "14969920",
+    "amountUsd": "14.969366",
+    "minimumAmount": "14670522"
+   },
+   "timeEstimate": 1,
+   "totalImpact": {
+    "usd": "-0.029134",
+    "percent": "-0.19"
+   },
+   "sender": "0xabf20312dB7A6e807765ee7522E7d8c8DBB637D3",
+   "recipient": "0xabf20312dB7A6e807765ee7522E7d8c8DBB637D3"
+  },
+  "protocol": {
+   "v2": {
+    "orderId": "0x54dc0f0143e184ecf1737f4a1e4087863e6b2ddd56061fb13c818e0928bf7e10",
+    "orderData": {
+     "version": "v1",
+     "solverChainId": "base",
+     "solver": "0xf70da97812cb96acdf810712aa562db8dfa3dbef",
+     "salt": "0x7ec0a67dd83d7a3568af1fdcaec196436ccba25e09582e2e4cc5fa90b10cde47",
+     "inputs": [
+      {
+       "payment": {
+        "chainId": "robinhood",
+        "currency": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+        "amount": "15000000",
+        "weight": "1"
+       },
+       "refunds": [
+        {
+         "chainId": "robinhood",
+         "recipient": "0xabf20312dB7A6e807765ee7522E7d8c8DBB637D3",
+         "currency": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+         "minimumAmount": "0",
+         "deadline": 1791737030,
+         "extraData": "0x000000000000000000000000b92fe925dc43a0ecde6c8b1a2709c170ec4fff4f"
+        },
+        {
+         "chainId": "arbitrum",
+         "recipient": "0xabf20312dB7A6e807765ee7522E7d8c8DBB637D3",
+         "currency": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+         "minimumAmount": "0",
+         "deadline": 1791737030,
+         "extraData": "0x000000000000000000000000b92fe925dc43a0ecde6c8b1a2709c170ec4fff4f"
+        }
+       ]
+      }
+     ],
+     "output": {
+      "chainId": "arbitrum",
+      "payments": [
+       {
+        "recipient": "0xabf20312dB7A6e807765ee7522E7d8c8DBB637D3",
+        "currency": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+        "minimumAmount": "14670522",
+        "expectedAmount": "14969920"
+       }
+      ],
+      "calls": [],
+      "deadline": 1791737030,
+      "extraData": "0x000000000000000000000000b92fe925dc43a0ecde6c8b1a2709c170ec4fff4f"
+     },
+     "fees": []
+    },
+    "paymentDetails": {
+     "chainId": "robinhood",
+     "depository": "0x4cd00e387622c35bddb9b4c962c136462338bc31",
+     "currency": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+     "amount": "15000000"
+    }
+   }
+  }
+ },
+ "usdgToSolanaSol": {
+  "steps": [
+   {
+    "id": "approve",
+    "kind": "transaction",
+    "requestId": "0x1791132230b63254bcbb457b45bdf1d251ab84560981d144767c19b7b282db17",
+    "items": [
+     {
+      "status": "incomplete",
+      "data": {
+       "from": "0xabf20312dB7A6e807765ee7522E7d8c8DBB637D3",
+       "to": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
+       "data": "0x095ea7b30000000000000000000000004cd00e387622c35bddb9b4c962c136462338bc310000000000000000000000000000000000000000000000000000000000e4e1c0",
+       "value": "0",
+       "chainId": 4663,
+       "gas": "79215",
+       "maxFeePerGas": "28271600",
+       "maxPriorityFeePerGas": "0"
+      }
+     }
+    ]
+   },
+   {
+    "id": "deposit",
+    "kind": "transaction",
+    "requestId": "0x1791132230b63254bcbb457b45bdf1d251ab84560981d144767c19b7b282db17",
+    "items": [
+     {
+      "status": "incomplete",
+      "data": {
+       "from": "0xabf20312dB7A6e807765ee7522E7d8c8DBB637D3",
+       "to": "0x4cd00e387622c35bddb9b4c962c136462338bc31",
+       "data": "0xe8017952000000000000000000000000abf20312db7a6e807765ee7522e7d8c8dbb637d30000000000000000000000005fc5360d0400a0fd4f2af552add042d716f1d1680000000000000000000000000000000000000000000000000000000000e4e1c067a6713c5004b8eb9c4d91325ab75e64e291a4927ae1bf82ae46f2f32191c1b8",
+       "value": "0",
+       "chainId": 4663,
+       "gas": "84269",
+       "maxFeePerGas": "28271600",
+       "maxPriorityFeePerGas": "0"
+      }
+     }
+    ]
+   }
+  ],
+  "fees": {
+   "gas": {
+    "amountUsd": "0.006437"
+   },
+   "relayer": {
+    "amountUsd": "0.032314"
+   },
+   "relayerGas": {
+    "amountUsd": "0.000322"
+   },
+   "relayerService": {
+    "amountUsd": "0.031992"
+   },
+   "app": {
+    "amountUsd": "0"
+   }
+  },
+  "details": {
+   "currencyIn": {
+    "currency": {
+     "chainId": 4663,
+     "address": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+     "symbol": "USDG",
+     "decimals": 6
+    },
+    "amount": "15000000",
+    "amountUsd": "14.998500",
+    "minimumAmount": "15000000"
+   },
+   "currencyOut": {
+    "currency": {
+     "chainId": 792703809,
+     "address": "11111111111111111111111111111111",
+     "symbol": "SOL",
+     "decimals": 9
+    },
+    "amount": "122775488",
+    "amountUsd": "14.936116",
+    "minimumAmount": "120319978"
+   },
+   "timeEstimate": 1,
+   "totalImpact": {
+    "usd": "-0.062384",
+    "percent": "-0.42"
+   },
+   "sender": "0xabf20312dB7A6e807765ee7522E7d8c8DBB637D3",
+   "recipient": "4iTFFwUquYH7e1G4Ms6oUnBxPHf4wmHj456eLXLmwaB7"
+  },
+  "protocol": {
+   "v2": {
+    "orderId": "0x67a6713c5004b8eb9c4d91325ab75e64e291a4927ae1bf82ae46f2f32191c1b8",
+    "orderData": {
+     "version": "v1",
+     "solverChainId": "base",
+     "solver": "0xf70da97812cb96acdf810712aa562db8dfa3dbef",
+     "salt": "0xaf2b9fb66189ed0b81e423e1e652ea285761cb441b12763f939951192e5691e3",
+     "inputs": [
+      {
+       "payment": {
+        "chainId": "robinhood",
+        "currency": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+        "amount": "15000000",
+        "weight": "1"
+       },
+       "refunds": [
+        {
+         "chainId": "robinhood",
+         "recipient": "0xabf20312dB7A6e807765ee7522E7d8c8DBB637D3",
+         "currency": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+         "minimumAmount": "0",
+         "deadline": 1791737030,
+         "extraData": "0x000000000000000000000000b92fe925dc43a0ecde6c8b1a2709c170ec4fff4f"
+        },
+        {
+         "chainId": "solana",
+         "recipient": "4iTFFwUquYH7e1G4Ms6oUnBxPHf4wmHj456eLXLmwaB7",
+         "currency": "11111111111111111111111111111111",
+         "minimumAmount": "0",
+         "deadline": 1791737030,
+         "extraData": "0x"
+        }
+       ]
+      }
+     ],
+     "output": {
+      "chainId": "solana",
+      "payments": [
+       {
+        "recipient": "4iTFFwUquYH7e1G4Ms6oUnBxPHf4wmHj456eLXLmwaB7",
+        "currency": "11111111111111111111111111111111",
+        "minimumAmount": "120319978",
+        "expectedAmount": "122775488"
+       }
+      ],
+      "calls": [],
+      "deadline": 1791737030,
+      "extraData": "0x"
+     },
+     "fees": []
+    },
+    "paymentDetails": {
+     "chainId": "robinhood",
+     "depository": "0x4cd00e387622c35bddb9b4c962c136462338bc31",
+     "currency": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+     "amount": "15000000"
+    }
+   }
+  }
+ },
+ "arbEthToRhEth": {
+  "steps": [
+   {
+    "id": "deposit",
+    "kind": "transaction",
+    "requestId": "0x1791132231824ac0a1181ddf631a541cccb802b548bfa509de3b10ee3645c809",
+    "items": [
+     {
+      "status": "incomplete",
+      "data": {
+       "from": "0xabf20312dB7A6e807765ee7522E7d8c8DBB637D3",
+       "to": "0x4cd00e387622c35bddb9b4c962c136462338bc31",
+       "data": "0x49290c1c000000000000000000000000abf20312db7a6e807765ee7522e7d8c8dbb637d3f5537eaaa739bfcea3069cfe402759271751dfccd95330a3a4873e8984d690ba",
+       "value": "5600000000000000",
+       "chainId": 42161,
+       "gas": "33724",
+       "maxFeePerGas": "22000000",
+       "maxPriorityFeePerGas": "0"
+      }
+     }
+    ]
+   }
+  ],
+  "fees": {
+   "gas": {
+    "amountUsd": "0.002005"
+   },
+   "relayer": {
+    "amountUsd": "0.031156"
+   },
+   "relayerGas": {
+    "amountUsd": "0.002078"
+   },
+   "relayerService": {
+    "amountUsd": "0.029078"
+   },
+   "app": {
+    "amountUsd": "0"
+   }
+  },
+  "details": {
+   "currencyIn": {
+    "currency": {
+     "chainId": 42161,
+     "address": "0x0000000000000000000000000000000000000000",
+     "symbol": "ETH",
+     "decimals": 18
+    },
+    "amount": "5600000000000000",
+    "amountUsd": "15.129929",
+    "minimumAmount": "5600000000000000"
+   },
+   "currencyOut": {
+    "currency": {
+     "chainId": 4663,
+     "address": "0x0000000000000000000000000000000000000000",
+     "symbol": "ETH",
+     "decimals": 18
+    },
+    "amount": "5588468283500776",
+    "amountUsd": "15.098773",
+    "minimumAmount": "5476698917830761"
+   },
+   "timeEstimate": 1,
+   "totalImpact": {
+    "usd": "-0.031156",
+    "percent": "-0.21"
+   },
+   "sender": "0xabf20312dB7A6e807765ee7522E7d8c8DBB637D3",
+   "recipient": "0xabf20312dB7A6e807765ee7522E7d8c8DBB637D3"
+  },
+  "protocol": {
+   "v2": {
+    "orderId": "0xf5537eaaa739bfcea3069cfe402759271751dfccd95330a3a4873e8984d690ba",
+    "orderData": {
+     "version": "v1",
+     "solverChainId": "base",
+     "solver": "0xf70da97812cb96acdf810712aa562db8dfa3dbef",
+     "salt": "0xebbcc3622fea4ccd3e9dcc4a0c87380dcc228223f2100308e53ea1c2f8659f4f",
+     "inputs": [
+      {
+       "payment": {
+        "chainId": "arbitrum",
+        "currency": "0x0000000000000000000000000000000000000000",
+        "amount": "5600000000000000",
+        "weight": "1"
+       },
+       "refunds": [
+        {
+         "chainId": "arbitrum",
+         "recipient": "0xabf20312dB7A6e807765ee7522E7d8c8DBB637D3",
+         "currency": "0x0000000000000000000000000000000000000000",
+         "minimumAmount": "0",
+         "deadline": 1791737031,
+         "extraData": "0x000000000000000000000000b92fe925dc43a0ecde6c8b1a2709c170ec4fff4f"
+        },
+        {
+         "chainId": "robinhood",
+         "recipient": "0xabf20312dB7A6e807765ee7522E7d8c8DBB637D3",
+         "currency": "0x0000000000000000000000000000000000000000",
+         "minimumAmount": "0",
+         "deadline": 1791737031,
+         "extraData": "0x000000000000000000000000b92fe925dc43a0ecde6c8b1a2709c170ec4fff4f"
+        }
+       ]
+      }
+     ],
+     "output": {
+      "chainId": "robinhood",
+      "payments": [
+       {
+        "recipient": "0xabf20312dB7A6e807765ee7522E7d8c8DBB637D3",
+        "currency": "0x0000000000000000000000000000000000000000",
+        "minimumAmount": "5476698917830761",
+        "expectedAmount": "5588468283500776"
+       }
+      ],
+      "calls": [],
+      "deadline": 1791737031,
+      "extraData": "0x000000000000000000000000b92fe925dc43a0ecde6c8b1a2709c170ec4fff4f"
+     },
+     "fees": []
+    },
+    "paymentDetails": {
+     "chainId": "arbitrum",
+     "depository": "0x4cd00e387622c35bddb9b4c962c136462338bc31",
+     "currency": "0x0000000000000000000000000000000000000000",
+     "amount": "5600000000000000"
+    }
+   }
+  }
+ }
+}

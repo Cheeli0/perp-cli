@@ -15,9 +15,20 @@ perp wallet setup                # one-click setup — passphrase prompt
 ```bash
 # Setup wizard with explicit args (no prompts):
 perp --json setup --non-interactive \
-  --wallet-name <name> \
-  --passphrase <pp> \
-  [--default-exchange <pacifica|hyperliquid|lighter|aster>]
+  (--wallet <existing-ows-wallet> | --wallet-name <new-name> --passphrase <pp>) \
+  [--network mainnet|testnet] \
+  [--venues <pacifica,hyperliquid,lighter,aster,lighter-rh,ondo,arcus,qfex>] \
+  [--default-venue <venue>] \
+  [--slippage-bps <n>] [--slippage <venue>=<bps> ...]
+# Writes settings only. Agent registration signs with the master wallet — only with
+# explicit user consent: add --approve-agents --yes (passphrase via OWS_PASSPHRASE;
+# Ondo key id + secret as 2 stdin lines with --ondo-secret-stdin). A failed venue
+# returns APPROVE_FAILED with per-venue results in error.details.result.agents.
+# No master wallet on this machine: the user creates keys on the exchange websites and
+# pipes them in — --import-agents <venues> --yes (one stdin line per venue in order; ondo
+# 2 lines) [--master-address <venue>=<addr>] [--lighter-account-index <n> --lighter-api-key-index <n>];
+# omit --wallet. Imported keys trade only: deposit / withdraw / transfer / bridge / referral
+# set / agent approve then fail with NO_SIGNER_AVAILABLE → the user does them on the website.
 
 # wallet setup (one-click) only prompts for passphrase — set OWS_PASSPHRASE env to skip:
 OWS_PASSPHRASE=<pp> perp --json wallet setup --name <name> --max-tx-usd <usd> --max-daily-usd <usd>
@@ -25,7 +36,7 @@ OWS_PASSPHRASE=<pp> perp --json wallet setup --name <name> --max-tx-usd <usd> --
 
 ### ALWAYS use these (non-interactive, agent-safe):
 ```bash
-perp --json wallet set <exchange> <key>     # set private key (or Aster API key)
+printf '%s' "$KEY" | OWS_PASSPHRASE=<pp> perp --json wallet set <exchange>   # import key (stdin) into OWS vault → active wallet
 perp --json wallet generate evm             # generate EVM wallet
 perp --json wallet generate solana          # generate Solana wallet
 perp --json wallet show                     # check configured wallets
@@ -53,8 +64,8 @@ perp --json risk check --notional <$> --leverage <L>  # pre-trade risk check
 npm install -g perp-cli@latest
 # or use npx -y perp-cli@latest as the prefix
 
-# 2. Register wallet (user provides key)
-perp --json wallet set hl 0xUSER_PRIVATE_KEY
+# 2. Register wallet (user provides key — on stdin, never argv)
+printf '%s' "$USER_PRIVATE_KEY" | OWS_PASSPHRASE=<pp> perp --json wallet set hl
 
 # 3. Verify
 perp --json wallet show
@@ -70,15 +81,16 @@ perp --json -e hl market list
 
 ### Multi-Exchange Setup (for Funding Rate Arb)
 To run arb, you need wallets on AT LEAST 2 exchanges. Each exchange needs:
-- A configured wallet with a private key (or API key for Aster)
+- A wallet key in the OWS vault (EVM for HL / Lighter / Aster, Solana for Pacifica)
 - USDC balance deposited on-exchange
 
 ```bash
-# 1. Register wallets (any 2+ of: hl, pac, lt, aster)
-perp --json wallet set hl 0xEVM_KEY
-perp --json wallet set pac SOLANA_BASE58_KEY
-perp --json wallet set lt 0xEVM_KEY          # may be the same EVM key as HL
-perp --json wallet set aster <ASTER_API_KEY>
+# 1. Register wallets (any 2+ of: hl, pac, lt, aster). The active OWS wallet serves every
+#    venue, so EVM + Solana venues need one multi-chain wallet (perp wallet generate <name>)
+#    or two vault wallets selected per command with --ows <name>:
+printf '%s' "$EVM_KEY" | OWS_PASSPHRASE=<pp> perp --json wallet set hl --name evm
+printf '%s' "$SOLANA_KEY" | OWS_PASSPHRASE=<pp> perp --json wallet set pac --name sol   # now active; HL: --ows evm
+perp --json wallet agent approve lighter     # Lighter trading key
 
 # 2. Verify
 perp --json wallet show
@@ -102,19 +114,18 @@ perp --json arb scan --min 5
 ### Lighter API Key Setup
 Lighter uses a separate API key for trading. Two paths:
 
-1. **Auto-setup (default)**: When `LIGHTER_PRIVATE_KEY` is set (env or `wallet set lt`), the CLI auto-generates and saves the API key on first use. Default index is 4 (indexes 0–3 are reserved by Lighter's frontend). Override with `LIGHTER_API_KEY_INDEX` env var. Valid range: 4–254.
+1. **No implicit registration**: setting a key (`wallet set lt`, env) never registers a Lighter API key — adapter creation signs nothing. Register explicitly with `perp wallet agent approve lighter`.
 2. **Managed agent (recommended for long-running agents)**: `perp wallet agent approve lighter --master <wallet> --api-key-index <slot>` registers a per-agent slot with explicit expiry tracking + 3-tier signer routing.
 
-If auto-setup fails (e.g. transient network error), retry manually:
+Register / retry:
 ```bash
 perp --json wallet agent approve lighter --master <wallet>
 ```
 
 ### Using the Same EVM Key for Multiple Exchanges
-One EVM private key works for both Hyperliquid and Lighter:
+One EVM private key works for Hyperliquid, Lighter and Aster — `wallet set` imports it once as the active OWS wallet:
 ```bash
-perp --json wallet set hl 0xKEY
-perp --json wallet set lt 0xKEY        # same key, different exchange binding
+printf '%s' "$KEY" | OWS_PASSPHRASE=<pp> perp --json wallet set hl
 ```
 
 ## Wallet Key Types
@@ -334,7 +345,7 @@ Symbols are auto-resolved by the CLI. **Always use bare symbols** (e.g., `BTC`, 
 
 ## Common Agent Mistakes
 
-1. **Using `perp setup` / `perp init` / `perp wallet setup`** — interactive, will hang forever. Use `wallet set` instead.
+1. **Using `perp setup` / `perp init` / `perp wallet setup`** — interactive, will hang forever. Use `wallet set` (key on stdin) instead.
 2. **Forgetting `--json`** — output becomes unparseable human text.
 3. **Trading with zero balance** — check `perp --json portfolio -e <ex>` first, tell user to deposit.
 4. **Retrying a trade without checking** — leads to double positions. Always check `account positions` after a trade, even if it seemed to fail.

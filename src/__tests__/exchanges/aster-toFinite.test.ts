@@ -32,6 +32,35 @@ async function buildAdapter(account: unknown, positionRisk: unknown[] = []) {
   return ast;
 }
 
+describe("AsterAdapter.getPerpAssetTransferable — the transfer asset's own row, not account-wide margin", () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+  // Multi-asset margin: the account holds USDC and no USDT; account-level availableBalance is 8.960302.
+  const account = {
+    availableBalance: "8.960302",
+    assets: [
+      { asset: "USDT", walletBalance: "0.00000000", availableBalance: "8.96030200", maxWithdrawAmount: "0.00000000" },
+      { asset: "USDC", walletBalance: "8.96030200", availableBalance: "8.96030200", maxWithdrawAmount: "8.96030200" },
+    ],
+  };
+
+  it("reads assets[asset].maxWithdrawAmount (\"maximum amount for transfer out\")", async () => {
+    const ast = await buildAdapter(account);
+    expect(await ast.getPerpAssetTransferable("USDT")).toBe(0);
+    expect(await ast.getPerpAssetTransferable("USDC")).toBe(8.960302);
+  });
+
+  it.each([
+    ["a response without assets", { availableBalance: "1" }],
+    ["no row for the asset", { assets: [account.assets[1]] }],
+    ["a row without maxWithdrawAmount", { assets: [{ asset: "USDT" }] }],
+    ["a non-numeric maxWithdrawAmount", { assets: [{ asset: "USDT", maxWithdrawAmount: "n/a" }] }],
+  ])("%s → EXCHANGE_ERROR (never an assumed 0)", async (_n, payload) => {
+    await expect((await buildAdapter(payload)).getPerpAssetTransferable("USDT")).rejects.toMatchObject({ structured: { code: "EXCHANGE_ERROR" } });
+  });
+});
+
 describe("AsterAdapter.getBalance — parseFiniteVenueNumber guards (Phase 2.4)", () => {
   beforeEach(() => {
     vi.resetModules();
@@ -139,7 +168,9 @@ describe("AsterAdapter.getPositions — parseFiniteVenueNumber guards (Phase 2.4
   // gates the liquidation warning on `liq > 0`, so a "0" silently drops the
   // position out of liquidation monitoring. Unknown is now reported as "N/A",
   // matching the Pacifica adapter, so it reads as absent rather than as a price.
-  it("mark/liquidation report 'N/A' when positionRisk omits the symbol", async () => {
+  // CHANGELOG (Unreleased): unpublished position fields are null instead of "0"/"N/A";
+  // liquidationPrice is `string | null` (interface.ts). markPrice stays a required string → "N/A".
+  it("mark reports 'N/A' and liquidation null (never 0) when positionRisk omits the symbol", async () => {
     const ast = await buildAdapter(
       {
         totalWalletBalance: "1000", totalUnrealizedProfit: "0",
@@ -150,6 +181,6 @@ describe("AsterAdapter.getPositions — parseFiniteVenueNumber guards (Phase 2.4
     );
     const pos = await ast.getPositions();
     expect(pos[0].markPrice).toBe("N/A");
-    expect(pos[0].liquidationPrice).toBe("N/A");
+    expect(pos[0].liquidationPrice).toBeNull();
   });
 });

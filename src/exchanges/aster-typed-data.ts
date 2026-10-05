@@ -12,6 +12,8 @@
  *   - EIP-712 message keys are PascalCase; HTTP query-string keys are camelCase
  */
 
+import { PerpError } from "../errors.js";
+
 // ── Domain constants ──────────────────────────────────────────────────────────
 
 /** Domain A: used for master-signed ops (ApproveAgent, DelAgent, ApproveBuilder). */
@@ -73,7 +75,7 @@ export interface ApproveAgentParams {
   builderName?: string;
   /** Microsecond-precision nonce (Date.now() * 1000 + counter). Serialized as decimal string. */
   nonceMicros: number | string;
-  asterChain?: AsterChain;
+  asterChain: AsterChain;
 }
 
 /**
@@ -142,7 +144,7 @@ export function buildApproveAgentTypedData(params: ApproveAgentParams): {
       message["BuilderName"] = params.builderName;
     }
   }
-  message["AsterChain"] = params.asterChain ?? "Mainnet";
+  message["AsterChain"] = params.asterChain;
   message["User"]       = params.user;
   message["Nonce"]      = String(params.nonceMicros);
 
@@ -160,16 +162,20 @@ export interface DelAgentParams {
   user: `0x${string}`;
   agentAddress: `0x${string}`;
   nonceMicros: number | string;
-  asterChain?: AsterChain;
+  asterChain: AsterChain;
 }
 
 /**
  * Build the EIP-712 typed-data payload for `DELETE /fapi/v3/agent`.
  *
- * TODO: confirm DelAgent struct vs Aster docs at Step 0b spike.
- * HypurrQuant_FE does not implement a revoke/delAgent method — this is a
- * best-effort field set mirroring the ApproveAgent terminal fields (AgentAddress,
- * AsterChain, User, Nonce) without the permission booleans.
+ * OPEN ITEM (docs/TEST-PLAN.md "Aster DelAgent struct — mainnet verification"): the
+ * public Aster V3 docs (asterdex/api-docs, futures api v3 + testnet, checked 2026-10-02)
+ * document no agent-delete endpoint or DelAgent struct, and HypurrQuant_FE has no
+ * revoke method. This field set mirrors the ApproveAgent terminal fields (AgentAddress,
+ * AsterChain, User, Nonce) without the permission booleans. It is only reachable on
+ * mainnet (assertAgentApproveSupported refuses Aster agent management on testnet), and
+ * revoke treats any non-confirming venue response as APPROVE_FAILED (assertAsterAgentDeleted),
+ * so a wrong struct fails loudly instead of reporting a false revoke.
  */
 export function buildDelAgentTypedData(params: DelAgentParams): {
   domain: typeof ASTER_DOMAIN_A;
@@ -186,7 +192,7 @@ export function buildDelAgentTypedData(params: DelAgentParams): {
 
   const message: Record<string, unknown> = {
     AgentAddress: params.agentAddress,
-    AsterChain:   params.asterChain ?? "Mainnet",
+    AsterChain:   params.asterChain,
     User:         params.user,
     Nonce:        String(params.nonceMicros),
   };
@@ -259,7 +265,7 @@ export interface ApproveBuilderParams {
   builderName?: string;
   user: `0x${string}`;
   nonceMicros: number | string;
-  asterChain?: AsterChain;
+  asterChain: AsterChain;
 }
 
 /**
@@ -301,7 +307,7 @@ export function buildApproveBuilderTypedData(params: ApproveBuilderParams): {
   if (params.builderName !== undefined) {
     message["BuilderName"] = params.builderName;
   }
-  message["AsterChain"] = params.asterChain ?? "Mainnet";
+  message["AsterChain"] = params.asterChain;
   message["User"]       = params.user;
   message["Nonce"]      = String(params.nonceMicros);
 
@@ -310,5 +316,180 @@ export function buildApproveBuilderTypedData(params: ApproveBuilderParams): {
     types: { ApproveBuilder: builderTypes },
     primaryType: "ApproveBuilder",
     message,
+  };
+}
+
+// ── buildDelBuilderTypedData ──────────────────────────────────────────────────
+
+export interface DelBuilderParams {
+  builder: string;
+  user: `0x${string}`;
+  nonceMicros: number | string;
+  asterChain: AsterChain;
+}
+
+/**
+ * EIP-712 payload for `DELETE /fapi/v3/builder` (revoke a builder approval).
+ * Source: asterdex/api-docs demo/aster-code.py `delBuilder` — main-wallet signed,
+ * primaryType "DelBuilder", fields = the request params with the first letter
+ * upper-cased in insertion order: Builder, AsterChain, User, Nonce (Domain A).
+ */
+export function buildDelBuilderTypedData(params: DelBuilderParams): {
+  domain: typeof ASTER_DOMAIN_A;
+  types: { DelBuilder: Eip712Field[] };
+  primaryType: "DelBuilder";
+  message: Record<string, unknown>;
+} {
+  return {
+    domain: ASTER_DOMAIN_A,
+    types: {
+      DelBuilder: [
+        { name: "Builder",    type: "string"  },
+        { name: "AsterChain", type: "string"  },
+        { name: "User",       type: "string"  },
+        { name: "Nonce",      type: "uint256" },
+      ],
+    },
+    primaryType: "DelBuilder",
+    message: { Builder: params.builder, AsterChain: params.asterChain, User: params.user, Nonce: String(params.nonceMicros) },
+  };
+}
+
+// ── buildRegisterAndApproveAgentTypedData ─────────────────────────────────────
+
+/** signatureChainId for an EVM `user` on POST /fapi/v3/registerAndApproveAgent (101 = Solana). */
+export const ASTER_REGISTER_AGENT_EVM_CHAIN_ID = 56;
+
+export interface RegisterAndApproveAgentParams {
+  user: `0x${string}`;
+  /** Microsecond timestamp; server tolerance ±10 s, never reused. */
+  nonceMicros: number | string;
+  agentName: string;
+  agentAddress: `0x${string}`;
+  /** Agent expiry, Unix milliseconds. */
+  expiredMs: number | string;
+  signatureChainId: number;
+  canSpotTrade: boolean;
+  canPerpTrade: boolean;
+  canWithdraw: boolean;
+  /** Space-delimited IPs / CIDRs; "" when none. Must be non-empty when canWithdraw. */
+  ipWhitelist: string;
+}
+
+/**
+ * EIP-712 payload for `POST /fapi/v3/registerAndApproveAgent` (asterdex/api-docs
+ * eeddec8, V3 futures v3 + testnet, added 2026-05-12). Unauthenticated endpoint;
+ * the user's wallet signs the literal (not URL-encoded) parameter string
+ *   user=…&nonce=…&agentName=…&agentAddress=…&expired=…&signatureChainId=…&canSpotTrade=…&canPerpTrade=…&canWithdraw=…&ipWhitelist=…
+ * wrapped as Message{msg} under domain AsterSignTransaction / v1 / chainId =
+ * signatureChainId (56 for EVM) / zero verifyingContract. Unlike approveAgent
+ * this carries no AsterChain field — the host selects the network.
+ */
+export function buildRegisterAndApproveAgentTypedData(params: RegisterAndApproveAgentParams): {
+  domain: { name: string; version: string; chainId: number; verifyingContract: string };
+  types: typeof ORDER_TYPES;
+  primaryType: "Message";
+  message: { msg: string };
+  /** Request parameters in signing order (the caller appends `signature`). */
+  params: [string, string][];
+} {
+  if (params.canWithdraw && params.ipWhitelist.trim().length === 0) {
+    throw new PerpError("INVALID_PARAMS", "Aster registerAndApproveAgent requires an IP whitelist when withdraw permission is granted", {
+      remediation: "Pass --ip-whitelist \"<ip> <ip/cidr>\" (space-separated), or drop --can-withdraw",
+    });
+  }
+  for (const [k, v] of [["agentName", params.agentName], ["ipWhitelist", params.ipWhitelist]] as const) {
+    // The signed msg is a raw k=v&… string — a '&' or '=' inside a value would make it ambiguous.
+    if (/[&=]/.test(v)) {
+      throw new PerpError("INVALID_PARAMS", `Aster registerAndApproveAgent: ${k} must not contain '&' or '='`, {
+        remediation: k === "agentName" ? "Choose an --agent-name without '&' or '='" : "Separate IP whitelist entries with spaces",
+      });
+    }
+  }
+  const entries: [string, string][] = [
+    ["user", params.user],
+    ["nonce", String(params.nonceMicros)],
+    ["agentName", params.agentName],
+    ["agentAddress", params.agentAddress],
+    ["expired", String(params.expiredMs)],
+    ["signatureChainId", String(params.signatureChainId)],
+    ["canSpotTrade", String(params.canSpotTrade)],
+    ["canPerpTrade", String(params.canPerpTrade)],
+    ["canWithdraw", String(params.canWithdraw)],
+    ["ipWhitelist", params.ipWhitelist],
+  ];
+  return {
+    domain: {
+      name: "AsterSignTransaction",
+      version: "1",
+      chainId: params.signatureChainId,
+      verifyingContract: "0x0000000000000000000000000000000000000000",
+    },
+    types: ORDER_TYPES,
+    primaryType: "Message",
+    message: { msg: entries.map(([k, v]) => `${k}=${v}`).join("&") },
+    params: entries,
+  };
+}
+
+// ── buildWithdrawTypedData ────────────────────────────────────────────────────
+
+/** EIP-712 types of the EVM withdraw signature (field names contain spaces — they are part of the type hash). */
+export const ASTER_WITHDRAW_TYPES = {
+  Action: [
+    { name: "type", type: "string" },
+    { name: "destination", type: "address" },
+    { name: "destination Chain", type: "string" },
+    { name: "token", type: "string" },
+    { name: "amount", type: "string" },
+    { name: "fee", type: "string" },
+    { name: "nonce", type: "uint256" },
+    { name: "aster chain", type: "string" },
+  ],
+} as const;
+
+export interface WithdrawTypedDataParams {
+  /** Destination chain id — also the EIP-712 domain chainId (docs: "The chainId of the withdraw chain"). */
+  chainId: number;
+  /** `destination Chain` name: 1 → "ETH", 56 → "BSC", 42161 → "Arbitrum". */
+  chainName: string;
+  /** Receipt address — the account's own registered address. */
+  receiver: string;
+  /** Currency name, e.g. "USDT". */
+  asset: string;
+  /** Amount in token units, the SAME string sent as the `amount` request param. */
+  amount: string;
+  /** Fee in token units, the SAME string sent as the `fee` request param. */
+  fee: string;
+  /** ms timestamp × 1000, decimal string; sent as the `userNonce` request param. */
+  userNonce: string;
+}
+
+/**
+ * Master-signed EVM withdraw signature (`userSignature` of POST /fapi/v3/aster/user-withdraw).
+ * Source: asterdex/api-docs demo/aster-deposit-withdrawal.md "EVM Withdraw Signature" and
+ * asterdex/API-demo futures-v3-demo/58_withdrawEvm.js. Domain name "Aster" (NOT the
+ * "AsterSignTransaction" API-auth domain); `aster chain` is the fixed string "Mainnet".
+ */
+export function buildWithdrawTypedData(p: WithdrawTypedDataParams): {
+  domain: { name: "Aster"; version: "1"; chainId: number; verifyingContract: string };
+  types: typeof ASTER_WITHDRAW_TYPES;
+  primaryType: "Action";
+  message: Record<string, string>;
+} {
+  return {
+    domain: { name: "Aster", version: "1", chainId: p.chainId, verifyingContract: "0x0000000000000000000000000000000000000000" },
+    types: ASTER_WITHDRAW_TYPES,
+    primaryType: "Action",
+    message: {
+      "type": "Withdraw",
+      "destination": p.receiver,
+      "destination Chain": p.chainName,
+      "token": p.asset,
+      "amount": p.amount,
+      "fee": p.fee,
+      "nonce": p.userNonce,
+      "aster chain": "Mainnet",
+    },
   };
 }

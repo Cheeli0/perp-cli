@@ -27,6 +27,25 @@ export const ERROR_CODES = {
   INVALID_PASSPHRASE:   { code: "INVALID_PASSPHRASE",   status: 401, retryable: false },
   NOT_IMPLEMENTED:      { code: "NOT_IMPLEMENTED",      status: 501, retryable: false },
 
+  // Venue abstraction (docs/DESIGN-venue-abstraction.md §10)
+  UNKNOWN_VENUE:        { code: "UNKNOWN_VENUE",        status: 400, retryable: false },
+  TIF_REQUIRED:         { code: "TIF_REQUIRED",         status: 400, retryable: false },
+  INVALID_TICK:         { code: "INVALID_TICK",         status: 400, retryable: false },
+  NO_ENV_TIER:          { code: "NO_ENV_TIER",          status: 401, retryable: false },
+  NO_BRIDGE_ROUTE:      { code: "NO_BRIDGE_ROUTE",      status: 400, retryable: false },
+  CAPABILITY_UNSUPPORTED: { code: "CAPABILITY_UNSUPPORTED", status: 400, retryable: false },
+  /** Part of a multi-leg placement was accepted and part failed; retrying would duplicate the accepted legs. */
+  ORDER_PARTIAL:        { code: "ORDER_PARTIAL",        status: 500, retryable: false },
+  /** The order was submitted but its outcome is not confirmed; retrying could double-trade. */
+  ORDER_PENDING:        { code: "ORDER_PENDING",        status: 202, retryable: false },
+  /** The order was definitely NOT placed: the venue rejected it, or it failed before it was sent (design §12.3). */
+  ORDER_REJECTED:       { code: "ORDER_REJECTED",       status: 422, retryable: false },
+  /**
+   * The venue explicitly refused a non-order account action (withdraw / transfer / approval) and
+   * executed nothing — distinct from a network / unknown outcome (EXCHANGE_ERROR, UNKNOWN).
+   */
+  ACTION_REJECTED:      { code: "ACTION_REJECTED",      status: 422, retryable: false },
+
   // 5xx - System / transient errors
   EXCHANGE_UNREACHABLE: { code: "EXCHANGE_UNREACHABLE", status: 503, retryable: true },
   RATE_LIMITED: { code: "RATE_LIMITED", status: 429, retryable: true, retryAfterMs: 1000 },
@@ -163,7 +182,8 @@ export function classifyError(err: unknown, exchange?: string): StructuredError 
       exchange,
       remediation:
         "This venue requires a completed deposit to the main wallet before any authenticated endpoint works. " +
-        "Deposit funds from the exchange UI, then retry. Public market data and agent-wallet setup are unaffected.",
+        "Deposit with: perp funds deposit aster <amount> (USDT on BNB Chain; --chain arbitrum / --asset USDC also work), " +
+        "or from the exchange UI, then retry. Public market data and agent-wallet setup are unaffected.",
     };
   }
 
@@ -233,4 +253,131 @@ export class PerpError extends Error {
       ...(strippedDetails && Object.keys(strippedDetails).length > 0 ? { details: strippedDetails } : {}),
     };
   }
+}
+
+// ── Order outcome classification (design §12.3) ──
+
+/**
+ * Codes that mean "the order was definitely not placed / filled nothing": a validation
+ * or policy failure before sending (incl. PRICE_STALE: no price to build the order), or an
+ * explicit venue rejection. Every other code
+ * (EXCHANGE_UNREACHABLE, TIMEOUT, EXCHANGE_ERROR, RATE_LIMITED, UNKNOWN, …) raised by
+ * an order call leaves the outcome unknown.
+ */
+export const DEFINITE_ORDER_FAILURE_CODES: ReadonlySet<ErrorCode> = new Set<ErrorCode>([
+  "INVALID_PARAMS", "SYMBOL_NOT_FOUND", "INSUFFICIENT_BALANCE", "MARGIN_INSUFFICIENT",
+  "SIZE_TOO_SMALL", "SIZE_TOO_LARGE", "RISK_VIOLATION", "DEPOSIT_REQUIRED",
+  "NO_SIGNER_AVAILABLE", "AGENT_NOT_REGISTERED", "AGENT_EXPIRED", "POLICY_DENIED",
+  "KEY_NOT_FOUND", "WALLET_LOCKED", "PASSPHRASE_REQUIRED", "INVALID_PASSPHRASE",
+  "NOT_IMPLEMENTED", "UNKNOWN_VENUE", "TIF_REQUIRED", "INVALID_TICK",
+  "NO_ENV_TIER", "CAPABILITY_UNSUPPORTED", "SIGNATURE_FAILED", "ORDER_REJECTED", "ACTION_REJECTED",
+  // No usable price to build/check the order — raised only before an order is sent.
+  "PRICE_STALE",
+]);
+
+/**
+ * true when `e` is a PerpError that says the order was definitely not placed: by its code, or —
+ * whatever the code — by `details.sent === false`, the thrower's explicit statement that it
+ * refused locally and sent nothing (QFEX: POSITION_NOT_FOUND from the pre-send position read).
+ * POSITION_NOT_FOUND is deliberately NOT in DEFINITE_ORDER_FAILURE_CODES: classifyError() also
+ * derives it from free message text ("position" + "not found"), and Aster / Lighter test such
+ * derived codes against the set — a text match is not proof that nothing was placed.
+ */
+export function isDefiniteOrderFailure(e: unknown): boolean {
+  if (!(e instanceof PerpError)) return false;
+  return DEFINITE_ORDER_FAILURE_CODES.has(e.structured.code) || e.structured.details?.sent === false;
+}
+
+/**
+ * Failure BEFORE an order was sent (resolution, validation, pricing, nonce, signing):
+ * definitely not placed. A PerpError that already carries a definite code is kept.
+ */
+export function orderNotSent(venue: string, what: string, e: unknown): PerpError {
+  // By CODE only: a not-sent error with a retryable code (TIMEOUT / EXCHANGE_UNREACHABLE with
+  // details.sent === false) is still re-typed, so an order call never surfaces a retryable code.
+  if (e instanceof PerpError && DEFINITE_ORDER_FAILURE_CODES.has(e.structured.code)) return e;
+  return new PerpError("ORDER_REJECTED", `${venue} ${what} not sent: ${extractErrorMessage(e)}`, { exchange: venue });
+}
+
+/**
+ * Failure AFTER an order was sent (transport error, timeout, 5xx, unreadable body):
+ * the outcome is unknown — ORDER_PENDING (non-retryable, never resubmit).
+ */
+export function orderOutcomeUnknown(venue: string, what: string, e: unknown, remediation?: string): PerpError {
+  if (e instanceof PerpError && e.structured.code === "ORDER_PENDING") return e;
+  return new PerpError("ORDER_PENDING", `${venue} ${what}: outcome unknown — ${extractErrorMessage(e)}`, {
+    exchange: venue,
+    remediation: remediation ?? `Do NOT resubmit — the order may have been placed. Check open orders, balances and positions on ${venue}`,
+  });
+}
+
+/**
+ * A plain Error an adapter throws AFTER the order request reached the venue with an
+ * HTTP 5xx: Hyperliquid `HL exchange API error (5xx): …` (exchange POST, unparseable
+ * body) and Pacifica `POST <path> failed (5xx): …`. The outcome is unknown, never a
+ * rejection.
+ */
+export function isUnknownOutcomeServerError(e: unknown): boolean {
+  if (e instanceof PerpError) return false;
+  return /^HL exchange API error \(5\d\d\)|^POST \S+ failed \(5\d\d\)/.test(extractErrorMessage(e));
+}
+
+/** A thrown value that looks like a transport failure (fetch/network/timeout/unparseable body). */
+export function isTransportFailure(e: unknown): boolean {
+  if (e instanceof PerpError) return false;
+  if (e instanceof TypeError || e instanceof SyntaxError) return true;
+  const name = e instanceof Error ? e.name : "";
+  if (name === "AbortError" || name === "TimeoutError") return true;
+  return /fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket hang up|network|timed? ?out/i.test(extractErrorMessage(e));
+}
+
+const CONNECT_FAILURE_CODES: ReadonlySet<string> = new Set(["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "UND_ERR_CONNECT_TIMEOUT", "ENETUNREACH", "EHOSTUNREACH"]);
+
+/**
+ * A fetch failure where no connection was ever established (DNS failure, connection refused,
+ * connect timeout — read from the error's `code` / `cause` chain): the request was not sent.
+ */
+export function isConnectFailure(e: unknown): boolean {
+  const seen = new Set<unknown>();
+  const walk = (x: unknown): boolean => {
+    if (x === null || typeof x !== "object" || seen.has(x)) return false;
+    seen.add(x);
+    const o = x as { code?: unknown; cause?: unknown; errors?: unknown };
+    if (typeof o.code === "string" && CONNECT_FAILURE_CODES.has(o.code)) return true;
+    if (Array.isArray(o.errors) && o.errors.length > 0 && o.errors.every(walk)) return true;
+    return walk(o.cause);
+  };
+  return walk(e);
+}
+
+/**
+ * Failure of the request that SENDS an order / cancel / withdraw / transfer / leverage change.
+ * No connection was established (isConnectFailure) → not sent (definite). Anything else
+ * (connection reset, timeout, unreadable body, 5xx) → outcome unknown: ORDER_PENDING, never the
+ * retryable EXCHANGE_UNREACHABLE / TIMEOUT. A PerpError that is already definite is kept.
+ */
+export function sendFailure(venue: string, what: string, e: unknown, remediation?: string): PerpError {
+  if (e instanceof PerpError && DEFINITE_ORDER_FAILURE_CODES.has(e.structured.code)) return e;
+  if (isDefiniteOrderFailure(e)) return orderNotSent(venue, what, e);
+  if (isConnectFailure(e)) return orderNotSent(venue, what, e);
+  return orderOutcomeUnknown(venue, what, e, remediation);
+}
+
+/** Remediation for an unknown-outcome account action (not an order). */
+export function unknownActionRemediation(venue: string, action: string): string {
+  return `Do NOT resubmit — the ${action} may have been executed. Check balances, positions and open orders on ${venue} first`;
+}
+
+/**
+ * Strict positive decimal amount ("10", "10.5"; no sign, exponent, or trailing text — "10abc"
+ * and "1e3" are refused). Returns the trimmed string.
+ */
+export function parsePositiveDecimal(raw: string, what: string): string {
+  const s = String(raw).trim();
+  if (!/^(\d+(\.\d+)?|\.\d+)$/.test(s) || !(Number(s) > 0)) {
+    throw new PerpError("INVALID_PARAMS", `${what} must be a positive decimal number (got "${raw}")`, {
+      remediation: "Pass a plain decimal amount, e.g. 10 or 10.5",
+    });
+  }
+  return s;
 }

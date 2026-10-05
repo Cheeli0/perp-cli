@@ -17,34 +17,41 @@
  * status + raw body for each, the way the adapter never does.
  *
  * SAFETY:
- *   - TESTNET ONLY. Never run against mainnet with a funded master key.
- *   - The master private key is read from env (ASTER_TESTNET_MASTER_PK) — never
- *     hard-code or commit a key. canWithdraw is forced false so no withdrawal
+ *   - TESTNET ONLY. The base URL is the Aster venue definition's testnet
+ *     restUrl (`networkConfig(getVenue("aster"), "testnet")`) — no env override.
+ *   - The master key never leaves the OWS vault (SSOT Rule #3): pass the OWS
+ *     wallet name with `--ows <wallet>`; the passphrase is resolved like the CLI
+ *     (OWS_PASSPHRASE / stdin pipe). canWithdraw is forced false so no withdrawal
  *     permission is ever granted by the probe.
  *   - UNVERIFIED: this script was authored from the spec but could not be run in
  *     the authoring session (no testnet creds). Treat the first run as the test.
  *
  * RUN:
- *   ASTER_TESTNET_MASTER_PK=0x... \
- *   ASTER_TESTNET_URL=https://fapi.asterdex-testnet.com \
- *   npx tsx scripts/probe-aster-agent.ts
+ *   OWS_PASSPHRASE=... npx tsx scripts/probe-aster-agent.ts --ows <testnet-master-wallet>
  */
 
 import { Wallet } from "ethers";
+import { getVenue, networkConfig } from "../src/exchanges/venue.js";
+import "../src/exchanges/venues/index.js";
+import { OwsEvmSigner } from "../src/signer/ows-evm.js";
+import { resolvePassphrase } from "../src/agent-wallet/passphrase.js";
 
-const BASE_URL = process.env.ASTER_TESTNET_URL ?? "https://fapi.asterdex-testnet.com";
-const PK = process.env.ASTER_TESTNET_MASTER_PK;
+const BASE_URL = networkConfig(getVenue("aster"), "testnet").restUrl;
 
-if (!PK) {
-  console.error("Set ASTER_TESTNET_MASTER_PK (testnet master private key). Aborting.");
+const owsFlag = process.argv.indexOf("--ows");
+const OWS_WALLET = owsFlag === -1 ? null : process.argv[owsFlag + 1] ?? null;
+if (OWS_WALLET === null) {
+  console.error("Pass the testnet master OWS wallet: --ows <wallet>. Aborting.");
   process.exit(1);
 }
-if (!/testnet/i.test(BASE_URL)) {
-  console.error(`Refusing to run against a non-testnet URL: ${BASE_URL}`);
+const passphrase = await resolvePassphrase({});
+if (passphrase === null) {
+  console.error("No OWS passphrase: set OWS_PASSPHRASE or pipe it on stdin. Aborting.");
   process.exit(1);
 }
 
-const master = new Wallet(PK);
+const master = OwsEvmSigner.create(OWS_WALLET, passphrase);
+const masterAddress = master.getAddress();
 const agent = Wallet.createRandom(); // throwaway agent address for the probe
 
 // Per spec: nonce = microseconds; expired = milliseconds (agent validity deadline).
@@ -54,7 +61,7 @@ const SIGNATURE_CHAIN_ID = 56; // EVM addresses (101 = Solana) — a message fie
 
 // Exact field order from the spec's Signature Instructions block.
 const msg =
-  `user=${master.address}` +
+  `user=${masterAddress}` +
   `&nonce=${nonceMicros}` +
   `&agentName=probe-agent` +
   `&agentAddress=${agent.address}` +
@@ -79,7 +86,7 @@ function domain(chainId: number) {
 async function submit(endpoint: string, chainId: number): Promise<void> {
   const signature = await master.signTypedData(domain(chainId), MESSAGE_TYPES, { msg });
   const body = new URLSearchParams({
-    user: master.address,
+    user: masterAddress,
     nonce: String(nonceMicros),
     agentName: "probe-agent",
     agentAddress: agent.address,
@@ -107,7 +114,7 @@ async function submit(endpoint: string, chainId: number): Promise<void> {
 
 async function main(): Promise<void> {
   console.log(`Aster agent-approval probe → ${BASE_URL}`);
-  console.log(`  master=${master.address}  agent=${agent.address} (throwaway)`);
+  console.log(`  master=${masterAddress}  agent=${agent.address} (throwaway)`);
   console.log(`  msg = ${msg}`);
   // 2x2 matrix: documented flat-msg envelope across both endpoints + both chainIds.
   for (const endpoint of ["/fapi/v3/registerAndApproveAgent", "/fapi/v3/approveAgent"]) {

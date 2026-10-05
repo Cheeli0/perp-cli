@@ -20,11 +20,19 @@ import type { ExchangeAdapter, ExchangeBalance, ExchangePosition } from "../exch
 import { makeTable, formatUsd, formatPnl, printJson, jsonOk, jsonError, withJsonErrors } from "../utils.js";
 import { isDexCapable } from "../exchanges/capabilities.js";
 import type { DashboardExchange } from "../dashboard/index.js";
+import { getVenue, listVenuesWithRole } from "../exchanges/venue.js";
+import "../exchanges/venues/index.js";
+import { listConfiguredAccountVenues } from "../config.js";
+import { HYPERLIQUID_API_URL } from "../api/public/urls.js";
+import { fetchValuedSpotBalances, getSpotAdapter, spotSharesPerpMargin, withSpotTimeout } from "../exchanges/spot-factory.js";
+import { scrubSecretEnv } from "../secret-env.js";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
-const EXCHANGES = ["pacifica", "hyperliquid", "lighter", "aster"] as const;
-type ExchangeName = typeof EXCHANGES[number];
+/** Venues with an account API (market-data-only venues are excluded). */
+function accountVenueIds(): string[] {
+  return listVenuesWithRole("account").map(v => v.id);
+}
 
 type Mode = "snapshot" | "health" | "watch" | "serve";
 
@@ -34,6 +42,8 @@ interface SpotHolding {
   available: string;
   held?: string;
   valueUsd: number;
+  /** true = same money as perp equity (Pacifica USDC, HL unified USDC) — not added to totals. */
+  shared: boolean;
 }
 
 interface PerpSummary {
@@ -49,7 +59,7 @@ interface PositionEntry {
   size: string;
   entryPrice: string;
   markPrice: string;
-  liquidationPrice: string;
+  liquidationPrice: string | null;
   unrealizedPnl: string;
   leverage: number;
 }
@@ -128,7 +138,7 @@ interface StdinOptions {
 }
 
 interface ResolvedOptions {
-  exchangeList: string[];      // exchanges to fetch (1-4 of EXCHANGES)
+  exchangeList: string[];      // account-role venue ids to fetch
   scope: "all" | "single";
   arb: boolean;
   health: boolean;
@@ -190,10 +200,11 @@ function parseList(input: string | undefined): string[] {
 }
 
 function validateExchanges(list: string[]): string[] {
+  const valid = accountVenueIds();
   const lower = list.map(s => s.toLowerCase());
-  const unknown = lower.filter(e => !EXCHANGES.includes(e as ExchangeName));
+  const unknown = lower.filter(e => !valid.includes(e));
   if (unknown.length > 0) {
-    throw new Error(`Unknown exchange: ${unknown.join(", ")}. Valid: ${EXCHANGES.join(", ")}`);
+    throw new Error(`Unknown exchange: ${unknown.join(", ")}. Valid: ${valid.join(", ")}`);
   }
   return lower;
 }
@@ -211,8 +222,9 @@ function resolveOptions(
   program: Command,
   flags: CliFlags,
   stdinOpts: StdinOptions,
+  defaultExchanges: string[],
 ): ResolvedOptions {
-  // 1) Build exchange list. Precedence: stdin > --exchanges > -e > all.
+  // 1) Build exchange list. Precedence: stdin > --exchanges > -e > all configured.
   let exchangeList: string[];
   let scope: "all" | "single" = "all";
 
@@ -229,7 +241,7 @@ function resolveOptions(
       exchangeList = validateExchanges([ex]);
       scope = "single";
     } else {
-      exchangeList = [...EXCHANGES];
+      exchangeList = [...defaultExchanges];
     }
   }
   // If only 1 entry and we got there via -e or stdin.exchange, scope is single.
@@ -318,64 +330,33 @@ async function fetchExchangeEntry(
       adapter.getFundingPayments(200).catch(() => [] as { time: number; symbol: string; payment: string }[]),
     ]);
 
-    // Spot balances (only HL + LT). Pacifica/Aster are perp-only.
+    // Spot balances for every venue with def.spot (§12). Failures are surfaced on
+    // stderr (the perp snapshot is still reported); unpriced tokens are excluded + warned.
     let spot: SpotHolding[] = [];
     let isUnified = false;
+    const def = getVenue(exName);
+    const warn = (msg: string) => process.stderr.write(`[warn] ${msg}\n`);
     try {
-      if (exName === "hyperliquid") {
-        const { HyperliquidSpotAdapter } = await import("../exchanges/hyperliquid-spot.js");
-        const { HyperliquidAdapter } = await import("../exchanges/hyperliquid.js");
-        const hlSpot = new HyperliquidSpotAdapter(adapter as InstanceType<typeof HyperliquidAdapter>);
-        await hlSpot.init();
-        const [raw, markets] = await Promise.all([hlSpot.getSpotBalances(), hlSpot.getSpotMarkets()]);
-        const priceMap = new Map(markets.map(m => [m.baseToken.toUpperCase(), Number(m.markPrice)]));
-        const strip = (t: string) => t.replace(/-SPOT$/i, "").toUpperCase();
-        spot = raw.filter(b => Number(b.total) > 0).map(b => {
-          const base = strip(b.token);
-          return {
-            token: b.token,
-            total: b.total,
-            available: b.available,
-            held: b.held,
-            valueUsd: base === "USDC" ? Number(b.total) : (priceMap.get(base) ?? 0) * Number(b.total),
-          };
-        });
-        // Read the actual abstraction mode (populated during init()) instead
-        // of assuming all main HL accounts are unified. Standard/default mode
-        // accounts must include spot USDC in totalAccountValueUsd because
-        // perp equity does NOT contain it. HIP-3 dex accounts always run
-        // standard semantics. Codex v0.12.12 final QA #1.
-        const hlAdapter = adapter as InstanceType<typeof HyperliquidAdapter>;
-        const dexScoped = isDexCapable(adapter) && !!adapter.dex;
-        isUnified = !dexScoped && hlAdapter.isUnifiedAccount === true;
-      } else if (exName === "lighter") {
-        const { LighterAdapter } = await import("../exchanges/lighter.js");
-        const { LighterSpotAdapter } = await import("../exchanges/lighter-spot.js");
-        const ltSpot = new LighterSpotAdapter(adapter as InstanceType<typeof LighterAdapter>);
-        await ltSpot.init();
-        const [raw, markets] = await Promise.all([ltSpot.getSpotBalances(), ltSpot.getSpotMarkets()]);
-        const priceMap = new Map(markets.map(m => [m.baseToken.toUpperCase(), Number(m.markPrice)]));
-        spot = raw.filter(b => Number(b.total) > 0).map(b => ({
-          token: b.token,
-          total: b.total,
-          available: b.available,
-          held: b.held,
-          valueUsd: b.token === "USDC" || b.token === "USDC_SPOT"
-            ? Number(b.total)
-            : (priceMap.get(b.token.toUpperCase()) ?? 0) * Number(b.total),
+      const spotAdapter = await withSpotTimeout(getSpotAdapter(def.id, adapter), `${def.displayName} spot adapter`);
+      if (spotAdapter !== null) {
+        // Wallet-model venues (Arcus) price only held tokens; bounded by SPOT_VALUATION_TIMEOUT_MS.
+        spot = (await fetchValuedSpotBalances(def, spotAdapter, warn)).map(b => ({
+          token: b.token, total: b.total, available: b.available, held: b.held, valueUsd: b.valueUsd, shared: b.shared,
         }));
+        // HIP-3 dex accounts always run standard (non-unified) semantics. Codex v0.12.12 final QA #1.
+        const dexScoped = isDexCapable(adapter) && !!adapter.dex;
+        isUnified = !dexScoped && spotSharesPerpMargin(def, adapter);
       }
-    } catch { /* spot not available */ }
+    } catch (e) {
+      warn(`${def.displayName} spot balances unavailable: ${e instanceof Error ? e.message : String(e)}`);
+    }
 
     const cutoff24h = Date.now() - 24 * 60 * 60 * 1000;
     const recent = fundingPayments.filter(f => f.time >= cutoff24h);
     const funding24h = recent.reduce((sum, f) => sum + Number(f.payment), 0);
 
-    // For unified accounts (HL), USDC spot is already in perp equity.
-    // Account value = perp equity + non-USDC spot; for non-unified, equity + all spot.
-    const nonUsdcSpotValue = isUnified
-      ? spot.filter(b => b.token.replace(/-SPOT$/i, "").toUpperCase() !== "USDC").reduce((s, b) => s + b.valueUsd, 0)
-      : spot.reduce((s, b) => s + b.valueUsd, 0);
+    // Shared balances (Pacifica USDC, HL unified USDC) are already in perp equity (§12.4 #8).
+    const nonUsdcSpotValue = spot.filter(b => !b.shared).reduce((s, b) => s + b.valueUsd, 0);
 
     return {
       name: exName,
@@ -479,11 +460,13 @@ async function runHealth(exchangeList: string[]): Promise<HealthBlock> {
   const exchanges: Record<string, "ok" | "error"> = {};
   await Promise.all(exchangeList.map(async (ex) => {
     const fn = pingMap[ex];
-    if (!fn) {
-      exchanges[ex] = "error";
-      return;
-    }
     try {
+      if (!fn) {
+        // No dedicated ping helper: probe the venue's public market-data path.
+        await getVenue(ex).publicData.fetchMarkets("mainnet");
+        exchanges[ex] = "ok";
+        return;
+      }
       const r = await fn();
       exchanges[ex] = r.ok ? "ok" : "error";
     } catch {
@@ -744,11 +727,11 @@ async function runWatch(
 // ── Serve mode (delegates to dashboard infra) ──────────────────────────────
 
 const KNOWN_HIP3_DEXES = ["xyz", "flx", "hyna", "km", "cash", "vntl"];
-const HL_INFO_URL = "https://api.hyperliquid.xyz/info";
 
 async function checkDexPositions(address: string, dex: string): Promise<number> {
   try {
-    const res = await fetch(HL_INFO_URL, {
+    // Selected network (review L7): follows -n via setSharedApiNetwork (live binding).
+    const res = await fetch(HYPERLIQUID_API_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ type: "clearinghouseState", user: address, dex }),
@@ -898,8 +881,8 @@ async function runServe(
   try {
     const { exec } = await import("child_process");
     const url = `http://localhost:${dashboard.port}`;
-    if (process.platform === "darwin") exec(`open ${url}`);
-    else if (process.platform === "linux") exec(`xdg-open ${url}`);
+    if (process.platform === "darwin") exec(`open ${url}`, { env: scrubSecretEnv(process.env) });
+    else if (process.platform === "linux") exec(`xdg-open ${url}`, { env: scrubSecretEnv(process.env) });
   } catch { /* user can open manually */ }
 
   const ac = new AbortController();
@@ -930,7 +913,7 @@ export function registerPortfolioCommand(
   program
     .command("portfolio")
     .description("Unified account view: balances, positions, risk (replaces account balance / status / dashboard)")
-    .option("--exchanges <list>", "Comma-separated exchanges to include (default: all). Plural to avoid collision with global -e/--exchange.")
+    .option("--exchanges <list>", "Comma-separated exchanges to include (default: all with configured credentials). Plural to avoid collision with global -e/--exchange.")
     .option("--arb", "Include top arb opportunities (replaces 'perp status')")
     .option("--health", "Connectivity-only mode (replaces 'perp status --health')")
     .option("--watch [interval]", "Poll mode: clear screen + redraw each tick (ms; default 5000)")
@@ -958,7 +941,7 @@ export function registerPortfolioCommand(
 
       let resolved: ResolvedOptions;
       try {
-        resolved = resolveOptions(program, flags, stdinOpts);
+        resolved = resolveOptions(program, flags, stdinOpts, await listConfiguredAccountVenues());
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (json) {

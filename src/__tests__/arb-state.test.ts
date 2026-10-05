@@ -53,7 +53,7 @@ describe("Arb State Persistence", () => {
   });
 
   it("loadArbState returns null when no file exists", () => {
-    const state = loadArbState();
+    const state = loadArbState("mainnet");
     expect(state).toBeNull();
   });
 
@@ -69,9 +69,9 @@ describe("Arb State Persistence", () => {
     });
     state.positions.push(makePosition({ symbol: "BTC", longSize: 0.01, shortSize: 0.01 }));
 
-    saveArbState(state);
+    saveArbState("mainnet", state);
 
-    const loaded = loadArbState();
+    const loaded = loadArbState("mainnet");
     expect(loaded).not.toBeNull();
     expect(loaded!.version).toBe(1);
     expect(loaded!.config.minSpread).toBe(30);
@@ -92,12 +92,12 @@ describe("Arb State Persistence", () => {
       maxPositions: 5,
       settleStrategy: "aware",
     });
-    saveArbState(state);
+    saveArbState("mainnet", state);
 
-    addPosition(makePosition({ symbol: "ETH" }));
-    addPosition(makePosition({ symbol: "BTC" }));
+    addPosition("mainnet", makePosition({ symbol: "ETH" }));
+    addPosition("mainnet", makePosition({ symbol: "BTC" }));
 
-    const positions = getPositions();
+    const positions = getPositions("mainnet");
     expect(positions).toHaveLength(2);
     expect(positions.map(p => p.symbol).sort()).toEqual(["BTC", "ETH"]);
   });
@@ -112,12 +112,12 @@ describe("Arb State Persistence", () => {
       maxPositions: 5,
       settleStrategy: "aware",
     });
-    saveArbState(state);
+    saveArbState("mainnet", state);
 
-    addPosition(makePosition({ symbol: "ETH", longSize: 1.0 }));
-    addPosition(makePosition({ symbol: "ETH", longSize: 2.0 }));
+    addPosition("mainnet", makePosition({ symbol: "ETH", longSize: 1.0 }));
+    addPosition("mainnet", makePosition({ symbol: "ETH", longSize: 2.0 }));
 
-    const positions = getPositions();
+    const positions = getPositions("mainnet");
     expect(positions).toHaveLength(1);
     expect(positions[0].longSize).toBe(2.0);
   });
@@ -132,15 +132,15 @@ describe("Arb State Persistence", () => {
       maxPositions: 5,
       settleStrategy: "aware",
     });
-    saveArbState(state);
+    saveArbState("mainnet", state);
 
-    addPosition(makePosition({ symbol: "ETH" }));
-    addPosition(makePosition({ symbol: "BTC" }));
-    addPosition(makePosition({ symbol: "SOL" }));
+    addPosition("mainnet", makePosition({ symbol: "ETH" }));
+    addPosition("mainnet", makePosition({ symbol: "BTC" }));
+    addPosition("mainnet", makePosition({ symbol: "SOL" }));
 
-    removePosition("BTC");
+    removePosition("mainnet", "BTC");
 
-    const positions = getPositions();
+    const positions = getPositions("mainnet");
     expect(positions).toHaveLength(2);
     expect(positions.map(p => p.symbol).sort()).toEqual(["ETH", "SOL"]);
   });
@@ -155,12 +155,12 @@ describe("Arb State Persistence", () => {
       maxPositions: 5,
       settleStrategy: "aware",
     });
-    saveArbState(state);
+    saveArbState("mainnet", state);
 
-    addPosition(makePosition({ symbol: "ETH" }));
-    removePosition("NONEXISTENT");
+    addPosition("mainnet", makePosition({ symbol: "ETH" }));
+    removePosition("mainnet", "NONEXISTENT");
 
-    const positions = getPositions();
+    const positions = getPositions("mainnet");
     expect(positions).toHaveLength(1);
   });
 
@@ -174,20 +174,20 @@ describe("Arb State Persistence", () => {
       maxPositions: 5,
       settleStrategy: "aware",
     });
-    saveArbState(state);
+    saveArbState("mainnet", state);
 
-    addPosition(makePosition({
+    addPosition("mainnet", makePosition({
       symbol: "ETH",
       accumulatedFunding: 0,
       lastCheckTime: "2025-01-15T10:00:00.000Z",
     }));
 
-    updatePosition("ETH", {
+    updatePosition("mainnet", "ETH", {
       accumulatedFunding: 1.234,
       lastCheckTime: "2025-01-15T12:00:00.000Z",
     });
 
-    const positions = getPositions();
+    const positions = getPositions("mainnet");
     expect(positions).toHaveLength(1);
     expect(positions[0].accumulatedFunding).toBe(1.234);
     expect(positions[0].lastCheckTime).toBe("2025-01-15T12:00:00.000Z");
@@ -206,18 +206,18 @@ describe("Arb State Persistence", () => {
       maxPositions: 5,
       settleStrategy: "aware",
     });
-    saveArbState(state);
-    addPosition(makePosition({ symbol: "ETH" }));
+    saveArbState("mainnet", state);
+    addPosition("mainnet", makePosition({ symbol: "ETH" }));
 
-    updatePosition("NONEXISTENT", { accumulatedFunding: 999 });
+    updatePosition("mainnet", "NONEXISTENT", { accumulatedFunding: 999 });
 
-    const positions = getPositions();
+    const positions = getPositions("mainnet");
     expect(positions).toHaveLength(1);
     expect(positions[0].symbol).toBe("ETH");
   });
 
   it("getPositions returns empty list when no state", () => {
-    const positions = getPositions();
+    const positions = getPositions("mainnet");
     expect(positions).toEqual([]);
   });
 
@@ -235,10 +235,10 @@ describe("Arb State Persistence", () => {
     state.positions.push(makePosition({ symbol: "ETH", accumulatedFunding: 5.67 }));
     state.positions.push(makePosition({ symbol: "BTC", accumulatedFunding: 12.34 }));
     state.lastScanTime = "2025-01-15T12:00:00.000Z";
-    saveArbState(state);
+    saveArbState("mainnet", state);
 
     // Simulate crash: reset in-memory state by reloading
-    const recovered = loadArbState();
+    const recovered = loadArbState("mainnet");
     expect(recovered).not.toBeNull();
     expect(recovered!.positions).toHaveLength(2);
     expect(recovered!.positions.find(p => p.symbol === "ETH")!.accumulatedFunding).toBe(5.67);
@@ -250,13 +250,13 @@ describe("Arb State Persistence", () => {
 
   it("loadArbState returns null for corrupt JSON", () => {
     writeFileSync(TEST_FILE, "not valid json{{{", { mode: 0o600 });
-    const state = loadArbState();
+    const state = loadArbState("mainnet");
     expect(state).toBeNull();
   });
 
   it("loadArbState returns null for wrong version", () => {
     writeFileSync(TEST_FILE, JSON.stringify({ version: 99 }), { mode: 0o600 });
-    const state = loadArbState();
+    const state = loadArbState("mainnet");
     expect(state).toBeNull();
   });
 
@@ -265,7 +265,7 @@ describe("Arb State Persistence", () => {
       minSpread: 30, closeSpread: 5, size: 100,
       holdDays: 7, bridgeCost: 0.5, maxPositions: 5, settleStrategy: "aware",
     });
-    saveArbState(state);
+    saveArbState("mainnet", state);
     // Main file should exist, .tmp should NOT exist after successful save
     expect(existsSync(TEST_FILE)).toBe(true);
     expect(existsSync(TMP_FILE)).toBe(false);
@@ -283,7 +283,7 @@ describe("Arb State Persistence", () => {
     writeFileSync(TMP_FILE, JSON.stringify(state, null, 2), { mode: 0o600 });
     writeFileSync(TEST_FILE, "corrupted{{{partial write", { mode: 0o600 });
 
-    const recovered = loadArbState();
+    const recovered = loadArbState("mainnet");
     expect(recovered).not.toBeNull();
     expect(recovered!.positions).toHaveLength(1);
     expect(recovered!.positions[0].symbol).toBe("BTC");
@@ -302,7 +302,7 @@ describe("Arb State Persistence", () => {
     // Only .tmp exists (crash before rename completed)
     writeFileSync(TMP_FILE, JSON.stringify(state, null, 2), { mode: 0o600 });
 
-    const recovered = loadArbState();
+    const recovered = loadArbState("mainnet");
     expect(recovered).not.toBeNull();
     expect(recovered!.positions[0].symbol).toBe("SOL");
   });
@@ -311,7 +311,7 @@ describe("Arb State Persistence", () => {
     writeFileSync(TEST_FILE, "corrupt main{{{", { mode: 0o600 });
     writeFileSync(TMP_FILE, "corrupt tmp{{{", { mode: 0o600 });
 
-    const state = loadArbState();
+    const state = loadArbState("mainnet");
     expect(state).toBeNull();
   });
 

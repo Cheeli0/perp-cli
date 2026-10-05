@@ -147,14 +147,16 @@ describe("AsterAdapter.getPositions — positionRisk failure is surfaced", () =>
 
   const POS = [{ symbol: "BTCUSDT", positionAmt: "1", entryPrice: "60000", unrealizedProfit: "0", leverage: "10" }];
 
-  it("reports mark/liq as N/A (not 0) when positionRisk fails", async () => {
+  // CHANGELOG (Unreleased): unpublished position fields are null instead of "0"/"N/A";
+  // liquidationPrice is `string | null` (interface.ts). markPrice stays a required string → "N/A".
+  it("reports mark/liq unknown (not 0): mark 'N/A', liq null when positionRisk fails", async () => {
     // "0" is filtered by risk.ts and gates off event-stream's liquidation
     // warning, so a zero here silently removes the position from monitoring.
     const ast = await buildPositions(POS, new Error("429 rate limited"));
     const warn = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const out = await ast.getPositions();
     warn.mockRestore();
-    expect(out[0].liquidationPrice).toBe("N/A");
+    expect(out[0].liquidationPrice).toBeNull();
     expect(out[0].markPrice).toBe("N/A");
   });
 

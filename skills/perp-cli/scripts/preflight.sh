@@ -38,7 +38,7 @@ WALLET_OUT=$($PERP --json wallet show 2>/dev/null || echo '{"ok":false}')
 if echo "$WALLET_OUT" | grep -q '"ok":true'; then
   add_check "wallet" "pass" "Wallet configured"
 else
-  add_check "wallet" "fail" "No wallet configured — run: perp wallet set <exchange> <key>"
+  add_check "wallet" "fail" "No wallet configured — run: perp wallet set <exchange>  (key via hidden prompt or stdin)"
 fi
 
 # 3. Exchange connectivity (proxy via unauthenticated market prices fetch)

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { executePlan, type ExecutionPlan } from "../../plan-executor.js";
+import { PerpError } from "../../errors.js";
 import type {
   ExchangeAdapter,
   ExchangePosition,
@@ -12,11 +13,19 @@ vi.mock("../../execution-log.js", () => ({ logExecution: vi.fn() }));
 // Mock adapter factory
 // ---------------------------------------------------------------------------
 
+// Registered venue id ("hyperliquid") — the plan resolves the venue's slippage bound; an
+// unregistered name is UNKNOWN_VENUE. Positions are STATEFUL: market_order / close_position
+// steps are verified as the measured position delta (CHANGELOG "perp plan execute:
+// market_order and close_position steps are verified by the position delta").
+const DEFAULT_SLIPPAGE = { bps: 50, source: "default" };
+const entryOpts = { reduceOnly: false, slippage: DEFAULT_SLIPPAGE };
+const closeOpts = { reduceOnly: true, slippage: DEFAULT_SLIPPAGE };
+
 function createMockAdapter(overrides?: {
   positions?: ExchangePosition[];
   balance?: Partial<ExchangeBalance>;
 }) {
-  const positions: ExchangePosition[] = overrides?.positions ?? [];
+  let positions: ExchangePosition[] = (overrides?.positions ?? []).map(p => ({ ...p }));
   const balance: ExchangeBalance = {
     equity: "10000",
     available: "8000",
@@ -24,21 +33,33 @@ function createMockAdapter(overrides?: {
     unrealizedPnl: "0",
     ...overrides?.balance,
   };
+  const applyFill = (symbol: string, side: "buy" | "sell", size: string) => {
+    const p = positions.find(x => x.symbol === symbol);
+    const signed = (p ? (p.side === "long" ? 1 : -1) * Number(p.size) : 0) + (side === "buy" ? 1 : -1) * Number(size);
+    positions = positions.filter(x => x.symbol !== symbol);
+    if (Math.abs(signed) > 1e-12) {
+      positions.push({ ...(p ?? { symbol, entryPrice: "100", markPrice: "100", liquidationPrice: null, unrealizedPnl: "0", leverage: 1 }),
+        symbol, side: signed > 0 ? "long" : "short", size: String(Number(Math.abs(signed).toFixed(10))) });
+    }
+  };
 
   return {
-    name: "mock",
+    name: "hyperliquid",
     getMarkets: vi.fn().mockResolvedValue([]),
     getOrderbook: vi.fn().mockResolvedValue({ bids: [], asks: [] }),
     getRecentTrades: vi.fn().mockResolvedValue([]),
     getFundingHistory: vi.fn().mockResolvedValue([]),
     getKlines: vi.fn().mockResolvedValue([]),
     getBalance: vi.fn().mockResolvedValue(balance),
-    getPositions: vi.fn().mockResolvedValue(positions),
+    getPositions: vi.fn(async () => positions.map(p => ({ ...p }))),
     getOpenOrders: vi.fn().mockResolvedValue([]),
     getOrderHistory: vi.fn().mockResolvedValue([]),
     getTradeHistory: vi.fn().mockResolvedValue([]),
     getFundingPayments: vi.fn().mockResolvedValue([]),
-    marketOrder: vi.fn().mockResolvedValue({ orderId: "m-1" }),
+    marketOrder: vi.fn(async (symbol: string, side: "buy" | "sell", size: string) => {
+      applyFill(symbol, side, size);
+      return { orderId: "m-1" };
+    }),
     limitOrder: vi.fn().mockResolvedValue({ orderId: "l-1" }),
     editOrder: vi.fn().mockResolvedValue({ orderId: "e-1" }),
     cancelOrder: vi.fn().mockResolvedValue({ cancelled: true }),
@@ -77,14 +98,15 @@ describe("Scenario 1: Open long BTC with stop loss", () => {
 
     // marketOrder: symbol, side, size
     expect(adapter.marketOrder).toHaveBeenCalledTimes(1);
-    expect(adapter.marketOrder).toHaveBeenCalledWith("BTC", "buy", "0.01");
+    expect(adapter.marketOrder).toHaveBeenCalledWith("BTC", "buy", "0.01", entryOpts);
 
     // stopOrder: symbol, side, size, triggerPrice, opts
     // CRITICAL: stop loss side is SELL (opposite of long)
     expect(adapter.stopOrder).toHaveBeenCalledTimes(1);
     expect(adapter.stopOrder).toHaveBeenCalledWith(
       "BTC", "sell", "0.01", "60000",
-      { limitPrice: undefined, reduceOnly: false },
+      // Market trigger carries the resolved slippage bound (CHANGELOG: "plan stop_order steps pass the resolved setting").
+      { limitPrice: undefined, reduceOnly: false, slippage: DEFAULT_SLIPPAGE },
     );
 
     // Verify call order
@@ -118,9 +140,9 @@ describe("Scenario 2: Delta-neutral hedge", () => {
     expect(adapter.marketOrder).toHaveBeenCalledTimes(2);
 
     // First call: long BTC
-    expect(adapter.marketOrder).toHaveBeenNthCalledWith(1, "BTC", "buy", "0.01");
+    expect(adapter.marketOrder).toHaveBeenNthCalledWith(1, "BTC", "buy", "0.01", entryOpts);
     // Second call: short ETH
-    expect(adapter.marketOrder).toHaveBeenNthCalledWith(2, "ETH", "sell", "0.1");
+    expect(adapter.marketOrder).toHaveBeenNthCalledWith(2, "ETH", "sell", "0.1", entryOpts);
   });
 });
 
@@ -161,11 +183,13 @@ describe("Scenario 3: Emergency close all", () => {
     // cancelAllOrders called first
     expect(adapter.cancelAllOrders).toHaveBeenCalledTimes(1);
 
-    // close_position fetches positions, then sells the long
-    expect(adapter.getPositions).toHaveBeenCalledTimes(1);
+    // close_position reads the live position, then sells the long reduce-only; the close is
+    // verified by re-reading the position (closePerpVerified), so getPositions is read again.
+    expect(vi.mocked(adapter.getPositions).mock.calls.length).toBeGreaterThanOrEqual(2);
     expect(adapter.marketOrder).toHaveBeenCalledTimes(1);
-    // CRITICAL: closing a LONG = must SELL, not buy
-    expect(adapter.marketOrder).toHaveBeenCalledWith("BTC", "sell", "0.5");
+    // CRITICAL: closing a LONG = must SELL (reduce-only), not buy
+    expect(adapter.marketOrder).toHaveBeenCalledWith("BTC", "sell", "0.5", closeOpts);
+    expect(await adapter.getPositions()).toEqual([]);
 
     // Verify order: cancel before market order
     const cancelCallOrder = adapter.cancelAllOrders.mock.invocationCallOrder[0];
@@ -215,8 +239,8 @@ describe("Scenario 4: Scale in with wait", () => {
 
     // marketOrder called exactly twice, both buy ETH 1
     expect(adapter.marketOrder).toHaveBeenCalledTimes(2);
-    expect(adapter.marketOrder).toHaveBeenNthCalledWith(1, "ETH", "buy", "1");
-    expect(adapter.marketOrder).toHaveBeenNthCalledWith(2, "ETH", "buy", "1");
+    expect(adapter.marketOrder).toHaveBeenNthCalledWith(1, "ETH", "buy", "1", entryOpts);
+    expect(adapter.marketOrder).toHaveBeenNthCalledWith(2, "ETH", "buy", "1", entryOpts);
 
     // Wait actually paused at least ~100ms
     expect(elapsed).toBeGreaterThanOrEqual(90); // allow small timing margin
@@ -233,11 +257,14 @@ describe("Scenario 4: Scale in with wait", () => {
 // ---------------------------------------------------------------------------
 
 describe("Scenario 5: Rollback on failure", () => {
-  it("rolls back (cancelAllOrders) when a step with onFailure=rollback throws", async () => {
+  // CHANGELOG: "onFailure: rollback now actually reverses filled market-order steps (reduce-only
+  // closePerpVerified for the MEASURED fill) ... (previously cancelAllOrders() on every symbol)".
+  it("rolls back (reduce-only reversal of the filled buy) when a step with onFailure=rollback is rejected", async () => {
     const adapter = createMockAdapter();
 
-    // limitOrder will fail
-    adapter.limitOrder.mockRejectedValueOnce(new Error("Insufficient margin"));
+    // limitOrder is definitively rejected (a typed rejection: nothing was placed). An untyped
+    // Error from a limit placement would be ORDER_PENDING (outcome unknown), never "failed".
+    adapter.limitOrder.mockRejectedValueOnce(new PerpError("MARGIN_INSUFFICIENT", "Insufficient margin"));
 
     const plan: ExecutionPlan = {
       version: "1.0",
@@ -252,20 +279,20 @@ describe("Scenario 5: Rollback on failure", () => {
     // Overall status is failed
     expect(result.status).toBe("failed");
 
-    // Step 1 succeeded
+    // Step 1 was reversed
     const buyStep = result.steps.find(s => s.stepId === "buy");
-    expect(buyStep?.status).toBe("success");
+    expect(buyStep?.status).toBe("rolled_back");
 
     // Step 2 rolled back
     const failStep = result.steps.find(s => s.stepId === "fail");
     expect(failStep?.status).toBe("rolled_back");
     expect(failStep?.error?.message).toContain("Insufficient margin");
 
-    // Rollback called cancelAllOrders (the rollback function cancels all for market_order steps)
-    expect(adapter.cancelAllOrders).toHaveBeenCalled();
-
-    // marketOrder was called once (the buy), limitOrder was called once (the failing sell)
-    expect(adapter.marketOrder).toHaveBeenCalledTimes(1);
+    // The rollback closes exactly the measured fill reduce-only; it never cancels every order.
+    expect(adapter.cancelAllOrders).not.toHaveBeenCalled();
+    expect(adapter.marketOrder).toHaveBeenCalledTimes(2);
+    expect(adapter.marketOrder).toHaveBeenNthCalledWith(2, "BTC", "sell", "0.01", closeOpts);
+    expect(await adapter.getPositions()).toEqual([]);
     expect(adapter.limitOrder).toHaveBeenCalledTimes(1);
   });
 });
@@ -279,7 +306,8 @@ describe("Scenario 6: Skip non-critical step", () => {
     const adapter = createMockAdapter();
 
     // stopOrder will fail
-    adapter.stopOrder.mockRejectedValueOnce(new Error("Rate limit exceeded"));
+    // Typed definite rejection: an untyped Error from a stop placement is ORDER_PENDING (plan stops).
+    adapter.stopOrder.mockRejectedValueOnce(new PerpError("ORDER_REJECTED", "Rate limit exceeded"));
 
     const plan: ExecutionPlan = {
       version: "1.0",
@@ -376,7 +404,7 @@ describe("Scenario 8: Close position side correctness", () => {
     expect(result.status).toBe("completed");
     expect(adapter.marketOrder).toHaveBeenCalledTimes(1);
     // MUST be sell to close a long — if this were "buy", user doubles their position!
-    expect(adapter.marketOrder).toHaveBeenCalledWith("BTC", "sell", "0.5");
+    expect(adapter.marketOrder).toHaveBeenCalledWith("BTC", "sell", "0.5", closeOpts);
   });
 
   it("closes a SHORT position by BUYING (not selling)", async () => {
@@ -407,7 +435,7 @@ describe("Scenario 8: Close position side correctness", () => {
     expect(result.status).toBe("completed");
     expect(adapter.marketOrder).toHaveBeenCalledTimes(1);
     // MUST be buy to close a short — if this were "sell", user doubles their position!
-    expect(adapter.marketOrder).toHaveBeenCalledWith("ETH", "buy", "2.0");
+    expect(adapter.marketOrder).toHaveBeenCalledWith("ETH", "buy", "2.0", closeOpts);
   });
 
   it("fails gracefully when closing a non-existent position", async () => {
@@ -482,7 +510,8 @@ describe("Scenario 10: Dependency chain failure propagation", () => {
     const adapter = createMockAdapter();
 
     // Step A (market_order) will fail
-    adapter.marketOrder.mockRejectedValueOnce(new Error("Exchange down"));
+    // Typed definite rejection (an untyped Error is measured → ORDER_PENDING, see the pending test below).
+    adapter.marketOrder.mockRejectedValueOnce(new PerpError("ORDER_REJECTED", "Exchange down"));
 
     const plan: ExecutionPlan = {
       version: "1.0",
@@ -508,11 +537,14 @@ describe("Scenario 10: Dependency chain failure propagation", () => {
     expect(adapter.stopOrder).toHaveBeenCalledTimes(0);
   });
 
-  it("skips A but still runs B (dependsOn skipped step is not treated as failed) and C", async () => {
+  // CHANGELOG: "dependsOn now blocks unless the dependency succeeded (a skipped / pending /
+  // rolled-back dependency used to let the step run)".
+  it("A skipped → B (dependsOn A) is skipped too; C (no dependency) still runs", async () => {
     const adapter = createMockAdapter();
 
     // Step A will fail but is marked skip
-    adapter.marketOrder.mockRejectedValueOnce(new Error("Exchange down"));
+    // Typed definite rejection (an untyped Error is measured → ORDER_PENDING, see the pending test below).
+    adapter.marketOrder.mockRejectedValueOnce(new PerpError("ORDER_REJECTED", "Exchange down"));
 
     const plan: ExecutionPlan = {
       version: "1.0",
@@ -525,24 +557,21 @@ describe("Scenario 10: Dependency chain failure propagation", () => {
 
     const result = await executePlan(adapter, plan);
 
-    // The executor dependency check only blocks on dep.status === "failed", NOT "skipped".
-    // So A is skipped (not "failed"), B's dependency sees a non-failed dep and proceeds, C runs too.
     expect(result.steps).toHaveLength(3);
 
     expect(result.steps[0].stepId).toBe("A");
     expect(result.steps[0].status).toBe("skipped");
 
-    // B runs because "skipped" !== "failed" in the dependency check
+    // B is blocked: its dependency did not succeed
     expect(result.steps[1].stepId).toBe("B");
-    expect(result.steps[1].status).toBe("success");
+    expect(result.steps[1].status).toBe("skipped");
+    expect(result.steps[1].error?.code).toBe("DEPENDENCY_FAILED");
 
     expect(result.steps[2].stepId).toBe("C");
     expect(result.steps[2].status).toBe("success");
 
-    // marketOrder called once (A, which failed), limitOrder called once (B succeeded)
     expect(adapter.marketOrder).toHaveBeenCalledTimes(1);
-    expect(adapter.limitOrder).toHaveBeenCalledTimes(1);
-    expect(adapter.limitOrder).toHaveBeenCalledWith("BTC", "buy", "60000", "0.02");
+    expect(adapter.limitOrder).toHaveBeenCalledTimes(0);
     expect(adapter.getBalance).toHaveBeenCalledTimes(1);
   });
 
@@ -553,7 +582,8 @@ describe("Scenario 10: Dependency chain failure propagation", () => {
     // With abort, the executor returns immediately so B never enters.
     // To get a "failed" status in completedSteps while continuing, we need a special setup:
     // A fails+abort -> only A in results, plan stops. B never runs.
-    adapter.marketOrder.mockRejectedValueOnce(new Error("Exchange down"));
+    // Typed definite rejection (an untyped Error is measured → ORDER_PENDING, see the pending test below).
+    adapter.marketOrder.mockRejectedValueOnce(new PerpError("ORDER_REJECTED", "Exchange down"));
 
     const plan: ExecutionPlan = {
       version: "1.0",
@@ -574,10 +604,10 @@ describe("Scenario 10: Dependency chain failure propagation", () => {
     expect(adapter.limitOrder).toHaveBeenCalledTimes(0);
   });
 
-  it("skipped status does NOT propagate through dependency chain: A(skip) -> B(dep A) -> C(dep B) all run", async () => {
+  it("a skipped step blocks the whole dependency chain: A(skip) -> B(dep A) -> C(dep B) all skipped", async () => {
     const adapter = createMockAdapter();
 
-    adapter.marketOrder.mockRejectedValueOnce(new Error("fail"));
+    adapter.marketOrder.mockRejectedValueOnce(new PerpError("ORDER_REJECTED", "fail"));
 
     const plan: ExecutionPlan = {
       version: "1.0",
@@ -590,18 +620,41 @@ describe("Scenario 10: Dependency chain failure propagation", () => {
 
     const result = await executePlan(adapter, plan);
 
-    // The executor only blocks on dep.status === "failed". "skipped" is NOT "failed",
-    // so B proceeds (dep A exists and is not failed), and C proceeds (dep B exists and is success).
     expect(result.status).toBe("completed");
     expect(result.steps).toHaveLength(3);
-    expect(result.steps[0].status).toBe("skipped");  // A failed but skipped
-    expect(result.steps[1].status).toBe("success");   // B runs (A's "skipped" != "failed")
-    expect(result.steps[2].status).toBe("success");   // C runs (B succeeded)
+    expect(result.steps[0].status).toBe("skipped");  // A failed, onFailure=skip
+    expect(result.steps[1].status).toBe("skipped");  // B blocked (A did not succeed)
+    expect(result.steps[2].status).toBe("skipped");  // C blocked (B did not succeed)
 
-    // A's market order attempted (failed), B's limit order ran, C's stop order ran
     expect(adapter.marketOrder).toHaveBeenCalledTimes(1);
-    expect(adapter.limitOrder).toHaveBeenCalledTimes(1);
-    expect(adapter.stopOrder).toHaveBeenCalledTimes(1);
+    expect(adapter.limitOrder).toHaveBeenCalledTimes(0);
+    expect(adapter.stopOrder).toHaveBeenCalledTimes(0);
+  });
+
+  it("an untyped market-order error is an unknown outcome: pending, quarantined, dependents never run", async () => {
+    vi.useFakeTimers();
+    try {
+      const adapter = createMockAdapter();
+      adapter.marketOrder.mockRejectedValueOnce(new Error("Exchange down"));
+      const plan: ExecutionPlan = {
+        version: "1.0",
+        steps: [
+          { id: "A", action: "market_order", params: { symbol: "BTC", side: "buy", size: "0.01" }, onFailure: "skip" },
+          { id: "B", action: "limit_order", params: { symbol: "BTC", side: "buy", size: "0.02", price: "60000" }, dependsOn: "A" },
+        ],
+      };
+      const p = executePlan(adapter, plan);
+      await vi.runAllTimersAsync();
+      const result = await p;
+      expect(result.status).toBe("pending");
+      expect(result.steps).toHaveLength(1);
+      expect(result.steps[0].status).toBe("pending");
+      expect(result.quarantined).toEqual(["BTC"]);
+      expect(adapter.marketOrder).toHaveBeenCalledTimes(1);
+      expect(adapter.limitOrder).toHaveBeenCalledTimes(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -746,8 +799,8 @@ describe("Edge cases", () => {
     await executePlan(adapter, plan);
 
     // market_order uppercases the symbol
-    expect(adapter.marketOrder).toHaveBeenNthCalledWith(1, "BTC", "buy", "0.1");
-    // close_position uppercases for lookup and uses position's original symbol
-    expect(adapter.marketOrder).toHaveBeenNthCalledWith(2, "BTC", "sell", "1");
+    expect(adapter.marketOrder).toHaveBeenNthCalledWith(1, "BTC", "buy", "0.1", entryOpts);
+    // close_position uppercases for lookup and closes the LIVE position (1 + the verified 0.1 buy)
+    expect(adapter.marketOrder).toHaveBeenNthCalledWith(2, "BTC", "sell", "1.1", closeOpts);
   });
 });

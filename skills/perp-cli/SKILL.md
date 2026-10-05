@@ -1,9 +1,9 @@
 ---
 name: perp-cli
-description: "Multi-DEX perpetual futures trading via the perp-cli command-line tool. Use when user asks to: trade perps, check funding rates, scan/execute arbitrage (perp-perp or spot-perp), run delta-neutral strategies, bridge USDC across chains, manage positions/orders/leverage, deposit/withdraw, hedge spot+perp, trade HIP-3 DEXes, or mentions perp-cli, hypurrquant, Pacifica, Hyperliquid, Lighter, Aster, HyperEVM, funding arb, or U-tokens (UBTC/UETH/USOL). Covers Pacifica (Solana), Hyperliquid (HyperEVM), Lighter (Ethereum), and Aster (BNB Chain)."
+description: "Multi-DEX perpetual futures trading via the perp-cli command-line tool. Use when user asks to: trade perps, check funding rates, scan/execute arbitrage (perp-perp or spot-perp), run delta-neutral strategies, bridge USDC across chains, manage positions/orders/leverage, deposit/withdraw, hedge spot+perp, trade HIP-3 DEXes, or mentions perp-cli, hypurrquant, Pacifica, Hyperliquid, Lighter, Aster, Lighter RH, Ondo Perps, Arcus, HyperEVM, funding arb, or U-tokens (UBTC/UETH/USOL). Covers Pacifica (Solana), Hyperliquid (HyperEVM), Lighter (Ethereum), Aster (BNB Chain), Lighter RH and Arcus (Robinhood chain) and Ondo Perps (off-chain)."
 license: MIT
 allowed-tools: "Bash(perp:*), Bash(npx perp-cli:*), Bash(npx -y perp-cli:*)"
-compatibility: "Requires Node.js 20 or newer and the perp-cli npm package (global install or npx). Network access required for exchange APIs and bridge providers. Mutating commands need wallet keys configured via 'perp wallet set EXCHANGE KEY' (Solana base58 / EVM hex / Aster API key). Skill is portable across Claude Code, Claude.ai, Cursor, Codex, and Gemini CLI — no platform-specific features."
+compatibility: "Requires Node.js 20 or newer and the perp-cli npm package (global install or npx). Network access required for exchange APIs and bridge providers. Mutating commands need a wallet key imported into the OWS vault via 'perp wallet set EXCHANGE' (key on stdin or hidden prompt — never argv). Skill is portable across Claude Code, Claude.ai, Cursor, Codex, and Gemini CLI — no platform-specific features."
 metadata:
   author: hypurrquant
   version: "0.13.0"
@@ -11,7 +11,7 @@ metadata:
 
 # perp-cli
 
-Multi-DEX perpetual futures CLI + MCP server for Pacifica (Solana), Hyperliquid (HyperEVM), Lighter (Ethereum), and Aster (BNB Chain). v0.13.0+ also supports Hyperliquid Outcome markets (HIP-4) — fully-collateralized binary/range contracts quoted in USDH.
+Multi-DEX perpetual futures CLI + MCP server for Pacifica (Solana), Hyperliquid (HyperEVM), Lighter (Ethereum), Aster (BNB Chain), Lighter RH (`lighter-rh`, Robinhood chain, USDG), Ondo Perps (`ondo`), QFEX (`qfex`, custodial TradFi perps — import-only API key; reduce-only / close / stop / TP-SL / edit are refused for now, see "QFEX" below), Arcus (`arcus`, Robinhood chain, USDG). v0.13.0+ also supports Hyperliquid Outcome markets (HIP-4) — fully-collateralized binary/range contracts quoted in USDH.
 
 ## Instructions
 
@@ -36,7 +36,7 @@ Also bundled under `scripts/`: `preflight.sh`, `arb-monitor.sh`, `funding-analys
 1. **Always pass `--json`.** Without it, output is human-formatted and hard to parse.
 2. **Always run `--dry-run` first** for any mutating trade (open / close / bridge / withdraw). Show the result, get user confirmation, then execute without `--dry-run`.
 3. **Always use `--fields`** when you only need specific data — saves tokens.
-4. **Avoid bare `perp setup` / `perp init` / `perp wallet setup`** — they prompt and will hang an agent. Use `perp wallet set <exchange> <key>` for key registration, or `perp setup --non-interactive --passphrase <pp> --wallet-name <name>` (and `OWS_PASSPHRASE=<pp> perp wallet setup --name <n> --max-tx-usd <usd> --max-daily-usd <usd>`) when the wizard is required.
+4. **Avoid bare `perp setup` / `perp init` / `perp wallet setup`** — they prompt and will hang an agent. Use `printf '%s' "$KEY" | OWS_PASSPHRASE=<pp> perp --json wallet set <exchange>` for key registration (key on stdin; a key on argv is rejected), or `perp --json setup --non-interactive --wallet <ows-wallet> --venues <list> [--default-venue <v>] [--slippage-bps <n>] [--slippage <venue>=<bps>]` (new wallet: `--wallet-name <name> --passphrase <pp>`; agent registration only with `--approve-agents --yes`, after user confirmation) (and `OWS_PASSPHRASE=<pp> perp wallet setup --name <n> --max-tx-usd <usd> --max-daily-usd <usd>`) when the wizard is required.
 5. **NEVER trade without explicit user confirmation.** A dry-run is not consent.
 6. **NEVER read `~/.perp/.env` or other key files.** The CLI reads them — you should not.
 7. **NEVER manually add `-PERP` suffix** to symbols. Use bare names (`BTC`, `SOL`, `ICP`); the CLI resolves exchange-specific naming.
@@ -60,13 +60,40 @@ perp --json portfolio -e <ex>         # per-exchange USDC available (account bal
 If any required exchange is missing, register it (user supplies the key):
 
 ```bash
-perp --json wallet set pac   <SOLANA_BASE58_KEY>     # Pacifica
-perp --json wallet set hl    <EVM_HEX_KEY>           # Hyperliquid
-perp --json wallet set lt    <EVM_HEX_KEY>           # Lighter (auto-generates API key, default index 4)
-perp --json wallet set aster <ASTER_API_KEY>         # Aster (BNB Chain)
+printf '%s' "$EVM_HEX_KEY" | OWS_PASSPHRASE=<pp> perp --json wallet set hl          # Hyperliquid / Lighter / Aster (EVM)
+printf '%s' "$SOLANA_BASE58_KEY" | OWS_PASSPHRASE=<pp> perp --json wallet set pac   # Pacifica (Solana)
 ```
 
-The same EVM key works for both Hyperliquid and Lighter.
+The key is read from stdin (never argv — an argv key is rejected) and imported into the OWS vault; the imported wallet becomes `owsActiveWallet`, which serves every venue. The same EVM key works for Hyperliquid, Lighter and Aster. Lighter trading additionally needs `perp wallet agent approve lighter`.
+
+Lighter RH / Ondo Perps / Arcus have no `wallet set` path — register an agent / API key (user runs it; Ondo reads key id + secret from stdin):
+
+```bash
+perp --json wallet agent approve lighter-rh
+printf '%s\n%s\n' "$KEY_ID" "$SECRET" | perp --json wallet agent approve ondo
+perp --json wallet agent approve arcus --master <ows-wallet>   # address must be on the Arcus access whitelist
+```
+
+**No master wallet on this computer?** The user can create the agent / API key on the exchange website and import it — key on stdin only, verified against the venue before it is stored (`verification.status` is `"unverified"` only for Pacifica, which lists bindings master-signed only):
+
+```bash
+printf '%s' "$AGENT_KEY" | perp --json wallet agent import hyperliquid               # master read from HL
+printf '%s' "$AGENT_KEY" | perp --json wallet agent import aster --master-address 0x…  # also Aster testnet
+printf '%s' "$AGENT_KEY" | perp --json wallet agent import pacifica --master-address <SOL>
+printf '%s' "$API_KEY" | perp --json wallet agent import lighter --account-index <n> --api-key-index <slot>
+printf '%s' "$ED25519_KEY" | perp --json wallet agent import arcus --master-address 0x…
+```
+
+Imported keys trade; `funds deposit|withdraw|transfer|bridge`, `wallet manage referral set` and `wallet agent approve` need the master → `NO_SIGNER_AVAILABLE` (tell the user to do it on the website or `perp wallet import` the master). `wallet agent revoke` of an imported key needs `--local-only` and does NOT revoke it on the exchange; `rotate` is refused (new key on the website → `import --replace`).
+
+**QFEX** (`-e qfex`, testnet = QFEX UAT): keys are created on the QFEX website and imported by the USER (`perp wallet agent import qfex [--account-id <uuid>]` — the resolved account UUID must be confirmed). Rules an agent must follow:
+- Refused with `CAPABILITY_UNSUPPORTED` (do not work around): any reduce-only order (`trade close/close-all/flatten/reduce/stop/tpsl`, `--tp/--sl`, MCP `trade_close`), `trade edit`, `--client-id`, non-USD-quoted markets, QFEX as a funding-arb / funding-bot leg. To flatten, tell the user to place a plain opposite order or use the QFEX web app.
+- Limit GTC / ALO returns `status: accepted, finality: pending` after the ACK; `open` only via `perp --json trade status c:<id> --symbol <S> -e qfex`.
+- `ORDER_PENDING` = outcome unknown: NEVER resubmit; check with the `c:<id>` in the remediation.
+- Funding rates on QFEX are unverified: excluded everywhere unless `perp --json arb scan --rates --include-unverified` (display only).
+- Withdrawals need `settings.withdraw.qfex` (allowlist + limits), which only the user can set in an interactive terminal — an agent cannot set or change it. `perp --json --dry-run funds withdraw qfex <amt> --to <addr>` shows the gate verdict.
+
+Venue rules for these: `trade limit` on `ondo` / `arcus` has **no default `--tif`** (pass one: ondo GTC|IOC|ALO, arcus GTT|IOC|FOK|ALO); market orders on every venue are bounded by `--slippage-bps <n>` → `settings.slippageBps.<venue>` → `settings.defaultSlippageBps` (shipped default 50). Ondo (US, PA) and Arcus (US, CA, GB) print a one-time restricted-region notice on stderr when used with credentials (warn only, never blocks).
 
 ### Step 3: Discover (read-only)
 
@@ -180,6 +207,8 @@ perp --json funds rebalance execute --auto-bridge
 
 Always run `funds bridge quote` before `funds bridge send` so the user sees fees + ETA.
 
+Relay swaps between assets (`--from-asset` / `--to-asset`, chains `robinhood`, `arbitrum`, `bsc`, `base`, destination `solana`): run `perp --json --dry-run funds bridge send ...` first — it prints the locally verified quote (amount in, expected out, protocol-guaranteed minimum, fees, ETA) and the min-out verdict without loading a key. Stable → native (e.g. USDG → SOL / ETH) needs `--min-out`. The recipient is always the master wallet's own address; an `ORDER_PENDING` result carries the Relay request id — never bridge again before checking it.
+
 ### Strategy engine (20 algorithms + scripted plans)
 
 ```bash
@@ -201,6 +230,8 @@ perp --json background list
 perp --json background logs <id> -f
 perp --json background stop <id>
 ```
+
+Background jobs inherit the parent's `-n`, `--dry-run`, `-e`, `--ows`, `-w`, `--no-agent`, `--dex`, and never receive key material (argv/env): they resolve credentials from the OWS vault / agent keystores / `~/.perp/.env` themselves. `--background` with `-k`, `--passphrase`, `--ows-key` or a shell-exported key / `OWS_PASSPHRASE` → `INVALID_PARAMS` — register an agent (`perp wallet agent approve <venue>`), which signs without the master passphrase.
 
 ### Position sizing & safety
 
@@ -311,16 +342,32 @@ For a full troubleshooting + non-interactive flow guide, read `references/agent-
 ## Referrals (optional, ask once per setup)
 
 ```bash
-perp --json settings referrals on    # opt-in (no extra fees — exchange rebates only)
-perp --json settings referrals off
+perp --json --dry-run -e hyperliquid wallet manage referral set   # preview (nothing signed)
+perp --json -e hyperliquid wallet manage referral set [code]      # signs + sends ONE referral action
+perp --json -e lighter wallet manage referral set [code]          # Lighter (needs an agent key)
 ```
 
-When the user first sets up a wallet, ask:
-> "perp-cli development is supported by optional referrals. Enable? No extra fees — only exchange rebates are used."
+Referral codes are never applied implicitly (adapter creation signs nothing). When the user first sets up a wallet, ask:
+> "perp-cli development is supported by optional referrals. Apply the referral code? It signs one referral action on the venue; no extra fees — only exchange rebates are used."
+
+## Builder fees (OFF by default — never enable on your own)
+
+Builder fees are extra fees on the USER's perp orders, paid to a third-party builder. perp-cli attaches none unless the user explicitly set `settings builder.<venue>` AND the venue approval is confirmed. Do not configure or approve a builder unless the user asks for it.
+
+```bash
+perp --json wallet builder status [venue]                 # support, config, approval, attaches?
+perp --json --dry-run wallet builder approve <venue>      # plan only — show it to the user
+perp --json wallet builder approve <venue> --yes          # only after explicit user consent (master-signed)
+perp --json --no-builder trade market BTC buy 0.1         # one run without the fee
+```
+
+qfex: `builder.qfex <uuid>` is a fee share (no extra fee, no approval; mainnet only). Unsupported: lighter, lighter-rh, arcus (`CAPABILITY_UNSUPPORTED`). An order whose approval is missing or unknown is sent without the fee (`execution.notes`); `execution.builderFee` records what was attached.
 
 ## MCP Server
 
 The package also ships a 22-tool MCP server (no API keys required for read-only market data — `get_markets`, `get_orderbook`, `get_funding_rates`, `get_prices`, `get_outcome_markets`, `get_outcome_view`, `get_outcome_book`, plus 15 account/advisor tools):
+
+MCP network: `PERP_NETWORK=mainnet|testnet` (validated; unset = mainnet); every result's `meta.network` says which. The only write tools, `trade_execute` / `trade_close`, run the same local risk gate as `perp trade` (no override over MCP), refuse non-reduce-only orders on quarantined symbols, and log every order.
 
 ```json
 {

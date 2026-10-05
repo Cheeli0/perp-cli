@@ -62,9 +62,10 @@ export interface TWAPParams {
   client_order_id?: string;
 }
 
+/** POST /orders/twap/cancel — pacifica-fi/python-sdk rest/cancel_twap_order.py signs {symbol, order_id}. */
 export interface CancelTWAPParams {
   symbol: string;
-  twap_order_id: number;
+  order_id: number;
 }
 
 export interface TPSLParams {

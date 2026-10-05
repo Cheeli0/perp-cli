@@ -253,7 +253,7 @@ describe("Flow 2: 데몬 라이프사이클 — 진입 → 펀딩 축적 → 스
 
   it("step 4: position tracked in arb-state after entry", () => {
     const state = createInitialState(makeDefaultConfig());
-    saveArbState(state);
+    saveArbState("mainnet", state);
 
     const pos = makePosition({
       symbol: "BTC",
@@ -263,9 +263,9 @@ describe("Flow 2: 데몬 라이프사이클 — 진입 → 펀딩 축적 → 스
       longSize: 0.001,
       shortSize: 0.001,
     });
-    addPosition(pos);
+    addPosition("mainnet", pos);
 
-    const positions = getPositions();
+    const positions = getPositions("mainnet");
     expect(positions).toHaveLength(1);
     expect(positions[0].symbol).toBe("BTC");
     expect(positions[0].entrySpread).toBe(42.9);
@@ -320,12 +320,12 @@ describe("Flow 2: 데몬 라이프사이클 — 진입 → 펀딩 축적 → 스
 
   it("step 8+9: position removed and exit logged", () => {
     const state = createInitialState(makeDefaultConfig());
-    saveArbState(state);
-    addPosition(makePosition({ symbol: "BTC" }));
+    saveArbState("mainnet", state);
+    addPosition("mainnet", makePosition({ symbol: "BTC" }));
 
     // Remove the position
-    removePosition("BTC");
-    const positions = getPositions();
+    removePosition("mainnet", "BTC");
+    const positions = getPositions("mainnet");
     expect(positions).toHaveLength(0);
 
     // Log the exit
@@ -407,14 +407,14 @@ describe("Flow 3: 리버설 발생 → 긴급 청산", () => {
   it("full reversal flow: position open → reversal detected → exit logged → notification sent", async () => {
     // Step 1: Position is open
     const state = createInitialState(makeDefaultConfig());
-    saveArbState(state);
-    addPosition(makePosition({
+    saveArbState("mainnet", state);
+    addPosition("mainnet", makePosition({
       symbol: "WIF",
       longExchange: "hyperliquid",
       shortExchange: "pacifica",
       entrySpread: 45,
     }));
-    expect(getPositions()).toHaveLength(1);
+    expect(getPositions("mainnet")).toHaveLength(1);
 
     // Step 2: Reversal detected
     const snapshot: FundingSnapshot = {
@@ -461,8 +461,8 @@ describe("Flow 3: 리버설 발생 → 긴급 청산", () => {
     expect(mockFetch).toHaveBeenCalledOnce();
 
     // Step 6: Position removed from state
-    removePosition("WIF");
-    expect(getPositions()).toHaveLength(0);
+    removePosition("mainnet", "WIF");
+    expect(getPositions("mainnet")).toHaveLength(0);
   });
 
   it("notifyIfEnabled skips notification when event type not in enabled list", async () => {
@@ -790,9 +790,9 @@ describe("Flow 6: 크래시 복구 시나리오", () => {
 
   it("step 1-2: create state, add BTC and ETH positions", () => {
     const state = createInitialState(makeDefaultConfig());
-    saveArbState(state);
+    saveArbState("mainnet", state);
 
-    addPosition(makePosition({
+    addPosition("mainnet", makePosition({
       symbol: "BTC",
       longExchange: "hyperliquid",
       shortExchange: "pacifica",
@@ -800,7 +800,7 @@ describe("Flow 6: 크래시 복구 시나리오", () => {
       shortSize: 0.01,
       accumulatedFunding: 5.67,
     }));
-    addPosition(makePosition({
+    addPosition("mainnet", makePosition({
       symbol: "ETH",
       longExchange: "lighter",
       shortExchange: "pacifica",
@@ -809,7 +809,7 @@ describe("Flow 6: 크래시 복구 시나리오", () => {
       accumulatedFunding: 12.34,
     }));
 
-    const positions = getPositions();
+    const positions = getPositions("mainnet");
     expect(positions).toHaveLength(2);
   });
 
@@ -817,19 +817,19 @@ describe("Flow 6: 크래시 복구 시나리오", () => {
     // Set up state with positions
     const state = createInitialState(makeDefaultConfig());
     state.lastSuccessfulScanTime = "2025-01-15T14:30:00.000Z";
-    saveArbState(state);
+    saveArbState("mainnet", state);
 
-    addPosition(makePosition({
+    addPosition("mainnet", makePosition({
       symbol: "BTC",
       accumulatedFunding: 5.67,
     }));
-    addPosition(makePosition({
+    addPosition("mainnet", makePosition({
       symbol: "ETH",
       accumulatedFunding: 12.34,
     }));
 
     // Simulate crash: just reload
-    const recovered = loadArbState();
+    const recovered = loadArbState("mainnet");
     expect(recovered).not.toBeNull();
     expect(recovered!.positions).toHaveLength(2);
 
@@ -842,9 +842,9 @@ describe("Flow 6: 크래시 복구 시나리오", () => {
   it("step 5: lastSuccessfulScanTime preserved", () => {
     const state = createInitialState(makeDefaultConfig());
     state.lastSuccessfulScanTime = "2025-01-15T14:30:00.000Z";
-    saveArbState(state);
+    saveArbState("mainnet", state);
 
-    const recovered = loadArbState();
+    const recovered = loadArbState("mainnet");
     expect(recovered!.lastSuccessfulScanTime).toBe("2025-01-15T14:30:00.000Z");
   });
 
@@ -861,7 +861,7 @@ describe("Flow 6: 크래시 복구 시나리오", () => {
     writeFileSync(TEST_STATE_FILE, "corrupted{{{data", { mode: 0o600 });
 
     // Recovery should use .tmp
-    const recovered = loadArbState();
+    const recovered = loadArbState("mainnet");
     expect(recovered).not.toBeNull();
     expect(recovered!.positions).toHaveLength(1);
     expect(recovered!.positions[0].symbol).toBe("SOL");
@@ -872,7 +872,7 @@ describe("Flow 6: 크래시 복구 시나리오", () => {
     writeFileSync(TEST_STATE_FILE, "corrupt main{{{", { mode: 0o600 });
     writeFileSync(TMP_FILE, "corrupt tmp{{{", { mode: 0o600 });
 
-    const state = loadArbState();
+    const state = loadArbState("mainnet");
     expect(state).toBeNull();
   });
 });
@@ -930,33 +930,33 @@ describe("Flow 7: 하트비트 + 거래소 다운 시나리오", () => {
       ...makeDefaultConfig(),
       maxPositions: 2,
     });
-    saveArbState(state);
+    saveArbState("mainnet", state);
 
     // Add 2 positions — reaching max
-    addPosition(makePosition({ symbol: "BTC" }));
-    addPosition(makePosition({ symbol: "ETH" }));
+    addPosition("mainnet", makePosition({ symbol: "BTC" }));
+    addPosition("mainnet", makePosition({ symbol: "ETH" }));
 
-    const positions = getPositions();
+    const positions = getPositions("mainnet");
     const canEnter = positions.length < state.config.maxPositions;
     expect(canEnter).toBe(false);
   });
 
   it("positions on down exchange are tracked for degraded state", () => {
     const state = createInitialState(makeDefaultConfig());
-    saveArbState(state);
+    saveArbState("mainnet", state);
 
-    addPosition(makePosition({
+    addPosition("mainnet", makePosition({
       symbol: "ETH",
       longExchange: "hyperliquid",
       shortExchange: "pacifica",
     }));
-    addPosition(makePosition({
+    addPosition("mainnet", makePosition({
       symbol: "BTC",
       longExchange: "lighter",
       shortExchange: "pacifica",
     }));
 
-    const positions = getPositions();
+    const positions = getPositions("mainnet");
     const downExchange = "lighter";
     const degradedPositions = positions.filter(
       p => p.longExchange === downExchange || p.shortExchange === downExchange,
@@ -1061,10 +1061,10 @@ describe("Cross-cutting: edge cases and combined scenarios", () => {
 
   it("full entry+exit pipeline logs both records with matching symbols", () => {
     const state = createInitialState(makeDefaultConfig());
-    saveArbState(state);
+    saveArbState("mainnet", state);
 
     // Entry
-    addPosition(makePosition({ symbol: "DOGE", entrySpread: 60 }));
+    addPosition("mainnet", makePosition({ symbol: "DOGE", entrySpread: 60 }));
     const entryRec = logExecution({
       type: "arb_entry", exchange: "hyperliquid+pacifica", symbol: "DOGE",
       side: "entry", size: "1000", status: "success", dryRun: false,
@@ -1072,7 +1072,7 @@ describe("Cross-cutting: edge cases and combined scenarios", () => {
     });
 
     // Some time passes, then exit
-    removePosition("DOGE");
+    removePosition("mainnet", "DOGE");
     const exitRec = logExecution({
       type: "arb_close", exchange: "hyperliquid+pacifica", symbol: "DOGE",
       side: "close", size: "1000", status: "success", dryRun: false,
@@ -1088,16 +1088,16 @@ describe("Cross-cutting: edge cases and combined scenarios", () => {
 
   it("updatePosition tracks accumulated funding over time", () => {
     const state = createInitialState(makeDefaultConfig());
-    saveArbState(state);
+    saveArbState("mainnet", state);
 
-    addPosition(makePosition({ symbol: "ETH", accumulatedFunding: 0 }));
+    addPosition("mainnet", makePosition({ symbol: "ETH", accumulatedFunding: 0 }));
 
     // Simulate hourly funding updates
-    updatePosition("ETH", { accumulatedFunding: 0.05, lastCheckTime: "2025-01-15T11:00:00Z" });
-    updatePosition("ETH", { accumulatedFunding: 0.10, lastCheckTime: "2025-01-15T12:00:00Z" });
-    updatePosition("ETH", { accumulatedFunding: 0.15, lastCheckTime: "2025-01-15T13:00:00Z" });
+    updatePosition("mainnet", "ETH", { accumulatedFunding: 0.05, lastCheckTime: "2025-01-15T11:00:00Z" });
+    updatePosition("mainnet", "ETH", { accumulatedFunding: 0.10, lastCheckTime: "2025-01-15T12:00:00Z" });
+    updatePosition("mainnet", "ETH", { accumulatedFunding: 0.15, lastCheckTime: "2025-01-15T13:00:00Z" });
 
-    const positions = getPositions();
+    const positions = getPositions("mainnet");
     expect(positions[0].accumulatedFunding).toBe(0.15);
     expect(positions[0].lastCheckTime).toBe("2025-01-15T13:00:00Z");
   });

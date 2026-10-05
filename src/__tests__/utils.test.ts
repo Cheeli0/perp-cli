@@ -285,3 +285,15 @@ describe("withJsonErrors", () => {
     expect(joined).toContain("boom");
   });
 });
+
+describe("symbolMatch — HIP-3 dex prefix", () => {
+  it("a dex-scoped venue symbol matches the bare user input, never the reverse", async () => {
+    const { symbolMatch } = await import("../utils.js");
+    expect(symbolMatch("xyz:XYZ100", "XYZ100")).toBe(true);
+    expect(symbolMatch("xyz:NVDA", "nvda")).toBe(true);
+    expect(symbolMatch("xyz:NVDA", "xyz:NVDA")).toBe(true);
+    expect(symbolMatch("NVDA", "xyz:NVDA")).toBe(false);
+    expect(symbolMatch("xyz:NVDA", "km:NVDA")).toBe(false);
+    expect(symbolMatch("xyz:NVDA", "TSLA")).toBe(false);
+  });
+});

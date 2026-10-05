@@ -14,7 +14,7 @@
  *   URNM ≠ URANIUM
  */
 
-const HL_INFO_URL = "https://api.hyperliquid.xyz/info";
+import { HYPERLIQUID_API_URL, sharedApiNetwork } from "./api/public/urls.js";
 
 /** Known aliases: different symbol → same underlying */
 const ALIASES: Record<string, string> = {
@@ -90,7 +90,8 @@ export interface DexArbPair {
 }
 
 async function hlInfoPost(body: Record<string, unknown>): Promise<unknown> {
-  const res = await fetch(HL_INFO_URL, {
+  // Selected network (review L7): HYPERLIQUID_API_URL follows -n via setSharedApiNetwork (live binding).
+  const res = await fetch(HYPERLIQUID_API_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -104,7 +105,8 @@ async function hlInfoPost(body: Record<string, unknown>): Promise<unknown> {
  */
 export async function fetchAllDexAssets(): Promise<DexAsset[]> {
   const { withCache, TTL_MARKET } = await import("./cache.js");
-  return withCache("pub:hl:allDexAssets", TTL_MARKET, () => _fetchAllDexAssetsLive());
+  // Network in the key: a mainnet snapshot must never answer a testnet run (L7).
+  return withCache(`pub:hl:${sharedApiNetwork()}:allDexAssets`, TTL_MARKET, () => _fetchAllDexAssetsLive());
 }
 
 async function _fetchAllDexAssetsLive(): Promise<DexAsset[]> {

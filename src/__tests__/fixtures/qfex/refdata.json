@@ -1,0 +1,1479 @@
+{
+ "$schema": "https://api.qfex.com/schemas/RefdataResponse.json",
+ "type": "refdata",
+ "data": [
+  {
+   "clobPairId": "0",
+   "symbol": "CL-USD",
+   "underlier_price": "",
+   "price_change_24h": "",
+   "default_max_leverage": 10,
+   "tick_size": "0.01",
+   "lot_size": "0.001",
+   "min_price": "88.33201197",
+   "max_price": "94.36087731",
+   "min_quantity": "0.1",
+   "max_quantity": "10000000",
+   "base_asset": "CL",
+   "quote_asset": "USD",
+   "margin_asset": "USDC",
+   "order_time_in_force": [
+    "GTC",
+    "IOC",
+    "FOK"
+   ],
+   "order_types": [
+    "LIMIT",
+    "MARKET",
+    "ALO"
+   ],
+   "market_hours": {
+    "friday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "15:59:59"
+     }
+    ],
+    "monday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "16:59:59"
+     },
+     {
+      "session": "open",
+      "open": "17:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "saturday": [
+     {
+      "session": "weekend",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "sunday": [
+     {
+      "session": "weekend",
+      "open": "00:00:00",
+      "close": "16:59:59"
+     },
+     {
+      "session": "open",
+      "open": "17:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "thursday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "15:59:59"
+     },
+     {
+      "session": "open",
+      "open": "17:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "tuesday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "15:59:59"
+     },
+     {
+      "session": "open",
+      "open": "17:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "tz": "America/Chicago",
+    "wednesday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "15:59:59"
+     },
+     {
+      "session": "open",
+      "open": "17:00:00",
+      "close": "23:59:59"
+     }
+    ]
+   },
+   "status": "ACTIVE",
+   "product_category": "COMMODITY"
+  },
+  {
+   "clobPairId": "2",
+   "symbol": "NATGAS-USD",
+   "underlier_price": "",
+   "price_change_24h": "",
+   "default_max_leverage": 20,
+   "tick_size": "0.001",
+   "lot_size": "0.01",
+   "min_price": "2.93178262",
+   "max_price": "3.1318836",
+   "min_quantity": "1",
+   "max_quantity": "100000000",
+   "base_asset": "NATGAS",
+   "quote_asset": "USD",
+   "margin_asset": "USDC",
+   "order_time_in_force": [
+    "GTC",
+    "IOC",
+    "FOK"
+   ],
+   "order_types": [
+    "LIMIT",
+    "MARKET",
+    "ALO"
+   ],
+   "market_hours": {
+    "friday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "15:59:59"
+     }
+    ],
+    "monday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "13:29:59"
+     },
+     {
+      "session": "close",
+      "open": "13:30:00",
+      "close": "16:59:59"
+     },
+     {
+      "session": "open",
+      "open": "17:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "saturday": [
+     {
+      "session": "weekend",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "sunday": [
+     {
+      "session": "weekend",
+      "open": "00:00:00",
+      "close": "16:59:59"
+     },
+     {
+      "session": "open",
+      "open": "17:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "thursday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "15:59:59"
+     },
+     {
+      "session": "open",
+      "open": "17:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "tuesday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "15:59:59"
+     },
+     {
+      "session": "open",
+      "open": "17:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "tz": "America/Chicago",
+    "wednesday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "15:59:59"
+     },
+     {
+      "session": "open",
+      "open": "17:00:00",
+      "close": "23:59:59"
+     }
+    ]
+   },
+   "status": "ACTIVE",
+   "product_category": "COMMODITY"
+  },
+  {
+   "clobPairId": "15",
+   "symbol": "GOLD-USD",
+   "underlier_price": "",
+   "price_change_24h": "",
+   "default_max_leverage": 20,
+   "tick_size": "0.1",
+   "lot_size": "0.0001",
+   "min_price": "4076.02275944",
+   "max_price": "4212.78813926",
+   "min_quantity": "0.001",
+   "max_quantity": "10000000",
+   "base_asset": "GOLD",
+   "quote_asset": "USD",
+   "margin_asset": "USDC",
+   "order_time_in_force": [
+    "GTC",
+    "IOC",
+    "FOK"
+   ],
+   "order_types": [
+    "LIMIT",
+    "MARKET",
+    "ALO"
+   ],
+   "market_hours": {
+    "friday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "17:00:00"
+     }
+    ],
+    "monday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "saturday": [
+     {
+      "session": "weekend",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "sunday": [
+     {
+      "session": "open",
+      "open": "17:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "thursday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "tuesday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "tz": "America/New_York",
+    "wednesday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ]
+   },
+   "status": "ACTIVE",
+   "product_category": "COMMODITY"
+  },
+  {
+   "clobPairId": "16",
+   "symbol": "SILVER-USD",
+   "underlier_price": "",
+   "price_change_24h": "",
+   "default_max_leverage": 20,
+   "tick_size": "0.01",
+   "lot_size": "0.001",
+   "min_price": "59.50642817",
+   "max_price": "61.50308513",
+   "min_quantity": "0.001",
+   "max_quantity": "10000000",
+   "base_asset": "SILVER",
+   "quote_asset": "USD",
+   "margin_asset": "USDC",
+   "order_time_in_force": [
+    "GTC",
+    "IOC",
+    "FOK"
+   ],
+   "order_types": [
+    "LIMIT",
+    "MARKET",
+    "ALO"
+   ],
+   "market_hours": {
+    "friday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "17:00:00"
+     }
+    ],
+    "monday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "saturday": [
+     {
+      "session": "weekend",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "sunday": [
+     {
+      "session": "open",
+      "open": "17:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "thursday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "tuesday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "tz": "America/New_York",
+    "wednesday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ]
+   },
+   "status": "ACTIVE",
+   "product_category": "COMMODITY"
+  },
+  {
+   "clobPairId": "17",
+   "symbol": "US100-USD",
+   "underlier_price": "",
+   "price_change_24h": "",
+   "default_max_leverage": 30,
+   "tick_size": "1",
+   "lot_size": "0.0001",
+   "min_price": "29804.85727675",
+   "max_price": "31839.10813533",
+   "min_quantity": "0.001",
+   "max_quantity": "10000000",
+   "base_asset": "US100",
+   "quote_asset": "USD",
+   "margin_asset": "USDC",
+   "order_time_in_force": [
+    "GTC",
+    "IOC",
+    "FOK"
+   ],
+   "order_types": [
+    "LIMIT",
+    "MARKET",
+    "ALO"
+   ],
+   "market_hours": {
+    "friday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "15:59:59"
+     }
+    ],
+    "monday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "16:59:59"
+     },
+     {
+      "session": "open",
+      "open": "17:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "saturday": [
+     {
+      "session": "weekend",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "sunday": [
+     {
+      "session": "weekend",
+      "open": "00:00:00",
+      "close": "16:59:59"
+     },
+     {
+      "session": "open",
+      "open": "17:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "thursday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "15:59:59"
+     },
+     {
+      "session": "open",
+      "open": "17:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "tuesday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "15:59:59"
+     },
+     {
+      "session": "open",
+      "open": "17:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "tz": "America/Chicago",
+    "wednesday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "15:59:59"
+     },
+     {
+      "session": "open",
+      "open": "17:00:00",
+      "close": "23:59:59"
+     }
+    ]
+   },
+   "status": "ACTIVE",
+   "product_category": "INDEX"
+  },
+  {
+   "clobPairId": "21",
+   "symbol": "AAPL-USD",
+   "underlier_price": "",
+   "price_change_24h": "",
+   "default_max_leverage": 10,
+   "tick_size": "0.01",
+   "lot_size": "0.001",
+   "min_price": "316.73283923",
+   "max_price": "350.07313809",
+   "min_quantity": "0.01",
+   "max_quantity": "10000000",
+   "base_asset": "AAPL",
+   "quote_asset": "USD",
+   "margin_asset": "USDC",
+   "order_time_in_force": [
+    "GTC",
+    "IOC",
+    "FOK"
+   ],
+   "order_types": [
+    "LIMIT",
+    "MARKET",
+    "ALO"
+   ],
+   "market_hours": {
+    "friday": [
+     {
+      "session": "pre_market",
+      "open": "04:00:00",
+      "close": "09:30:00"
+     },
+     {
+      "session": "open",
+      "open": "09:30:00",
+      "close": "16:00:00"
+     },
+     {
+      "session": "post_market",
+      "open": "16:00:00",
+      "close": "19:59:59"
+     },
+     {
+      "session": "weekend",
+      "open": "20:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "monday": [
+     {
+      "session": "pre_market",
+      "open": "04:00:00",
+      "close": "09:30:00"
+     },
+     {
+      "session": "open",
+      "open": "09:30:00",
+      "close": "16:00:00"
+     },
+     {
+      "session": "post_market",
+      "open": "16:00:00",
+      "close": "19:59:59"
+     }
+    ],
+    "saturday": [
+     {
+      "session": "weekend",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "sunday": [
+     {
+      "session": "weekend",
+      "open": "00:00:00",
+      "close": "19:59:59"
+     }
+    ],
+    "thursday": [
+     {
+      "session": "pre_market",
+      "open": "04:00:00",
+      "close": "09:30:00"
+     },
+     {
+      "session": "open",
+      "open": "09:30:00",
+      "close": "16:00:00"
+     },
+     {
+      "session": "post_market",
+      "open": "16:00:00",
+      "close": "19:59:59"
+     }
+    ],
+    "tuesday": [
+     {
+      "session": "pre_market",
+      "open": "04:00:00",
+      "close": "09:30:00"
+     },
+     {
+      "session": "open",
+      "open": "09:30:00",
+      "close": "16:00:00"
+     },
+     {
+      "session": "post_market",
+      "open": "16:00:00",
+      "close": "19:59:59"
+     }
+    ],
+    "tz": "America/New_York",
+    "wednesday": [
+     {
+      "session": "pre_market",
+      "open": "04:00:00",
+      "close": "09:30:00"
+     },
+     {
+      "session": "open",
+      "open": "09:30:00",
+      "close": "16:00:00"
+     },
+     {
+      "session": "post_market",
+      "open": "16:00:00",
+      "close": "19:59:59"
+     }
+    ]
+   },
+   "status": "ACTIVE",
+   "product_category": "EQUITY"
+  },
+  {
+   "clobPairId": "35",
+   "symbol": "SKHYNIX-KRW",
+   "underlier_price": "",
+   "price_change_24h": "",
+   "default_max_leverage": 7,
+   "tick_size": "100",
+   "lot_size": "0.000001",
+   "min_price": "1750838.52703463",
+   "max_price": "1935137.31935405",
+   "min_quantity": "0.00001",
+   "max_quantity": "10000000",
+   "base_asset": "SKHYNIX",
+   "quote_asset": "KRW",
+   "margin_asset": "USDC",
+   "order_time_in_force": [
+    "GTC",
+    "IOC",
+    "FOK"
+   ],
+   "order_types": [
+    "LIMIT",
+    "MARKET",
+    "ALO"
+   ],
+   "market_hours": {
+    "friday": [
+     {
+      "session": "open",
+      "open": "09:00:00",
+      "close": "15:30:00"
+     }
+    ],
+    "monday": [
+     {
+      "session": "open",
+      "open": "09:00:00",
+      "close": "15:30:00"
+     }
+    ],
+    "saturday": [
+     {
+      "session": "weekend",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "sunday": [
+     {
+      "session": "weekend",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "thursday": [
+     {
+      "session": "close",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "tuesday": [
+     {
+      "session": "open",
+      "open": "09:00:00",
+      "close": "15:30:00"
+     }
+    ],
+    "tz": "Asia/Seoul",
+    "wednesday": [
+     {
+      "session": "open",
+      "open": "09:00:00",
+      "close": "15:30:00"
+     }
+    ]
+   },
+   "status": "ACTIVE",
+   "product_category": "EQUITY"
+  },
+  {
+   "clobPairId": "100",
+   "symbol": "US500-USD",
+   "underlier_price": "",
+   "price_change_24h": "",
+   "default_max_leverage": 30,
+   "tick_size": "0.1",
+   "lot_size": "0.001",
+   "min_price": "7468.87618155",
+   "max_price": "7978.64435939",
+   "min_quantity": "0.001",
+   "max_quantity": "10000000",
+   "base_asset": "US500",
+   "quote_asset": "USD",
+   "margin_asset": "USDC",
+   "order_time_in_force": [
+    "GTC",
+    "IOC",
+    "FOK"
+   ],
+   "order_types": [
+    "LIMIT",
+    "MARKET",
+    "ALO"
+   ],
+   "market_hours": {
+    "friday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "15:59:59"
+     }
+    ],
+    "monday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "16:59:59"
+     },
+     {
+      "session": "open",
+      "open": "17:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "saturday": [
+     {
+      "session": "weekend",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "sunday": [
+     {
+      "session": "weekend",
+      "open": "00:00:00",
+      "close": "16:59:59"
+     },
+     {
+      "session": "open",
+      "open": "17:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "thursday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "15:59:59"
+     },
+     {
+      "session": "open",
+      "open": "17:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "tuesday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "15:59:59"
+     },
+     {
+      "session": "open",
+      "open": "17:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "tz": "America/Chicago",
+    "wednesday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "15:59:59"
+     },
+     {
+      "session": "open",
+      "open": "17:00:00",
+      "close": "23:59:59"
+     }
+    ]
+   },
+   "status": "ACTIVE",
+   "product_category": "INDEX"
+  },
+  {
+   "clobPairId": "191",
+   "symbol": "ZHIPU-HKD",
+   "underlier_price": "",
+   "price_change_24h": "",
+   "default_max_leverage": 10,
+   "tick_size": "0.01",
+   "lot_size": "0.01",
+   "min_price": "591.62803542",
+   "max_price": "653.90467072",
+   "min_quantity": "0.1",
+   "max_quantity": "100000",
+   "base_asset": "ZHIPU",
+   "quote_asset": "HKD",
+   "margin_asset": "USDC",
+   "order_time_in_force": [
+    "GTC",
+    "IOC",
+    "FOK"
+   ],
+   "order_types": [
+    "LIMIT",
+    "MARKET",
+    "ALO"
+   ],
+   "market_hours": {
+    "friday": [
+     {
+      "session": "open",
+      "open": "09:30:00",
+      "close": "12:00:00"
+     },
+     {
+      "session": "open",
+      "open": "13:00:00",
+      "close": "16:00:00"
+     }
+    ],
+    "monday": [
+     {
+      "session": "open",
+      "open": "09:30:00",
+      "close": "12:00:00"
+     },
+     {
+      "session": "open",
+      "open": "13:00:00",
+      "close": "16:00:00"
+     }
+    ],
+    "saturday": [
+     {
+      "session": "weekend",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "sunday": [
+     {
+      "session": "weekend",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "thursday": [
+     {
+      "session": "open",
+      "open": "09:30:00",
+      "close": "12:00:00"
+     },
+     {
+      "session": "open",
+      "open": "13:00:00",
+      "close": "16:00:00"
+     }
+    ],
+    "tuesday": [
+     {
+      "session": "open",
+      "open": "09:30:00",
+      "close": "12:00:00"
+     },
+     {
+      "session": "open",
+      "open": "13:00:00",
+      "close": "16:00:00"
+     }
+    ],
+    "tz": "Asia/Hong_Kong",
+    "wednesday": [
+     {
+      "session": "open",
+      "open": "09:30:00",
+      "close": "12:00:00"
+     },
+     {
+      "session": "open",
+      "open": "13:00:00",
+      "close": "16:00:00"
+     }
+    ]
+   },
+   "status": "INACTIVE",
+   "product_category": "EQUITY"
+  },
+  {
+   "clobPairId": "192",
+   "symbol": "ZHIPU-USD",
+   "underlier_price": "",
+   "price_change_24h": "",
+   "default_max_leverage": 10,
+   "tick_size": "0.01",
+   "lot_size": "0.01",
+   "min_price": "130.5",
+   "max_price": "159.5",
+   "min_quantity": "0.1",
+   "max_quantity": "100000",
+   "base_asset": "ZHIPU",
+   "quote_asset": "USD",
+   "margin_asset": "USDC",
+   "order_time_in_force": [
+    "GTC",
+    "IOC",
+    "FOK"
+   ],
+   "order_types": [
+    "LIMIT",
+    "MARKET",
+    "ALO"
+   ],
+   "market_hours": {},
+   "status": "INACTIVE",
+   "product_category": "EQUITY"
+  },
+  {
+   "clobPairId": "251",
+   "symbol": "ANTHROPIC-USD",
+   "underlier_price": "",
+   "price_change_24h": "",
+   "default_max_leverage": 10,
+   "tick_size": "0.01",
+   "lot_size": "0.001",
+   "min_price": "1827.261",
+   "max_price": "2233.319",
+   "min_quantity": "0.01",
+   "max_quantity": "100000",
+   "base_asset": "ANTHROPIC",
+   "quote_asset": "USD",
+   "margin_asset": "USDC",
+   "order_time_in_force": [
+    "GTC",
+    "IOC",
+    "FOK"
+   ],
+   "order_types": [
+    "LIMIT",
+    "MARKET",
+    "ALO"
+   ],
+   "market_hours": {
+    "friday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "monday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "saturday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "sunday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "thursday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "tuesday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "tz": "UTC",
+    "wednesday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ]
+   },
+   "status": "ACTIVE",
+   "product_category": "EQUITY"
+  },
+  {
+   "clobPairId": "252",
+   "symbol": "OPENAI-USD",
+   "underlier_price": "",
+   "price_change_24h": "",
+   "default_max_leverage": 10,
+   "tick_size": "0.01",
+   "lot_size": "0.001",
+   "min_price": "1453.07718",
+   "max_price": "1775.98322",
+   "min_quantity": "0.01",
+   "max_quantity": "100000",
+   "base_asset": "OPENAI",
+   "quote_asset": "USD",
+   "margin_asset": "USDC",
+   "order_time_in_force": [
+    "GTC",
+    "IOC",
+    "FOK"
+   ],
+   "order_types": [
+    "LIMIT",
+    "MARKET",
+    "ALO"
+   ],
+   "market_hours": {
+    "friday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "monday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "saturday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "sunday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "thursday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "tuesday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "tz": "UTC",
+    "wednesday": [
+     {
+      "session": "open",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ]
+   },
+   "status": "ACTIVE",
+   "product_category": "EQUITY"
+  },
+  {
+   "clobPairId": "255",
+   "symbol": "IBIT-USD",
+   "underlier_price": "",
+   "price_change_24h": "",
+   "default_max_leverage": 10,
+   "tick_size": "0.01",
+   "lot_size": "0.01",
+   "min_price": "47.35665",
+   "max_price": "48.31335",
+   "min_quantity": "0.1",
+   "max_quantity": "10000000",
+   "base_asset": "IBIT",
+   "quote_asset": "USD",
+   "margin_asset": "USDC",
+   "order_time_in_force": [
+    "GTC",
+    "IOC",
+    "FOK"
+   ],
+   "order_types": [
+    "LIMIT",
+    "MARKET",
+    "ALO"
+   ],
+   "market_hours": {
+    "friday": [
+     {
+      "session": "pre_market",
+      "open": "04:00:00",
+      "close": "09:30:00"
+     },
+     {
+      "session": "open",
+      "open": "09:30:00",
+      "close": "16:00:00"
+     },
+     {
+      "session": "post_market",
+      "open": "16:00:00",
+      "close": "19:59:59"
+     },
+     {
+      "session": "weekend",
+      "open": "20:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "monday": [
+     {
+      "session": "pre_market",
+      "open": "04:00:00",
+      "close": "09:30:00"
+     },
+     {
+      "session": "open",
+      "open": "09:30:00",
+      "close": "16:00:00"
+     },
+     {
+      "session": "post_market",
+      "open": "16:00:00",
+      "close": "19:59:59"
+     }
+    ],
+    "saturday": [
+     {
+      "session": "weekend",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "sunday": [
+     {
+      "session": "weekend",
+      "open": "00:00:00",
+      "close": "19:59:59"
+     }
+    ],
+    "thursday": [
+     {
+      "session": "pre_market",
+      "open": "04:00:00",
+      "close": "09:30:00"
+     },
+     {
+      "session": "open",
+      "open": "09:30:00",
+      "close": "16:00:00"
+     },
+     {
+      "session": "post_market",
+      "open": "16:00:00",
+      "close": "19:59:59"
+     }
+    ],
+    "tuesday": [
+     {
+      "session": "pre_market",
+      "open": "04:00:00",
+      "close": "09:30:00"
+     },
+     {
+      "session": "open",
+      "open": "09:30:00",
+      "close": "16:00:00"
+     },
+     {
+      "session": "post_market",
+      "open": "16:00:00",
+      "close": "19:59:59"
+     }
+    ],
+    "tz": "America/New_York",
+    "wednesday": [
+     {
+      "session": "pre_market",
+      "open": "04:00:00",
+      "close": "09:30:00"
+     },
+     {
+      "session": "open",
+      "open": "09:30:00",
+      "close": "16:00:00"
+     },
+     {
+      "session": "post_market",
+      "open": "16:00:00",
+      "close": "19:59:59"
+     }
+    ]
+   },
+   "status": "ACTIVE",
+   "product_category": "EQUITY"
+  },
+  {
+   "clobPairId": "36",
+   "symbol": "KIA-KRW",
+   "underlier_price": "",
+   "price_change_24h": "",
+   "default_max_leverage": 10,
+   "tick_size": "10",
+   "lot_size": "0.00001",
+   "min_price": "107302.5",
+   "max_price": "118597.5",
+   "min_quantity": "0.0001",
+   "max_quantity": "10000000",
+   "base_asset": "KIA",
+   "quote_asset": "KRW",
+   "margin_asset": "USDC",
+   "order_time_in_force": [
+    "GTC",
+    "IOC",
+    "FOK"
+   ],
+   "order_types": [
+    "LIMIT",
+    "MARKET",
+    "ALO"
+   ],
+   "market_hours": {
+    "friday": [
+     {
+      "session": "open",
+      "open": "09:00:00",
+      "close": "15:30:00"
+     }
+    ],
+    "monday": [
+     {
+      "session": "open",
+      "open": "09:00:00",
+      "close": "15:30:00"
+     }
+    ],
+    "saturday": [
+     {
+      "session": "weekend",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "sunday": [
+     {
+      "session": "weekend",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "thursday": [
+     {
+      "session": "close",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "tuesday": [
+     {
+      "session": "open",
+      "open": "09:00:00",
+      "close": "15:30:00"
+     }
+    ],
+    "tz": "Asia/Seoul",
+    "wednesday": [
+     {
+      "session": "open",
+      "open": "09:00:00",
+      "close": "15:30:00"
+     }
+    ]
+   },
+   "status": "INACTIVE",
+   "product_category": "EQUITY"
+  },
+  {
+   "clobPairId": "79",
+   "symbol": "ASHR-USD",
+   "underlier_price": "",
+   "price_change_24h": "",
+   "default_max_leverage": 30,
+   "tick_size": "0.01",
+   "lot_size": "0.01",
+   "min_price": "30.9035",
+   "max_price": "34.1565",
+   "min_quantity": "0.1",
+   "max_quantity": "10000000",
+   "base_asset": "ASHR",
+   "quote_asset": "USD",
+   "margin_asset": "USDC",
+   "order_time_in_force": [
+    "GTC",
+    "IOC",
+    "FOK"
+   ],
+   "order_types": [
+    "LIMIT",
+    "MARKET",
+    "ALO"
+   ],
+   "market_hours": {
+    "friday": [
+     {
+      "session": "pre_market",
+      "open": "04:00:00",
+      "close": "09:30:00"
+     },
+     {
+      "session": "open",
+      "open": "09:30:00",
+      "close": "16:00:00"
+     },
+     {
+      "session": "post_market",
+      "open": "16:00:00",
+      "close": "19:59:59"
+     },
+     {
+      "session": "weekend",
+      "open": "20:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "monday": [
+     {
+      "session": "pre_market",
+      "open": "04:00:00",
+      "close": "09:30:00"
+     },
+     {
+      "session": "open",
+      "open": "09:30:00",
+      "close": "16:00:00"
+     },
+     {
+      "session": "post_market",
+      "open": "16:00:00",
+      "close": "19:59:59"
+     }
+    ],
+    "saturday": [
+     {
+      "session": "weekend",
+      "open": "00:00:00",
+      "close": "23:59:59"
+     }
+    ],
+    "sunday": [
+     {
+      "session": "weekend",
+      "open": "00:00:00",
+      "close": "19:59:59"
+     }
+    ],
+    "thursday": [
+     {
+      "session": "pre_market",
+      "open": "04:00:00",
+      "close": "09:30:00"
+     },
+     {
+      "session": "open",
+      "open": "09:30:00",
+      "close": "16:00:00"
+     },
+     {
+      "session": "post_market",
+      "open": "16:00:00",
+      "close": "19:59:59"
+     }
+    ],
+    "tuesday": [
+     {
+      "session": "pre_market",
+      "open": "04:00:00",
+      "close": "09:30:00"
+     },
+     {
+      "session": "open",
+      "open": "09:30:00",
+      "close": "16:00:00"
+     },
+     {
+      "session": "post_market",
+      "open": "16:00:00",
+      "close": "19:59:59"
+     }
+    ],
+    "tz": "America/New_York",
+    "wednesday": [
+     {
+      "session": "pre_market",
+      "open": "04:00:00",
+      "close": "09:30:00"
+     },
+     {
+      "session": "open",
+      "open": "09:30:00",
+      "close": "16:00:00"
+     },
+     {
+      "session": "post_market",
+      "open": "16:00:00",
+      "close": "19:59:59"
+     }
+    ]
+   },
+   "status": "INACTIVE",
+   "product_category": "INDEX"
+  },
+  {
+   "clobPairId": "81",
+   "symbol": "BIRD-USD",
+   "underlier_price": "",
+   "price_change_24h": "",
+   "default_max_leverage": 10,
+   "tick_size": "0.01",
+   "lot_size": "0.001",
+   "min_price": "3.0465",
+   "max_price": "3.7235",
+   "min_quantity": "0.01",
+   "max_quantity": "10000000",
+   "base_asset": "BIRD",
+   "quote_asset": "USD",
+   "margin_asset": "USDC",
+   "order_time_in_force": [
+    "GTC",
+    "IOC",
+    "FOK"
+   ],
+   "order_types": [
+    "LIMIT",
+    "MARKET",
+    "ALO"
+   ],
+   "market_hours": {},
+   "status": "DELISTED",
+   "product_category": "EQUITY"
+  }
+ ]
+}
