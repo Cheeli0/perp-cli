@@ -11,6 +11,7 @@
  */
 
 import "dotenv/config";
+import { registerAdapterNetwork } from "./exchanges/adapter-network.js";
 import { builderPlanFor } from "./exchanges/builder-fee.js";
 import { resolveAdapterSlippage } from "./exchanges/slippage.js";
 import { createRequire } from "node:module";
@@ -95,6 +96,7 @@ async function getOrCreateAdapter(exchange: string): Promise<ExchangeAdapter> {
   });
   adapters.set(def.id, adapter);
   adapterNetworks.set(adapter, network);
+  registerAdapterNetwork(adapter, network);
   return adapter;
 }
 
@@ -2082,7 +2084,10 @@ server.tool(
         } catch { /* skip */ }
       }));
 
-      const rows = positions.map(pos => {
+      // Entries without a verified entry price have no price PnL: listed apart, never priced at a guess.
+      const priced = positions.filter((p): p is typeof p & { entryLongPrice: number; entryShortPrice: number } => p.entryLongPrice !== null && p.entryShortPrice !== null);
+      const unpricedPositions = positions.filter(p => p.entryLongPrice === null || p.entryShortPrice === null).map(p => p.symbol);
+      const rows = priced.map(pos => {
         const daysHeld = Math.max(1, Math.round((Date.now() - new Date(pos.entryTime).getTime()) / 86400000));
         const funding = (fundingByExSym.get(`${pos.longExchange}:${pos.symbol}`) ?? 0) + (fundingByExSym.get(`${pos.shortExchange}:${pos.symbol}`) ?? 0);
         const longPrice = currentPrices.get(`${pos.longExchange}:${pos.symbol}`) ?? pos.entryLongPrice;
@@ -2097,7 +2102,7 @@ server.tool(
 
       const totals = { funding: rows.reduce((s, r) => s + r.funding, 0), pricePnl: rows.reduce((s, r) => s + r.pricePnl, 0), totalPnl: rows.reduce((s, r) => s + r.totalPnl, 0) };
 
-      return { content: [{ type: "text", text: ok({ period, positionCount: rows.length, positions: rows, totals }) }] };
+      return { content: [{ type: "text", text: ok({ period, positionCount: rows.length, positions: rows, unpricedPositions, totals }) }] };
     } catch (e) {
       return { content: [{ type: "text", text: errOf(e) }], isError: true };
     }

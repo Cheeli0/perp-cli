@@ -36,13 +36,13 @@ import type { AgentMeta } from "../settings.js";
 import type { AgentSigningStrategy } from "../agent-wallet/signing-strategy.js";
 import { isExpired } from "../agent-wallet/expiry.js";
 import { classifyError, DEFINITE_ORDER_FAILURE_CODES, isTransportFailure, orderNotSent, orderOutcomeUnknown, PerpError, sendFailure, type ErrorCode } from "../errors.js";
-import { parseFiniteVenueNumber } from "../utils/numeric.js";
+import { parseFiniteVenueNumber, venueRateField } from "../utils/numeric.js";
 import { buildOrderTypedData, buildWithdrawTypedData } from "./aster-typed-data.js";
 import { alignProtectionPrice, requireOnTick, requirePositive, slippagePrice, subDecimal } from "./precision.js";
 import { unsupported } from "./trading-v2.js";
 import { networkConfig } from "./venue.js";
 import { approvalFromMax, bpsToRate, builderGateOf, NO_BUILDER, rateToBps, requireFeeBps, type BuilderApproval, type BuilderDecision, type BuilderFeeGate, type BuilderTarget } from "./builder-fee.js";
-import { ASTER_FUNDS_CHAINS, asterVenue, type AsterFundsChain } from "./venues/aster.js";
+import { ASTER_CLIENT_ID_RE, ASTER_FUNDS_CHAINS, asterVenue, type AsterFundsChain } from "./venues/aster.js";
 import {
   assertAsterWithdrawAmount, assertAsterWithdrawSignature, parseAsterWithdrawLimits, requireAsterFundsNetwork,
   type AsterWithdrawLimits, type AsterWithdrawResult,
@@ -168,6 +168,20 @@ export function asterOrderRejection(e: PerpError): PerpError {
     exchange: "aster", httpStatus: http, venueCode: code,
     ...(remediation !== null ? { remediation } : e.structured.remediation !== undefined ? { remediation: e.structured.remediation } : {}),
   });
+}
+
+/**
+ * An Aster client order id as sent / queried. V3 futures "New Order" `newClientOrderId`: "A unique
+ * id among open orders. Automatically generated if not sent. Can only be string following the
+ * rule: ^[\.A-Z\:/a-z0-9_-]{1,36}$". Anything else → INVALID_PARAMS, nothing sent.
+ */
+export function requireAsterClientOrderId(id: string): string {
+  if (!ASTER_CLIENT_ID_RE.test(id)) {
+    throw new PerpError("INVALID_PARAMS", `Aster client order id "${id}" must be 1-36 chars of A-Z a-z 0-9 . : / _ -`, {
+      exchange: "aster", remediation: "Pass a shorter id of that charset as --client-id, or use --auto-id",
+    });
+  }
+  return id;
 }
 
 // ── ResolvedSigner type ────────────────────────────────────────────────────────
@@ -619,7 +633,7 @@ export class AsterAdapter implements ExchangeAdapter {
 
     return (data ?? []).map((d) => ({
       time: Number(d.fundingTime ?? 0),
-      rate: String(d.fundingRate ?? "0"),
+      rate: venueRateField(d.fundingRate, "fundingRate fundingRate", "aster"),
       price: d.markPrice ? String(d.markPrice) : null,
     }));
   }
@@ -917,13 +931,14 @@ export class AsterAdapter implements ExchangeAdapter {
 
   // ── Trading ──
 
-  async marketOrder(symbol: string, side: "buy" | "sell", size: string, opts: { reduceOnly: boolean; slippage: ResolvedSlippage }): Promise<unknown> {
+  async marketOrder(symbol: string, side: "buy" | "sell", size: string, opts: { reduceOnly: boolean; slippage: ResolvedSlippage; clientOrderId?: string }): Promise<unknown> {
     // Design §13.2 / §13.10 #6: never native MARKET (no price cap) — an IOC LIMIT at the
     // protection price (mark ± opts.slippage.bps, tick-aligned toward crossing, inside
     // PRICE_FILTER / PERCENT_PRICE). newOrderRespType=RESULT makes the response carry the
     // final IOC status (FILLED / EXPIRED) and executedQty.
     const r = this._resolveSigner();
     const apiSymbol = this._toApi(symbol);
+    const clientOrderId = opts.clientOrderId === undefined ? null : requireAsterClientOrderId(opts.clientOrderId);
     let protectionPrice: string;
     let protection: { referencePrice: string; protectionPrice: string; appliedBps: number };
     try {
@@ -941,6 +956,7 @@ export class AsterAdapter implements ExchangeAdapter {
       quantity: size,
       newOrderRespType: "RESULT",
     };
+    if (clientOrderId !== null) params.newClientOrderId = clientOrderId;
     if (opts.reduceOnly) params.reduceOnly = "true";
     Object.assign(params, await this._builderParams());
 
@@ -999,10 +1015,11 @@ export class AsterAdapter implements ExchangeAdapter {
     side: "buy" | "sell",
     price: string,
     size: string,
-    opts?: { reduceOnly?: boolean; tif?: string },
+    opts?: { reduceOnly?: boolean; tif?: string; clientOrderId?: string },
   ): Promise<unknown> {
     const r = this._resolveSigner();
     const apiSymbol = this._toApi(symbol);
+    const clientOrderId = opts?.clientOrderId === undefined ? null : requireAsterClientOrderId(opts.clientOrderId);
     let params: Record<string, string | number | boolean>;
     try {
       // Common TIF names (§13.3): GTC / IOC / ALO→GTX (GTX accepted as alias); FOK unsupported.
@@ -1022,6 +1039,7 @@ export class AsterAdapter implements ExchangeAdapter {
       // final status result of the order(FILLED or EXPIRED) will be returned directly". The default ACK
       // answers NEW for a post-only order that then expires because it would cross (live mainnet 2026-10-05).
       if (tif === "IOC" || tif === "GTX") params.newOrderRespType = "RESULT";
+      if (clientOrderId !== null) params.newClientOrderId = clientOrderId;
       if (opts?.reduceOnly) params.reduceOnly = "true";
       Object.assign(params, await this._builderParams());
     } catch (e) {
@@ -1068,11 +1086,49 @@ export class AsterAdapter implements ExchangeAdapter {
   }
 
   async cancelOrder(symbol: string, orderId: string): Promise<unknown> {
+    return this._cancelOne(symbol, { orderId }, orderId);
+  }
+
+  /**
+   * Cancel one order by client order id — V3 futures "Cancel Order" (DELETE /fapi/v3/order):
+   * "Either `orderId` or `origClientOrderId` must be sent."
+   */
+  async cancelOrderByClientId(symbol: string, clientOrderId: string): Promise<unknown> {
+    const id = requireAsterClientOrderId(clientOrderId);
+    return this._cancelOne(symbol, { origClientOrderId: id }, `c:${id}`);
+  }
+
+  /**
+   * One order's row — V3 futures "Query Order" (GET /fapi/v3/order, symbol + orderId or
+   * origClientOrderId). Docs: CANCELED / EXPIRED orders with no fill older than 7 days "will not
+   * be found". -2013 NO_SUCH_ORDER → ORDER_NOT_FOUND; any other failure throws as is.
+   */
+  async queryOrderRow(symbol: string, ref: { kind: "orderId" | "clientOrderId"; value: string }): Promise<Record<string, unknown>> {
+    const key: Record<string, string> = ref.kind === "orderId" ? { orderId: ref.value } : { origClientOrderId: requireAsterClientOrderId(ref.value) };
+    const label = ref.kind === "orderId" ? ref.value : `c:${ref.value}`;
+    let row: unknown;
+    try {
+      row = await this._signedGetEip712("/fapi/v3/order", { symbol: this._toApi(symbol), ...key }, this._resolveSigner());
+    } catch (e) {
+      if (e instanceof PerpError && e.structured.details?.venueCode === -2013) {
+        throw new PerpError("ORDER_NOT_FOUND", `Aster has no order ${label} on ${symbol.toUpperCase()} (-2013 NO_SUCH_ORDER)`, {
+          exchange: "aster", venueCode: -2013, remediation: "List orders: perp account orders -e aster / perp history orders -e aster",
+        });
+      }
+      throw e;
+    }
+    if (row === null || typeof row !== "object" || Array.isArray(row)) {
+      throw new PerpError("EXCHANGE_ERROR", `Aster GET /fapi/v3/order ${label}: unexpected response shape`, { exchange: "aster" });
+    }
+    return row as Record<string, unknown>;
+  }
+
+  private async _cancelOne(symbol: string, key: { orderId: string } | { origClientOrderId: string }, orderId: string): Promise<unknown> {
     const r = this._resolveSigner();
     try {
       return await this._signedDeleteEip712("/fapi/v3/order", {
         symbol: this._toApi(symbol),
-        orderId,
+        ...key,
       }, r);
     } catch (e) {
       // Docs (futures V3 error codes): "-2011 CANCEL_REJECTED" — the venue refused the cancel; the

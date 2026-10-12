@@ -75,6 +75,11 @@ export interface TpSlLeg {
  */
 export async function placeTpSlLeg(adapter: ExchangeAdapter, network: Network, leg: TpSlLeg): Promise<OrderResult> {
   const venue = getVenue(adapter.name);
+  // A TradingV2 venue with separate TP/SL orders (QFEX) places its own legs.
+  const own = (adapter as { placeTpSlLeg?: (l: TpSlLeg) => Promise<OrderResult> }).placeTpSlLeg;
+  if (isTradingV2(adapter) && typeof own === "function" && requireCapabilities(venue).tpsl === "separateOrders") {
+    return own.call(adapter, leg);
+  }
   if (!isLegacyFamily(venue.family) || requireCapabilities(venue).tpsl !== "separateOrders") {
     throw new PerpError("INVALID_PARAMS", `${venue.displayName} does not place TP/SL as separate trigger orders`);
   }
@@ -262,9 +267,12 @@ class LegacyTradingV2 implements TradingV2 {
     return lighterClientOrderIndex(clientOrderId);
   }
 
-  /** Pacifica's client_order_id for the request (a full UUID, validated by the adapter before sending). */
-  private pacificaClientId(clientOrderId: string | null): string | undefined {
-    return this.family === "pacifica" && clientOrderId !== null ? clientOrderId : undefined;
+  /**
+   * The string client order id the adapter sends, validated there before sending: Pacifica
+   * `client_order_id` (full UUID), Hyperliquid `c` (128-bit hex cloid), Aster `newClientOrderId`.
+   */
+  private stringClientId(clientOrderId: string | null): string | undefined {
+    return this.family !== "lighter" && clientOrderId !== null ? clientOrderId : undefined;
   }
 
   private parse(raw: unknown, size: string, step: string | null = null): Parsed {
@@ -278,13 +286,21 @@ class LegacyTradingV2 implements TradingV2 {
 
   /**
    * Build the result. clientOrderId is only what the venue order carries: Lighter's
-   * clientOrderIndex and Pacifica's client_order_id as the adapter sent them (Hyperliquid and
-   * Aster orders carry none through this CLI — a --client-id is refused there).
+   * clientOrderIndex, Pacifica's client_order_id and Hyperliquid's cloid as the adapter sent
+   * them; Aster's `clientOrderId` echoed by the venue — only when one was sent (Aster generates
+   * one for every order otherwise, which perp-cli did not choose and does not report).
    * The order was sent, so a response without any id is reported (note), never thrown.
    */
-  private result(req: { symbol: string }, raw: unknown, p: Parsed, execution: OrderExecution): OrderResult {
-    const clientOrderId = this.family === "lighter" ? idString(rec(raw)?.clientOrderIndex)
-      : this.family === "pacifica" ? idString(rec(raw)?.clientOrderId) : null;
+  private result(req: { symbol: string; clientOrderId?: string | null }, raw: unknown, p: Parsed, execution: OrderExecution): OrderResult {
+    const sent = req.clientOrderId ?? null;
+    let clientOrderId: string | null = null;
+    if (this.family === "lighter") clientOrderId = idString(rec(raw)?.clientOrderIndex);
+    else if (this.family === "pacifica" || this.family === "hyperliquid") clientOrderId = idString(rec(raw)?.clientOrderId);
+    else if (sent !== null) {
+      clientOrderId = idString(rec(raw)?.clientOrderId);
+      if (clientOrderId === null) execution.notes.push(`the venue response does not echo the client order id ${sent} that was sent`);
+      else if (clientOrderId !== sent) execution.notes.push(`the venue echoed client order id ${clientOrderId}, not the ${sent} that was sent`);
+    }
     if (p.orderId === null && clientOrderId === null) {
       execution.notes.push(`the venue response carries no order id — find the order with: perp account orders -e ${this.venue.id}`);
     }
@@ -305,8 +321,8 @@ class LegacyTradingV2 implements TradingV2 {
     const opts: { reduceOnly: boolean; slippage: ResolvedSlippage; clientOrderIndex?: number; clientOrderId?: string } = { reduceOnly: req.reduceOnly, slippage };
     const idx = await this.lighterIndex(req.clientOrderId);
     if (idx !== undefined) opts.clientOrderIndex = idx;
-    const pacId = this.pacificaClientId(req.clientOrderId);
-    if (pacId !== undefined) opts.clientOrderId = pacId;
+    const cid = this.stringClientId(req.clientOrderId);
+    if (cid !== undefined) opts.clientOrderId = cid;
     const lot = await this.lotSize(req.symbol, req.size);
     const raw = await this.adapter.marketOrder(req.symbol, req.side, lot.size, opts);
 
@@ -409,8 +425,8 @@ class LegacyTradingV2 implements TradingV2 {
     const opts: { reduceOnly: boolean; tif: string; clientOrderIndex?: number; clientOrderId?: string } = { reduceOnly: req.reduceOnly, tif: req.tif };
     const idx = await this.lighterIndex(req.clientOrderId);
     if (idx !== undefined) opts.clientOrderIndex = idx;
-    const pacId = this.pacificaClientId(req.clientOrderId);
-    if (pacId !== undefined) opts.clientOrderId = pacId;
+    const cid = this.stringClientId(req.clientOrderId);
+    if (cid !== undefined) opts.clientOrderId = cid;
     const lot = await this.lotSize(req.symbol, req.size);
     const raw = await this.adapter.limitOrder(req.symbol, req.side, req.price, lot.size, opts);
     const t = this.nativeTif(req.tif);
@@ -433,7 +449,7 @@ class LegacyTradingV2 implements TradingV2 {
     if (req.triggerSource !== null && (this.family === "hyperliquid" || this.family === "lighter")) {
       throw unsupported(this.venue.displayName, "triggerSource", "trigger orders fire on the venue's fixed price source", "Omit --trigger-type");
     }
-    if (this.family === "pacifica" && req.clientOrderId !== null) {
+    if (this.family !== "lighter" && req.clientOrderId !== null) {
       throw unsupported(this.venue.displayName, "stopClientOrderId", "this CLI does not send a client order id with stop orders", "Omit the client order id for stop orders");
     }
     const isMarket = req.type === "stopMarket";
@@ -593,9 +609,7 @@ class LegacyTradingV2 implements TradingV2 {
    */
   async cancelByRef(symbol: string, ref: OrderRef, listedType: string | null = null): Promise<CancelResult> {
     if (this.family === "pacifica" && ref.kind === "clientOrderId") return this.cancelPacificaByClientId(symbol, ref);
-    if (ref.kind !== "orderId") {
-      throw unsupported(this.venue.displayName, "cancelByClientOrderId", "orders are cancelled by venue order id", `Look up the order id: perp account orders -e ${this.venue.id}`);
-    }
+    if (this.family === "lighter" && ref.kind === "clientOrderId") return this.cancelLighterByClientId(symbol, ref);
     // Pacifica stop / TP / SL orders (incl. the position-level TP/SL that `--tp/--sl` and `trade tpsl`
     // create: order_type take_profit_market / stop_loss_market, price 0, amount 0) are cancelled on
     // POST /orders/stop/cancel (cancel_stop_order); /orders/cancel refuses them with 422 "Failed to
@@ -611,9 +625,16 @@ class LegacyTradingV2 implements TradingV2 {
     let raw: unknown;
     let refusal: PacificaCancelRefusal | null = null;
     try {
-      raw = pacStop
-        ? await (this.adapter as ExchangeAdapter & { cancelStopOrder(symbol: string, orderId: string): Promise<unknown> }).cancelStopOrder(symbol, ref.value)
-        : await this.adapter.cancelOrder(symbol, ref.value);
+      if (ref.kind === "clientOrderId") {
+        // Native cancel by client order id: HL `cancelByCloid`, Aster DELETE /fapi/v3/order origClientOrderId.
+        raw = this.family === "hyperliquid"
+          ? await (this.adapter as ExchangeAdapter & { cancelByCloid(symbol: string, cloid: string): Promise<unknown> }).cancelByCloid(symbol, ref.value)
+          : await (this.adapter as ExchangeAdapter & { cancelOrderByClientId(symbol: string, id: string): Promise<unknown> }).cancelOrderByClientId(symbol, ref.value);
+      } else {
+        raw = pacStop
+          ? await (this.adapter as ExchangeAdapter & { cancelStopOrder(symbol: string, orderId: string): Promise<unknown> }).cancelStopOrder(symbol, ref.value)
+          : await this.adapter.cancelOrder(symbol, ref.value);
+      }
     } catch (e) {
       // Pacifica HTTP 4xx (e.g. 422 "Failed to cancel order" code 5 for an already-filled order):
       // a definite refusal of THIS request — settled from the order's history_by_id, never "cancelled".
@@ -639,7 +660,7 @@ class LegacyTradingV2 implements TradingV2 {
         return Array.isArray(st) && st[0] === "success" ? out("cancelled") : out("pending", "the venue response carries no per-order \"success\"");
       }
       case "aster":
-        return r !== null && r.status === "CANCELED" && idString(r.orderId) === ref.value
+        return r !== null && r.status === "CANCELED" && idString(ref.kind === "orderId" ? r.orderId : r.clientOrderId) === ref.value
           ? out("cancelled") : out("pending", "the venue response does not show this order CANCELED");
       case "pacifica":
         if (refusal !== null) return refusal.kind === "failed" ? out({ error: refusal.error }) : out("pending", refusal.reason);
@@ -650,6 +671,7 @@ class LegacyTradingV2 implements TradingV2 {
           awaitTxExecuted: (r: unknown, what: string) => Promise<void>;
           cancelOutcome: (r: unknown, symbol: string, orderId: string) => Promise<"cancelled" | "filled" | "open" | null>;
         };
+        if (ref.kind !== "orderId") throw new PerpError("INVALID_PARAMS", "unreachable: a Lighter client order id is resolved to its order id first");
         try {
           await lt.awaitTxExecuted(raw, `cancel ${ref.value} ${symbol}`);
         } catch (e) {
@@ -681,6 +703,32 @@ class LegacyTradingV2 implements TradingV2 {
       });
     }
     const r = await this.cancelByRef(symbol, { kind: "orderId", value: found.orderId }, found.type);
+    const mine = <T extends { ref: OrderRef | null }>(x: T): T => ({ ...x, ref });
+    return { ...r, cancelled: r.cancelled.map(() => ref), failed: r.failed.map(mine), pending: (r.pending ?? []).map(mine) };
+  }
+
+  /**
+   * Lighter / Lighter RH cancel by client order index. lighter-go L2CancelOrderTxInfo: `Index int64
+   * // Client Order Index or Order Index of the order to cancel` (client indexes 1..2^48 − 1, order
+   * indexes above). The index is resolved to the order's row (accountOrders?client_order_indexes —
+   * LighterAdapter.orderStatusRow) and cancelled through the per-order path above (the cancel is
+   * signed with that client index — lighterOrderSignIndex — and proven by the tx + the order's
+   * final state), reported under the client reference the caller gave. Not listed / not open →
+   * ORDER_NOT_FOUND (nothing sent).
+   */
+  private async cancelLighterByClientId(symbol: string, ref: OrderRef): Promise<CancelResult> {
+    const { lighterOrderIdOf } = await import("./lighter.js");
+    const lt = this.adapter as ExchangeAdapter & { orderStatusRow(symbol: string, ref: OrderRef): Promise<Record<string, unknown>> };
+    const row = await lt.orderStatusRow(symbol, ref);
+    const orderId = lighterOrderIdOf(row);
+    if (orderId === "") {
+      throw new PerpError("EXCHANGE_ERROR", `${this.venue.displayName} order row for client order index ${ref.value} carries no order id; nothing was cancelled`, {
+        exchange: this.venue.id, remediation: `List open orders: perp account orders -e ${this.venue.id}`,
+      });
+    }
+    // Open or not is decided by the per-order path: an order no longer among the market's active
+    // orders → ORDER_NOT_FOUND there (LighterAdapter.activeOrderRow), nothing sent.
+    const r = await this.cancelByRef(symbol, { kind: "orderId", value: orderId });
     const mine = <T extends { ref: OrderRef | null }>(x: T): T => ({ ...x, ref });
     return { ...r, cancelled: r.cancelled.map(() => ref), failed: r.failed.map(mine), pending: (r.pending ?? []).map(mine) };
   }
@@ -830,23 +878,26 @@ class LegacyTradingV2 implements TradingV2 {
   async getOrderStatus(symbol: string, ref: OrderRef): Promise<OrderResult> {
     if (this.family === "lighter") return this.lighterOrderStatus(symbol, ref);
     if (this.family === "pacifica") return this.pacificaOrderStatus(symbol, ref);
+    if (this.family === "aster") return this.asterOrderStatus(symbol, ref);
     if (this.family !== "hyperliquid" || !isQueryOrderCapable(this.adapter)) {
       throw unsupported(this.venue.displayName, "orderStatus", "the adapter has no single-order status query",
         `List orders and positions: perp account orders -e ${this.venue.id} / perp account positions -e ${this.venue.id}`);
     }
-    if (ref.kind !== "orderId" || !/^\d+$/.test(ref.value)) {
-      throw new PerpError("INVALID_PARAMS", `Hyperliquid order status needs a numeric order id (got ${ref.kind === "orderId" ? ref.value : `c:${ref.value}`})`);
+    if (ref.kind === "orderId" && !/^\d+$/.test(ref.value)) {
+      throw new PerpError("INVALID_PARAMS", `Hyperliquid order status needs a numeric order id or c:<cloid> (got ${ref.value})`);
     }
-    const raw = await this.adapter.queryOrder(Number(ref.value));
+    // info orderStatus `oid`: "Either u64 representing the order id or 16-byte hex string representing the client order id".
+    const label = ref.kind === "orderId" ? ref.value : `c:${ref.value}`;
+    const raw = await this.adapter.queryOrder(ref.kind === "orderId" ? Number(ref.value) : ref.value);
     const r = rec(raw);
     if (r?.status === "unknownOid") {
-      throw new PerpError("ORDER_NOT_FOUND", `Hyperliquid order ${ref.value} not found`, { exchange: "hyperliquid" });
+      throw new PerpError("ORDER_NOT_FOUND", `Hyperliquid order ${label} not found`, { exchange: "hyperliquid" });
     }
     const wrap = rec(r?.order);
     const o = rec(wrap?.order);
     const st = wrap?.status;
     if (r?.status !== "order" || o === null || typeof st !== "string") {
-      throw new PerpError("EXCHANGE_ERROR", `Hyperliquid orderStatus ${ref.value}: unexpected response shape`, { exchange: "hyperliquid" });
+      throw new PerpError("EXCHANGE_ERROR", `Hyperliquid orderStatus ${label}: unexpected response shape`, { exchange: "hyperliquid" });
     }
     const orig = plainDecimal(o.origSz);
     const left = plainDecimal(o.sz);
@@ -862,9 +913,34 @@ class LegacyTradingV2 implements TradingV2 {
     else if (st === "rejected" || st.endsWith("Rejected")) status = "rejected";
     else if (st === "canceled" || st.endsWith("Canceled")) status = "cancelled";
     else { status = "accepted"; finality = "pending"; }
+    const orderId = idString(o.oid);
+    if (orderId === null && ref.kind === "clientOrderId") {
+      throw new PerpError("EXCHANGE_ERROR", `Hyperliquid orderStatus ${label}: the order row carries no oid`, { exchange: "hyperliquid" });
+    }
+    const cloid = typeof o.cloid === "string" && o.cloid !== "" ? o.cloid : null;
     return withExecution({
-      venue: this.venue.id, symbol, status, finality, orderId: ref.value, clientOrderId: null,
+      // No --symbol is needed for a cloid query (orderStatus is per user): the row's coin names the market.
+      venue: this.venue.id, symbol: symbol !== "" ? symbol : String(o.coin ?? ""), status, finality,
+      orderId: orderId ?? ref.value, clientOrderId: cloid,
       filledSize: filled, avgPrice: null, venueRaw: raw,
     }, "statusQuery", { notes: filled === null ? [`venue status "${st}"; filled size not reported`] : [`venue status "${st}"`] });
+  }
+
+  /**
+   * Aster per-order status from GET /fapi/v3/order (AsterAdapter.queryOrderRow: by orderId or
+   * origClientOrderId). Status / fill only from the row's `status` / `executedQty` (parseAster);
+   * an unmapped status or unreadable executedQty → accepted / pending.
+   */
+  private async asterOrderStatus(symbol: string, ref: OrderRef): Promise<OrderResult> {
+    const ast = this.adapter as ExchangeAdapter & { queryOrderRow(symbol: string, ref: OrderRef): Promise<Record<string, unknown>> };
+    const row = await ast.queryOrderRow(symbol, ref);
+    const p = parseAster(row);
+    const clientOrderId = idString(row.clientOrderId);
+    return withExecution({
+      venue: this.venue.id, symbol, status: p.status, finality: p.finality,
+      orderId: p.orderId ?? (ref.kind === "orderId" ? ref.value : null),
+      clientOrderId: ref.kind === "clientOrderId" ? clientOrderId ?? ref.value : clientOrderId,
+      filledSize: p.filledSize, avgPrice: p.avgPrice, venueRaw: row,
+    }, "statusQuery", { notes: [`venue status "${String(row.status)}" (GET /fapi/v3/order)`] });
   }
 }

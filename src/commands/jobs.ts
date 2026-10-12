@@ -1,14 +1,38 @@
 import { Command } from "commander";
-import { listJobs, stopJob, removeJob, loadJob, logFile, startJob, assertTmuxSessionName } from "../jobs.js";
-import { printJson, jsonOk } from "../utils.js";
+import { listJobs, stopJob, removeJob, loadJob, logFile, startJob, assertTmuxSessionName, JOB_STOP_TIMEOUT_MS, type JobEntry } from "../jobs.js";
+import { printJson, jsonOk, symbolMatch } from "../utils.js";
+import type { ExchangeAdapter } from "../exchanges/index.js";
+import { PerpError } from "../errors.js";
 import chalk from "chalk";
 import { existsSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { scrubSecretEnv } from "../secret-env.js";
 
+/**
+ * What a stopped job left on its venue(s): open orders and positions on its symbol (every symbol
+ * when the job has none). One entry per venue; a failed read is reported, never "nothing left".
+ */
+async function leftoversOf(job: JobEntry, getAdapterFor: (venue: string) => Promise<ExchangeAdapter>): Promise<Array<{ venue: string; orders: unknown[]; positions: unknown[]; error: string | null }>> {
+  const sym = typeof job.params.symbol === "string" && job.params.symbol !== "ALL" ? job.params.symbol.toUpperCase() : null;
+  const venues = job.exchange === "multi" ? [] : job.exchange.split(/[+,]/).map(v => v.trim()).filter(Boolean);
+  const out: Array<{ venue: string; orders: unknown[]; positions: unknown[]; error: string | null }> = [];
+  for (const venue of venues) {
+    try {
+      const a = await getAdapterFor(venue);
+      const [orders, positions] = await Promise.all([a.getOpenOrders(), a.getPositions()]);
+      const mine = <T extends { symbol: string }>(xs: T[]) => sym === null ? xs : xs.filter(x => symbolMatch(x.symbol, sym));
+      out.push({ venue, orders: mine(orders), positions: mine(positions).filter(p => Number(p.size) !== 0), error: null });
+    } catch (e) {
+      out.push({ venue, orders: [], positions: [], error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+  return out;
+}
+
 export function registerBackgroundCommands(
   program: Command,
-  isJson: () => boolean
+  isJson: () => boolean,
+  getAdapterFor?: (venue: string) => Promise<ExchangeAdapter>,
 ) {
   const jobs = program.command("background").description("Background process supervisor (tmux sessions for strategies, alerts, etc.)");
 
@@ -53,17 +77,39 @@ export function registerBackgroundCommands(
 
   jobs
     .command("stop <id>")
-    .description("Stop a running job")
-    .action((id: string) => {
+    .description("Stop a running job gracefully: SIGINT (the job cancels its orders / saves state), wait up to --timeout, only then kill; reports what is left on the venue")
+    .option("--timeout <sec>", "Seconds to wait for the job's own cleanup before killing it", String(JOB_STOP_TIMEOUT_MS / 1000))
+    .action(async (id: string, opts: { timeout: string }) => {
       const job = loadJob(id);
       if (!job) {
         console.log(chalk.red(`\n  Job ${id} not found.\n`));
         return;
       }
-
-      stopJob(id);
-      if (isJson()) return printJson(jsonOk({ id, status: "stopped" }));
-      console.log(chalk.green(`\n  Job ${id} stopped.\n`));
+      const timeoutSec = Number(opts.timeout);
+      if (!(timeoutSec > 0)) throw new PerpError("INVALID_PARAMS", `--timeout must be a positive number of seconds (got ${opts.timeout})`);
+      if (!isJson()) console.log(chalk.gray(`\n  Stopping job ${id} (SIGINT, waiting up to ${timeoutSec}s for its cleanup)...`));
+      const r = await stopJob(id, timeoutSec * 1000);
+      if (r === null) return;
+      const log = logFile(id);
+      const tail = existsSync(log) ? readFileSync(log, "utf-8").split("\n").filter(l => l.trim() !== "").slice(-12) : [];
+      const left = getAdapterFor !== undefined ? await leftoversOf(job, getAdapterFor) : [];
+      const leftCount = left.reduce((n, v) => n + v.orders.length + v.positions.length, 0);
+      if (isJson()) return printJson(jsonOk({ id, status: "stopped", stop: r, leftovers: left, logTail: tail }));
+      if (r.outcome === "forced") console.log(chalk.red.bold(`  Job ${id} was FORCE-KILLED: ${r.note}. Its own cleanup (cancel orders / save state) did NOT run.`));
+      else if (r.outcome === "graceful") console.log(chalk.green(`  Job ${id} exited after SIGINT (${(r.waitedMs / 1000).toFixed(1)}s).`));
+      else console.log(chalk.gray(`  Job ${id} was not running.`));
+      if (tail.length > 0) {
+        console.log(chalk.gray("  Last log lines:"));
+        for (const l of tail) console.log(chalk.gray(`    ${l}`));
+      }
+      for (const v of left) {
+        if (v.error !== null) { console.log(chalk.yellow(`  ${v.venue}: could not read what is left (${v.error}) — check: perp -e ${v.venue} account orders / account positions`)); continue; }
+        for (const o of v.orders as Array<{ symbol: string; side: string; size: string; price: string; orderId: string }>) console.log(chalk.yellow(`  LEFT OPEN on ${v.venue}: order ${o.side} ${o.size} ${o.symbol} @ ${o.price} (${o.orderId}) — cancel: perp -e ${v.venue} trade cancel ${o.symbol} ${o.orderId}`));
+        for (const p of v.positions as Array<{ symbol: string; side: string; size: string }>) console.log(chalk.yellow(`  LEFT OPEN on ${v.venue}: position ${p.side} ${p.size.replace(/^-/, "")} ${p.symbol} — close: perp -e ${v.venue} trade close ${p.symbol}`));
+      }
+      if (left.length > 0 && leftCount === 0 && left.every(v => v.error === null)) console.log(chalk.green(`  Nothing left open on ${left.map(v => v.venue).join(", ")}${typeof job.params.symbol === "string" ? ` for ${job.params.symbol}` : ""}.`));
+      if (job.exchange === "multi") console.log(chalk.gray("  Multi-venue job: check every venue: perp arb status"));
+      console.log();
     });
 
   jobs
@@ -101,15 +147,16 @@ export function registerBackgroundCommands(
 
   jobs
     .command("remove <id>")
-    .description("Remove a job entry and its logs")
-    .action((id: string) => {
+    .description("Remove a job entry and its logs (a running job is stopped gracefully first)")
+    .action(async (id: string) => {
       const job = loadJob(id);
       if (!job) {
         console.log(chalk.red(`\n  Job ${id} not found.\n`));
         return;
       }
       if (job.status === "running") {
-        stopJob(id);
+        const r = await stopJob(id);
+        if (r?.outcome === "forced" && !isJson()) console.log(chalk.red(`  Job ${id} was force-killed (${r.note}); its cleanup did not run — check its venue for open orders / positions.`));
       }
       removeJob(id);
       if (isJson()) return printJson(jsonOk({ id, removed: true }));

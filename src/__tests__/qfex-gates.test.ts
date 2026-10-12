@@ -186,7 +186,7 @@ describe("automation gate: unattended flows are refused on QFEX while stops are 
     const e = qfexAutomationGate(null) as PerpError;
     expect(e.structured.code).toBe("CAPABILITY_UNSUPPORTED");
     expect(e.structured.details).toMatchObject({ venue: "qfex", feature: "automation" });
-    expect(e.structured.remediation).toMatch(/manual commands.*Q21/);
+    expect(e.structured.remediation).toMatch(/manual commands.*Q2 \/ Q4/);
     expect(qfexAutomationGate(true)).toBeNull();
   });
 
@@ -276,14 +276,12 @@ describe("CLI gates (-e qfex), nothing is sent", () => {
     ["market --tp", ["trade", "market", "AAPL", "buy", "1", "--tp", "400"]],
     ["limit --sl", ["trade", "limit", "AAPL", "buy", "330", "1", "--tif", "IOC", "--sl", "300"]],
     ["tpsl", ["trade", "tpsl", "AAPL", "long", "--sl", "300"]],
-  ])("%s → the uniform stop-order unsupported error (Q21) before any read or send", async (_n, args) => {
+  ])("%s → no longer refused up front (Q21 passed): it goes on to read the venue", async (_n, args) => {
     writeSettings({ agents: AGENTS });
     const r = await run(["-e", "qfex", ...args]);
-    expect(r.ok).toBe(false);
-    expect(r.error!.code).toBe("CAPABILITY_UNSUPPORTED");
-    expect(r.error!.details).toMatchObject({ venue: "qfex", feature: "stopOrder" });
-    expect(r.error!.remediation).toMatch(/Q21/);
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(r.ok).toBe(false); // this suite's fetch throws on any call
+    expect(r.error!.details).not.toMatchObject({ feature: "stopOrder" });
+    expect(fetchMock).toHaveBeenCalled();
   });
 
   it.each([
@@ -295,7 +293,7 @@ describe("CLI gates (-e qfex), nothing is sent", () => {
     expect(r.ok).toBe(false);
     expect(r.error!.code).toBe("CAPABILITY_UNSUPPORTED");
     expect(r.error!.details).toMatchObject({ feature: "restingReduceOnly" });
-    expect(r.error!.remediation).toMatch(/Use --tif IOC, or reduce the position now instead: perp trade reduce AAPL <percent> -e qfex/);
+    expect(r.error!.remediation).toMatch(/Use --tif IOC, or set a take-profit \/ stop-loss on the position instead: perp trade tpsl AAPL/);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -312,12 +310,11 @@ describe("CLI gates (-e qfex), nothing is sent", () => {
     expect(fetchMock).toHaveBeenCalled();
   });
 
-  it("trade edit → amend unsupported (cancel, then re-place)", async () => {
+  it("trade edit is no longer refused up front (Q5 passed): it goes on to read the order", async () => {
     writeSettings({ agents: AGENTS });
     const r = await run(["-e", "qfex", "trade", "edit", "AAPL", "o1", "330", "1"]);
-    expect(r.error!.code).toBe("CAPABILITY_UNSUPPORTED");
-    expect(r.error!.details).toMatchObject({ feature: "amend" });
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(r.ok).toBe(false); // fetch throws
+    expect(r.error!.details ?? {}).not.toMatchObject({ feature: "amend" });
   });
 
   it("funds withdraw qfex --dry-run evaluates the local gate: unset → POLICY_DENIED; set → a plan, nothing sent", async () => {

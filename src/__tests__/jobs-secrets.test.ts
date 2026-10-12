@@ -157,7 +157,7 @@ describe("L6: tmux session names, file modes, alerts network", () => {
     expect(() => assertTmuxSessionName("perp-alerts-k3x9")).not.toThrow();
     saveJob({ id: "deadbeef", strategy: "twap", exchange: "hyperliquid", params: {}, tmuxSession: "perp-x;touch /tmp/pwn", startedAt: "", status: "running" });
     execFileSync.mockClear();
-    expect(() => stopJob("deadbeef")).toThrow(/Invalid tmux session name/);
+    await expect(stopJob("deadbeef")).rejects.toThrow(/Invalid tmux session name/);
     expect(execFileSync).not.toHaveBeenCalled();
   });
 

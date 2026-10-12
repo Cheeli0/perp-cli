@@ -163,12 +163,12 @@ describe("Command injection attempts", () => {
     const adapter = mockAdapter();
     const program = createTradeProgram(adapter, true);
 
-    // BEHAVIOR CHANGE: a venue whose orders carry no client id (the mock is hyperliquid) refuses
-    // --client-id up front (CAPABILITY_UNSUPPORTED) instead of accepting and dropping it.
+    // The mock is hyperliquid: a client id must be a 128-bit hex cloid (0x + 32 hex), so the
+    // injection string is refused up front (INVALID_PARAMS) and nothing is sent.
     await expect(run(program, [
       "trade", "market", "BTC", "buy", "0.1",
       "--client-id", '"; DROP TABLE orders; --',
-    ])).rejects.toMatchObject({ structured: { code: "CAPABILITY_UNSUPPORTED" } });
+    ])).rejects.toMatchObject({ structured: { code: "INVALID_PARAMS" } });
     expect(adapter.marketOrder).not.toHaveBeenCalled();
   });
 });

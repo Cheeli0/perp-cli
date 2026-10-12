@@ -2,7 +2,7 @@
  * `perp outcome` — Hyperliquid Outcome markets (HIP-4).
  *
  * Currently HL-only. Asset class is fully collateralized binary/range
- * contracts, USDH-quoted. No leverage, no liquidation. Settlement is
+ * contracts, quoted per outcome (outcomeMeta quoteToken, e.g. USDC). No leverage, no liquidation. Settlement is
  * dated per-outcome.
  */
 
@@ -59,7 +59,8 @@ export function registerOutcomeCommands(
       }
 
       console.log(chalk.white.bold(`\n  Outcome Markets (Hyperliquid HIP-4)`));
-      console.log(chalk.gray(`  Quote: USDH · No leverage · Min order $10\n`));
+      const quotes = [...new Set(markets.map((m) => m.quoteToken))].join(" / ");
+      console.log(chalk.gray(`  Quote: ${quotes} (per outcome) · No leverage · Min order 10 quote tokens\n`));
 
       for (const m of markets) {
         const expiry = m.expiryMs ? new Date(m.expiryMs).toISOString().replace("T", " ").slice(0, 16) + " UTC" : "—";
@@ -144,7 +145,9 @@ export function registerOutcomeCommands(
     .action(async () => {
       const adapter = await getOutcomeAdapter();
       const orders = await adapter.getOpenOrders();
-      if (isJson()) return printJson(jsonOk(orders));
+      if (isJson()) {
+        return printJson(jsonOk((orders as Array<Record<string, unknown>>).map((o) => ({ ...o, outcome: adapter.describeCoin(String(o.symbol ?? "")) }))));
+      }
 
       if (orders.length === 0) {
         console.log(chalk.gray("\n  No open outcome orders.\n"));
@@ -157,31 +160,51 @@ export function registerOutcomeCommands(
       const rows = (orders as Array<Record<string, unknown>>).map((o) => {
         const side = String(o.side ?? "").toLowerCase();
         const sideLabel = side === "buy" ? chalk.green("BUY") : side === "sell" ? chalk.red("SELL") : chalk.gray(String(o.side ?? ""));
+        const coin = String(o.symbol ?? "");
+        const d = adapter.describeCoin(coin);
+        const strip = (n: string) => n.replace(/^template:/, "");
         return [
-          String(o.symbol ?? ""),
+          d !== null ? `#${d.outcome} ${strip(d.name)} · ${strip(d.sideName)} (side ${d.side}, ${coin})` : coin,
           sideLabel,
           String(o.size ?? ""),
           String(o.price ?? ""),
           String(o.orderId ?? ""),
         ];
       });
-      console.log("\n" + makeTable(["coin", "side", "size", "price", "oid"], rows) + "\n");
+      console.log("\n" + makeTable(["outcome · side", "dir", "size", "price", "oid"], rows) + "\n");
     });
 
   // ── outcome buy / sell ───────────────────────────────────────────────────
   for (const action of ["buy", "sell"] as const) {
-    supportsDryRun(outcome.command(`${action} <outcome> <side> <usd>`))
-      .description(`${action === "buy" ? "Buy" : "Sell"} a side of an outcome (USDH notional; supports --dry-run)`)
+    const cmd = supportsDryRun(outcome.command(`${action} <outcome> <side> [usd]`))
+      .description(`${action === "buy" ? "Buy" : "Sell"} a side of an outcome: [usd] notional in the outcome's quote token (outcomeMeta quoteToken, e.g. USDC), or --size <shares>${action === "sell" ? " / --all (the whole position)" : ""}; supports --dry-run`)
       .option("--limit <px>", "Limit price (default: aggressive Ioc at top of book)")
       .option("--tif <tif>", "Time-in-force: gtc | ioc | alo (default: ioc for market, gtc for limit)")
-      .action(async (outcomeArg: string, sideArg: string, usdArg: string, opts: { limit?: string; tif?: string }, command: Command) => {
+      .option("--size <shares>", "Number of shares (integer) instead of a notional");
+    if (action === "sell") cmd.option("--all", "Sell the whole position of this outcome side (shares read from the account)");
+    cmd
+      .action(async (outcomeArg: string, sideArg: string, usdArg: string | undefined, opts: { limit?: string; tif?: string; size?: string; all?: boolean }, command: Command) => {
         // --dry-run is the root flag (never re-declared here — the root would swallow it).
         const merged = { ...opts, dryRun: isDryRun(command) };
+        const given = [usdArg !== undefined, opts.size !== undefined, opts.all === true].filter(Boolean).length;
+        if (given !== 1) {
+          throw new PerpError("INVALID_PARAMS", `outcome ${action}: give exactly one of <usd>, --size <shares>${action === "sell" ? ", --all" : ""}`, {
+            remediation: `e.g. perp outcome ${action} <outcome> <side> 12 | --size 13${action === "sell" ? " | --all" : ""}`,
+          });
+        }
         const adapter = await getOutcomeAdapter();
         const { outcome: outcomeId, side } = await resolveOutcomeSide(adapter, outcomeArg, sideArg);
-        const usd = Number(usdArg);
-        if (!Number.isFinite(usd) || usd <= 0) {
+        const usd = usdArg !== undefined ? Number(usdArg) : null;
+        if (usd !== null && (!Number.isFinite(usd) || usd <= 0)) {
           throw new PerpError("INVALID_PARAMS", `Invalid notional: ${usdArg}`, {});
+        }
+        if (opts.size !== undefined && !/^[1-9]\d*$/.test(opts.size)) {
+          throw new PerpError("INVALID_PARAMS", `--size must be a positive whole number of shares (got ${opts.size})`, {});
+        }
+        // Shares held on this side now (spot outcome balance); every path reads it for the remainder check.
+        const held = Number((await adapter.getPositions()).find(p => p.outcome === outcomeId && p.side === side)?.size ?? "0");
+        if (opts.all === true && !(Math.floor(held) >= 1)) {
+          throw new PerpError("POSITION_NOT_FOUND", `No whole share of outcome ${outcomeId} side ${side} to sell (held ${held})`, { remediation: "See: perp outcome positions" });
         }
 
         // Resolve price + size from notional
@@ -201,7 +224,11 @@ export function registerOutcomeCommands(
             price = Math.max(0.0001, Number(bestBid) * 0.95).toFixed(5);
           }
         }
-        const size = String(Math.floor(usd / Number(price))); // outcome sizes are integer shares
+        // Outcome sizes are integer shares.
+        const size = opts.all === true ? String(Math.floor(held)) : opts.size !== undefined ? opts.size : String(Math.floor((usd as number) / Number(price)));
+        if (action === "sell" && Number(size) > held) {
+          throw new PerpError("SIZE_TOO_LARGE", `outcome sell ${size} shares exceeds the ${held} held on outcome ${outcomeId} side ${side}; nothing was sent`, { remediation: "Use --all, or a smaller --size" });
+        }
 
         const tifMap = { GTC: "Gtc", IOC: "Ioc", ALO: "Alo" } as const;
         const tifNorm = tifMap[tif];
@@ -218,17 +245,25 @@ export function registerOutcomeCommands(
 
         // Validate min-notional client-side so --dry-run surfaces it too
         // (placeOrder enforces but is bypassed by --dry-run early return).
+        const quote = adapter.quoteTokenOf(outcomeId);
+        // A position worth less than the 10-quote minimum can never be sold (every order must be >= 10):
+        // warn before an order that would leave such a remainder.
+        const after = action === "buy" ? held + Number(size) : held - Number(size);
+        if (after > 0 && after * Number(price) < 10) {
+          const msg = `this ${action} leaves ${after} share(s) ≈ ${(after * Number(price)).toFixed(2)} ${quote} on outcome ${outcomeId} side ${side} — below the 10 ${quote} minimum order value, so that remainder cannot be sold on its own${action === "sell" ? " (use --all to sell everything)" : ""}`;
+          process.stderr.write(chalk.yellow(`  WARNING: ${msg}\n`));
+        }
         if (Number(orderInfo.notional) < 10) {
           throw new PerpError(
             "INVALID_PARAMS",
-            `Outcome order notional must be at least 10 USDH (got price=${price} * size=${size} = ${orderInfo.notional})`,
+            `Outcome order value must be at least 10 ${quote} (got price=${price} * size=${size} = ${orderInfo.notional})`,
             { exchange: "hyperliquid", remediation: "Increase --usd or pass --limit so price*size >= 10" },
           );
         }
 
         if (merged.dryRun) {
           if (isJson()) return printJson(jsonOk({ dryRun: true, sent: false, order: orderInfo }));
-          console.log(chalk.yellow(`\n  [dry-run] ${action.toUpperCase()} outcome=${outcomeId} side=${side} ${size}@${price} (notional ~$${orderInfo.notional} USDH, tif=${tifNorm})\n`));
+          console.log(chalk.yellow(`\n  [dry-run] ${action.toUpperCase()} outcome=${outcomeId} side=${side} ${size}@${price} (notional ~${orderInfo.notional} ${quote}, tif=${tifNorm})\n`));
           return;
         }
 

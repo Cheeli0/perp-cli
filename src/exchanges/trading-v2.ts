@@ -6,7 +6,7 @@
  * methods, so an adapter can implement both without overloads.
  */
 
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { PerpError } from "../errors.js";
 import type { VenueCapabilities, VenueDefinition } from "./venue.js";
 import { orderRefOf } from "./venue-types.js";
@@ -158,10 +158,7 @@ export function validateOrderRequest(venue: VenueDefinition, caps: VenueCapabili
   // A reduce-only limit order may only carry the TIFs the venue allows for it (Ondo: IOC only —
   // a resting reduce-only order is refused there); refused before anything is sent.
   if (req.reduceOnly && req.type === "limit" && req.tif !== null && caps.reduceOnlyTif !== null && !caps.reduceOnlyTif.includes(req.tif)) {
-    // QFEX refuses stop orders (Q21), so `trade tpsl` is not an alternative there.
-    const alternative = venue.family === "qfex"
-      ? `reduce the position now instead: perp trade reduce ${req.symbol} <percent> -e ${venue.id} (stop / TP / SL orders are not available on ${venue.id})`
-      : `set a take-profit / stop-loss on the position instead: perp trade tpsl ${req.symbol} <long|short> --tp <price>${caps.tpsl !== null && caps.tpsl !== "positionLevel" ? " [--size <qty>]" : ""} -e ${venue.id}`;
+    const alternative = `set a take-profit / stop-loss on the position instead: perp trade tpsl ${req.symbol} <long|short> --tp <price>${caps.tpsl !== null && caps.tpsl !== "positionLevel" ? " [--size <qty>]" : ""} -e ${venue.id}`;
     throw unsupported(venue.displayName, "restingReduceOnly",
       `a reduce-only limit order can only be ${caps.reduceOnlyTif.join(" / ")} (got ${req.tif})`,
       `Use --tif ${caps.reduceOnlyTif.join(" | ")}, or ${alternative}`);
@@ -283,12 +280,14 @@ export function newClientOrderId(prefix = "p"): string {
 /**
  * Client order id in the venue's format: Lighter-family `clientOrderIndex` is a
  * decimal integer ≤ 2^48 − 1 (ms timestamp × 100 + 2 random digits); QFEX and Pacifica take a
- * UUID (QFEX: the format the venue itself generates; Pacifica: "Full UUID string"); every other
- * venue takes newClientOrderId().
+ * UUID (QFEX: the format the venue itself generates; Pacifica: "Full UUID string"); Hyperliquid a
+ * 128-bit cloid ("0x" + 32 hex); every other venue (Aster: [.A-Z:/a-z0-9_-]{1,36}) takes
+ * newClientOrderId().
  */
 export function newVenueClientOrderId(venue: VenueDefinition): string {
   if (venue.family === "lighter") return String(Date.now() * 100 + Math.floor(Math.random() * 100));
   if (venue.family === "qfex" || venue.family === "pacifica") return randomUUID();
+  if (venue.family === "hyperliquid") return `0x${randomBytes(16).toString("hex")}`;
   return newClientOrderId();
 }
 

@@ -30,9 +30,9 @@
  *     until QFEX_RESTING_REDUCE_ONLY_VERIFIED;
  *   - unattended automation — bots, plans, TWAP, DCA, grid, funding-arb, trailing stop,
  *     background jobs (automationGate) — until QFEX_AUTOMATION_VERIFIED;
- *   - every stop order (Q21) — and so `trade stop`, `trade tpsl` and `--tp/--sl`, whose legs are
- *     stops (stopOrderGate); stop-limit and stops that open are not offered by the venue at all;
- *   - amend (Q5): cancel, then re-place;
+ *   - stop-limit and stops that open (the venue offers neither); reduce-only stop-MARKET orders
+ *     (TAKE_PROFIT / STOP_LOSS, Q21 passed — placeStop) are placed;
+ *   - amend of a reduce-only order (a plain LIMIT / ALO is amended — Q5 passed);
  *   - attached TP/SL (Q7);
  *   - markets not quoted in USD (sizing / risk / notional code assumes USD);
  *   - user-supplied client order ids (not unique on the venue).
@@ -69,7 +69,7 @@ import {
   fetchQfexInstruments, qfexPlainSymbol, qfexPublicData, qfexTradable, qfexVenueSymbol, type QfexInstrument,
 } from "./public.js";
 import {
-  QFEX_AUTOMATION_VERIFIED, QFEX_MODIFY_KEEPS_CLIENT_ID, QFEX_REDUCE_ONLY_WIRE, decimalsEqual, fromWireNumber, isZeroDecimal,
+  QFEX_AUTOMATION_VERIFIED, QFEX_MODIFY_KEEPS_CLIENT_ID, QFEX_REDUCE_ONLY_WIRE, QFEX_STOP_CLIENT_ID_ECHO, decimalsEqual, fromWireNumber, isZeroDecimal,
   qfexAutomationGate, qfexReduceOnlyGate, reduceOnlyWireValue, subDecimals, sumDecimals, toWireNumber, weightedAveragePrice, type QfexCredentials,
   type QfexReduceOnlyWire,
 } from "./signing.js";
@@ -82,6 +82,20 @@ import {
 export const QFEX_MARK_MAX_AGE_MS = 10_000;
 /** /refdata cache: bands move with the session, so it is short. */
 const INSTRUMENTS_TTL_MS = 30_000;
+/** settledByHistory: historic-orders reads (and the wait between them) for an order that left the open list. */
+const HISTORY_SETTLE_TRIES = 4;
+const HISTORY_SETTLE_DELAY_MS = 1_000;
+
+/**
+ * A stop order's history verdict. Observed 2026-10-13: stop orders never appear in
+ * /user/historic-orders and /user/trade rows carry no order id, so a vanished stop cannot be
+ * proven cancelled — "not indexed" becomes a reason that says so (the cancel stays pending).
+ */
+function stopHistoryVerdict(settled: string): string {
+  return settled === "not indexed"
+    ? "no longer listed open, but QFEX keeps no record of stop orders (not in /user/historic-orders), so the cancel cannot be proven — if perp account orders/positions -e qfex both show nothing for the symbol, it is gone"
+    : settled;
+}
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const STOP_TYPES: ReadonlySet<string> = new Set(["TAKE_PROFIT", "STOP_LOSS"]);
 const KLINE_RESOLUTION: Readonly<Record<string, string>> = {
@@ -395,13 +409,145 @@ export class QfexAdapter implements ExchangeAdapter, TradingV2 {
   }
 
   /**
-   * The uniform refusal of every stop order — and so of `--tp/--sl` and `trade tpsl`, whose legs
-   * are stops. Callers ask BEFORE an entry is sent (stopOrderGateOf).
+   * The uniform refusal of every stop order while Q21 is unset — and so of `--tp/--sl` and
+   * `trade tpsl`, whose legs are stops. Callers ask BEFORE an entry is sent (stopOrderGateOf).
+   * Null now that Q21 passed (QFEX_STOP_CLIENT_ID_ECHO).
    */
-  stopOrderGate(): PerpError {
+  stopOrderGate(): PerpError | null {
+    if (QFEX_STOP_CLIENT_ID_ECHO === true) return null;
     return unsupported("qfex", "stopOrder",
       "the stop order acknowledgement is not documented to echo a client order id, so a stop cannot be correlated safely (Q21)",
       "Set stops / TP / SL on the QFEX web app until docs/TEST-PLAN.md QFEX item Q21 passes");
+  }
+
+  /**
+   * One reduce-only stop-market order (add_order with order_type TAKE_PROFIT / STOP_LOSS).
+   * Docs stop_add_order: "The direction given must be the eventual direction of the triggered
+   * order", `price` = "Price for when the order is triggered", quantity "Must respect lot size
+   * but not min/max limits", order_time_in_force "Required for legacy reasons, the value will
+   * not be read", and "TAKE_PROFIT and STOP_LOSS orders cannot exceed your current position,
+   * attempting to do this could cause your order to be rejected or other stop orders to be
+   * cancelled". So, before sending (every refusal definite, nothing sent):
+   *   - a non-zero position, the order side opposite to it;
+   *   - size + Σ quantity of the other open stops of the SAME type on the symbol ≤ |position|
+   *     (never makes the venue cancel another stop);
+   *   - kind given (TP/SL legs) or, for a plain stop, from the trigger vs the MDS mark price
+   *     (closing a long: below mark = STOP_LOSS, above = TAKE_PROFIT; a short: the mirror).
+   * After the send: the ACK must carry our client id and reduce_only true (production 2026-10-12);
+   * the row is then read back from get_user_orders (final "open" only with that row). The venue's
+   * repeating `stop_order_response` frames are a heartbeat and never read as state.
+   */
+  private async placeStop(req: OrderRequest, kind: "tp" | "sl" | null): Promise<OrderResult> {
+    const gate = this.stopOrderGate();
+    if (gate !== null) throw gate;
+    if (req.clientOrderId === null || !UUID_RE.test(req.clientOrderId)) {
+      throw new PerpError("INVALID_PARAMS", "QFEX stop orders carry a perp-cli generated client order id (UUID)");
+    }
+    if (req.triggerPrice === null) throw new PerpError("INVALID_PARAMS", "stop order requires a trigger price");
+    if (req.triggerSource !== null) {
+      throw unsupported("qfex", "triggerSource", "QFEX stops trigger on the venue's own price source", "Omit --trigger-type");
+    }
+    const clientOrderId = req.clientOrderId;
+    this.requireMeta();
+    const i = await this.instrumentOf(req.symbol);
+    const size = floorSize(req.size, i.lotSize);
+    const trigger = requireOnTick(req.triggerPrice, i.tickSize);
+    const what = `stop add_order ${i.venueSymbol}`;
+    let session: QfexTradeSession;
+    let exec: OrderExecution;
+    let orderType: "TAKE_PROFIT" | "STOP_LOSS";
+    try {
+      const s = await this.session();
+      session = s.session;
+      exec = execution("trigger", { referencePrice: trigger, tifSent: "GTC (not read by the venue for stops)", builderFee: s.builder.applied, notes: ["reduce-only stop-market: executes as a market order when triggered (no slippage bound)"] });
+      if (s.builder.note !== null) exec.notes.push(s.builder.note);
+      const rows = (await this.userPositions()).positions.filter(p => p.symbol === i.venueSymbol);
+      if (rows.length > 1) throw new PerpError("EXCHANGE_ERROR", `/user/positions lists ${rows.length} rows for ${i.venueSymbol}`);
+      const position = rows.length === 0 ? 0 : rows[0].position;
+      if (typeof position !== "number" || !Number.isFinite(position)) throw new PerpError("EXCHANGE_ERROR", `/user/positions reports position ${JSON.stringify(position)} for ${i.venueSymbol}`);
+      if (position === 0) {
+        throw new PerpError("POSITION_NOT_FOUND", `QFEX ${i.venueSymbol}: no open position — a stop order can only reduce one (docs: stops "cannot exceed your current position"); not sent`, {
+          exchange: "qfex", sent: false, remediation: "Check positions: perp account positions -e qfex",
+        });
+      }
+      const closeSide = position > 0 ? "sell" : "buy";
+      if (req.side !== closeSide) {
+        throw new PerpError("INVALID_PARAMS", `QFEX ${i.venueSymbol}: a ${req.side} stop cannot reduce the ${position > 0 ? "long" : "short"} position — not sent`, { exchange: "qfex", remediation: `Use side ${closeSide}` });
+      }
+      if (kind !== null) orderType = kind === "tp" ? "TAKE_PROFIT" : "STOP_LOSS";
+      else {
+        const mark = await this.referenceMark(i.venueSymbol);
+        if (decimalsEqual(trigger, mark)) throw new PerpError("INVALID_PARAMS", `QFEX ${i.venueSymbol}: trigger ${trigger} equals the mark ${mark} — cannot tell stop-loss from take-profit; not sent`);
+        const below = lessThan(trigger, mark);
+        orderType = (closeSide === "sell") === below ? "STOP_LOSS" : "TAKE_PROFIT";
+        exec.notes.push(`sent as ${orderType}: trigger ${trigger} is ${below ? "below" : "above"} the mark ${mark}`);
+      }
+      const held = floorSize(plainNumber(Math.abs(position), "position"), i.lotSize);
+      const sameType = (await session.getUserOrders(i.venueSymbol)).filter(o => o.symbol === i.venueSymbol && o.type === orderType);
+      const reserved = sumDecimals(sameType.map(o => fromWireNumber(o.quantity, i.lotSize, "quantity")));
+      const total = sumDecimals([reserved, size]);
+      if (lessThan(held, total)) {
+        throw new PerpError("SIZE_TOO_LARGE",
+          `QFEX ${i.venueSymbol}: ${orderType} ${size} + ${reserved} in other open ${orderType} orders exceeds the ${held} position — not sent (the venue may reject it or cancel other stops)`, {
+            exchange: "qfex", position: held, reservedByStops: reserved, stopOrderIds: sameType.map(o => o.order_id),
+            remediation: sameType.length > 0 ? `Cancel a ${orderType} first: perp trade cancel ${i.symbol} <orderId> -e qfex (${sameType.map(o => o.order_id).join(", ")})` : `Use a size of at most ${held}`,
+          });
+      }
+    } catch (e) {
+      // The rule's own refusals keep their code (nothing was sent); read failures become "not sent".
+      if (e instanceof PerpError && ["POSITION_NOT_FOUND", "INVALID_PARAMS", "SIZE_TOO_LARGE"].includes(e.structured.code)) throw e;
+      throw orderNotSent("qfex", what, e);
+    }
+    const params: Record<string, unknown> & { symbol: string; client_order_id: string } = {
+      symbol: i.venueSymbol, side: req.side === "buy" ? "BUY" : "SELL", order_type: orderType, order_time_in_force: "GTC",
+      quantity: toWireNumber(size, "quantity"), price: toWireNumber(trigger, "price"), client_order_id: clientOrderId,
+      reduce_only: reduceOnlyWireValue(QFEX_REDUCE_ONLY_WIRE as QfexReduceOnlyWire, true),
+    };
+    if (subDecimal(req.size, size) !== "0") exec.notes.push(`size ${req.size} floored to the lot ${i.lotSize} → ${size}`);
+    const add = await session.addOrder({ params, immediate: false, postOnly: false, lotSize: i.lotSize, band: null });
+    const unconfirmed = reduceOnlyUnconfirmedFrame(add.responses);
+    if (unconfirmed !== null) throw this.reduceOnlyEchoError(i, add.orderId, clientOrderId, unconfirmed.reduce_only, { orderId: add.orderId, responses: add.responses });
+    // Read back: "open" only with the get_user_orders row of THIS stop (by client id).
+    let row: QfexOrderResponse | null = null;
+    try {
+      row = this.pick((await session.getUserOrders(i.venueSymbol)).filter(o => STOP_TYPES.has(o.type)), { kind: "clientOrderId", value: clientOrderId });
+    } catch (e) {
+      exec.notes.push(`read-back failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    const venueRaw = { orderId: add.orderId, responses: add.responses, row };
+    if (row === null) {
+      exec.notes.push(`acknowledged (ACK); not listed by get_user_orders yet — verify: perp trade status c:${clientOrderId} --symbol ${i.symbol} -e qfex`);
+      return { venue: "qfex", symbol: i.symbol, status: "accepted", finality: "pending", orderId: add.orderId, clientOrderId, filledSize: null, avgPrice: null, execution: exec, venueRaw };
+    }
+    exec.notes.push(`listed open as ${row.type} (untriggered)`);
+    return { venue: "qfex", symbol: i.symbol, status: "open", finality: "final", orderId: row.order_id, clientOrderId, filledSize: "0", avgPrice: null, execution: exec, venueRaw };
+  }
+
+  /** A TP / SL leg (separateOrders: legacy-trading-v2 placeTpSlLeg dispatches here). Stop-market only. */
+  async placeTpSlLeg(leg: { symbol: string; closeSide: "buy" | "sell"; size: string; trigger: string; kind: "tp" | "sl"; limitPrice: string | null }): Promise<OrderResult> {
+    if (leg.limitPrice !== null) {
+      throw unsupported("qfex", "stopLimit", "the venue's stop orders convert to market orders when triggered", "Omit --tp-limit on qfex");
+    }
+    return this.placeStop({
+      symbol: leg.symbol, side: leg.closeSide, type: "stopMarket", size: leg.size, price: null, triggerPrice: leg.trigger,
+      triggerSource: null, tif: null, reduceOnly: true, clientOrderId: qfexClientOrderId(), slippage: null, tpsl: null,
+    }, leg.kind);
+  }
+
+  /**
+   * Orders left on symbols where the account holds NO position: resting reduce-only LIMIT / ALO
+   * orders and TAKE_PROFIT / STOP_LOSS stops. Production 2026-10-12 (Q2): the venue does NOT
+   * cancel a resting reduce-only order when the position closes; whether one the market reaches
+   * while flat would open a position is unproven. `symbol` null = every symbol.
+   */
+  async orphanedReduceOnlyOrders(symbol: string | null): Promise<Array<{ symbol: string; orderId: string; type: string; side: string; price: string; quantity: string }>> {
+    const venueSymbol = symbol === null ? null : (await this.instrumentOf(symbol)).venueSymbol;
+    const { session } = await this.session();
+    const [orders, { positions }] = await Promise.all([session.getUserOrders(venueSymbol), this.userPositions()]);
+    const held = new Set(positions.filter(p => typeof p.position === "number" && p.position !== 0).map(p => p.symbol));
+    return orders
+      .filter(o => !held.has(o.symbol) && (STOP_TYPES.has(o.type) || o.reduce_only === true))
+      .map(o => ({ symbol: qfexPlainSymbol(o.symbol), orderId: o.order_id, type: o.type, side: o.side, price: String(o.price), quantity: String(o.quantity_remaining) }));
   }
 
   /**
@@ -527,7 +673,7 @@ export class QfexAdapter implements ExchangeAdapter, TradingV2 {
       if (!req.reduceOnly) {
         throw unsupported("qfex", "openingStop", "QFEX stop orders only reduce a position (they cannot exceed it)", "Stop orders on qfex must be reduce-only");
       }
-      throw this.stopOrderGate();
+      return this.placeStop(req, null);
     }
     if (req.clientOrderId === null || !UUID_RE.test(req.clientOrderId)) {
       throw new PerpError("INVALID_PARAMS", "QFEX orders carry a perp-cli generated client order id (UUID); user-supplied ids are not accepted because ids are not unique on the venue", {
@@ -742,12 +888,26 @@ export class QfexAdapter implements ExchangeAdapter, TradingV2 {
       take_profit: typeof row.take_profit === "number" ? row.take_profit : 0,
       stop_loss: typeof row.stop_loss === "number" ? row.stop_loss : 0,
     };
+    // The MODIFIED frame carries a NEW order id and the SAME client id (Q5, production 2026-10-12):
+    // modifyOrder correlates on that client id plus the sent symbol / side / type / price / quantity.
     const modified = await session.modifyOrder({ params, clientOrderId: row.client_order_id, lotSize: i.lotSize, tickSize: i.tickSize });
+    const notes = [`replacedOrderId ${row.order_id}: the venue assigns a new order id on modify (client id ${modified.client_order_id} kept)`];
+    let newRow: QfexOrderResponse | null = null;
+    try {
+      newRow = this.pick(await session.getUserOrders(i.venueSymbol), { kind: "orderId", value: modified.order_id });
+    } catch (e) {
+      notes.push(`read-back failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    if (newRow !== null) {
+      const r = this.openOrderResult(i, newRow);
+      return { ...r, execution: execution("nativeAmend", { tifSent: modified.time_in_force, notes: [...notes, "new order listed open (get_user_orders)"] }), venueRaw: { modified, row: newRow, replacedOrderId: row.order_id } };
+    }
+    notes.push(`the new order ${modified.order_id} is not listed open yet (it may have filled) — check: perp trade status ${modified.order_id} --symbol ${i.symbol} -e qfex`);
     return {
       venue: "qfex", symbol: i.symbol, status: "accepted", finality: "pending",
       orderId: modified.order_id, clientOrderId: modified.client_order_id, filledSize: null, avgPrice: null,
-      execution: execution("nativeAmend", { tifSent: modified.time_in_force, notes: [`replacedOrderId ${row.order_id}: the venue assigns a new order id on modify`] }),
-      venueRaw: modified,
+      execution: execution("nativeAmend", { tifSent: modified.time_in_force, notes }),
+      venueRaw: { modified, replacedOrderId: row.order_id },
     };
   }
 
@@ -841,7 +1001,12 @@ export class QfexAdapter implements ExchangeAdapter, TradingV2 {
     const result: CancelResult = { venue: "qfex", cancelled: [], failed: [], pending: [], venueRaw: outcome };
     if (outcome.kind === "cancelled") result.cancelled.push(ref);
     else if (outcome.kind === "refused") result.failed.push({ ref, error: `venue answered ${outcome.status}` });
-    else (result.pending as NonNullable<CancelResult["pending"]>).push({ ref, reason: outcome.reason, remediation: "Do NOT assume it was cancelled. Check: perp account orders -e qfex" });
+    else {
+      const settled = STOP_TYPES.has(row.type) ? await this.settleUnknownStopCancel(i.venueSymbol, row.order_id) : null;
+      if (settled === "cancelled") result.cancelled.push(ref);
+      else if (settled === "filled") result.failed.push({ ref, error: `order ${row.order_id} triggered / filled before the cancel` });
+      else (result.pending as NonNullable<CancelResult["pending"]>).push({ ref, reason: settled === null ? outcome.reason : `${outcome.reason}; re-check: ${settled}`, remediation: "Do NOT assume it was cancelled. Check: perp account orders -e qfex" });
+    }
     return result;
   }
 
@@ -856,7 +1021,7 @@ export class QfexAdapter implements ExchangeAdapter, TradingV2 {
       return result;
     }
     const normalIds = new Set(before.filter(o => !STOP_TYPES.has(o.type)).map(o => o.order_id));
-    const sent = await session.cancelAll(venueSymbol, normalIds);
+    const sent = await session.cancelAll(venueSymbol, normalIds, new Set(before.map(o => o.order_id)));
     const proven = new Set(sent.cancelled);
     // Verifying re-list: the venue documents no completion signal for cancel_all_orders, and
     // whether it also removes stop orders is unverified (Q8).
@@ -865,25 +1030,82 @@ export class QfexAdapter implements ExchangeAdapter, TradingV2 {
     const refOf = (id: string): OrderRef => ({ kind: "orderId", value: id });
     for (const o of before) {
       if (proven.has(o.order_id)) { result.cancelled.push(refOf(o.order_id)); continue; }
+      if (!stillOpen.has(o.order_id)) {
+        // Gone without a CANCELLED frame on this connection: settled from the order's own record
+        // (/user/historic-orders, bounded retries for its indexing lag) — cancelled, filled /
+        // triggered, or still unproven.
+        const settled = STOP_TYPES.has(o.type) ? stopHistoryVerdict(await this.settledByHistory(o.symbol, o.order_id)) : await this.settledByHistory(o.symbol, o.order_id);
+        if (settled === "cancelled") result.cancelled.push(refOf(o.order_id));
+        else if (settled === "filled") result.failed.push({ ref: refOf(o.order_id), error: `order ${o.order_id} ${STOP_TYPES.has(o.type) ? "triggered / " : ""}filled before the cancel` });
+        else pending.push({ ref: refOf(o.order_id), reason: `no longer listed after cancel_all_orders, and its historic-orders row does not settle it yet (${settled})`, remediation: "Check: perp account orders -e qfex / perp account positions -e qfex" });
+        continue;
+      }
       if (STOP_TYPES.has(o.type)) {
-        if (!stillOpen.has(o.order_id)) {
-          pending.push({ ref: refOf(o.order_id), reason: "stop order no longer listed after cancel_all_orders, but no CANCELLED frame proved it (it may have triggered)", remediation: "Check: perp account positions -e qfex" });
-          continue;
-        }
         const one = await session.cancelStopOrder(o.symbol, o.order_id);
         if (one.kind === "cancelled") result.cancelled.push(refOf(o.order_id));
         else if (one.kind === "refused") result.failed.push({ ref: refOf(o.order_id), error: `venue answered ${one.status}` });
-        else pending.push({ ref: refOf(o.order_id), reason: one.reason, remediation: "Check: perp account orders -e qfex" });
+        else {
+          // Observed on mainnet (2026-10-13): cancel_stop_order on a reduce-only stop whose position
+          // was just closed answers "ServerError: unexpected error" while the venue removes the stop
+          // itself. Unknown stays unknown unless a re-list AND the order's own record settle it.
+          const settled = await this.settleUnknownStopCancel(o.symbol, o.order_id);
+          if (settled === "cancelled") result.cancelled.push(refOf(o.order_id));
+          else if (settled === "filled") result.failed.push({ ref: refOf(o.order_id), error: `order ${o.order_id} triggered / filled before the cancel` });
+          else pending.push({ ref: refOf(o.order_id), reason: `${one.reason}; re-check: ${settled}`, remediation: "Check: perp account orders -e qfex" });
+        }
         continue;
       }
       pending.push({
         ref: refOf(o.order_id),
-        reason: stillOpen.has(o.order_id) ? "still listed open after cancel_all_orders" : "no longer listed, but no CANCELLED frame proved the cancel (it may have filled)",
+        reason: "still listed open after cancel_all_orders",
         remediation: "Check: perp account orders -e qfex / perp account positions -e qfex",
       });
     }
     result.venueRaw = { before: before.length, cancelAll: sent, afterOpen: after.length, excluded: "TWAP orders are not cancelled by perp-cli" };
     return result;
+  }
+
+  /**
+   * How an order that disappeared from the open orders ended, from its /user/historic-orders row
+   * (Q6: the row may lag): "cancelled" / "filled" when the row proves it, else "not indexed" /
+   * the unproven status after HISTORY_SETTLE_TRIES reads HISTORY_SETTLE_DELAY_MS apart.
+   */
+  /** After an unknown stop-cancel outcome: "cancelled"/"filled" only when the stop is no longer listed open
+   *  AND its historic-orders row settles it; otherwise a reason string (the cancel stays pending). */
+  private async settleUnknownStopCancel(venueSymbol: string, orderId: string): Promise<"cancelled" | "filled" | string> {
+    const { session } = await this.session();
+    await new Promise(r => setTimeout(r, HISTORY_SETTLE_DELAY_MS));
+    let open: Awaited<ReturnType<typeof session.getUserOrders>>;
+    try {
+      open = await session.getUserOrders(venueSymbol);
+    } catch (e) {
+      // The cancel outcome stays unknown; the caller reports it pending (never thrown away).
+      return `open-order re-list failed: ${e instanceof Error ? e.message : String(e)}`;
+    }
+    if (open.some(o => o.order_id === orderId)) return "still listed open";
+    return stopHistoryVerdict(await this.settledByHistory(venueSymbol, orderId));
+  }
+
+  private async settledByHistory(venueSymbol: string, orderId: string): Promise<"cancelled" | "filled" | string> {
+    let last = "not indexed";
+    for (let i = 0; i < HISTORY_SETTLE_TRIES; i++) {
+      if (i > 0) await new Promise(r => setTimeout(r, HISTORY_SETTLE_DELAY_MS));
+      let rows: QfexHistoricOrder[];
+      try {
+        const body = await this.client.get<{ data?: unknown }>("/user/historic-orders", { symbol: venueSymbol, limit: 1000 });
+        rows = listOf<QfexHistoricOrder>(body.data, "/user/historic-orders data").filter(h => h.order_id === orderId);
+      } catch (e) {
+        last = `historic-orders read failed: ${e instanceof Error ? e.message : String(e)}`;
+        continue;
+      }
+      if (rows.length !== 1) { last = rows.length === 0 ? "not indexed" : `${rows.length} rows`; continue; }
+      const h = rows[0];
+      if (Number(h.filled_qty) > 0) return "filled";
+      const cls = qfexStatusClass(h.terminal_status);
+      if (h.terminal_status === "CANCELLED" || h.terminal_status === "CANCELLED_STP" || h.terminal_status === "EXPIRED") return "cancelled";
+      last = `terminal_status ${JSON.stringify(h.terminal_status)} (${cls})`;
+    }
+    return last;
   }
 
   async applyLeverage(symbol: string, leverage: number, marginMode: "cross" | "isolated" | null): Promise<LeverageResult> {

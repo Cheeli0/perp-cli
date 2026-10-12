@@ -5,7 +5,10 @@ import { assertStrategySimulatable } from "../bot/engine.js";
 import chalk from "chalk";
 import { printJson, jsonOk, jsonError } from "../utils.js";
 import type { ExchangeAdapter } from "../exchanges/index.js";
-import { loadBotConfig, parseStrategy, quickGridConfig, quickDCAConfig, runBot, PRESETS, getPreset, getPresetsByStrategy } from "../bot/index.js";
+import { loadBotConfig, parseStrategy, quickGridConfig, quickDCAConfig, runBot, PRESETS, getPreset, getPresetsByStrategy, withPresetSize } from "../bot/index.js";
+import type { CliVenueSelection } from "../bot/config.js";
+import { resolveVenueId } from "../exchanges/venue.js";
+import { PerpError } from "../errors.js";
 import type { BotOutputMode } from "../bot/index.js";
 import { updateJobState } from "../jobs.js";
 import { runTWAP, runFundingArb, runGrid, runDCA, runTrailingStop } from "../strategies/index.js";
@@ -19,6 +22,12 @@ export function registerStrategyCommands(
 ) {
   const bot = program.command("strategy").description("Trading strategies — long-running bot algorithms + one-shot scripted plans");
 
+  /** The root `-e` selection: resolved id + whether it was given on the command line (not the default). */
+  const cliVenue = (): CliVenueSelection => ({
+    id: resolveVenueId(String(program.opts().exchange)),
+    explicit: program.getOptionValueSource("exchange") === "cli",
+  });
+
   // ── bot start <config> ──
 
   bot
@@ -28,7 +37,8 @@ export function registerStrategyCommands(
     .option("--headless", "Run without TUI dashboard")
     .option("--job-id <id>", "Job ID (set by background runner)")
     .action(async (configPath: string, opts: { background?: boolean; headless?: boolean; jobId?: string }) => {
-      const config = loadBotConfig(configPath);
+      // config.exchange (resolved) is the venue for EVERY strategy type; a contradicting explicit -e is refused.
+      const config = loadBotConfig(configPath, cliVenue());
 
       if (opts.background) {
         const { startJob, jobSelectorsOf } = await import("../jobs.js");
@@ -44,9 +54,7 @@ export function registerStrategyCommands(
         return;
       }
 
-      const adapter = config.strategy.type === "funding-arb"
-        ? await getAdapterFor(config.exchange)
-        : await getAdapter();
+      const adapter = await getAdapterFor(config.exchange);
 
       const mode = resolveOutputMode(isJson, opts.headless);
       const log = makeLog();
@@ -386,7 +394,8 @@ export function registerStrategyCommands(
     .option("--background", "Run in background (tmux)")
     .option("--headless", "Run without TUI dashboard")
     .option("--job-id <id>", "Job ID")
-    .action(async (name: string, symbol: string | undefined, opts: { background?: boolean; headless?: boolean; jobId?: string }) => {
+    .option("--size <n>", "Override the preset size: grid total base size, DCA base size per order, arb $ per leg")
+    .action(async (name: string, symbol: string | undefined, opts: { background?: boolean; headless?: boolean; jobId?: string; size?: string }) => {
       const preset = getPreset(name);
       if (!preset) {
         console.error(chalk.red(`\n  Unknown preset: "${name}"`));
@@ -398,7 +407,8 @@ export function registerStrategyCommands(
 
       // For arb presets, need multiple adapters
       if (preset.strategy === "funding-arb") {
-        const config = preset.buildConfig("multi", sym);
+        const built = preset.buildConfig("multi", sym);
+        const config = opts.size !== undefined ? withPresetSize(built, opts.size) : built;
         const arbStrategy = config.strategy as import("../bot/config.js").FundingArbStrategyParams;
         const adapters = new Map<string, ExchangeAdapter>();
 
@@ -420,7 +430,7 @@ export function registerStrategyCommands(
 
         if (opts.background) {
           const { startJob, jobSelectorsOf } = await import("../jobs.js");
-          const cliArgs = [`strategy`, `preset`, name, sym];
+          const cliArgs = [`strategy`, `preset`, name, sym, ...(opts.size !== undefined ? [`--size`, opts.size] : [])];
           const job = startJob({
             strategy: `bot:${preset.strategy}`,
             exchange: "multi",
@@ -445,11 +455,12 @@ export function registerStrategyCommands(
 
       // Grid / DCA presets
       const adapter = await getAdapter();
-      const config = preset.buildConfig(adapter.name, sym);
+      const built = preset.buildConfig(adapter.name, sym);
+      const config = opts.size !== undefined ? withPresetSize(built, opts.size) : built;
 
       if (opts.background) {
         const { startJob, jobSelectorsOf } = await import("../jobs.js");
-        const cliArgs = [`strategy`, `preset`, name, sym];
+        const cliArgs = [`strategy`, `preset`, name, sym, ...(opts.size !== undefined ? [`--size`, opts.size] : [])];
         const job = startJob({
           strategy: `bot:${preset.strategy}`,
           exchange: adapter.name,
@@ -679,7 +690,7 @@ export function registerStrategyCommands(
       // Load or build config
       let config: import("../bot/config.js").BotConfig;
       if (opts.config) {
-        config = loadBotConfig(opts.config);
+        config = loadBotConfig(opts.config, cliVenue());
         // Override strategy type and symbol from CLI args
         config.strategy = { ...(config.strategy as Record<string, unknown>), type: strategyName } as import("../bot/config.js").StrategyParams;
         config.symbol = sym;
@@ -740,8 +751,8 @@ export function registerStrategyCommands(
         return process.exit(1);
       }
 
-      const adapter = await getAdapter();
-      config.exchange = adapter.name;
+      // --config: the config's venue (resolved against -e above); otherwise the -e venue.
+      const adapter = await getAdapterFor(config.exchange);
       const mode = resolveOutputMode(isJson, opts.headless);
       const log = makeLog();
 
@@ -750,12 +761,23 @@ export function registerStrategyCommands(
       const multiExchangeStrategies = ["funding-auto", "funding-arb", "funding-arb-v2", "spot-perp-arb", "basis-arb", "hedge-agent"];
       if (multiExchangeStrategies.includes(strategyName) && getAdapterFor) {
         extraAdapters = new Map();
-        for (const ex of ["pacifica", "hyperliquid", "lighter", "aster"]) {
+        // --exchanges restricts the venue set (each listed venue must load); the default set
+        // skips a venue that cannot load, with a warning.
+        const explicit = opts.exchanges !== undefined;
+        const venues = explicit ? opts.exchanges!.split(",").map(e => resolveVenueId(e.trim())) : ["pacifica", "hyperliquid", "lighter", "aster"];
+        if (explicit && !venues.includes(adapter.name as typeof venues[number])) {
+          throw new PerpError("INVALID_PARAMS", `--exchanges ${opts.exchanges} does not include the bot's own venue ${adapter.name}`, {
+            remediation: `Add ${adapter.name} to --exchanges, or select another venue with -e`,
+          });
+        }
+        for (const ex of venues) {
           if (ex === adapter.name) continue;
           try {
-            const a = await getAdapterFor(ex);
-            extraAdapters.set(ex, a);
-          } catch { /* skip unavailable exchanges */ }
+            extraAdapters.set(ex, await getAdapterFor(ex));
+          } catch (e) {
+            if (explicit) throw e;
+            log(`  WARNING: ${ex} unavailable (${e instanceof Error ? e.message : String(e)}) — running without it`);
+          }
         }
       }
 
@@ -1022,7 +1044,7 @@ function registerRunSubcommands(
 
   const gridCmd = run
     .command("grid <symbol>")
-    .description("Run grid trading bot (places limit orders across a price range)");
+    .description("Run grid trading bot (places limit orders across a price range). At stop the remaining orders are cancelled; the grid's inventory (position change since start) is left open with a warning unless --close-on-stop");
   gridCmd
     .requiredOption("--upper <price>", "Upper price bound")
     .requiredOption("--lower <price>", "Lower price bound")
@@ -1033,11 +1055,12 @@ function registerRunSubcommands(
     .option("--interval <sec>", "Check interval in seconds", "10")
     .option("--max-runtime <sec>", "Max runtime in seconds (0 = forever)", "0")
     .option("--trailing-stop <pct>", "Stop if equity drops by this % from peak")
+    .option("--close-on-stop", "At stop, close the grid's own inventory (position change since start) reduce-only; default: leave it open and warn")
     .option("--job-id <id>", "Job ID (set automatically for background jobs)")
     .action(async (symbol: string, opts: {
       upper: string; lower: string; grids: string; size: string;
       side: string; leverage?: string; interval: string;
-      maxRuntime: string; trailingStop?: string; jobId?: string;
+      maxRuntime: string; trailingStop?: string; closeOnStop?: boolean; jobId?: string;
     }) => {
       const side = opts.side.toLowerCase();
       if (side !== "long" && side !== "short" && side !== "neutral") {
@@ -1057,6 +1080,7 @@ function registerRunSubcommands(
         intervalSec: parseInt(opts.interval),
         maxRuntime: parseInt(opts.maxRuntime),
         trailingStop: opts.trailingStop ? parseFloat(opts.trailingStop) : undefined,
+        closeOnStop: opts.closeOnStop === true,
       };
 
       const log = (msg: string) => {

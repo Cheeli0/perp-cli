@@ -95,10 +95,10 @@ describe("Pacifica client order id", () => {
     expect(r).toMatchObject({ orderId: "42", clientOrderId: UUID, status: "open", finality: "final", symbol: "ETH" });
   });
 
-  it("pacifica declares client order ids; hyperliquid and aster do not (a caller id is refused there)", () => {
+  it("pacifica, hyperliquid (cloid) and aster (newClientOrderId) declare client order ids", () => {
     expect(requireCapabilities(getVenue("pacifica")).clientOrderId).toBe(true);
-    expect(requireCapabilities(getVenue("hyperliquid")).clientOrderId).toBe(false);
-    expect(requireCapabilities(getVenue("aster")).clientOrderId).toBe(false);
+    expect(requireCapabilities(getVenue("hyperliquid")).clientOrderId).toBe(true);
+    expect(requireCapabilities(getVenue("aster")).clientOrderId).toBe(true);
   });
 });
 

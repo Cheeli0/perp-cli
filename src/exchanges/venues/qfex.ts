@@ -12,7 +12,7 @@
 import type { VenueDefinition, VenuePublicData } from "../venue.js";
 import type { Network } from "../venue-types.js";
 import { BUILDER_FEE_CAPABILITIES } from "../builder-fee.js";
-import { QFEX_RESTING_REDUCE_ONLY_VERIFIED } from "../qfex/signing.js";
+import { QFEX_MODIFY_KEEPS_CLIENT_ID, QFEX_RESTING_REDUCE_ONLY_VERIFIED } from "../qfex/signing.js";
 
 /**
  * Hosts per network. VenueNetworkConfig carries only two (rest + ws), so the MDS and banker
@@ -92,13 +92,12 @@ export const qfexVenue: VenueDefinition = {
     orderAck: "async",
     // Attached take_profit / stop_loss exists on add_order, but the stop quantity on a partial
     // or zero-fill entry and the id of the resulting stop are unverified (Q7) → separate
-    // reduce-only stops sized to the verified fill. Those legs are STOP orders and therefore
-    // refused until Q21 passes (QfexAdapter.stopOrderGate) — `--tp/--sl` and `trade tpsl` are
-    // refused before anything is sent.
+    // reduce-only TAKE_PROFIT / STOP_LOSS stop orders sized to the verified fill (Q21 passed on
+    // production 2026-10-12: the stop ACK echoes the client id — qfex/signing.ts QFEX_STOP_CLIENT_ID_ECHO).
     tpsl: "separateOrders",
-    // modify_order returns a NEW order id and "client_order_id cannot be used for modifies";
-    // whether MODIFIED keeps the client id is unverified (Q5) → no safe correlation → off.
-    amend: null,
+    // modify_order returns a NEW order id; the MODIFIED frame keeps the client id (Q5, production
+    // 2026-10-12 — QFEX_MODIFY_KEEPS_CLIENT_ID) → native amend correlated by client id.
+    amend: QFEX_MODIFY_KEEPS_CLIENT_ID === true ? "native" : null,
     batchPlaceMax: null,
     marginModes: ["cross"],
     // TRON USDT and USD bank rails are out of scope.

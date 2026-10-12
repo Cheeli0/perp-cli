@@ -67,13 +67,29 @@ export type QfexReduceOnlyWire = "boolean" | "integer";
 export const QFEX_REDUCE_ONLY_WIRE = "boolean" as QfexReduceOnlyWire | null;
 
 /**
+ * Q21 — stop orders can be correlated by client id. PRODUCTION 2026-10-12 ~16:03 UTC, GOLD-USD
+ * (scratchpad qfex-probe.mts): `add_order {order_type:"STOP_LOSS", side:"SELL", quantity:0.003,
+ * price:3900 (trigger), order_time_in_force:"GTC", client_order_id, reduce_only:true}` →
+ * order_response ACK echoing the client_order_id and reduce_only true (order_origin
+ * "STOP_ORDER"); then a `stop_order_response` frame about every second (stop_order_id = the same
+ * id, client_order_id echoed, stop_order_type "STOPLOSS") — a heartbeat, NOT new state;
+ * get_user_orders lists the row with type STOP_LOSS (status untriggered). `cancel_stop_order
+ * {stop_order_id}` → an `ack` frame, then order_response CANCELLED with the client id.
+ * Docs stop_add_order: "TAKE_PROFIT and STOP_LOSS orders cannot exceed your current position".
+ * true → reduce-only stop-market orders (trade stop, trade tpsl, --tp/--sl legs) are placed.
+ */
+export const QFEX_STOP_CLIENT_ID_ECHO = true as true | null;
+
+/**
  * Whether UNATTENDED automation may trade on QFEX (bots, plans, TWAP, DCA, grid, funding-arb,
- * trailing stop, background jobs). UNSET: stop orders are refused (Q21), funding is unverified
- * (Q4) and a resting reduce-only order is not proven to be capped at match time (Q2), so an
- * unattended flow has no venue-side protective exit — every automated entry point refuses to
- * start (QfexAdapter.automationGate → assertCanClosePositions, startJob). Manual commands
- * (trade close / reduce / close-all / flatten / limit --reduce-only) are not affected.
- * To open: set to `true` once Q21 has passed (stop orders can be placed and correlated).
+ * trailing stop, background jobs). UNSET. Q21 passed (stops can be placed and correlated,
+ * QFEX_STOP_CLIENT_ID_ECHO), but funding is unverified (Q4) and whether a RESTING reduce-only
+ * order that the market reaches while flat opens a position is unproven (Q2: production
+ * 2026-10-12 — a resting reduce-only SELL stayed OPEN after the position was closed by a plain
+ * sell; the venue does not cancel it), and no automated flow places its own protective stop yet.
+ * Every automated entry point refuses to start (QfexAdapter.automationGate →
+ * assertCanClosePositions, startJob). Manual commands are not affected.
+ * To open: set to `true` once Q2 (resting reduce-only while flat) is settled.
  */
 export const QFEX_AUTOMATION_VERIFIED = null as true | null;
 
@@ -93,12 +109,15 @@ export const QFEX_AUTOMATION_VERIFIED = null as true | null;
 export const QFEX_RESTING_REDUCE_ONLY_VERIFIED = null as true | null;
 
 /**
- * Whether a MODIFIED order_response keeps the original client_order_id (Q5). UNSET: the docs
- * say "client_order_id cannot be used for modifies" and the MODIFIED example carries a NEW
- * order_id with no link to the old one, so a modify cannot be correlated safely. Until
- * verified true, amend is refused (cancel, then re-place).
+ * Whether a MODIFIED order_response keeps the original client_order_id (Q5). TRUE — PRODUCTION
+ * 2026-10-12 ~16:03 UTC, GOLD-USD: a resting BUY LIMIT 4050 modified with `modify_order
+ * {order_id, symbol, side, order_type, quantity, price:4060, reduce_only:false}` → order_response
+ * MODIFIED with a NEW order_id (8e4a…, old c563…) and the SAME client_order_id. amend correlates
+ * by that client id and reports the new order id. A modify of a resting reduce-only order to a
+ * crossing price while flat → INVALID_QUANTITY (rejected, order unchanged) — reduce-only orders
+ * are still not amended (QfexAdapter.amendOrder).
  */
-export const QFEX_MODIFY_KEEPS_CLIENT_ID = null as boolean | null;
+export const QFEX_MODIFY_KEEPS_CLIENT_ID = true as boolean | null;
 
 /**
  * Whether order_response.user_id is the ACCOUNT id the session authenticated as (Q22).
@@ -123,9 +142,9 @@ export function qfexReduceOnlyGate(wire: QfexReduceOnlyWire | null): PerpError |
 export function qfexAutomationGate(verified: true | null): PerpError | null {
   if (verified === true) return null;
   return unsupported("qfex", "automation",
-    "stop orders are refused (Q21) and a resting reduce-only order is not proven to be capped at match time (Q2), so an unattended strategy has no protective exit on the venue",
-    "Trade QFEX with the manual commands (perp trade market / limit / close / reduce / close-all / flatten -e qfex) and watch the position yourself; "
-    + "automation opens once docs/TEST-PLAN.md QFEX item Q21 passes");
+    "funding is unverified (Q4) and a resting reduce-only order the market reaches while flat is not proven harmless (Q2), and no automated flow places its own protective stop yet",
+    "Trade QFEX with the manual commands (perp trade market / limit / stop / tpsl / close / reduce / close-all / flatten -e qfex) and watch the position yourself; "
+    + "automation opens once docs/TEST-PLAN.md QFEX items Q2 / Q4 are settled");
 }
 
 /** `reduce_only` value for the wire in the verified format. */

@@ -857,8 +857,13 @@ function registerAnalyticsSubcommands(
           }),
         );
 
+        // Entries without a verified entry price (a bot leg the venue reported no fill price for)
+        // have no price PnL: listed apart, never priced at a guess.
+        const priced = positions.filter((p): p is typeof p & { entryLongPrice: number; entryShortPrice: number } => p.entryLongPrice !== null && p.entryShortPrice !== null);
+        const unpricedPositions = positions.filter(p => p.entryLongPrice === null || p.entryShortPrice === null).map(p => p.symbol);
+
         // Build comparison data
-        const rows = positions.map(pos => {
+        const rows = priced.map(pos => {
           const daysHeld = Math.max(1, Math.round((Date.now() - new Date(pos.entryTime).getTime()) / 86400000));
           const longFunding = fundingByExSym.get(`${pos.longExchange}:${pos.symbol}`) ?? 0;
           const shortFunding = fundingByExSym.get(`${pos.shortExchange}:${pos.symbol}`) ?? 0;
@@ -909,6 +914,7 @@ function registerAnalyticsSubcommands(
           period: opts.period ?? "all",
           positionCount: rows.length,
           positions: rows,
+          unpricedPositions,
           totals: {
             ...totals,
             roi: totals.notional > 0 ? (totals.totalPnl / totals.notional) * 100 : 0,
@@ -935,6 +941,7 @@ function registerAnalyticsSubcommands(
           ["Symbol", "Long → Short", "Mode", "Held", "Funding", "Price PnL", "Total PnL", "ROI", "Ann.ROI"],
           tableRows,
         ));
+        if (unpricedPositions.length > 0) console.log(chalk.gray(`  No entry price recorded (not compared): ${unpricedPositions.join(", ")}\n`));
 
         console.log(chalk.white.bold("  Totals:"));
         console.log(`    Funding Income:   ${formatPnl(totals.funding)}`);

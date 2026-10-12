@@ -107,9 +107,9 @@ describe("QFEX decimal math (no float ===)", () => {
 });
 
 describe("QFEX live-checked wire facts (hard gates while UNSET)", () => {
-  it("reduce_only is a JSON boolean (Q2, production 2026-10-05); modify correlation and user_id meaning are not asserted", () => {
+  it("reduce_only is a JSON boolean (Q2, 2026-10-05); MODIFIED keeps the client id (Q5, 2026-10-12); user_id meaning is not asserted", () => {
     expect(QFEX_REDUCE_ONLY_WIRE).toBe("boolean");
-    expect(QFEX_MODIFY_KEEPS_CLIENT_ID).toBeNull();
+    expect(QFEX_MODIFY_KEEPS_CLIENT_ID).toBe(true);
     expect(QFEX_USER_ID_IS_ACCOUNT).toBeNull();
   });
 

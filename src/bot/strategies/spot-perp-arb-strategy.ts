@@ -10,6 +10,7 @@
 
 import type { Strategy, StrategyContext, StrategyAction, EnrichedSnapshot } from "../strategy-types.js";
 import type { ExchangeAdapter } from "../../exchanges/index.js";
+import { requiredArbMargin } from "../../rebalance.js";
 import { registerStrategy } from "../strategy-registry.js";
 import { getFundingHours } from "../../funding.js";
 import { annualizeHourlyRate } from "../../funding/normalize.js";
@@ -23,11 +24,16 @@ import type { SpotMarketInfo } from "../../exchanges/spot-interface.js";
 import type { VenueMarket } from "../../exchanges/venue-types.js";
 import { SpotPerpExecutor } from "./spot-perp-executor.js";
 import { findSpotQuoteBalance, getBotSpotAdapter, nonQuoteSpotBalances, spotNetworkOf, spotSharesPerpMargin, spotTokenBase } from "../../exchanges/spot-factory.js";
+import type { SpotAdapter } from "../../exchanges/spot-interface.js";
 import { getVenue } from "../../exchanges/venue.js";
+import { updatePosition } from "../../arb/state.js";
+import { recordSpotPerpClose, recordSpotPerpEntry, stateEntryOf, stateWriteFailed } from "./spot-perp-state.js";
 import { isQuarantined, quarantineSymbol } from "../quarantine.js";
 
 /** Consecutive failed closes before a position is quarantined (no sell→fail→re-hedge loop). */
 const MAX_CLOSE_FAILURES = 3;
+/** Spot leg buying power: notional plus 1% for the taker fee and the spot buy's slippage bound. */
+const SPOT_FEE_BUFFER = 1.01;
 
 // ── Types ──
 
@@ -250,11 +256,12 @@ export class SpotPerpArbStrategy implements Strategy {
         symbol: pos.symbol, spotExchange: pos.spotExchange, perpExchange: pos.perpExchange,
         spotAdapter, perpAdapter, size: pos.size, log: ctx.log,
       });
-      if (closed.closed) { toClose.push(pos); this._closeFailures.delete(pos.symbol); }
+      if (closed.closed) { toClose.push(pos); this._closeFailures.delete(pos.symbol); this.recordClose(spotAdapter, pos, null, ctx); }
       else if (closed.manual) {
         this.quarantine(pos.symbol, closed.reason, pos.spotExchange, pos.perpExchange, ctx);
       } else if (closed.remainingSize !== null) {
         pos.size = closed.remainingSize; // partial close: remainder still hedged
+        this.recordClose(spotAdapter, pos, closed.remainingSize, ctx);
         this._closeFailures.delete(pos.symbol);
         this._failCooldown.set(`${pos.symbol}:close`, Date.now() + 5 * 60 * 1000);
       } else {
@@ -320,6 +327,13 @@ export class SpotPerpArbStrategy implements Strategy {
         size: pos.size, leverage: Math.min(p.leverage, newMaxLev), log: ctx.log,
       });
       if (ok.ok) {
+        // The spot leg is unchanged: the state entry follows the short to its new venue.
+        try {
+          const spotExAdapter = adapters.get(pos.spotExchange);
+          const rotSpot = spotExAdapter ? await this.executor.getSpotAdapter(pos.spotExchange, spotExAdapter) : null;
+          const entry = rotSpot !== null ? stateEntryOf(rotSpot, pos) : undefined;
+          if (rotSpot !== null && entry !== undefined) updatePosition(spotNetworkOf(rotSpot), entry.symbol, { shortExchange: getVenue(best.exchange).id, entryShortPrice: ok.entryPrice });
+        } catch (e) { stateWriteFailed("[SPA]", "update (rotation)", { ...pos, perpExchange: best.exchange }, e, ctx.log); }
         pos.perpExchange = best.exchange;
         pos.fundingHistory = [];
         pos.lastFundingCheck = 0;
@@ -407,9 +421,13 @@ export class SpotPerpArbStrategy implements Strategy {
           symbol: pos.symbol, spotExchange: pos.spotExchange, perpExchange: pos.perpExchange,
           spotAdapter, perpAdapter, size: pos.size, log: ctx.log,
         });
-        if (!closed.closed) {
+        if (closed.closed) this.recordClose(spotAdapter, pos, null, ctx);
+        else {
           if (closed.manual) this.quarantine(pos.symbol, closed.reason, pos.spotExchange, pos.perpExchange, ctx);
-          else if (closed.remainingSize !== null) pos.size = closed.remainingSize; // partial close: remainder still hedged
+          else if (closed.remainingSize !== null) {
+            pos.size = closed.remainingSize; // partial close: remainder still hedged
+            this.recordClose(spotAdapter, pos, closed.remainingSize, ctx);
+          }
           ctx.log(`  [SPA] CRITICAL: ${pos.symbol} could not be (fully) closed on stop`);
           remaining.push(pos);
         }
@@ -420,6 +438,11 @@ export class SpotPerpArbStrategy implements Strategy {
     const extra = ctx.state.get("extraAdapters") as Map<string, ExchangeAdapter> | undefined;
     if (extra) { for (const [, a] of extra) { try { await a.cancelAllOrders(); } catch { /* best effort */ } } }
     return [{ type: "cancel_all" }];
+  }
+
+  /** Close recorded in the arb state: entry removed (remaining null) or its legs set to the still-hedged remainder. */
+  private recordClose(spot: SpotAdapter, pos: SpotPerpPosition, remaining: string | null, ctx: StrategyContext): void {
+    recordSpotPerpClose(spot, pos, remaining, "[SPA]", ctx.log);
   }
 
   private quarantined(symbol: string, ctx: StrategyContext): boolean {
@@ -560,10 +583,11 @@ export class SpotPerpArbStrategy implements Strategy {
       if (sameExchange) {
         const perpBal = await perpAdapter.getBalance();
         const perpAvail = parseFloat(perpBal.available);
-        const totalNeeded = targetSizeUsd + targetSizeUsd / leverage;
-        if (perpAvail < totalNeeded) {
-          const max = perpAvail * 0.8 / (1 + 1 / leverage);
-          if (max < 10) { ctx.log(`  [SPA] Skip ${symbol}: insufficient balance`); return false; }
+        // Spot leg: notional × SPOT_FEE_BUFFER; perp leg: requiredArbMargin (notional / leverage × ARB_MARGIN_BUFFER).
+        const need = (n: number) => n * SPOT_FEE_BUFFER + requiredArbMargin(n, leverage);
+        if (perpAvail < need(targetSizeUsd)) {
+          const max = perpAvail / need(1);
+          if (max < 10) { ctx.log(`  [SPA] Skip ${symbol}: insufficient balance — $${perpAvail.toFixed(2)} available, $${need(10).toFixed(2)} needed for the $10 minimum (spot + perp margin at ${leverage}x)`); return false; }
           targetSizeUsd = Math.floor(max);
         }
       } else {
@@ -578,8 +602,15 @@ export class SpotPerpArbStrategy implements Strategy {
           const spotQuote = findSpotQuoteBalance(spotDef, spotNetworkOf(spotAdapter), await spotAdapter.getSpotBalances());
           if (spotQuote) spotAvailable += parseFloat(spotQuote.available);
         }
-        const maxNtl = Math.min(spotAvailable, pBal.available * leverage) * 0.8;
-        if (maxNtl < targetSizeUsd) { if (maxNtl < 10) { ctx.log(`  [SPA] Skip ${symbol}: insufficient balance (spot=$${spotAvailable.toFixed(2)}, perp=$${pBal.available.toFixed(2)})`); return false; } targetSizeUsd = Math.floor(maxNtl); }
+        // Spot leg: notional × SPOT_FEE_BUFFER of spot buying power; perp leg: requiredArbMargin at the leverage.
+        const maxNtl = Math.min(spotAvailable / SPOT_FEE_BUFFER, pBal.available / requiredArbMargin(1, leverage));
+        if (maxNtl < targetSizeUsd) {
+          if (maxNtl < 10) {
+            ctx.log(`  [SPA] Skip ${symbol}: insufficient balance for the $10 minimum — spot $${spotAvailable.toFixed(2)} (needs $${(10 * SPOT_FEE_BUFFER).toFixed(2)}), perp $${pBal.available.toFixed(2)} (needs $${requiredArbMargin(10, leverage).toFixed(2)} margin at ${leverage}x)`);
+            return false;
+          }
+          targetSizeUsd = Math.floor(maxNtl);
+        }
       }
 
       // Delegate to executor
@@ -590,7 +621,12 @@ export class SpotPerpArbStrategy implements Strategy {
 
       if (result.success) {
         const cur = ctx.state.get("spaPositions") as SpotPerpPosition[];
-        cur.push({ id: genPosId(), symbol, spotExchange, perpExchange, size: result.size!, entryTime: Date.now(), entryRate, fundingHistory: [], lastFundingCheck: 0 });
+        const pos: SpotPerpPosition = { id: genPosId(), symbol, spotExchange, perpExchange, size: result.size, entryTime: Date.now(), entryRate, fundingHistory: [], lastFundingCheck: 0 };
+        cur.push(pos);
+        recordSpotPerpEntry(spotAdapter, {
+          id: pos.id, symbol, spotExchange, perpExchange, entryTime: pos.entryTime, entrySpread: entryRate,
+          spotSize: result.spotSize, perpSize: Number(result.size), spotAvgPrice: result.spotAvgPrice, perpEntryPrice: result.perpEntryPrice,
+        }, "[SPA]", ctx.log);
         ctx.state.set("spaPositions", cur);
         ctx.state.set("arbPositions", cur.length);
         ctx.log(`  [SPA] Opened! (${cur.length}/${p.max_positions})`);

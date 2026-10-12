@@ -38,11 +38,11 @@ describe("venue definition", () => {
     expect(def.spot).toBeNull();
   });
 
-  it("declares the gated capabilities: funding unverified, tpsl separateOrders, amend off, generated client ids", () => {
+  it("declares the capabilities: funding unverified, tpsl separateOrders, native amend (Q5 passed), generated client ids", () => {
     expect(qfexVenue.fundingVerified).toBe(false);
     const caps = qfexVenue.capabilities!;
     expect(caps.tpsl).toBe("separateOrders");
-    expect(caps.amend).toBeNull();
+    expect(caps.amend).toBe("native");
     expect(caps.orderAck).toBe("async");
     expect(caps.clientOrderId).toBe(true);
     expect(caps.timeInForce).toEqual(["GTC", "IOC", "FOK", "ALO"]);

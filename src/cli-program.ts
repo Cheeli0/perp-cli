@@ -8,6 +8,7 @@ import { PacificaAdapter } from "./exchanges/pacifica.js";
 import { HyperliquidAdapter } from "./exchanges/hyperliquid.js";
 import type { ExchangeAdapter } from "./exchanges/interface.js";
 import { getVenue, listVenues, resolveVenueId, READ_ONLY_CREDENTIALS, type VenueDefinition } from "./exchanges/venue.js";
+import { registerAdapterNetwork } from "./exchanges/adapter-network.js";
 import "./exchanges/venues/index.js";
 import type { Network as VenueNetwork, VenueId } from "./exchanges/venue-types.js";
 import { PerpError } from "./errors.js";
@@ -169,6 +170,7 @@ export function buildProgram(opts: { defaultExchange: string; version: string })
       noBuilder: program.opts().builder === false,
     });
     _adapters.set(key, adapter);
+    registerAdapterNetwork(adapter, network);
     return adapter;
   }
 
@@ -249,7 +251,7 @@ export function buildProgram(opts: { defaultExchange: string; version: string })
   // registerFundsCommands above.
 
   // Background processes & strategies
-  registerBackgroundCommands(program, isJson);
+  registerBackgroundCommands(program, isJson, getAdapterForExchange);
   registerStrategyCommands(program, getAdapter, getAdapterForExchange, isJson);
 
   // Agent-friendly commands

@@ -8,8 +8,10 @@
  *   - l2Book/candle/allMids: `#<encoding>` (e.g., `#10`)
  *   - spotClearinghouseState balance: `+<encoding>` (e.g., `+10`)
  *
- * Outcome trades draw collateral from the spot USDH balance (token index 360),
- * NOT USDC. Min order notional: $10 USDH.
+ * Outcome trades draw collateral from the spot balance of the outcome's own quote token —
+ * `outcomeMeta.outcomes[].quoteToken` (live 2026-10-12: "USDC" on every listed outcome; a USDH-only
+ * balance was refused by the venue "Insufficient spot balance asset=100014881"). Min order value:
+ * 10 quote tokens (docs error-responses MinTradeSpotNtl "Order must have minimum value of 10 {quote_token}.").
  */
 
 import { PerpError } from "../errors.js";
@@ -26,7 +28,8 @@ import type {
 import type { HyperliquidAdapter } from "./hyperliquid.js";
 
 const OUTCOME_ASSET_OFFSET = 100_000_000;
-const MIN_ORDER_USDH = 10;
+/** docs error-responses MinTradeSpotNtl: "Order must have minimum value of 10 {quote_token}." */
+const MIN_ORDER_QUOTE = 10;
 /** Outcome encoding `10*outcome + side` keeps side as the units digit, so
  *  side must be 0..9 to avoid overflow into the next outcome's id space. */
 const MAX_SIDE = 9;
@@ -39,6 +42,8 @@ type RawOutcomeMeta = {
     name: string;
     description: string;
     sideSpecs: Array<{ name: string }>;
+    /** Quote token name of this outcome (e.g. "USDC"); validated where used (quoteTokenOf). */
+    quoteToken?: unknown;
   }>;
   questions: unknown[];
 };
@@ -290,6 +295,7 @@ export class HyperliquidOutcomeAdapter implements OutcomeAdapter {
       });
       return {
         outcome: o.outcome,
+        quoteToken: this.quoteTokenOf(o.outcome),
         name: o.name,
         description: o.description,
         ...parsed,
@@ -479,28 +485,29 @@ export class HyperliquidOutcomeAdapter implements OutcomeAdapter {
     await this.init();
     this._validateOutcomeSide(opts.outcome, opts.side);
 
+    const quote = this.quoteTokenOf(opts.outcome);
     const notional = Number(opts.price) * Number(opts.size);
-    if (!Number.isFinite(notional) || notional < MIN_ORDER_USDH) {
+    if (!Number.isFinite(notional) || notional < MIN_ORDER_QUOTE) {
       throw new PerpError(
         "INVALID_PARAMS",
-        `Outcome order notional must be at least ${MIN_ORDER_USDH} USDH (got price=${opts.price} * size=${opts.size} = ${notional.toFixed(4)})`,
+        `Outcome order value must be at least ${MIN_ORDER_QUOTE} ${quote} (got price=${opts.price} * size=${opts.size} = ${notional.toFixed(4)})`,
         {
           exchange: "hyperliquid",
-          remediation: `Increase price or size so price*size >= ${MIN_ORDER_USDH}`,
+          remediation: `Increase price or size so price*size >= ${MIN_ORDER_QUOTE}`,
         },
       );
     }
 
-    // Pre-check USDH balance (only on buy — sell consumes outcome shares).
+    // Pre-check the quote-token spot balance (only on buy — sell consumes outcome shares).
     if (opts.isBuy) {
-      const usdh = await this._getUsdhAvailable();
-      if (usdh < notional) {
+      const available = await this._getSpotAvailable(quote);
+      if (available < notional) {
         throw new PerpError(
           "INSUFFICIENT_BALANCE",
-          `Insufficient USDH for outcome buy: need ${notional.toFixed(4)} USDH, have ${usdh.toFixed(4)}`,
+          `Insufficient ${quote} for outcome buy: need ${notional.toFixed(4)} ${quote}, have ${available.toFixed(4)} (spot)`,
           {
             exchange: "hyperliquid",
-            remediation: "Bridge USDC→USDH on Hyperliquid (perp funds bridge) or buy USDH on HL spot",
+            remediation: `Outcome ${opts.outcome} is quoted in ${quote}: hold ${quote} on Hyperliquid spot (perp-to-spot transfer or a spot swap)`,
           },
         );
       }
@@ -551,7 +558,14 @@ export class HyperliquidOutcomeAdapter implements OutcomeAdapter {
     }
     const st = statuses[0];
     if (st.error) {
-      throw new PerpError("EXCHANGE_ERROR", `Outcome order rejected: ${String(st.error)}`, { exchange: "hyperliquid" });
+      // A per-entry error inside status "ok" is the venue's definite refusal of THIS order (nothing
+      // placed) — never a retryable EXCHANGE_ERROR. Live 2026-10-12: "Insufficient spot balance asset=100014881".
+      const msg = String(st.error);
+      const insufficient = /insufficient/i.test(msg);
+      throw new PerpError(insufficient ? "INSUFFICIENT_BALANCE" : "ORDER_REJECTED", `Outcome order rejected: ${msg}`, {
+        exchange: "hyperliquid", venueError: msg,
+        ...(insufficient ? { remediation: "Check the outcome's quote token balance on Hyperliquid spot: perp outcome list (quote per outcome)" } : {}),
+      });
     }
   }
 
@@ -563,7 +577,8 @@ export class HyperliquidOutcomeAdapter implements OutcomeAdapter {
     }
     const st = statuses[0];
     if (typeof st === "object" && st !== null && "error" in st) {
-      throw new PerpError("EXCHANGE_ERROR", `Outcome cancel rejected: ${String((st as { error: unknown }).error)}`, { exchange: "hyperliquid" });
+      const msg = String((st as { error: unknown }).error);
+      throw new PerpError("ORDER_REJECTED", `Outcome cancel rejected: ${msg}`, { exchange: "hyperliquid", venueError: msg });
     }
   }
 
@@ -574,6 +589,36 @@ export class HyperliquidOutcomeAdapter implements OutcomeAdapter {
   }
 
   // ── Private ──────────────────────────────────────────────────────────────
+
+  /**
+   * The outcome's quote token from outcomeMeta (`quoteToken`, e.g. "USDC"). Unknown outcome →
+   * SYMBOL_NOT_FOUND; missing / non-string quoteToken → EXCHANGE_ERROR (never an assumed token).
+   */
+  quoteTokenOf(outcome: number): string {
+    const o = this._outcomeMeta?.outcomes.find((x) => x.outcome === outcome);
+    if (!o) {
+      throw new PerpError("SYMBOL_NOT_FOUND", `Unknown outcome id: ${outcome}`, { exchange: "hyperliquid", remediation: "Run: perp outcome list" });
+    }
+    if (typeof o.quoteToken !== "string" || o.quoteToken.trim() === "") {
+      throw new PerpError("EXCHANGE_ERROR", `Hyperliquid outcomeMeta outcome ${outcome} has no quoteToken (got ${JSON.stringify(o.quoteToken ?? null)}) — its collateral token is unknown`, { exchange: "hyperliquid" });
+    }
+    return o.quoteToken;
+  }
+
+  /**
+   * The outcome / side behind an outcome coin ("#14881" = outcome 1488, side 1) with its names from
+   * outcomeMeta; null when the coin is not an outcome coin or the outcome is not listed.
+   */
+  describeCoin(coin: string): { outcome: number; side: number; name: string; sideName: string } | null {
+    if (!/^[#+]\d+$/.test(coin)) return null;
+    const enc = Number(coin.slice(1));
+    const outcome = Math.floor(enc / 10);
+    const side = enc % 10;
+    const o = this._outcomeMeta?.outcomes.find((x) => x.outcome === outcome);
+    const sideName = o?.sideSpecs[side]?.name;
+    if (!o || sideName === undefined) return null;
+    return { outcome, side, name: o.name, sideName };
+  }
 
   private _lookupSideName(outcome: number, side: number): string {
     const o = this._outcomeMeta?.outcomes.find((x) => x.outcome === outcome);
@@ -612,18 +657,29 @@ export class HyperliquidOutcomeAdapter implements OutcomeAdapter {
     if (agent?.userEvmAddress) return agent.userEvmAddress;
     throw new PerpError(
       "NO_SIGNER_AVAILABLE",
-      "Hyperliquid user address not resolved — cannot query spot/USDH state",
+      "Hyperliquid user address not resolved — cannot query the spot balance state",
       { exchange: "hyperliquid", remediation: "Configure an OWS master wallet or register an HL agent" },
     );
   }
 
-  private async _getUsdhAvailable(): Promise<number> {
+  /**
+   * Available spot balance of `coin` (total − hold, spotClearinghouseState). A coin the account does
+   * not hold is not listed → 0 held. No balances list, or an unreadable total / hold → EXCHANGE_ERROR.
+   */
+  private async _getSpotAvailable(coin: string): Promise<number> {
     const userAddress = await this._resolveUserAddress();
-    const state = await this._infoPost({ type: "spotClearinghouseState", user: userAddress }) as { balances?: Array<Record<string, unknown>> };
-    const balances = state?.balances ?? [];
-    const usdh = balances.find((b) => String(b.coin) === "USDH");
-    if (!usdh) return 0;
-    return Math.max(0, Number(usdh.total ?? 0) - Number(usdh.hold ?? 0));
+    const state = await this._infoPost({ type: "spotClearinghouseState", user: userAddress }) as { balances?: unknown };
+    if (!Array.isArray(state?.balances)) {
+      throw new PerpError("EXCHANGE_ERROR", "Hyperliquid spotClearinghouseState has no balances list", { exchange: "hyperliquid" });
+    }
+    const row = (state.balances as Array<Record<string, unknown>>).find((b) => String(b.coin) === coin);
+    if (!row) return 0;
+    const total = Number(row.total);
+    const hold = Number(row.hold);
+    if (!Number.isFinite(total) || !Number.isFinite(hold)) {
+      throw new PerpError("EXCHANGE_ERROR", `Hyperliquid spot ${coin} balance unreadable (total ${JSON.stringify(row.total)}, hold ${JSON.stringify(row.hold)})`, { exchange: "hyperliquid" });
+    }
+    return Math.max(0, total - hold);
   }
 
   private async _invalidateAccountCache(): Promise<void> {

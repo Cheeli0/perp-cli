@@ -195,17 +195,53 @@ export function computeRebalancePlan(
 }
 
 /**
- * Check if an exchange has enough available balance for a given trade size.
+ * Headroom over the initial margin an arb leg needs before it is entered: covers taker fees,
+ * the slippage bound on the market entry, venue margin rounding and a mark move before the
+ * second leg fills (the leg must not be at maintenance margin right after entry).
+ */
+export const ARB_MARGIN_BUFFER = 1.5;
+
+/**
+ * Margin a leg of `notionalUsd` needs at `leverage` (the leverage the venue applies to the market
+ * — the arb does not change it), × ARB_MARGIN_BUFFER. Leverage unknown (null: the venue exposes no
+ * per-market setting) → the 1x requirement (the full notional): the most margin any leverage can
+ * need, so the check never under-states it.
+ */
+export function requiredArbMargin(notionalUsd: number, leverage: number | null, buffer = ARB_MARGIN_BUFFER): number {
+  const lev = leverage !== null && Number.isFinite(leverage) && leverage >= 1 ? leverage : 1;
+  return (notionalUsd / lev) * buffer;
+}
+
+/**
+ * Check if an exchange has enough available balance to open a leg of `notionalUsd` at
+ * `leverage` (requiredArbMargin). No balance snapshot for the exchange → false.
  */
 export function hasEnoughBalance(
   snapshots: ExchangeBalanceSnapshot[],
   exchange: string,
-  requiredUsd: number,
-  marginBuffer = 1.5,
+  notionalUsd: number,
+  leverage: number | null,
+  marginBuffer = ARB_MARGIN_BUFFER,
 ): boolean {
   const snap = snapshots.find((s) => s.exchange === exchange);
   if (!snap) return false;
-  return snap.available >= requiredUsd * marginBuffer;
+  return snap.available >= requiredArbMargin(notionalUsd, leverage, marginBuffer);
+}
+
+/**
+ * The leverage `adapter` applies to `symbol`: adapter.marketLeverage(symbol) where the venue has a
+ * per-symbol read (Hyperliquid activeAssetData, Pacifica /account/settings), else the
+ * adapter.getMarketSettings() row (Aster, Lighter, Arcus). null when neither lists the symbol;
+ * a failed read throws.
+ */
+export async function marketLeverageOf(adapter: object, symbol: string): Promise<number | null> {
+  const one = (adapter as { marketLeverage?: (s: string) => Promise<number> }).marketLeverage;
+  if (typeof one === "function") return one.call(adapter, symbol);
+  const read = (adapter as { getMarketSettings?: () => Promise<Array<{ symbol: string; leverage: number }>> }).getMarketSettings;
+  if (typeof read !== "function") return null;
+  const norm = (x: string) => x.toUpperCase().replace(/-PERP$/, "").replace(/^[^:]+:/, "");
+  const row = (await read.call(adapter)).find(r => norm(r.symbol) === norm(symbol));
+  return row !== undefined && row.leverage >= 1 ? row.leverage : null;
 }
 
 /**

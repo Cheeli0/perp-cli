@@ -27,6 +27,13 @@ interface ArbPairPosition {
   symbol: string;
   longExchange: string;
   shortExchange: string;
+  /**
+   * Where the pairing comes from: the arb state file or an arb entry in the execution log for
+   * exactly these legs (not closed since) — or "inferred" (a long and a short that merely share
+   * the symbol, e.g. a strategy bot's own position). Inferred pairs are reported apart and never
+   * closed without an explicit --pair.
+   */
+  provenance: ArbPairProvenance;
   longPosition: {
     side: "long";
     size: number;
@@ -68,7 +75,14 @@ interface SpotPerpPosition {
   spotExchange: string;
   perpExchange: string;
   spotToken: string;        // actual spot token, e.g. "UETH" on HL
+  /** The arb's own spot size (state entry, capped at the holding); the whole holding when there is no state entry (confirmed false). */
   spotAmount: number;
+  /** The venue's spot balance of the token (arb + anything else held). */
+  heldSpotAmount: number;
+  /** heldSpotAmount − spotAmount: spot held outside this arb. */
+  otherSpotAmount: number;
+  /** true = the arb state file records this spot-perp position; false = inferred from balances. */
+  confirmed: boolean;
   spotValueUsd: number;
   perpSide: "short" | "long";
   perpSize: number;
@@ -264,6 +278,43 @@ export function staleArbStateEntries(
   return out;
 }
 
+export type ArbPairProvenance = "state" | "executionLog" | "inferred";
+
+/** Per-leg engine entries (funding-arb-strategy: one record per leg) within this window form one pair entry. */
+const LEG_PAIRING_WINDOW_MS = 10 * 60_000;
+
+/**
+ * Whether a live long/short pair was opened by arb: an arb state entry for exactly these legs
+ * ("state"), else the latest successful arb_entry for exactly these legs in the execution log —
+ * combined (meta.arbPairId / meta.longExchange + shortExchange) or per-leg (meta.leg long on the
+ * long venue + leg short on the short venue within 10 min) — with no successful arb_close of the
+ * pair after it ("executionLog"). Anything else is "inferred". Never a symbol-only match.
+ */
+export function arbPairProvenance(
+  symbol: string, longExchange: string, shortExchange: string,
+  persisted: ReadonlyArray<{ symbol: string; longExchange: string; shortExchange: string; mode?: "perp-perp" | "spot-perp" }>,
+  records: ReadonlyArray<ExecutionRecord>,
+): ArbPairProvenance {
+  const sym = symbol.toUpperCase();
+  if (persisted.some(p => p.mode !== "spot-perp" && p.symbol.toUpperCase() === sym && p.longExchange === longExchange && p.shortExchange === shortExchange)) return "state";
+  const pairId = `${sym}:${longExchange}:${shortExchange}`;
+  const mine = records.filter(r => r.status === "success" && r.symbol.toUpperCase() === sym);
+  const combined = (r: ExecutionRecord) => r.meta?.arbPairId === pairId || (r.meta?.longExchange === longExchange && r.meta?.shortExchange === shortExchange);
+  const t = (r: ExecutionRecord) => new Date(r.timestamp).getTime();
+  let entryAt = -Infinity;
+  for (const r of mine.filter(x => x.type === "arb_entry")) {
+    if (combined(r)) { entryAt = Math.max(entryAt, t(r)); continue; }
+    if (r.meta?.leg === "long" && r.exchange === longExchange) {
+      const short = mine.find(x => x.type === "arb_entry" && x.meta?.leg === "short" && x.exchange === shortExchange && Math.abs(t(x) - t(r)) <= LEG_PAIRING_WINDOW_MS);
+      if (short !== undefined) entryAt = Math.max(entryAt, t(r), t(short));
+    }
+  }
+  if (entryAt === -Infinity) return "inferred";
+  const closedAfter = mine.some(r => r.type === "arb_close" && t(r) > entryAt
+    && (combined(r) || (r.meta?.leg === "long" && r.exchange === longExchange) || (r.meta?.leg === "short" && r.exchange === shortExchange)));
+  return closedAfter ? "inferred" : "executionLog";
+}
+
 function findArbEntryForPair(symbol: string, longExchange?: string, shortExchange?: string): ExecutionRecord | null {
   const entries = readExecutionLog({ type: "arb_entry", symbol });
   const successful = entries.filter(e => e.status === "success");
@@ -348,6 +399,8 @@ export function registerArbManageCommands(
 
       // Find arb pairs: same symbol, different exchanges, one long + one short
       const arbPairs: ArbPairPosition[] = [];
+      const persistedForPairs = getArbStatePositions(networkOf(program));
+      const arbRecords = [...readExecutionLog({ type: "arb_entry" }), ...readExecutionLog({ type: "arb_close" })];
 
       // Fetch current funding rates for spread calculation
       let rateMap: Map<string, { exchange: string; rate: number; markPrice: number; fundingHours: number | null }[]>;
@@ -414,6 +467,7 @@ export function registerArbManageCommands(
               symbol,
               longExchange: longPos.exchange,
               shortExchange: shortPos.exchange,
+              provenance: arbPairProvenance(symbol, longPos.exchange, shortPos.exchange, persistedForPairs, arbRecords),
               longPosition: {
                 side: "long",
                 size: longPos.size,
@@ -500,9 +554,9 @@ export function registerArbManageCommands(
           if (refPrice > 0 && spotAmount * refPrice < 1) continue;
 
           for (const shortPos of matchingShorts) {
-            // Check if this short is already used by a perp-perp pair
+            // Check if this short is already used by a CONFIRMED perp-perp pair
             const usedByPerpPerp = arbPairs.some(
-              ap => ap.symbol === perpSymbol && ap.shortExchange === shortPos.exchange
+              ap => ap.symbol === perpSymbol && ap.shortExchange === shortPos.exchange && ap.provenance !== "inferred"
             );
             if (usedByPerpPerp) continue;
 
@@ -513,6 +567,10 @@ export function registerArbManageCommands(
                 && p.shortExchange === shortPos.exchange
             );
 
+            // The arb's own spot size (the state entry), never the whole holding (pre-existing spot is reported apart).
+            const heldSpotAmount = spotAmount;
+            const arbSpotAmount = persisted !== undefined ? Math.min(persisted.longSize, heldSpotAmount) : heldSpotAmount;
+            const otherSpotAmount = Math.max(0, heldSpotAmount - arbSpotAmount);
             const entryTime = persisted?.entryTime ?? null;
             const holdDurationMs = entryTime ? Date.now() - new Date(entryTime).getTime() : null;
             const holdDuration = holdDurationMs ? formatDuration(holdDurationMs) : null;
@@ -525,7 +583,7 @@ export function registerArbManageCommands(
             const annualPct = hourlyRate * 8760 * 100;
 
             const perpNotional = shortPos.size * shortPos.markPrice;
-            const spotValueUsd = spotAmount * shortPos.markPrice; // approx using perp mark price
+            const spotValueUsd = arbSpotAmount * shortPos.markPrice; // approx using perp mark price
 
             // Funding income: fetch actual payments from exchange API
             let actualFundingIncome = 0;
@@ -564,7 +622,10 @@ export function registerArbManageCommands(
               spotExchange: spotEx,
               perpExchange: shortPos.exchange,
               spotToken: bal.token.replace(/-SPOT$/i, ""),
-              spotAmount,
+              spotAmount: arbSpotAmount,
+              heldSpotAmount,
+              otherSpotAmount,
+              confirmed: persisted !== undefined,
               spotValueUsd,
               perpSide: "short",
               perpSize: shortPos.size,
@@ -579,7 +640,7 @@ export function registerArbManageCommands(
               holdDurationMs,
               estimatedFundingIncome,
               estimatedFees: entryFees,
-              netPnl: (spotValueUsd - shortPos.entryPrice * spotAmount) + shortPos.unrealizedPnl + estimatedFundingIncome - entryFees,
+              netPnl: (spotValueUsd - shortPos.entryPrice * arbSpotAmount) + shortPos.unrealizedPnl + estimatedFundingIncome - entryFees,
               dailyFundingEstimate,
             });
           }
@@ -613,6 +674,9 @@ export function registerArbManageCommands(
           perpExchange: persisted.shortExchange,
           spotToken: "?",
           spotAmount: 0,
+          heldSpotAmount: 0,
+          otherSpotAmount: 0,
+          confirmed: true,
           spotValueUsd: 0,
           perpSide: "short",
           perpSize: shortPos.size,
@@ -636,6 +700,9 @@ export function registerArbManageCommands(
       // venues show its legs; the state file contributes entry time / funding to a pair that
       // is live. State entries with no live counterpart are listed apart, never as positions.
       const staleStateEntries = staleArbStateEntries(persistedAll, arbPairs, spotPerpPositions);
+      // Pairs only inferred from a long and a short sharing the symbol are reported apart (never as arb positions).
+      const unconfirmedPairs = arbPairs.filter(p => p.provenance === "inferred");
+      arbPairs.splice(0, arbPairs.length, ...arbPairs.filter(p => p.provenance !== "inferred"));
 
       // ── JSON output ──
       if (isJson()) {
@@ -650,6 +717,7 @@ export function registerArbManageCommands(
           spotPerpPairs: spotPerpPositions,
           venuesChecked,
           staleStateEntries,
+          unconfirmedPairs,
           aggregate: {
             perpPerpCount: arbPairs.length,
             spotPerpCount: spotPerpPositions.length,
@@ -666,7 +734,10 @@ export function registerArbManageCommands(
       }
 
       for (const st of staleStateEntries) {
-        console.log(chalk.yellow(`  Stale state entry (not on the venue, not counted): ${st.symbol} ${st.mode} ${st.longExchange}/${st.shortExchange} since ${st.entryTime}`));
+        console.log(chalk.yellow(`  Stale state entry (not on the venue, not counted): ${st.symbol} ${st.mode} ${st.longExchange}/${st.shortExchange} since ${st.entryTime} — drop it: perp arb close ${st.symbol} --state-only`));
+      }
+      for (const u of unconfirmedPairs) {
+        console.log(chalk.gray(`  Unconfirmed (inferred, not counted): ${u.symbol} long ${u.longExchange} ${u.longPosition.size} / short ${u.shortExchange} ${u.shortPosition.size} — no arb state / entry record for these legs; close only knowingly: perp arb close ${u.symbol} --pair ${u.longExchange}:${u.shortExchange}`));
       }
       if (arbPairs.length === 0 && spotPerpPositions.length === 0) {
         console.log(chalk.gray(`  No open arb positions found on ${venuesChecked.join(", ")}.\n`));
@@ -730,7 +801,7 @@ export function registerArbManageCommands(
           const legRows = [
             [
               chalk.green("Spot"),
-              `${sp.spotAmount.toFixed(4)} ${sp.spotToken}`,
+              `${sp.spotAmount.toFixed(4)} ${sp.spotToken}${sp.otherSpotAmount > 0 ? chalk.gray(` (+${sp.otherSpotAmount.toFixed(4)} other)`) : ""}${sp.confirmed ? "" : chalk.yellow(" (unconfirmed)")}`,
               `$${sp.perpEntryPrice.toFixed(4)}`,
               `$${spotPriceEach.toFixed(4)}`,
               formatPnl(spotPnl),
@@ -793,6 +864,40 @@ export function registerArbManageCommands(
       await printFundingEarned(getAdapterForExchange, isJson, { period: opts.period, symbol: opts.symbol });
     });
 
+  /**
+   * `arb close <sym> --state-only`: delete the arb state entry of `sym` ONLY when the venues show
+   * no live position for it (the same reconciliation as `arb status` staleStateEntries). Without
+   * --yes (or with --dry-run) the entry is only shown. Nothing is sent to any venue.
+   */
+  async function dropStaleStateEntry(sym: string, yes: boolean, dryRun: boolean): Promise<void> {
+    const net = networkOf(program);
+    const entries = getArbStatePositions(net).filter(p => p.symbol.toUpperCase() === sym);
+    if (entries.length === 0) {
+      throw new PerpError("POSITION_NOT_FOUND", `No arb state entry for ${sym} on ${net}`, { remediation: "See the state entries: perp arb status" });
+    }
+    const venuesChecked = await listArbVenues();
+    const live = (await readArbVenuePositions(venuesChecked, getAdapterForExchange))
+      .filter(x => x.position.symbol.replace("-PERP", "").toUpperCase() === sym)
+      .map(x => ({ exchange: x.exchange, side: x.position.side }));
+    const livePerp = live.filter(l => l.side === "long").flatMap(l => live.filter(s => s.side === "short" && s.exchange !== l.exchange).map(s => ({ symbol: sym, longExchange: l.exchange, shortExchange: s.exchange })));
+    const liveSpot = live.filter(l => l.side === "short").map(s => ({ symbol: sym, spotExchange: "", perpExchange: s.exchange }));
+    const stale = staleArbStateEntries(entries, livePerp, liveSpot);
+    if (stale.length !== entries.length) {
+      throw new PerpError("INVALID_PARAMS", `The ${sym} arb state entry is not stale: the venues still show its legs — close it instead: perp arb close ${sym}`, {
+        live, remediation: `Close the position: perp arb close ${sym}`,
+      });
+    }
+    if (!yes || dryRun) {
+      if (isJson()) return printJson(jsonOk({ symbol: sym, staleStateEntries: stale, deleted: false, remediation: `Confirm: perp arb close ${sym} --state-only --yes` }));
+      for (const st of stale) console.log(chalk.yellow(`  Stale ${st.mode} ${st.symbol} ${st.longExchange}/${st.shortExchange} since ${st.entryTime} (${st.reason})`));
+      console.log(chalk.gray(`  Nothing deleted. Confirm: perp arb close ${sym} --state-only --yes\n`));
+      return;
+    }
+    persistRemovePosition(net, sym);
+    if (isJson()) return printJson(jsonOk({ symbol: sym, staleStateEntries: stale, deleted: true }));
+    console.log(chalk.green(`  Dropped the stale ${sym} arb state entry (${net}). No order was sent.\n`));
+  }
+
   // ── arb close ──
 
   supportsDryRun(arb.command("close <symbol>"))
@@ -800,11 +905,18 @@ export function registerArbManageCommands(
     .option("--pair <pair>", "Specify arb pair as longExchange:shortExchange (e.g. pacifica:hyperliquid)")
     .option("--smart", "Smart execution: IOC limit at best bid/ask + 1 tick (reduces slippage)")
     .option("--spot-exch <exchange>", "Override spot exchange for spot-perp close (a bot spot venue: hl, lt, lrh, aster, ondo)")
-    .option("--perp-exch <exchange>", "Override perp exchange for spot-perp close")
+    .option("--perp-exch <exchange>", "Override perp exchange for spot-perp close. With both --spot-exch and --perp-exch the close needs no arb-state entry: it sells the spot and buys back the live perp short of <symbol> on those venues")
     .option("--force", "Act on a quarantined symbol (after checking its positions by hand)")
-    .action(async (symbol: string, opts: { pair?: string; smart?: boolean; spotExch?: string; perpExch?: string; force?: boolean }, cmd: Command) => {
+    .option("--state-only", "Drop a STALE arb state entry of <symbol> (one `arb status` lists under staleStateEntries: no live position on the venues) — sends no order; refused while the venues still show it")
+    .option("--yes", "With --state-only: confirm the deletion (without it, the entry is only shown)")
+    .action(async (symbol: string, opts: { pair?: string; smart?: boolean; spotExch?: string; perpExch?: string; force?: boolean; stateOnly?: boolean; yes?: boolean }, cmd: Command) => {
       const sym = symbol.toUpperCase();
       const dryRun = isDryRun(cmd);
+
+      if (opts.stateOnly) {
+        await dropStaleStateEntry(sym, opts.yes === true, dryRun);
+        return;
+      }
 
       // Global quarantine (design §12.3): an unknown / unhedged outcome was recorded for
       // this symbol. A human may still close it, but only knowingly (--force).
@@ -821,22 +933,32 @@ export function registerArbManageCommands(
       // Check if this is a spot-perp position (auto-detect from arb state)
       const arbState = loadArbState(networkOf(program));
       const statePos = arbState?.positions?.find(p => p.symbol.toUpperCase() === sym && p.mode === "spot-perp");
-      if (statePos) {
+      // Explicit --spot-exch + --perp-exch select the spot-perp close without a state entry
+      // (e.g. a pair opened by a strategy bot); the handler sizes it from live positions.
+      if ((opts.spotExch === undefined) !== (opts.perpExch === undefined)) {
+        throw new PerpError("INVALID_PARAMS", "--spot-exch and --perp-exch must be given together", {
+          remediation: `perp arb close ${sym} --spot-exch <spot venue> --perp-exch <perp venue>`,
+        });
+      }
+      const explicitSpotPerp = opts.spotExch !== undefined && opts.perpExch !== undefined;
+      if (statePos || explicitSpotPerp) {
         // ── Inline spot-perp close logic ──
-        const aliasMap: Record<string, string> = { hl: "hyperliquid", pac: "pacifica", lt: "lighter" };
-        const spotExch = aliasMap[opts.spotExch?.toLowerCase() ?? ""] || opts.spotExch?.toLowerCase() || statePos.spotExchange || statePos.longExchange;
-        const perpExch = aliasMap[opts.perpExch?.toLowerCase() ?? ""] || opts.perpExch?.toLowerCase() || statePos.shortExchange;
+        // Venue ids through the registry (every alias, e.g. lrh / ast); a stored spot venue may carry "-spot".
+        const venueIdOf = (v: string): string => resolveVenueId(v.replace(/-spot$/i, ""));
+        const spotRaw = opts.spotExch ?? statePos?.spotExchange ?? statePos?.longExchange;
+        const perpRaw = opts.perpExch ?? statePos?.shortExchange;
+        const spotExch = spotRaw === undefined ? undefined : venueIdOf(spotRaw);
+        const perpExch = perpRaw === undefined ? undefined : venueIdOf(perpRaw);
 
         if (!spotExch || !perpExch) {
-          const msg = "Cannot determine exchanges. Specify --spot-exch and --perp-exch, or ensure the position is tracked in state.";
-          if (isJson()) return printJson(jsonOk({ error: msg }));
-          console.log(chalk.red(`  ${msg}`));
-          return;
+          throw new PerpError("INVALID_PARAMS", "Cannot determine the spot and perp exchanges of this spot-perp position", {
+            remediation: `Pass both: perp arb close ${sym} --spot-exch <spot venue> --perp-exch <perp venue>`,
+          });
         }
 
         if (dryRun) {
           // Dry-run: nothing is sold, bought or transferred.
-          const plan = { status: "simulated", dryRun: true, sent: false, mode: "spot-perp", symbol: sym, spotExchange: spotExch, perpExchange: perpExch, longSize: statePos.longSize, shortSize: statePos.shortSize };
+          const plan = { status: "simulated", dryRun: true, sent: false, mode: "spot-perp", symbol: sym, spotExchange: spotExch, perpExchange: perpExch, longSize: statePos ? statePos.longSize : null, shortSize: statePos ? statePos.shortSize : null };
           if (isJson()) return printJson(jsonOk(plan));
           console.log(chalk.cyan(`  [DRY-RUN] Would close spot-perp ${sym}: sell spot on ${spotExch} + buy back the perp short on ${perpExch}`));
           return;
@@ -874,15 +996,19 @@ export function registerArbManageCommands(
         });
       }
 
-      // Find all possible arb pairs (long on one exchange, short on another)
-      const possiblePairs: { long: typeof allPositions[0]; short: typeof allPositions[0] }[] = [];
+      // Find all possible arb pairs (long on one exchange, short on another), each with its provenance:
+      // only pairs opened by arb (state / entry record) are closed without --pair.
+      const possiblePairs: { long: typeof allPositions[0]; short: typeof allPositions[0]; provenance: ArbPairProvenance }[] = [];
       const longs = allPositions.filter(p => p.side === "long");
       const shorts = allPositions.filter(p => p.side === "short");
+      const persistedForClose = getArbStatePositions(networkOf(program));
+      const closeRecords = [...readExecutionLog({ type: "arb_entry", symbol: sym }), ...readExecutionLog({ type: "arb_close", symbol: sym })];
       for (const l of longs) {
         for (const s of shorts) {
-          if (l.exchange !== s.exchange) possiblePairs.push({ long: l, short: s });
+          if (l.exchange !== s.exchange) possiblePairs.push({ long: l, short: s, provenance: arbPairProvenance(sym, l.exchange, s.exchange, persistedForClose, closeRecords) });
         }
       }
+      const confirmedPairs = possiblePairs.filter(p => p.provenance !== "inferred");
 
       // If --pair specified, filter to that specific pair
       let longPos: typeof allPositions[0] | undefined;
@@ -900,20 +1026,24 @@ export function registerArbManageCommands(
           longPos = match.long;
           shortPos = match.short;
         }
-      } else if (possiblePairs.length === 1) {
-        longPos = possiblePairs[0].long;
-        shortPos = possiblePairs[0].short;
-      } else if (possiblePairs.length > 1) {
-        // Multiple pairs found — require explicit --pair selection
-        throw new PerpError("INVALID_PARAMS", `Multiple arb pairs found for ${sym}. Use --pair to specify which one to close.`, {
+      } else if (confirmedPairs.length === 1) {
+        longPos = confirmedPairs[0].long;
+        shortPos = confirmedPairs[0].short;
+      } else if (confirmedPairs.length > 1 || possiblePairs.length > 0) {
+        // Several arb pairs, or only pairs inferred from unrelated positions: never guessed — --pair required.
+        const onlyInferred = confirmedPairs.length === 0;
+        throw new PerpError("INVALID_PARAMS", onlyInferred
+          ? `No ${sym} pair opened by arb (no arb state / entry record for these legs); ${possiblePairs.length} unconfirmed long/short combination(s) found. Use --pair to close one knowingly.`
+          : `Multiple arb pairs found for ${sym}. Use --pair to specify which one to close.`, {
           pairs: possiblePairs.map(p => ({
             arbPairId: `${sym}:${p.long.exchange}:${p.short.exchange}`,
             longExchange: p.long.exchange,
             shortExchange: p.short.exchange,
             longSize: p.long.size,
             shortSize: p.short.size,
+            provenance: p.provenance,
           })),
-          remediation: `Pick one: ${possiblePairs.map(p => `--pair ${p.long.exchange}:${p.short.exchange}`).join(" | ")}`,
+          remediation: `Pick one: ${(onlyInferred ? possiblePairs : confirmedPairs).map(p => `--pair ${p.long.exchange}:${p.short.exchange}`).join(" | ")}`,
         });
       }
 

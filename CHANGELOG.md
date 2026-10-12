@@ -4,6 +4,16 @@ All notable changes to `perp-cli`. Format follows [Keep a Changelog](https://kee
 
 ## [Unreleased]
 
+### FIX: mainnet trading-feature pass 2026-10-13
+
+- **`arb close <sym> --spot-exch <venue> --perp-exch <venue>`** closes a spot-perp pair that has no arb-state entry (e.g. opened by a bot), sized from the live positions. Before, it fell through to the perp-perp path and failed with `POSITION_NOT_FOUND`.
+- **`arb exec` entry records carry `arbPairId` / `longExchange` / `shortExchange`**, so `arb status` confirms the pair from the execution log. Before, every `arb exec` pair was listed under `unconfirmedPairs` (`provenance: "inferred"`).
+- **`strategy run <multi-venue strategy> --exchanges <list>`** now limits the venues (each listed venue must load; the list must include the bot's own venue). Before, it was ignored: the bot always loaded pacifica, hyperliquid, lighter and aster and skipped load failures silently. The default list now logs a warning for a venue it skips.
+- **`strategy preset <name> --size <n>`** overrides the preset size (grid total base size, DCA base size per order, arb $ per leg). Without it, `grid-conservative` on Aster SOL split 0.05 into 0.00625 per order (below the 0.01 step) and stopped with `SIZE_TOO_SMALL`.
+- **Spot-perp bot** (`strategy delta-neutral`, `spot-perp-arb`): writes, updates and removes its arb-state entry; the stop summary lists spot legs with the pair close command, adds a `close` field to each `openPositions` entry on the `done` line, and also prints to stderr in JSON mode. Equity that cannot be read (e.g. a HIP-4 outcome token with no spot price) is `null`, not 0, and balance conditions never fire on it.
+- **QFEX**: when `cancel_stop_order` answers without a confirmation (live: "unexpected error" right after the position was closed), the cancel is re-checked against the open-order list and the order history. QFEX keeps no history row for stop orders, so a vanished stop stays `pending`, with a reason that says so and how to check.
+- Verified live: see `docs/MAINNET-VERIFICATION-STATUS.md` §6.
+
 ### FIX / BEHAVIOR CHANGE: mainnet E2E 2026-10-05 — venue gates, request budgets, sizing on the lot
 
 **QFEX**

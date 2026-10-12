@@ -67,6 +67,12 @@ export class DCAStrategy implements Strategy {
     }];
   }
 
+  /** Done once the --orders total has been placed (0 = unlimited, never done). */
+  isDone(ctx: StrategyContext): boolean {
+    const total = this.params.total_orders;
+    return total > 0 && (ctx.state.get("dcaOrdersPlaced") as number) >= total;
+  }
+
   async onStop(_ctx: StrategyContext): Promise<StrategyAction[]> {
     return [{ type: "cancel_all" }];
   }

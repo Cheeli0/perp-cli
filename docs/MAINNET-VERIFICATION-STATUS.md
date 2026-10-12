@@ -388,3 +388,90 @@ A · B의 남은 것은 새 돈이 필요 없다. A+는 약 $5–7이 든다. D�
 9. 사용자에게 출금 허용 여부를 묻는다 → 허용되면 venue별 최소 금액으로 출금 한 번씩 (단계 D). 테스트 자금 회수와 겸한다.
 10. `arb auto`·봇·grid·DCA·funding-arb(§3 #14)와 단계 E는 사용자 결정 사항으로 분리한다.
 11. 통합 테스트 실패 14개 분류, 남은 키(Pacifica 8, Lighter 12, Lighter RH 슬롯 6) 정리, 작은 표시 문제(§4 #6–#10) 처리.
+
+## 6. 2026-10-12–13 거래 기능 전체 라이브 테스트 (그룹 1–3)
+
+> 이 절은 §1 · §2 · §3의 이전 행보다 우선한다. 특히 QFEX stop · TP/SL · amend(§1, §2.8에는 ⛔), HL · Aster client id(§2.9, §3 #8), HIP-4 · 자동화(§2.9, §3 #14, #16)는 이 절에서 라이브로 확인됐다.
+
+사용자 승인 (세션 기록): 그룹 1(자동화·기타 기능, 상한 $20), 그룹 2(venue당 상한 ≈ $25–30), 그룹 3(미구현·게이트 기능 구현 또는 해제). **출금은 여전히 미승인이며 마지막에 진행한다.** 봇은 최소 크기, 짧은 실행 시간으로 돌리고 끝나면 멈춘 뒤 청산했다. 이 절이 §2.9 · §3 #8 · #14 · #16과 다르면 이 절을 따른다.
+
+### 6.1 라이브로 확인된 것
+
+| 영역 | 확인된 내용 | venue |
+|---|---|---|
+| grid / DCA / trailing stop (`strategy grid` · `dca` · `trailing-stop`) | 주문 · 체결 · 정지 | Aster |
+| 엔진 전략 12종 (`strategy start <cfg>`) | 호가형(simple-mm, avellaneda-mm 등)은 호가를 내고 취소, mean-reversion · aggressive-taker는 체결 | Aster |
+| `strategy quick-grid` / `quick-dca` (백그라운드 포함) | quick-dca는 `--orders 2` 뒤 스스로 종료하고 열린 롱을 표시. `background stop`은 SIGINT로 정상 종료하고 남은 주문을 취소 ("Nothing left open on aster for SOL") | Aster |
+| 백그라운드 TWAP | 체결 · 종료 | Arcus |
+| `strategy plan execute` | 10개 동작 중 9개. `cancel_order`는 단계 참조 기능이 없어 미확인 | — |
+| funding-arb 자동 실행 → `arb close --pair` | SOL | Pacifica / HL |
+| `arb auto` 진입 → `arb close` | ETH | Lighter / HL |
+| `strategy quick-arb` → Ctrl-C → `arb close --pair` | JUP 30 (leg당 ≈ $10), 정지 시 두 leg 표시 | Pacifica / HL |
+| 현물-선물 arb `arb exec HYPE spot:hl pacifica 11` → `arb close` | 체결 · 청산 | HL 현물 / Pacifica |
+| `strategy delta-neutral` → Ctrl-C | HYPE 현물 0.13 + Pacifica 숏 0.13 진입. 가짜 손실 종료 없음, Ctrl-C에 즉시 정지. 청산은 `arb close HYPE --spot-exch hl --perp-exch pacifica` | HL 현물 / Pacifica |
+| `strategy apex` | 기본 기준에서는 진입 신호 없음(10 tick). `strategy run apex` 기준 완화(`minRadarScore=0`, `minPulseTier=NONE`, `size=0.06`)로 시장가 진입 체결, 정지 시 포지션 표시 | Aster |
+| HIP-4 outcome | GTC 주문 → 취소, IOC 매수 13개 → 매도 12개 (`--all` / `--size`). 1개(≈ $0.90) 잔여 | HL |
+| HIP-3 `xyz` scale-tp | GOLD 0.005 (≈ $20.8) 롱, 50%씩 2단(4289 / 4372) 걸림, 청산 후 주문 0 | HL xyz |
+| client order id | HL cloid로 주문 · 조회 · 취소, HIP-3 `--auto-id`. Lighter · Lighter RH client id로 취소 | HL, Lighter, Lighter RH |
+| QFEX 게이트 기능 | `trade stop`(거절 경우 포함), `c:id`로 손절 취소, tpsl 양쪽 leg, 고아 손절 경고와 함께 close, 시장가 `--sl` 후 flatten, `c:id`로 정정 | QFEX |
+| `strategy funding-auto` (`strategy run … --exchanges hyperliquid,pacifica`) | PENGU HL 롱 / Pacifica 숏 1597 (leg당 ≈ $12.5) 진입, 정지 시 `arb close --pair` 안내 → 청산. `sizeUsd`는 전략 내부 최소 $12 이상이어야 진입 | HL / Pacifica |
+| `strategy delta-neutral` 재확인 (봇 수정 후) | 진입 시 arb state 기록(`arb status` confirmed), 정지 요약에 현물 leg + `arb close --spot-exch … --perp-exch …`, equity 미상은 `null` + 경고. `arb close HYPE`가 플래그 없이 현물-선물로 자동 청산 | HL 현물 / Pacifica |
+| `strategy preset grid-conservative SOL --size 0.4` | 8개 주문(0.05씩) 배치, 정지 시 전부 취소 | Aster |
+| `trade split` (2 slice) | HL $21, Pacifica $21, Lighter $22, Lighter RH $22, Arcus $12, Ondo $26, QFEX $26 — 전부 2 slice 체결 → close. Pacifica · Lighter · Lighter RH · Arcus는 체결 응답에 평균가가 없어 `avgPrice: null` | 7개 venue (Aster는 10-05) |
+| `trade multi` | `hyperliquid:ETH:buy` + `pacifica:ETH:sell`, `lighter:SOL:buy` + `ondo:ETH:sell` — 양쪽 filled | HL, Pacifica, Lighter, Ondo |
+| `arb exec` 다른 쌍 | Lighter–Arcus SOL $12.5 → `arb status` → `arb close --pair`. $11은 계산 금액 $9.90 < Lighter 최소 $10으로 전송 전 `SIZE_TOO_SMALL` | Lighter / Arcus |
+| Aster client id | `--client-id` place → `status c:id` → `cancel c:id` → cancelled 확인, `--auto-id` | Aster |
+| HIP-3 포지션 상태 `account margin` / `account settings` | GOLD 0.003: margin(레버리지 20, 노셔널 $12.50) / settings `xyz:GOLD 20x cross` | HL xyz |
+| Ondo scale-tp 대안 | `trade tpsl ETH long --tp … --size 0.002` + `--size 0.003` — 부분 TP 2개 공존, close 후 주문 0 | Ondo |
+| QFEX `trade scale-in` | GOLD 2단(−5%, −7%) × 0.003 배치 → cancel-all → 주문 0 | QFEX |
+| 클라이언트 TWAP `trade twap SOL buy 0.2 60 --slices 2` | 2 slice 체결 → close. 첫 실행에서 `--json` 출력이 진행 로그와 섞여 JSON이 깨짐 → 진행 로그를 stderr로 보내도록 수정 후 재실행: 단일 JSON | Lighter |
+| 클라이언트 TWAP 추가 | Lighter RH TSLA 0.059, Ondo ETH 0.01 — 각각 2 slice 체결 → close. QFEX `trade twap`은 전송 전 `CAPABILITY_UNSUPPORTED`(자동화 게이트), 주문·포지션 0 확인 | Lighter RH, Ondo, QFEX |
+| HIP-3 leg `trade multi` | `--dex xyz trade multi hyperliquid:GOLD:buy:0.003 pacifica:ETH:sell:0.0042` — 전역 `--dex`가 HL leg에 적용되어 xyz:GOLD 체결, 양쪽 filled → close. leg 형식 자체에는 dex 칸이 없다 | HL xyz, Pacifica |
+| HIP-3 `trade split` | GOLD $22, 2 slice 체결 → close | HL xyz |
+| `trade multi` | `lighter-rh:TSLA:buy` + `qfex:GOLD:sell` — 양쪽 filled → 각각 close | Lighter RH, QFEX |
+| 격리 마진 재조회 | `trade leverage <sym> 5 --isolated` → 최소 포지션 → `account settings`가 `isolated` 표시 → close → cross 복구 확인. HL ETH, HIP-3 GOLD(20x cross로 복구), Lighter RH TSLA(`marginMode: isolated` 포지션 표시), Arcus SOL | HL, HL xyz, Lighter RH, Arcus |
+| 🟡 재확인 | Arcus `trade status`(open → `finality: final`), `wallet agent verify hyperliquid`(registered), HL `userAbstraction` 캐시 파일 생성, 가격 표기(HL markPrice, Lighter mid/mark, Ondo avgPrice 정상). HL `openInterest`의 긴 소수(`…0009`)는 HL API 원값 그대로 | HL, Arcus, Lighter, Ondo |
+
+QFEX 실측 (production raw probe): 손절 ACK가 `client_order_id`를 돌려준다. `modify_order`는 새 order_id를 주고 client id는 유지한다. resting reduce-only 주문은 포지션이 0이 된 뒤에도 남는다. 이 주문을 교차 가격으로 정정하면 `INVALID_QUANTITY`로 거절된다.
+
+### 6.2 이번에 고친 것
+
+| 증상 | 수정 | 라이브 재확인 |
+|---|---|---|
+| 전략 봇이 config의 exchange를 무시 (pacifica에서 실행) | `resolveConfigVenue` | 예 |
+| `time_after`가 봇을 끝내지 않음 | 수정 | 예 |
+| arb 잔고 검사가 레버리지를 무시 | 레버리지 반영 `hasEnoughBalance` | 예 |
+| 호가형 전략이 tick 단위가 아닌 가격 때문에 호가를 내지 못함 | `src/bot/quote-rules.ts` (tick 반올림, lot 내림, 최소 미달 건너뜀) | 예 |
+| avellaneda-mm가 SOL ≈ $109에서 ≈ $38에 호가 | 가격 단위 공식 | 예 |
+| HIP-4가 USDH를 가정 (venue quote는 USDC) | outcomeMeta의 quoteToken 사용 | 예 |
+| DCA 평균가가 보호 가격 | venue 체결 기준 | 예 |
+| `arb status` / `close`가 aster · arcus와 봇이 연 쌍을 못 봄 | 수정 | 예 |
+| `arb auto`가 진입하지 않는 이유를 말하지 않음 | 건너뛴 이유 로그 | 예 |
+| `background stop`이 tmux를 죽이고 주문을 남김 | SIGINT → 대기 → 보고 | 예 |
+| quick-dca가 `--orders` 뒤 멈추지 않음 | 수정 | 예 |
+| delta-neutral이 현물 매수를 손실로 계산해 종료, 정지가 안 됨 | 수정 | 예 |
+| quick-arb가 쌍을 안내 없이 남김 | 정지 시 열린 포지션 표시 | 예 |
+| `arb close <심볼>`이 state 항목 없는 현물-선물 쌍을 못 닫음 | `--spot-exch` + `--perp-exch`를 함께 주면 state 없이 현물-선물 경로로 청산 | 예 — HYPE |
+| `strategy run funding-auto`가 `--exchanges`를 무시하고 4개 venue를 항상 사용, 실패는 조용히 무시 | 지정한 venue만 사용(봇 자신의 venue 포함 필수), 지정 venue 로드 실패는 오류, 기본 목록의 실패는 경고 | 예 — HL, Pacifica만 사용 |
+| `strategy preset`에 크기 옵션 없음 (grid-conservative는 Aster에서 주문당 0.00625 < 0.01로 `SIZE_TOO_SMALL`) | `--size` 추가 (grid 총 크기 / DCA 주문당 크기 / arb leg당 $) | 예 — `--size 0.4` |
+| 봇의 현물-선물 진입이 arb state를 쓰지 않음, 정지 요약에 현물 leg 없음, JSON 모드에서 정지 요약 미출력, 다중 venue 봇 equity 0 표시 | state 기록·갱신·삭제, 현물 leg + 청산 명령, `done` 줄에 `close` 필드, 정지 요약 stderr 출력, 미상 equity는 `null`(잔고 조건도 미상이면 발동 안 함) | 예 — delta-neutral |
+| 클라이언트 TWAP의 `--json` 출력에 진행 로그가 섞임 | JSON 모드에서 진행 로그는 stderr | 예 — Lighter |
+| 현물-선물 경로의 venue 별칭이 hl / pac / lt만 처리 (`lrh`, `ast` 등은 그대로 전달), 판정 불가 시 `jsonOk({error})` + exit 0 | venue 레지스트리(`resolveVenueId`)로 해석, 모르는 venue는 `UNKNOWN_VENUE`, 판정 불가는 `INVALID_PARAMS` | 예 — dry-run (`lrh` / `ast` / 모르는 venue) |
+| `arb close`에 `--spot-exch` / `--perp-exch` 중 하나만 주면 조용히 무시 | `INVALID_PARAMS` | 예 |
+| QFEX 결과 불명 손절 취소 뒤 재조회 실패가 예외로 전파 (cancel-all의 남은 주문 처리 중단) | 재조회 실패도 pending + 이유 | 아니오 (단위 테스트) |
+| `arb exec`의 실행 기록 meta 키(`longExch`)가 provenance 판정 키와 달라 쌍이 항상 `inferred` | `arbPairId` / `longExchange` / `shortExchange` 추가 | 예 — Lighter–Arcus가 `executionLog`(confirmed) |
+| QFEX flatten이 이미 사라진 손절 주문 때문에 `ORDER_PARTIAL` | 아래 6.3 | 부분 |
+
+### 6.3 남은 문제
+
+| # | 항목 | 내용 |
+|---|---|---|
+| 1 | QFEX: 포지션을 닫은 직후 손절 · 익절 취소 | `cancel_stop_order`가 "ServerError: unexpected error"를 돌려주는데 직후 조회하면 주문이 없다. QFEX는 손절 주문을 `/user/historic-orders`에 남기지 않고 `/user/trade`에는 주문 ID가 없어 취소를 증명할 수 없다. 규칙(알 수 없음은 알 수 없음)대로 `ORDER_PARTIAL`을 유지하고, 이유와 확인 방법을 메시지에 적었다. 문서 없음 |
+| 2 | 다중 venue 봇 equity 미상 (HL 계정의 HIP-4 outcome 토큰에 현물 가격 없음) | equity가 `null`이라 drawdown / daily-loss 한도가 평가되지 않는다. HIP-4 토큰을 outcome 마켓 가격으로 평가하거나 제외할지 결정 필요 |
+| 2a | `funding-arb` 봇 전략의 현물-선물 경로 arb state 기록 | 수정됨 (단위 테스트, 라이브 재실행 안 함 🟡). 봇이 venue에서 복구한 포지션과 funding-arb의 perp-perp 경로는 여전히 state를 쓰지 않음 |
+| 2b | grid 봇 `fills`가 주문 배치를 체결로 셈 | 수정됨 — venue가 보고한 체결만 `fills`, 배치는 `ordersPlaced`. 라이브: preset 실행 `fills: 0, ordersPlaced: 8`. resting 주문이 나중에 체결된 것은 세지 못함(체결 내역 대조 없음) |
+| 2c | `trade cancel-all`은 심볼 인자를 받지 않는다 (`trade cancel-all GOLD` → CLI 오류) | 사용법 주의 |
+| 3 | `~/.perp/arb-state.json`의 오래된 PURR 항목 | `perp arb close PURR --state-only --yes`로 삭제 가능. 사용자 상태라 지우지 않았다 |
+| 4 | 미실행: claude-agent 전략(Anthropic 키 필요), plan `cancel_order`(단계 참조 기능 없음). 현물(Aster: USDT 필요, Arcus: 발급 키 필요)은 사용자 지시로 이번 범위에서 제외 | 사용자 결정 / 자금 필요 |
+| 6 | QFEX resting reduce-only / scale-tp 게이트 | 실측: resting reduce-only는 포지션이 0이 된 뒤에도 남는다. 나중에 체결될 때의 동작은 미증명이라 게이트 유지 (IOC만 허용). 해제하려면 resting 주문이 실제로 매칭되는 상황의 실험이 필요 |
+| 5 | funding-auto의 `sizeUsd` 기본값 $100 fallback 등 기존 코드의 `?? default` | SSOT 규칙 위반, 정리 필요 |

@@ -11,7 +11,7 @@ metadata:
 
 # perp-cli
 
-Multi-DEX perpetual futures CLI + MCP server for Pacifica (Solana), Hyperliquid (HyperEVM), Lighter (Ethereum), Aster (BNB Chain), Lighter RH (`lighter-rh`, Robinhood chain, USDG), Ondo Perps (`ondo`), QFEX (`qfex`, custodial TradFi perps — import-only API key; reduce-only / close / stop / TP-SL / edit are refused for now, see "QFEX" below), Arcus (`arcus`, Robinhood chain, USDG). v0.13.0+ also supports Hyperliquid Outcome markets (HIP-4) — fully-collateralized binary/range contracts quoted in USDH.
+Multi-DEX perpetual futures CLI + MCP server for Pacifica (Solana), Hyperliquid (HyperEVM), Lighter (Ethereum), Aster (BNB Chain), Lighter RH (`lighter-rh`, Robinhood chain, USDG), Ondo Perps (`ondo`), QFEX (`qfex`, custodial TradFi perps — import-only API key; resting reduce-only limits and automation are refused for now, see "QFEX" below), Arcus (`arcus`, Robinhood chain, USDG). v0.13.0+ also supports Hyperliquid Outcome markets (HIP-4) — fully-collateralized binary/range contracts; each outcome's quote token comes from `outcomeMeta.quoteToken` (USDC on every listed outcome as of 2026-10-12), minimum order value 10 quote tokens.
 
 ## Instructions
 
@@ -87,7 +87,9 @@ printf '%s' "$ED25519_KEY" | perp --json wallet agent import arcus --master-addr
 Imported keys trade; `funds deposit|withdraw|transfer|bridge`, `wallet manage referral set` and `wallet agent approve` need the master → `NO_SIGNER_AVAILABLE` (tell the user to do it on the website or `perp wallet import` the master). `wallet agent revoke` of an imported key needs `--local-only` and does NOT revoke it on the exchange; `rotate` is refused (new key on the website → `import --replace`).
 
 **QFEX** (`-e qfex`, testnet = QFEX UAT): keys are created on the QFEX website and imported by the USER (`perp wallet agent import qfex [--account-id <uuid>]` — the resolved account UUID must be confirmed). Rules an agent must follow:
-- Refused with `CAPABILITY_UNSUPPORTED` (do not work around): any reduce-only order (`trade close/close-all/flatten/reduce/stop/tpsl`, `--tp/--sl`, MCP `trade_close`), `trade edit`, `--client-id`, non-USD-quoted markets, QFEX as a funding-arb / funding-bot leg. To flatten, tell the user to place a plain opposite order or use the QFEX web app.
+- Works: market / IOC reduce-only closes (`trade close/close-all/flatten/reduce`), reduce-only stop-market orders (`trade stop`, `trade tpsl` TP/SL legs, `--tp/--sl` as separate stops after the verified fill; cancel with `trade cancel <S> <id>` or `trade cancel-stop`), `trade edit` of a plain LIMIT / ALO (the venue assigns a new order id; the client id is kept).
+- Refused with `CAPABILITY_UNSUPPORTED` (do not work around): resting reduce-only limits (GTC / ALO / FOK, `scale-tp`), stop-limit and opening stops, amend of a reduce-only order, `--client-id`, non-USD-quoted markets, unattended automation (bots / plans / TWAP / DCA / grid / background jobs), QFEX as a funding-arb / funding-bot leg.
+- After a close, reduce-only / stop orders left on a now-flat symbol are listed as a WARNING (the venue does not cancel them) — cancel them, or use `trade flatten`, which cancels them.
 - Limit GTC / ALO returns `status: accepted, finality: pending` after the ACK; `open` only via `perp --json trade status c:<id> --symbol <S> -e qfex`.
 - `ORDER_PENDING` = outcome unknown: NEVER resubmit; check with the `c:<id>` in the remediation.
 - Funding rates on QFEX are unverified: excluded everywhere unless `perp --json arb scan --rates --include-unverified` (display only).

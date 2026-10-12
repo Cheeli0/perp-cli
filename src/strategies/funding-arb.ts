@@ -1,9 +1,10 @@
 import { assertCanClosePositions } from "../exchanges/trading-v2.js";
 import { MAX_PRICE_DEVIATION_PCT, type ExchangeAdapter } from "../exchanges/index.js";
 import { symbolMatch, logSettledRejections } from "../utils.js";
+import { logExecution } from "../execution-log.js";
 import { updateJobState } from "../jobs.js";
 import { invalidateCache } from "../cache.js";
-import { fetchAllBalances, computeRebalancePlan, hasEnoughBalance, type ExchangeBalanceSnapshot } from "../rebalance.js";
+import { fetchAllBalances, computeRebalancePlan, hasEnoughBalance, marketLeverageOf, requiredArbMargin, type ExchangeBalanceSnapshot } from "../rebalance.js";
 import { checkArbLiquidity } from "../liquidity.js";
 import { computeAnnualSpread, toHourlyRate } from "../funding.js";
 import {
@@ -285,9 +286,19 @@ export async function runFundingArb(
 
               // Check balances before trading
               if (balanceSnapshots) {
-                if (!hasEnoughBalance(balanceSnapshots, longEx, matched.notional) ||
-                    !hasEnoughBalance(balanceSnapshots, shortEx, matched.notional)) {
-                  log(`[ARB] Skip ${symbol}: insufficient balance on ${longEx} or ${shortEx} (need ~$${matched.notional.toFixed(0)} per leg)`);
+                // Margin at the leverage each venue applies to the market (unknown → 1x, see requiredArbMargin).
+                let longLev: number | null;
+                let shortLev: number | null;
+                try {
+                  [longLev, shortLev] = await Promise.all([marketLeverageOf(longAdapter, symbol), marketLeverageOf(shortAdapter, symbol)]);
+                } catch (e) {
+                  log(`[ARB] Skip ${symbol}: could not read the market leverage (${e instanceof Error ? e.message : String(e)})`);
+                  continue;
+                }
+                if (!hasEnoughBalance(balanceSnapshots, longEx, matched.notional, longLev) ||
+                    !hasEnoughBalance(balanceSnapshots, shortEx, matched.notional, shortLev)) {
+                  const need = (ex: string, lev: number | null) => `${ex} ~$${requiredArbMargin(matched!.notional, lev).toFixed(2)} (${lev !== null ? `${lev}x` : "leverage unknown → 1x"})`;
+                  log(`[ARB] Skip ${symbol}: insufficient available balance for $${matched.notional.toFixed(2)}/leg — need ${need(longEx, longLev)}, ${need(shortEx, shortLev)}`);
                   continue;
                 }
               }
@@ -329,6 +340,12 @@ export async function runFundingArb(
                 entryPrices: { long: lowest.markPrice, short: highest.markPrice },
               });
 
+              // Entry record: `arb status` / `arb close` confirm this pair from it (arbPairProvenance).
+              logExecution({
+                type: "arb_entry", exchange: `${longEx}+${shortEx}`, symbol, side: "entry", size: res.hedged,
+                status: "success", dryRun: false,
+                meta: { arbPairId: `${symbol.toUpperCase()}:${longEx}:${shortEx}`, longExchange: longEx, shortExchange: shortEx, spread: annualSpread, source: SOURCE },
+              });
               log(`[ARB] OPENED ${symbol} delta-neutral ${res.hedged}/leg (${positions.length}/${maxPos})`);
             }
           }
@@ -421,7 +438,15 @@ async function closeArbPosition(pos: ArbPosition, adapters: Map<string, Exchange
       shortAdapter, shortExch: pos.shortExchange, shortSym: pos.symbol, shortSize,
       smart: false, log,
     });
-    if (res.status === "closed") { log(`[ARB] CLOSED ${pos.symbol} — both legs unwound (long ${longSize}, short ${shortSize})`); return true; }
+    if (res.status === "closed") {
+      logExecution({
+        type: "arb_close", exchange: `${pos.longExchange}+${pos.shortExchange}`, symbol: pos.symbol, side: "close", size: pos.size,
+        status: "success", dryRun: false,
+        meta: { arbPairId: `${pos.symbol.toUpperCase()}:${pos.longExchange}:${pos.shortExchange}`, longExchange: pos.longExchange, shortExchange: pos.shortExchange, source: SOURCE },
+      });
+      log(`[ARB] CLOSED ${pos.symbol} — both legs unwound (long ${longSize}, short ${shortSize})`);
+      return true;
+    }
     if (res.status === "failed") { log(`[ARB] Close error ${pos.symbol}: ${res.reason} — hedge intact`); return false; }
     log(`[ARB] Close ${pos.symbol} QUARANTINED: ${res.reason}`);
     return false;

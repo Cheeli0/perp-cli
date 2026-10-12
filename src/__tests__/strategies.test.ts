@@ -463,14 +463,15 @@ describe("DCA — runDCA", () => {
     expect(result.totalFilled).toBeCloseTo(0.5);
   });
 
-  it("computes average price from fill prices", async () => {
+  it("computes average price from the venue-reported fill prices (avgPrice), never the sent price", async () => {
     const { runDCA } = await import("../strategies/dca.js");
     let callNum = 0;
     const prices = [59000, 60000, 61000];
     const adapter = mockAdapter({
       marketOrder: vi.fn().mockImplementation(() => {
         const price = prices[callNum++];
-        return Promise.resolve({ orderId: `m${callNum}`, price: String(price) });
+        // `price` = the protection price sent (ignored); `avgPrice` = the venue's average fill.
+        return Promise.resolve({ orderId: `m${callNum}`, price: String(price + 500), avgPrice: String(price) });
       }),
     });
     const log = vi.fn();
@@ -485,6 +486,23 @@ describe("DCA — runDCA", () => {
 
     // avg = (1*59000 + 1*60000 + 1*61000) / 3 = 60000
     expect(result.avgPrice).toBeCloseTo(60000);
+  });
+
+  it("Aster live case: avg = venue avgPrice 108.745 (sent 109.29), no float noise; filled sum exact", async () => {
+    const { runDCA } = await import("../strategies/dca.js");
+    const adapter = mockAdapter({
+      marketOrder: vi.fn().mockResolvedValue({ orderId: "a", status: "FILLED", price: "109.29", avgPrice: "108.745", executedQty: "0.05" }),
+    });
+    const result = await runDCA(adapter, { symbol: "SOL", side: "buy", amountPerOrder: 0.05, intervalSec: 0.001, totalOrders: 3 }, undefined, vi.fn());
+    expect(result.avgPrice).toBe(108.745);
+    expect(result.totalFilled).toBe(0.15);
+  });
+
+  it("an order without a venue-reported fill price → avgPrice null (never the sent price)", async () => {
+    const { runDCA } = await import("../strategies/dca.js");
+    const adapter = mockAdapter({ marketOrder: vi.fn().mockResolvedValue({ orderId: "a", price: "100" }) });
+    const result = await runDCA(adapter, { symbol: "BTC", side: "buy", amountPerOrder: 1, intervalSec: 0.001, totalOrders: 2 }, undefined, vi.fn());
+    expect(result.avgPrice).toBeNull();
   });
 
   it("continues on individual order errors", async () => {

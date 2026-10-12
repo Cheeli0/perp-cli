@@ -30,6 +30,7 @@
  */
 
 import { PerpError } from "../errors.js";
+import { venueRateField } from "../utils/numeric.js";
 import { acquireRate, rateLimitedError } from "./rate-limiter.js";
 import { canonicalFor } from "./canonical-symbols.js";
 import type { AssetClass, FundingRateBasis, Network, VenueFundingRate, VenueMarket } from "./venue-types.js";
@@ -245,7 +246,7 @@ function toMarket(venue: LighterVenueId, net: Network, d: RawDetail, assetClass:
     quoteAsset: null,
     markPrice: d.mark_price,
     indexPrice: isNumStr(d.index_price) ? d.index_price : null,
-    fundingRate: fr ? String(fr.rate) : null,
+    fundingRate: fr ? venueRateField(fr.rate, "funding-rates rate", venue) : null,
     fundingRateBasis: BASIS_8H,
     settlementIntervalHours: SETTLEMENT_INTERVAL_HOURS,
     openInterest: typeof d.open_interest === "number" ? String(d.open_interest) : null,
@@ -288,7 +289,7 @@ export function lighterPublicData(venue: LighterVenueId): VenuePublicData {
           venueSymbol: String(r.market_id),
           symbol: r.symbol,
           canonical: canonicalFor(venue, r.symbol, cls),
-          rate: String(r.rate),
+          rate: venueRateField(r.rate, "funding-rates rate", venue),
           basis: BASIS_8H,
           markPrice: null, // /funding-rates carries no mark price
           nextFundingTime: null, // not published

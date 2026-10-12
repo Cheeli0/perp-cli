@@ -1,5 +1,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { parse as parseYaml } from "yaml";
+import { PerpError } from "../errors.js";
+import { resolveVenueId, type VenueId } from "../exchanges/venue.js";
 
 // ── Condition types ──
 
@@ -105,7 +107,33 @@ const DEFAULT_RISK: RiskConfig = {
 
 // ── Loader ──
 
-export function loadBotConfig(pathOrInline: string): BotConfig {
+/**
+ * The venue selected on the command line: the root `-e` value (resolved id) and whether it was
+ * given explicitly (commander option source "cli") or is the CLI default.
+ */
+export interface CliVenueSelection {
+  id: VenueId;
+  explicit: boolean;
+}
+
+/**
+ * The venue a config runs on. `config.exchange` (alias resolved; unknown → UNKNOWN_VENUE) wins
+ * over the CLI default; an explicit root `-e` naming a different venue is a contradiction →
+ * INVALID_PARAMS (never one of them silently). No `exchange` in the config → the CLI selection.
+ */
+export function resolveConfigVenue(configExchange: string | null, cli: CliVenueSelection): VenueId {
+  if (configExchange === null) return cli.id;
+  const id = resolveVenueId(configExchange);
+  if (cli.explicit && cli.id !== id) {
+    throw new PerpError("INVALID_PARAMS", `The config runs on "${configExchange}" (${id}) but -e selects ${cli.id}`, {
+      remediation: `Drop -e, or pass -e ${id}, or change "exchange" in the config`,
+    });
+  }
+  return id;
+}
+
+/** Load a bot config; its venue is resolved against the CLI selection (resolveConfigVenue). */
+export function loadBotConfig(pathOrInline: string, cli: CliVenueSelection): BotConfig {
   let raw: Record<string, unknown>;
 
   if (existsSync(pathOrInline)) {
@@ -120,12 +148,15 @@ export function loadBotConfig(pathOrInline: string): BotConfig {
     raw = JSON.parse(pathOrInline);
   }
 
-  return parseBotConfig(raw);
+  return parseBotConfig(raw, cli);
 }
 
-function parseBotConfig(raw: Record<string, unknown>): BotConfig {
+function parseBotConfig(raw: Record<string, unknown>, cli: CliVenueSelection): BotConfig {
   const name = String(raw.name ?? `bot-${Date.now()}`);
-  const exchange = String(raw.exchange ?? "hyperliquid");
+  if (raw.exchange !== undefined && (typeof raw.exchange !== "string" || raw.exchange.trim() === "")) {
+    throw new PerpError("INVALID_PARAMS", `Bot config "exchange" must be a venue name (got ${JSON.stringify(raw.exchange)})`);
+  }
+  const exchange: string = resolveConfigVenue(typeof raw.exchange === "string" ? raw.exchange : null, cli);
   const symbol = String(raw.symbol ?? "ETH");
   const monitorInterval = Number(raw.monitor_interval_sec ?? raw.interval ?? 30);
 

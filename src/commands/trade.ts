@@ -21,6 +21,8 @@ import { placeTpSlLeg, tradingV2Of } from "../exchanges/legacy-trading-v2.js";
 import type { AsterAdapter } from "../exchanges/aster.js";
 import type { PacificaAdapter } from "../exchanges/pacifica.js";
 import { PACIFICA_UUID_RE } from "../exchanges/venues/pacifica.js";
+import { HL_CLOID_RE } from "../exchanges/venues/hyperliquid.js";
+import { ASTER_CLIENT_ID_RE } from "../exchanges/venues/aster.js";
 import { parseOrderRef, type CancelResult, type Network, type OrderExecution, type OrderRef, type OrderRequest, type OrderResult, type TimeInForce } from "../exchanges/venue-types.js";
 import { resolveAdapterSlippage, resolveSlippage, type ResolvedSlippage } from "../exchanges/slippage.js";
 import { exactUnits, floorSize, floorToStep, lotStepOf, unitsToString } from "../exchanges/precision.js";
@@ -64,7 +66,8 @@ function parseSlippageBpsFlag(raw: string | undefined): number | null {
  * [A-Za-z0-9_-] minus 3 so the "-tp"/"-sl" TP/SL leg suffix always fits;
  * Ondo: 1–64 chars of [A-Za-z0-9_-]; Lighter(-RH): numeric clientOrderIndex (range
  * checked by the adapter); Pacifica: a full UUID (docs.pacifica.fi create-limit-order:
- * `client_order_id` "Full UUID string"). Venues without client ids refuse --client-id / --auto-id
+ * `client_order_id` "Full UUID string"); Hyperliquid: a 128-bit cloid, "0x" + 32 hex (HL_CLOID_RE);
+ * Aster: `newClientOrderId` ^[.A-Z:/a-z0-9_-]{1,36}$ (ASTER_CLIENT_ID_RE). Venues without client ids refuse --client-id / --auto-id
  * (v2ClientOrderId) — an id is never accepted and then dropped.
  */
 const V2_CLIENT_ID_RULES: Readonly<Partial<Record<VenueDefinition["id"], { re: RegExp; desc: string }>>> = {
@@ -73,6 +76,8 @@ const V2_CLIENT_ID_RULES: Readonly<Partial<Record<VenueDefinition["id"], { re: R
   lighter: { re: /^[1-9][0-9]{0,14}$/, desc: "a decimal integer from 1 to 2^48 - 1" },
   "lighter-rh": { re: /^[1-9][0-9]{0,14}$/, desc: "a decimal integer from 1 to 2^48 - 1" },
   pacifica: { re: PACIFICA_UUID_RE, desc: "a full UUID, e.g. f47ac10b-58cc-4372-a567-0e02b2c3d479" },
+  hyperliquid: { re: HL_CLOID_RE, desc: "a 128-bit hex cloid: 0x + 32 lowercase hex chars, e.g. 0x1234567890abcdef1234567890abcdef (or --auto-id)" },
+  aster: { re: ASTER_CLIENT_ID_RE, desc: "1-36 chars of A-Z a-z 0-9 . : / _ -" },
 };
 
 /**
@@ -100,7 +105,7 @@ function validateV2ClientId(def: VenueDefinition, id: string): void {
 /**
  * Venue client order id: the caller's --client-id/--auto-id (validated); else a generated id
  * for async-ack venues; else null. A venue whose orders carry no client id through this CLI
- * (hyperliquid, aster) refuses a caller id up front (CAPABILITY_UNSUPPORTED, nothing sent):
+ * refuses a caller id up front (CAPABILITY_UNSUPPORTED, nothing sent):
  * the order would be placed without it and `trade status c:<id>` / `trade cancel c:<id>` could
  * never find it.
  */
@@ -219,6 +224,41 @@ function trackedId(r: OrderResult, clientId: string | undefined): Record<string,
  * A venue whose reduce-only orders are currently refused says so UP FRONT — before an entry is sent ("entry filled, protection failed" never
  * happens) and before flatten cancels anything.
  */
+/**
+ * QFEX (orphanedReduceOnlyOrders): resting reduce-only / stop orders left on a symbol whose
+ * position is gone — the venue leaves them open (production 2026-10-12, Q2), and whether one the
+ * market reaches while flat opens a position is unproven. `cancel` false → a WARNING listing them
+ * with the cancel command; true (flatten) → each is cancelled (per-order proof) and the result
+ * returned. Venues without the method → null. A failed read is a WARNING (the close itself stands).
+ */
+async function orphanedReduceOnly(adapter: ExchangeAdapter, symbol: string | null, cancel: boolean): Promise<CancelResult | null> {
+  const fn = (adapter as { orphanedReduceOnlyOrders?: (s: string | null) => Promise<Array<{ symbol: string; orderId: string; type: string; side: string; price: string; quantity: string }>> }).orphanedReduceOnlyOrders;
+  if (typeof fn !== "function") return null;
+  let left: Awaited<ReturnType<typeof fn>>;
+  try {
+    left = await fn.call(adapter, symbol);
+  } catch (e) {
+    process.stderr.write(chalk.yellow(`  WARNING: could not check ${adapter.name} for reduce-only / stop orders left after the close (${extractErrorMessage(e)}) — check: perp account orders -e ${adapter.name}\n`));
+    return null;
+  }
+  if (left.length === 0) return null;
+  if (!cancel) {
+    process.stderr.write(chalk.yellow(`  WARNING: ${left.length} reduce-only / stop order(s) remain on ${adapter.name} with no position (the venue does not cancel them): `
+      + `${left.map(o => `${o.symbol} ${o.type} ${o.side} ${o.quantity} @ ${o.price} (${o.orderId})`).join("; ")}. Cancel: ${left.map(o => `perp trade cancel ${o.symbol} ${o.orderId} -e ${adapter.name}`).join(" ; ")}\n`));
+    return null;
+  }
+  if (!isTradingV2(adapter)) throw new PerpError("NOT_IMPLEMENTED", `${adapter.name}: orphaned reduce-only orders can only be cancelled on a TradingV2 adapter`);
+  const v2 = adapter;
+  const out: CancelResult = { venue: adapter.name as CancelResult["venue"], cancelled: [], failed: [], pending: [], venueRaw: [] };
+  for (const o of left) {
+    const r = await v2.cancelByRef(o.symbol, { kind: "orderId", value: o.orderId });
+    out.cancelled.push(...r.cancelled);
+    out.failed.push(...r.failed);
+    (out.pending as NonNullable<CancelResult["pending"]>).push(...(r.pending ?? []));
+  }
+  return out;
+}
+
 function refuseGatedReduceOnly(adapter: ExchangeAdapter): void {
   const gate = reduceOnlyGateOf(adapter);
   if (gate !== null) throw gate;
@@ -904,8 +944,8 @@ export function registerTradeCommands(
     .option("--client-id <id>", "Client order ID for idempotent tracking")
     .option("--auto-id", "Auto-generate a client order ID")
     .option("--force", "Bypass local risk-limit checks (maxPosition / total exposure)")
-    .option("--tp <price>", "Take-profit protecting this entry's fill (ondo / arcus: attached to any entry; other venues: --tif IOC entries only; qfex: not supported yet)")
-    .option("--sl <price>", "Stop-loss protecting this entry's fill (ondo / arcus: attached to any entry; other venues: --tif IOC entries only; qfex: not supported yet)")
+    .option("--tp <price>", "Take-profit protecting this entry's fill (ondo / arcus: attached to any entry; other venues: --tif IOC entries only)")
+    .option("--sl <price>", "Stop-loss protecting this entry's fill (ondo / arcus: attached to any entry; other venues: --tif IOC entries only)")
     .option("--slippage-bps <n>", "Slippage bound in bps for protection-priced TP/SL legs (default: settings slippageBps[venue] → defaultSlippageBps)")
     .action(async (symbol: string, side: string, price: string, size: string, opts: { tif?: string; reduceOnly?: boolean; clientId?: string; autoId?: boolean; force?: boolean; tp?: string; sl?: string; slippageBps?: string }) => {
       const s = side.toLowerCase();
@@ -995,7 +1035,7 @@ export function registerTradeCommands(
     });
 
   supportsDryRun(trade.command("cancel <symbolOrOrderId> [orderId]"))
-    .description("Cancel order(s) — by orderId (or c:<clientOrderId> on ondo/arcus/qfex/pacifica), by symbol + orderId, or by symbol name (cancels all orders for that symbol)")
+    .description("Cancel order(s) — by orderId (or c:<clientOrderId> on ondo/arcus/qfex/pacifica), by symbol + orderId / c:<clientOrderId> (every venue with client ids: also hyperliquid, aster, lighter, lighter-rh), or by symbol name (cancels all orders for that symbol)")
     .action(async (symbolOrOrderId: string, orderId?: string) => {
       const adapter = await getAdapter();
       const v2 = v2Of(adapter);
@@ -1179,7 +1219,8 @@ export function registerTradeCommands(
           durationSec: parseInt(duration),
           slices: opts.slices ? parseInt(opts.slices) : undefined,
           reduceOnly: opts.reduceOnly === true,
-        });
+        }, undefined, isJson() ? (m: string) => console.error(m) : undefined);
+        // JSON mode: progress goes to stderr so stdout stays one JSON document.
         if (isJson()) return printJson(jsonOk(twapResult));
         return;
       }
@@ -1365,6 +1406,15 @@ export function registerTradeCommands(
     .action(async (symbol: string, opts: { levels: string; size?: string }) => {
       const sym = symbol.toUpperCase();
       const adapter = await getAdapter();
+      if (adapter.name === "ondo") {
+        // docs.ondoperps.xyz take-profit-and-stop-loss: position TP/SL "Via Risk Management Module
+        // [POST /v1/perps/stop_order] ... applies to the full position, with a limit of one TP and one
+        // SL per market"; partial legs only "At Order Placement" (attached to each entry order). A
+        // resting reduce-only limit is refused too (reduce_only_invalid_tif) — no multi-level TP on a held position.
+        throw unsupported("Ondo", "scaleTp",
+          "position-level stops allow one TP and one SL per market (docs: take-profit-and-stop-loss), and resting reduce-only limits are refused",
+          `Set one (partial) take-profit: perp trade tpsl ${sym} <long|short> --tp <price> [--size <qty>] -e ondo, or attach --tp to each entry order`);
+      }
 
       // Parse levels: "72000:25,75000:25,80000:50"
       const levels = opts.levels.split(",").map(l => {
@@ -1429,7 +1479,7 @@ export function registerTradeCommands(
   // === Pacifica-only commands ===
 
   supportsDryRun(trade.command("edit <symbol> <orderId> <price> <size>"))
-    .description("Edit an existing order: new price and new open (unfilled) size; the order keeps its TIF / post-only (pacifica: re-created as ALO) — orderId, or c:<clientOrderId> on ondo/arcus; qfex: not supported — cancel, then re-place")
+    .description("Edit an existing order: new price and new open (unfilled) size; the order keeps its TIF / post-only (pacifica: re-created as ALO) — orderId, or c:<clientOrderId> on ondo/arcus/qfex (qfex: plain LIMIT / ALO only; the venue assigns a new order id, the client id is kept)")
     .option("--tif <tif>", "Time-in-force of the replacement (cancel+replace venues only, e.g. ondo; ALO keeps post-only)")
     .option("--force-tif", "Allow --tif to flip the order's post-only flag (ondo / pacifica); otherwise such a conflict is refused")
     .action(async (symbol: string, orderId: string, price: string, size: string, opts: { tif?: string; forceTif?: boolean }) => {
@@ -1446,9 +1496,20 @@ export function registerTradeCommands(
 
   trade
     .command("cancel-stop <symbol> <stopOrderId>")
-    .description("Cancel a stop / TP / SL order (pacifica; other venues: perp trade cancel)")
+    .description("Cancel a stop / TP / SL order (pacifica; qfex: stop order id or c:<clientOrderId>; other venues: perp trade cancel)")
     .action(async (symbol: string, stopOrderId: string) => {
       const adapter = await getAdapter();
+      if (adapter.name === "qfex" && isTradingV2(adapter)) {
+        // QFEX: cancelByRef reads the row first and routes a TAKE_PROFIT / STOP_LOSS row to cancel_stop_order.
+        const sym = symbol.toUpperCase();
+        if (dryRunGuard("cancel_stop", { exchange: adapter.name, symbol: sym, stopOrderId })) return;
+        const r = await adapter.cancelByRef(sym, parseOrderRef(stopOrderId));
+        const incomplete = cancelIncompleteError(r, sym);
+        if (incomplete !== null) { if (!isJson()) printCancel(r, sym); throw incomplete; }
+        if (isJson()) return printJson(jsonOk({ ...r, legacy: r.venueRaw }));
+        printCancel(r, sym);
+        return;
+      }
       const pac = adapter as ExchangeAdapter & Partial<Pick<PacificaAdapter, "cancelStopOrder">>;
       if (typeof pac.cancelStopOrder !== "function") {
         const { def } = tradingVenueOf(adapter);
@@ -1645,6 +1706,7 @@ export function registerTradeCommands(
         const { outcomes, failures } = await closeEach(adapter, positions, { smart: !!opts.smart, slippage, action: "close-all" });
         const partial = residualError(adapter.name, outcomes, failures);
         if (partial !== null) throw partial;
+        await orphanedReduceOnly(adapter, null, false);
         if (isJson()) return printJson(jsonOk({ closed: outcomes.length, results: outcomes }));
         console.log(chalk.green(`\n  Closed ${outcomes.length} position(s) on ${adapter.name} (verified).\n`));
       });
@@ -1675,6 +1737,7 @@ export function registerTradeCommands(
         const partial = residualError(adapter.name, [o]);
         if (!isJson()) printCloseOutcome(o);
         if (partial !== null) throw partial;
+        await orphanedReduceOnly(adapter, sym, false);
         if (isJson()) return printJson(jsonOk({ ...o, verified: true }));
         console.log();
       });
@@ -1701,6 +1764,14 @@ export function registerTradeCommands(
         invalidateCache("acct");
         const positions = await adapter.getPositions();
         const { outcomes, failures } = await closeEach(adapter, positions, { smart: !!opts.smart, slippage, action: "flatten" });
+        // QFEX: reduce-only / stop orders still listed on a now-flat symbol (placed meanwhile, or not
+        // covered by cancel-all) are cancelled one by one — the venue leaves them open (Q2).
+        const orphanCancels = await orphanedReduceOnly(adapter, null, true);
+        if (orphanCancels !== null) {
+          cancelResult.cancelled.push(...orphanCancels.cancelled);
+          cancelResult.failed.push(...orphanCancels.failed);
+          (cancelResult.pending ??= []).push(...(orphanCancels.pending ?? []));
+        }
         const partial = residualError(adapter.name, outcomes, failures);
         const cancelIncomplete = cancelIncompleteError(cancelResult, "all");
         if (partial !== null || cancelIncomplete !== null) {
@@ -1756,6 +1827,7 @@ export function registerTradeCommands(
         const partial = residualError(adapter.name, [o]);
         if (!isJson()) printCloseOutcome(o);
         if (partial !== null) throw partial;
+        await orphanedReduceOnly(adapter, sym, false);
         if (isJson()) return printJson(jsonOk({ reduced: true, percent: pct, sizeReduced: o.closed, requested: reduceSize, originalSize: pos.size, residual: o.residual, result: o }));
         console.log(chalk.green(`\n  Reduced ${sym} by ${o.closed} (${closeSide}, verified) on ${adapter.name}.\n`));
       });
@@ -1765,8 +1837,8 @@ export function registerTradeCommands(
 
   trade
     .command("status <orderId>")
-    .description("Query order status by ID (ondo/arcus/qfex/lighter/lighter-rh: orderId or c:<clientOrderId>, with --symbol; pacifica: orderId or c:<clientOrderId>)")
-    .option("--symbol <symbol>", "Market of the order (required on ondo/arcus/qfex, and for c:<clientOrderId> on lighter / lighter-rh)")
+    .description("Query order status by ID (ondo/arcus/qfex/lighter/lighter-rh/aster: orderId or c:<clientOrderId>, with --symbol; pacifica/hyperliquid: orderId or c:<clientOrderId>)")
+    .option("--symbol <symbol>", "Market of the order (required on ondo/arcus/qfex, and for c:<clientOrderId> on lighter / lighter-rh / aster)")
     .action(async (orderId: string, opts: { symbol?: string }) => {
       await withJsonErrors(isJson(), async () => {
         const adapter = await getAdapter();
@@ -1783,16 +1855,17 @@ export function registerTradeCommands(
           return;
         }
 
-        // c:<clientOrderId> on a legacy venue: the venue's own status query (pacifica, lighter /
-        // lighter-rh), or the uniform CAPABILITY_UNSUPPORTED (hyperliquid, aster) — never a local
-        // search that cannot match and answers ORDER_NOT_FOUND.
+        // c:<clientOrderId> on a legacy venue: the venue's own status query (pacifica, hyperliquid
+        // orderStatus by cloid, aster GET /fapi/v3/order origClientOrderId, lighter / lighter-rh) —
+        // never a local search that cannot match and answers ORDER_NOT_FOUND.
         const ref = parseOrderRef(orderId);
         if (ref.kind === "clientOrderId") {
           const def = getVenue(adapter.name);
           if (!requireCapabilities(def).clientOrderId) {
             throw unsupported(def.displayName, "statusByClientOrderId", "orders on this venue carry no client order id through perp-cli", `Query by venue order id: perp trade status <orderId> -e ${def.id}`);
           }
-          if (opts.symbol === undefined && def.family !== "pacifica") {
+          // Pacifica / Hyperliquid query per account (the row names the market); the others per market.
+          if (opts.symbol === undefined && def.family !== "pacifica" && def.family !== "hyperliquid") {
             throw new PerpError("INVALID_PARAMS", `${def.displayName} order status by client order id needs the market`, {
               remediation: `Pass --symbol <SYM>: perp trade status ${orderId} --symbol <SYM> -e ${def.id}`,
             });

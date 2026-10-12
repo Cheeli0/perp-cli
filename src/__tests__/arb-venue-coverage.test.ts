@@ -58,11 +58,17 @@ vi.mock("../bot/quarantine.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../bot/quarantine.js")>()),
   quarantineEntryFor: vi.fn(() => null),
 }));
-vi.mock("../execution-log.js", () => ({ logExecution: vi.fn(), readExecutionLog: vi.fn(() => []) }));
+// The SOL aster/arcus pair was opened by arb: its entry record (arbPairProvenance "executionLog").
+const SOL_ENTRY = { id: "e1", timestamp: "2026-10-05T10:00:00.000Z", type: "arb_entry", exchange: "aster+arcus", symbol: "SOL", side: "entry", size: "0.09", status: "success", dryRun: false, meta: { longExchange: "aster", shortExchange: "arcus" } };
+let logRecords: Array<Record<string, unknown>> = [];
+vi.mock("../execution-log.js", () => ({
+  logExecution: vi.fn(),
+  readExecutionLog: vi.fn((o?: { type?: string; symbol?: string }) => logRecords.filter(r => (o?.type === undefined || r.type === o.type) && (o?.symbol === undefined || r.symbol === o.symbol))),
+}));
 
 const { buildProgram } = await import("../cli-program.js");
 const { allCommands } = await import("../cli-flags.js");
-const { listArbVenues, readArbVenuePositions, staleArbStateEntries } = await import("../commands/arb/index.js");
+const { listArbVenues, readArbVenuePositions, staleArbStateEntries, arbPairProvenance } = await import("../commands/arb/index.js");
 
 function program(): Command {
   const { program: p } = buildProgram({ defaultExchange: "hyperliquid", version: "test" });
@@ -80,6 +86,7 @@ beforeEach(() => {
   out = [];
   for (const k of Object.keys(positions)) delete positions[k];
   configured = ["hyperliquid", "aster", "arcus"];
+  logRecords = [SOL_ENTRY];
   vi.spyOn(console, "log").mockImplementation((...a) => { out.push(a.map(String).join(" ")); });
   vi.spyOn(console, "error").mockImplementation(() => {});
   vi.spyOn(process.stderr, "write").mockImplementation(() => true);
@@ -135,6 +142,67 @@ describe("arb status", () => {
     liveSolPair();
     positions.arcus = async () => { throw new Error("HTTP 503"); };
     await expect(run("arb", "status")).rejects.toThrow(/Cannot read positions on arcus: HTTP 503/);
+  });
+});
+
+describe("inferred pairs (live 2026-10-12: a bot's own SOL long on aster was paired with an arb short)", () => {
+  it("status lists a long/short with no arb state / entry record under unconfirmedPairs, not as a position", async () => {
+    logRecords = [];
+    liveSolPair();
+    await run("arb", "status");
+    const d = lastJson().data;
+    expect(d.perpPerpPairs).toEqual([]);
+    expect(d.unconfirmedPairs).toEqual([expect.objectContaining({ symbol: "SOL", longExchange: "aster", shortExchange: "arcus", provenance: "inferred" })]);
+    expect(d.aggregate.totalPositions).toBe(0);
+  });
+
+  it("close refuses an inferred pair without --pair (INVALID_PARAMS naming it), closes it with --pair", async () => {
+    logRecords = [];
+    liveSolPair();
+    await expect(run("--dry-run", "arb", "close", "SOL")).rejects.toMatchObject({ structured: { code: "INVALID_PARAMS", remediation: expect.stringContaining("--pair aster:arcus") } });
+    await run("--dry-run", "arb", "close", "SOL", "--pair", "aster:arcus");
+    expect(lastJson()).toMatchObject({ ok: true, data: { dryRun: true, longExchange: "aster", shortExchange: "arcus" } });
+  });
+
+  it("an entry record closed since then no longer confirms the pair", async () => {
+    logRecords = [SOL_ENTRY, { ...SOL_ENTRY, id: "c1", type: "arb_close", timestamp: "2026-10-06T10:00:00.000Z" }];
+    liveSolPair();
+    await run("arb", "status");
+    expect(lastJson().data.perpPerpPairs).toEqual([]);
+  });
+});
+
+describe("arbPairProvenance", () => {
+  const rec = (o: Record<string, unknown>) => ({ id: "x", side: "x", size: "1", status: "success", dryRun: false, symbol: "SOL", ...o }) as never;
+  it("state entry for exactly these legs → state; symbol-only matches never confirm", () => {
+    expect(arbPairProvenance("SOL", "aster", "arcus", [{ symbol: "SOL", longExchange: "aster", shortExchange: "arcus" }], [])).toBe("state");
+    expect(arbPairProvenance("SOL", "aster", "hyperliquid", [{ symbol: "SOL", longExchange: "aster", shortExchange: "arcus" }], [rec({ type: "arb_entry", timestamp: "2026-10-01T00:00:00Z", exchange: "pacifica+hyperliquid", meta: { longExchange: "pacifica", shortExchange: "hyperliquid" } })])).toBe("inferred");
+  });
+  it("engine per-leg entries (leg long + leg short within 10 min) confirm; a later per-leg close un-confirms", () => {
+    const legs = [
+      rec({ type: "arb_entry", timestamp: "2026-10-01T00:00:00Z", exchange: "pacifica", meta: { leg: "long" } }),
+      rec({ type: "arb_entry", timestamp: "2026-10-01T00:01:00Z", exchange: "hyperliquid", meta: { leg: "short" } }),
+    ];
+    expect(arbPairProvenance("SOL", "pacifica", "hyperliquid", [], legs)).toBe("executionLog");
+    expect(arbPairProvenance("SOL", "pacifica", "hyperliquid", [], [...legs, rec({ type: "arb_close", timestamp: "2026-10-02T00:00:00Z", exchange: "pacifica", meta: { leg: "long" } })])).toBe("inferred");
+  });
+});
+
+describe("arb close --state-only", () => {
+  it("shows the stale entry without --yes, deletes it with --yes; no order either way", async () => {
+    const st = await import("../arb/state.js");
+    await run("arb", "close", "PURR", "--state-only");
+    expect(lastJson()).toMatchObject({ ok: true, data: { deleted: false, staleStateEntries: [expect.objectContaining({ symbol: "PURR" })] } });
+    expect(st.removePosition).not.toHaveBeenCalled();
+    await run("arb", "close", "PURR", "--state-only", "--yes");
+    expect(lastJson()).toMatchObject({ ok: true, data: { deleted: true } });
+    expect(st.removePosition).toHaveBeenCalledWith("mainnet", "PURR");
+    expect(marketOrder).not.toHaveBeenCalled();
+  });
+
+  it("refuses while the venues still show the position", async () => {
+    positions.hyperliquid = async () => [{ ...pos("short", "100"), symbol: "PURR" }];
+    await expect(run("arb", "close", "PURR", "--state-only", "--yes")).rejects.toMatchObject({ structured: { code: "INVALID_PARAMS" } });
   });
 });
 

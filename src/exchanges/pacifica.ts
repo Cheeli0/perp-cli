@@ -17,7 +17,7 @@ import type { AgentMeta } from "../settings.js";
 import { isExpired } from "../agent-wallet/expiry.js";
 import { randomUUID } from "crypto";
 import { PerpError, extractErrorMessage, orderOutcomeUnknown } from "../errors.js";
-import { parseFiniteVenueNumber } from "../utils/numeric.js";
+import { parseFiniteVenueNumber, venueRateField } from "../utils/numeric.js";
 import type { MarketInfo } from "../pacifica/types/market.js";
 import type { TimeInForce as PacificaTif } from "../pacifica/types/order.js";
 import type { IocOutcome } from "./ioc-outcome.js";
@@ -777,6 +777,31 @@ export class PacificaAdapter implements ExchangeAdapter {
     return mapped;
   }
 
+  /**
+   * The leverage this account applies to `symbol`: its GET /account/settings `margin_settings`
+   * entry ("Current leverage set by the user"); no entry → the market's max leverage (docs
+   * get-account-settings: "leverage default to max ... will return blank"). Unreadable → EXCHANGE_ERROR.
+   */
+  async marketLeverage(symbol: string): Promise<number> {
+    const sym = symbol.toUpperCase();
+    const settings = await this.client.getAccountSettings(this.account) as { margin_settings?: unknown } | null;
+    if (settings === null || typeof settings !== "object" || !Array.isArray(settings.margin_settings)) {
+      throw new PerpError("EXCHANGE_ERROR", `Pacifica /account/settings returned no margin_settings list (got ${JSON.stringify(settings).slice(0, 160)})`, { exchange: "pacifica" });
+    }
+    const entry = (settings.margin_settings as Array<{ symbol?: unknown; leverage?: unknown }>).find(e => typeof e?.symbol === "string" && e.symbol.toUpperCase() === sym);
+    if (entry !== undefined) {
+      if (typeof entry.leverage !== "number" || !(entry.leverage >= 1)) {
+        throw new PerpError("EXCHANGE_ERROR", `Pacifica /account/settings: malformed margin_settings entry ${JSON.stringify(entry)}`, { exchange: "pacifica" });
+      }
+      return entry.leverage;
+    }
+    const max = (await this.getMarkets()).find(m => m.symbol.toUpperCase() === sym)?.maxLeverage;
+    if (typeof max !== "number" || !(max >= 1)) {
+      throw new PerpError("EXCHANGE_ERROR", `Pacifica ${sym}: no /account/settings entry and no max leverage for the market`, { exchange: "pacifica" });
+    }
+    return max;
+  }
+
   async getOpenOrders(): Promise<ExchangeOrder[]> {
     if (!this._hasRealKey) throw new Error("No private key configured — account data unavailable. Run: perp setup");
     // GET /orders covers every market; spot orders (SOL-USDC) belong to the spot adapter.
@@ -1390,7 +1415,7 @@ export class PacificaAdapter implements ExchangeAdapter {
     if (!Array.isArray(data)) return [];
     return data.map((h) => ({
       time: Number(h.created_at ?? 0),
-      rate: String(h.funding_rate ?? "0"),
+      rate: venueRateField(h.funding_rate, "funding history funding_rate", "pacifica"),
       price: String(h.oracle_price ?? "0"),
     }));
   }

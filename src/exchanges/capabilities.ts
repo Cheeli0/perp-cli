@@ -52,7 +52,8 @@ export interface EvmAddressCapable {
 }
 
 export interface QueryOrderCapable {
-  queryOrder(orderId: number): Promise<unknown>;
+  /** Order id (u64) or, on Hyperliquid, a client order id (cloid) string. */
+  queryOrder(orderId: number | string): Promise<unknown>;
 }
 
 export interface UsdTransferCapable {

@@ -2,6 +2,9 @@ import { assertCanClosePositions } from "../exchanges/trading-v2.js";
 import type { ExchangeAdapter } from "../exchanges/index.js";
 import { resolveAdapterSlippage } from "../exchanges/slippage.js";
 import { updateJobState } from "../jobs.js";
+import { isIocOutcomeCapable, reportedAvgFillPrice } from "../exchanges/ioc-outcome.js";
+import { formatComputedPrice } from "../exchanges/precision.js";
+import { venueRateString } from "../utils/numeric.js";
 
 export interface DCAParams {
   symbol: string;
@@ -17,7 +20,11 @@ export interface DCAState {
   ordersPlaced: number;
   totalFilled: number;
   totalCost: number;
-  avgPrice: number;
+  /**
+   * Average fill price from the VENUE-reported average fill of every order (reportedAvgFillPrice),
+   * never the protection / limit price sent; null when any filled order reported none.
+   */
+  avgPrice: number | null;
   errors: number;
   startedAt: number;
   running: boolean;
@@ -28,7 +35,7 @@ export async function runDCA(
   params: DCAParams,
   jobId?: string,
   log: (msg: string) => void = console.log,
-): Promise<{ ordersPlaced: number; totalFilled: number; avgPrice: number; runtime: number }> {
+): Promise<{ ordersPlaced: number; totalFilled: number; avgPrice: number | null; runtime: number }> {
   assertCanClosePositions(adapter, `DCA on ${adapter.name}`);
   const { symbol, side, amountPerOrder, intervalSec, totalOrders } = params;
   const maxRuntime = (params.maxRuntime ?? 0) * 1000;
@@ -37,7 +44,7 @@ export async function runDCA(
     ordersPlaced: 0,
     totalFilled: 0,
     totalCost: 0,
-    avgPrice: 0,
+    avgPrice: null,
     errors: 0,
     startedAt: Date.now(),
     running: true,
@@ -54,6 +61,7 @@ export async function runDCA(
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 
+  let everyOrderPriced = true;
   try {
     while (state.running) {
       // Check if we've reached order limit
@@ -95,16 +103,20 @@ export async function runDCA(
       try {
         const result = await adapter.marketOrder(symbol, side, String(amountPerOrder), { reduceOnly: false, slippage: resolveAdapterSlippage(adapter, null) }) as Record<string, unknown>;
         state.ordersPlaced++;
-        state.totalFilled += amountPerOrder;
+        // Filled size: the venue-final IOC outcome when the adapter reports one; else the size sent
+        // (marketOrder throws on a definite no-fill / unknown outcome).
+        const outcome = isIocOutcomeCapable(adapter) ? adapter.iocOutcomeOf(result) : null;
+        const filled = outcome !== null ? Number(outcome.filledSize) : amountPerOrder;
+        state.totalFilled = Number(venueRateString(state.totalFilled + filled, "DCA filled total")); // sum without float noise
 
-        const fillPrice = Number(result?.price ?? result?.avg_price ?? result?.fill_price ?? 0);
-        if (fillPrice > 0) {
-          state.totalCost += amountPerOrder * fillPrice;
-          state.avgPrice = state.totalCost / state.totalFilled;
-        }
+        // The venue-reported average fill only: the result's `price` is the protection price that was sent.
+        const fillPrice = reportedAvgFillPrice(result);
+        if (fillPrice === null) everyOrderPriced = false;
+        else state.totalCost += filled * Number(fillPrice);
+        state.avgPrice = everyOrderPriced && state.totalFilled > 0 ? Number(formatComputedPrice(state.totalCost / state.totalFilled)) : null;
 
         const progress = totalOrders > 0 ? ` (${state.ordersPlaced}/${totalOrders})` : "";
-        log(`[DCA] Order #${state.ordersPlaced}${progress}: ${side} ${amountPerOrder} ${symbol}${state.avgPrice > 0 ? ` @ $${state.avgPrice.toFixed(2)} avg` : ""}`);
+        log(`[DCA] Order #${state.ordersPlaced}${progress}: ${side} ${filled} ${symbol}${fillPrice !== null ? ` @ $${fillPrice}` : " (fill price not reported)"}${state.avgPrice !== null ? `, avg $${state.avgPrice}` : ""}`);
 
         // Update job state
         if (jobId) {
@@ -140,7 +152,7 @@ export async function runDCA(
   }
 
   const runtime = Math.floor((Date.now() - state.startedAt) / 1000);
-  log(`[DCA] Done. ${state.ordersPlaced} orders, ${state.totalFilled} filled, avg $${state.avgPrice.toFixed(2)}, ${state.errors} errors, ${runtime}s`);
+  log(`[DCA] Done. ${state.ordersPlaced} orders, ${state.totalFilled} filled, avg ${state.avgPrice !== null ? `$${state.avgPrice}` : "not reported by the venue"}, ${state.errors} errors, ${runtime}s`);
 
   if (jobId) {
     updateJobState(jobId, {

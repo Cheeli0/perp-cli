@@ -115,11 +115,49 @@ Secrets are stored once (see `docs/SSOT_RULES.md` Rule #3): Lighter RH → `~/.p
 - **Time in force:** `trade limit` defaults to `GTC` on every venue (common names `GTC | IOC | FOK | ALO`; a TIF the venue does not offer → `CAPABILITY_UNSUPPORTED`). Lighter post-only (`ALO`) is disabled until verified on the venue.
 - **TP/SL on an entry:** `trade market|buy|sell|limit ... --tp <px> --sl <px>` means the same on every venue — *protect this entry's verified fill*. The direction is checked before anything is sent (long: tp > reference > sl; short: the reverse; reference = mark for market entries, the limit price for limit entries). Ondo attaches the legs to the order; Arcus sends an entry+TP/SL batch; Hyperliquid / Lighter / Aster verify the entry fill, then place reduce-only TP/SL trigger orders sized to it (only market or `--tif IOC` entries — a resting entry → `CAPABILITY_UNSUPPORTED`); Pacifica verifies the fill, then sets position TP/SL (refused if the symbol already has a position or TP/SL — never overwritten). Entry outcome unknown → `ORDER_PENDING` and **no** TP/SL (the position may be unprotected); entry filled but a leg failed → `ORDER_PARTIAL` (not retryable) with the entry result and which legs were placed — do not re-enter, finish with `trade tpsl`.
 - **TP/SL on a position:** `trade tpsl <SYM> <long|short> --tp <px> --sl <px> [--tp-limit <px>] [--size <n>]` — the argument is the **position's** side (buy/sell no longer accepted), checked against the live position; legs are reduce-only and sized to the live position (or `--size`).
-- **Stop orders are reduce-only by default** on every venue (`trade stop`); pass `--no-reduce-only` to let a stop open or flip a position. Lighter / Arcus market triggers execute as a limit at trigger ± the slippage bound (`--slippage-bps` or settings) and may stay unfilled in a fast move; other venues use native market triggers (`--slippage-bps` → `CAPABILITY_UNSUPPORTED`).
+- **Stop orders are reduce-only by default** on every venue (`trade stop`); pass `--no-reduce-only` to let a stop open or flip a position (refused on Ondo and QFEX, whose stops are always reduce-only). Lighter / Arcus market triggers execute as a limit at trigger ± the slippage bound (`--slippage-bps` or settings) and may stay unfilled in a fast move; other venues use native market triggers (`--slippage-bps` → `CAPABILITY_UNSUPPORTED`).
 - **Order edit:** `trade edit` keeps the order's TIF. Pacifica: post-only (ALO) orders are edited natively; GTC / TOB orders placed by perp-cli (TIF recorded in the client order id) are cancelled and replaced with the remaining open size; orders whose TIF is unknown → `CAPABILITY_UNSUPPORTED` (pass `--tif`).
 - **Slippage bound:** every market-type order (entry, close, spot) is bounded by one value: `--slippage-bps <n>` → `settings.slippageBps.<venue>` → `settings.defaultSlippageBps` (shipped default 50, shown in `perp settings show`; change with `perp settings set defaultSlippageBps <n>`). Values outside 1..venue max (Arcus 1000) are rejected before sending.
 - **Restricted regions:** creating a signing adapter for a venue with restricted regions (Ondo, Arcus, QFEX) prints a one-time stderr notice; it never blocks — check the venue terms yourself.
 - **Aggregate views** (`portfolio`, `account positions/orders`, `risk`, `history`, `wallet agent verify`, MCP `portfolio`) cover every account venue with configured credentials.
+
+### What works — mainnet verification (2026-10-13)
+
+Every mark below comes from a real-money mainnet run, not from code reading — at the venue minimum, with the per-venue cap raised to about $25–30 for multi-slice / multi-level checks and about $110 for the Hyperliquid TWAP. Details, evidence and the open issues: [`docs/MAINNET-VERIFICATION-STATUS.md`](docs/MAINNET-VERIFICATION-STATUS.md).
+
+✅ verified live · ⛔ not supported (refused before anything is sent) · ❌ implemented but not run on mainnet yet · — not offered by the venue
+
+| Feature | HL | HIP-3 `xyz` | Pacifica | Lighter | Lighter RH | Aster | Ondo | Arcus | QFEX |
+|---|---|---|---|---|---|---|---|---|---|
+| Market / limit (GTC, ALO, IOC), cancel, edit, close, reduce, flatten, status | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Entry `--tp/--sl`, `trade tpsl`, `trade stop` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Stop-limit | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ⛔ | ✅ | ⛔ |
+| Resting reduce-only limit | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ⛔ | ✅ | ⛔ (IOC only) |
+| Client order id (place / status / cancel) | ✅ | ✅ | ✅³ (UUID) | ✅ (numeric) | ✅ (numeric) | ✅ | ✅ | ✅ | generated ids only |
+| Isolated margin (set, read back with a position, revert) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ (venue rejected with `-4050`, condition unknown) | ⛔ | ✅ | ⛔ |
+| `trade scale-in` / `scale-tp` | ✅ | ✅ (position ≥ $20.5) | ✅ | ✅ | ✅ | ✅ | scale-in ✅ / scale-tp ⛔ — use partial `trade tpsl --size` ✅ | ✅ | scale-in ✅ / scale-tp ⛔ |
+| `trade split` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `trade multi` (legs on several venues) | ✅ | ✅ (global `--dex xyz`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Native TWAP (`trade twap`) | ✅ | ❌ (HL minimum $100) | ✅ master-signed / ⛔ agent-signed | —² | —² | —² | —² | —² | —² |
+| Client-side TWAP (`trade twap` on other venues, `strategy twap`, `--background`) | — | — | — | ✅ | ✅ | ✅ | ✅ | ✅ | ⛔ (automation gate) |
+| `account margin` with a position | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Spot (`trade spot-*`) | ✅ | — | ✅ | ✅ | ✅ | ❌ (needs USDT) | ✅ | ❌ (needs an Arcus-issued key) | — |
+| Deposit via perp-cli | ✅ | (HL) | ✅ | ✅ | ✅ | ✅ | ✅ | — (web app) | — (address only) |
+| Withdraw | ❌ | (HL) | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+
+² perp-cli has no native TWAP for this venue: `trade twap` runs the client-side TWAP (slices) instead. Whether the venue's API offers one is not checked.  
+³ Verified in the session; no saved log file.
+
+Automation, verified live (bounded runs at minimum size, stopped and flattened afterwards):
+
+| Area | Verified |
+|---|---|
+| Arbitrage | `arb exec` / `status` / `close` on Aster–Arcus, Lighter–Arcus; `arb auto` (Lighter–HL); spot-perp `arb exec <sym> spot:hl pacifica` and `arb close`; `strategy funding-arb`, `quick-arb`, `funding-auto` (Pacifica–HL); `strategy delta-neutral` (HL spot + Pacifica perp) |
+| Bots | `strategy grid` / `dca` / `trailing-stop` / `quick-grid` / `quick-dca` / `preset` (Aster); all 12 engine strategies via `strategy start <config>` (Aster); `strategy apex` (Aster) |
+| Execution helpers | `strategy twap` (Aster), `trade twap --background` (Arcus), `strategy plan execute` (9 of 10 action types — `cancel_order` not run), `perp background stop` (graceful: orders cancelled, positions listed) |
+| Hyperliquid HIP-4 outcomes | GTC place / cancel, IOC buy, `outcome sell --all` / `--size` |
+
+Not run on mainnet yet: withdrawals and `funds transfer` / `rebalance execute` / `bridge exchange` (run last), subaccounts, builder fees, `strategy claude-agent` (needs an Anthropic key), alerts / dashboard.
 
 ### QFEX
 
@@ -134,15 +172,21 @@ perp -e qfex trade status c:<id> --symbol AAPL        # by the generated client 
 perp funds deposit qfex                               # prints the USDC / Arbitrum One deposit address; you send the funds
 ```
 
-What perp-cli **refuses on QFEX for now** (uniform `CAPABILITY_UNSUPPORTED`; each is lifted only after the listed UAT check in `docs/TEST-PLAN.md` passes):
+Verified on QFEX production (2026-10-13): `trade close` / `close-all` / `flatten` / `reduce` (sent as reduce-only **IOC**), `trade stop`, `trade tpsl` (both legs), market entry with `--sl`, `trade edit` (native modify — a new order id, the client id is kept, so `c:<id>` keeps working), cancel / status by `c:<id>`.
+
+What perp-cli **still refuses on QFEX** (uniform `CAPABILITY_UNSUPPORTED`, before anything is sent):
 
 | Refused | Why | Do instead |
 |---|---|---|
-| Every reduce-only order: `trade close` / `close-all` / `flatten` / `reduce` / `stop` / `tpsl`, `--tp` / `--sl`, MCP `trade_close` | The `reduce_only` wire format is undocumented and the venue may ignore the flag — a "reduce-only" order would then open or flip a position (Q2) | Close with a plain opposite order (`trade market AAPL sell <size>`) or on the QFEX web app |
-| `trade edit` | A modify returns a new order id and cannot be tied to the order safely (Q5) | `trade cancel`, then place again |
+| Resting reduce-only orders (`trade limit --reduce-only` with GTC / ALO, `trade scale-tp`) | Live: a resting reduce-only order **stays open after the position goes flat**; how the venue treats it if it later matches is unverified | Reduce-only IOC (`trade close` / `reduce`), or `trade stop` / `trade tpsl` |
+| Stop-limit (`--tp-limit`, `trade stop` with a limit price) | The venue's stop orders convert to market orders when triggered | Stop-market |
+| Stops that open or flip a position (`trade stop --no-reduce-only`) | QFEX stop orders only reduce a position | Reduce-only stops |
+| `trade edit` of a reduce-only order | A reduce-only order is sized against the live position when placed; a modify would skip that check | `trade cancel`, then place again |
 | `--client-id` | Client ids are not unique on the venue; perp-cli only trusts ids it generates | Omit it (the generated id is reported) |
 | Markets not quoted in USD (`SKHYNIX-KRW`, …) | Sizing, risk limits and notionals assume USD | QFEX web app |
-| Funding arb / funding bots with QFEX as a leg; QFEX in `arb scan` rankings | The funding rate's unit is unverified and equity funding accrues only part of the week (Q4) | View only: `perp arb scan --rates --include-unverified` |
+| Unattended automation on QFEX: bots, plans, TWAP, DCA, grid, funding arb, trailing stop, background jobs; QFEX in `arb scan` rankings | Automation is gated until verified (`QFEX_AUTOMATION_VERIFIED`); the funding rate's unit is unverified and equity funding accrues only part of the week (Q4) | Trade QFEX by hand; view funding only: `perp arb scan --rates --include-unverified` |
+
+Known caveat: cancelling a stop / TP right after its position was closed can answer "unexpected error" while the venue removes the stop itself. QFEX keeps no record of stop orders, so perp-cli cannot prove the cancel and reports `ORDER_PARTIAL` (pending) — check `perp -e qfex account orders`; if it lists nothing, the stop is gone.
 
 Order outcomes are never guessed: an IOC / market order is final only on a venue terminal frame (nothing filled → `ORDER_REJECTED`, `reason: iocNoFill`); anything unclear after the order was sent is `ORDER_PENDING` with the `c:<id>` to check — never resubmit. perp-cli never enables QFEX cancel-on-disconnect, but **another connection of the same user that enabled it (e.g. the official QFEX CLI) cancels all of the account's orders when that connection drops**.
 
@@ -188,7 +232,7 @@ perp --json -e <EX> trade spot-balance
 | `market` | Prices, orderbook, funding, klines, HIP-3 dexes |
 | `account` | Balance, positions, orders, margin |
 | `trade` | Market/limit/stop orders, close, scale, split execution |
-| `outcome` | Hyperliquid Outcome (HIP-4) — binary/range contracts, USDH-quoted, no leverage |
+| `outcome` | Hyperliquid Outcome (HIP-4) — binary/range contracts, quoted per outcome (outcomeMeta `quoteToken`, USDC today), no leverage |
 | `arb` | Funding rate arb — scan, exec, close, monitor (perp-perp & spot-perp) |
 | `strategy` | 19 bot algorithms (grid, dca, twap, APEX, REFLECT, presets) + nested scripted plans |
 | `funds` | Deposit, withdraw, transfer, cross-chain bridge (multi-provider), inter-exchange rebalance |
@@ -253,14 +297,14 @@ perp --json -e <EX> account pnl                      # realized + unrealized + f
 perp --json -e <EX> account funding                  # personal funding payment history
 perp --json -e <EX> account settings                 # per-market leverage & margin mode
 
-# Outcome markets (Hyperliquid HIP-4 — fully-collateralized binary contracts, USDH-quoted, $10 min)
+# Outcome markets (Hyperliquid HIP-4 — fully-collateralized binary contracts, quote token per outcome (USDC today), min 10 quote tokens)
 perp --json outcome list                                       # active markets + Yes/No mid prices
 perp --json outcome view <outcome>                             # symmetric Yes/No book + underlying gap + expiry
 perp --json outcome book <outcome> <side>                      # one-side orderbook (e.g. '1 yes' or '1 0')
 perp --json outcome positions                                  # open outcome holdings
 perp --json outcome orders                                     # open outcome orders
 perp --json outcome buy <outcome> <side> <usd> --dry-run       # validate before submit
-perp --json outcome buy <outcome> <side> <usd>                 # market buy in USDH notional
+perp --json outcome buy <outcome> <side> <usd>                 # market buy, notional in the outcome's quote token
 perp --json outcome sell <outcome> <side> <usd> --limit <px> --tif gtc
 perp --json outcome cancel <outcome> <side> <oid>
 
@@ -451,8 +495,9 @@ perp --json --ndjson -e hl market list
 perp --json -e hl trade check BTC buy 0.01
 perp --json --dry-run -e hl trade market BTC buy 0.01
 
-# Idempotent orders with client ID
-perp --json -e hl trade market BTC buy 0.01 --client-id my-unique-id
+# Idempotent orders with client ID (Hyperliquid: a 128-bit cloid, 0x + 32 hex; --auto-id generates one)
+perp --json -e hl trade market BTC buy 0.01 --client-id 0x1234567890abcdef1234567890abcdef
+perp --json -e hl trade status c:0x1234567890abcdef1234567890abcdef
 ```
 
 All responses are auto-sanitized (control chars stripped, prompt injection patterns blocked).

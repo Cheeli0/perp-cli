@@ -57,7 +57,7 @@ import { quarantineSymbol } from "../../bot/quarantine.js";
 // The mock is registered under a REAL venue id ("hyperliquid"): every trade command
 // resolves the venue definition (capabilities, slippage bound) from adapter.name, and an
 // unregistered name is UNKNOWN_VENUE. Hyperliquid = legacy TradingV2 wrapper, native amend,
-// no client order ids, per-order cancel proof via statuses[0] === "success".
+// client order ids = 128-bit hex cloids, per-order cancel proof via statuses[0] === "success".
 //
 // Positions and open orders are STATEFUL: trade close / close-all / flatten / reduce verify
 // every close as a measured position delta (closePerpVerified, design §12.3 / CHANGELOG
@@ -254,15 +254,28 @@ describe("trade market -- parameter correctness", () => {
 describe("trade market -- client ID flow", () => {
   // BEHAVIOR CHANGE: the mock venue (hyperliquid) sends no client order id, so --client-id /
   // --auto-id are refused before anything is sent — never accepted and then dropped.
-  it.each([
-    [["--auto-id"]],
-    [["--client-id", "my-id"]],
-  ])("%j on a venue without client order ids → CAPABILITY_UNSUPPORTED, nothing sent or tracked", async (flags) => {
+  it("--client-id that is not a Hyperliquid cloid → INVALID_PARAMS, nothing sent or tracked", async () => {
     const adapter = mockAdapter();
-    await expect(run(adapter, ["trade", "market", "btc", "buy", "0.1", ...flags]))
-      .rejects.toMatchObject({ structured: { code: "CAPABILITY_UNSUPPORTED", details: { feature: "clientOrderId" } } });
+    await expect(run(adapter, ["trade", "market", "btc", "buy", "0.1", "--client-id", "my-id"]))
+      .rejects.toMatchObject({ structured: { code: "INVALID_PARAMS" } });
     expect(adapter.marketOrder).not.toHaveBeenCalled();
     expect(logClientId).not.toHaveBeenCalled();
+  });
+
+  it("--client-id <cloid> is sent to the adapter and tracked", async () => {
+    const adapter = mockAdapter();
+    const cloid = "0x1234567890abcdef1234567890abcdef";
+    await run(adapter, ["trade", "market", "btc", "buy", "0.1", "--client-id", cloid]);
+    expect(vi.mocked(adapter.marketOrder).mock.calls[0][3]).toMatchObject({ clientOrderId: cloid });
+    expect(logClientId).toHaveBeenCalledWith(expect.objectContaining({ clientOrderId: cloid, status: "submitted" }));
+  });
+
+  it("--auto-id generates a valid cloid (0x + 32 hex) and sends it", async () => {
+    const adapter = mockAdapter();
+    await run(adapter, ["trade", "market", "btc", "buy", "0.1", "--auto-id"]);
+    const sent = (vi.mocked(adapter.marketOrder).mock.calls[0][3] as { clientOrderId?: string }).clientOrderId;
+    expect(sent).toMatch(/^0x[0-9a-f]{32}$/);
+    expect(generateClientId).not.toHaveBeenCalled();
   });
 
   it("--smart with a client id is refused (the smart path sends none)", async () => {
@@ -319,12 +332,11 @@ describe("trade limit -- parameter correctness", () => {
     expect(typeof args[3]).toBe("string"); // size
   });
 
-  it("--auto-id on a venue without client order ids → CAPABILITY_UNSUPPORTED, nothing sent", async () => {
+  it("--auto-id on hyperliquid sends a generated cloid with the limit order", async () => {
     const adapter = mockAdapter();
-    await expect(run(adapter, ["trade", "limit", "btc", "buy", "60000", "0.1", "--auto-id"]))
-      .rejects.toMatchObject({ structured: { code: "CAPABILITY_UNSUPPORTED" } });
-    expect(adapter.limitOrder).not.toHaveBeenCalled();
-    expect(logClientId).not.toHaveBeenCalled();
+    await run(adapter, ["trade", "limit", "btc", "buy", "60000", "0.1", "--auto-id"]);
+    const opts = vi.mocked(adapter.limitOrder).mock.calls[0][4] as { clientOrderId?: string };
+    expect(opts.clientOrderId).toMatch(/^0x[0-9a-f]{32}$/);
   });
 
   it("duplicate detection prevents execution for limit orders too", async () => {

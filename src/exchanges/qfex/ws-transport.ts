@@ -679,7 +679,7 @@ export class QfexTradeSession {
    * `expected` order ids are collected until all arrived or the window ends. What is not
    * proven here is settled by the caller's verifying get_user_orders.
    */
-  async cancelAll(symbol: string | null, expected: ReadonlySet<string>): Promise<{ cancelled: string[]; frames: QfexFrame[]; complete: boolean; note: string | null }> {
+  async cancelAll(symbol: string | null, expected: ReadonlySet<string>, watch: ReadonlySet<string> = expected): Promise<{ cancelled: string[]; frames: QfexFrame[]; complete: boolean; note: string | null }> {
     const params: Record<string, unknown> = symbol === null ? {} : { symbol };
     const spec: CommandSpec = { type: "cancel_all_orders", params, what: `cancel_all_orders ${symbol ?? "(all symbols)"}`, clientOrderId: null, symbol };
     const t = this.opts.timeouts;
@@ -688,7 +688,8 @@ export class QfexTradeSession {
         const cancelled = new Set<string>();
         const frames: QfexFrame[] = [];
         const deadline = sentAt + t.cancelMs;
-        while (cancelled.size < expected.size) {
+        const done = () => [...expected].every(id => cancelled.has(id));
+        while (!done()) {
           const w = await io.next(deadline);
           if (w.kind !== "frame") {
             return { cancelled: [...cancelled], frames, complete: false, note: w.kind === "timeout" ? `window of ${t.cancelMs}ms ended` : `connection lost (${w.reason})` };
@@ -697,7 +698,9 @@ export class QfexTradeSession {
           const err = errFrameOf(w.frame);
           if (err !== null) throw this.errOutcome(spec, err, null);
           const r = orderResponseOf(w.frame);
-          if (r !== null && expected.has(r.order_id) && (r.status === "CANCELLED" || r.status === "CANCELLED_STP")) cancelled.add(r.order_id);
+          // `watch` ⊇ expected: CANCELLED frames of other listed orders (stops — whether cancel_all
+          // also cancels them is unverified, Q8) are recorded as proof too, without being waited for.
+          if (r !== null && (expected.has(r.order_id) || watch.has(r.order_id)) && (r.status === "CANCELLED" || r.status === "CANCELLED_STP")) cancelled.add(r.order_id);
         }
         return { cancelled: [...cancelled], frames, complete: true, note: null };
       });

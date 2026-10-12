@@ -50,8 +50,9 @@ export interface ArbPositionState {
   shortSize: number;
   entryTime: string; // ISO
   entrySpread: number; // annualized %
-  entryLongPrice: number;
-  entryShortPrice: number;
+  /** null = no verified fill price was reported for the leg (a strategy-bot entry; never a guess). */
+  entryLongPrice: number | null;
+  entryShortPrice: number | null;
   accumulatedFunding: number;
   lastCheckTime: string; // ISO
   /** "perp-perp" (default) or "spot-perp" */

@@ -352,7 +352,14 @@ describe("quoteRelaySwap", () => {
     const f = fixture("usdgToSolanaSol");
     const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify(f)));
     vi.stubGlobal("fetch", fetchMock);
-    const q = await relay.quoteRelaySwap(REQ_SOL);
+    // quoteRelaySwap checks the fixture's deadline against the wall clock: pin it before the deadline.
+    vi.useFakeTimers({ now: NOW * 1000, toFake: ["Date"] });
+    let q: Awaited<ReturnType<typeof relay.quoteRelaySwap>>;
+    try {
+      q = await relay.quoteRelaySwap(REQ_SOL);
+    } finally {
+      vi.useRealTimers();
+    }
     expect(q.expectedOut).toBe("0.122775488");
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("https://api.relay.link/quote");

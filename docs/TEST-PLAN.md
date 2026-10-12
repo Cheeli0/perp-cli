@@ -336,10 +336,10 @@ master 지갑이 이 컴퓨터에 없으면(import 한 키만 있음) CLI 입금
 
 | 막힌 것 | 해제 조건 |
 |---|---|
-| stop 주문: `trade stop` / `tpsl`, `--tp` / `--sl` (`feature: "stopOrder"`) | Q21 (attached TP/SL은 Q7) |
+| stop-limit, 포지션을 여는 stop (venue에 없음), attached TP/SL (`--tp/--sl`은 별도 stop 주문으로 처리) | 해제 없음 / Q7 |
 | **resting reduce-only**: `trade limit --reduce-only`를 GTC / ALO / FOK로, `trade scale-tp` (capability `reduceOnlyTif: ["IOC"]`) | Q2 잔여: 초과 resting reduce-only 주문이 체결 시점에 포지션까지만 체결(cap)됨이 확인되면 `QFEX_RESTING_REDUCE_ONLY_VERIFIED = true` → `reduceOnlyTif: null` |
-| **무인 자동화**: 봇, plan, TWAP, DCA, grid, funding-arb, trailing stop, 백그라운드 job (`automationGate` → `assertCanClosePositions`, `startJob`) | Q21 통과(stop 주문을 내고 상관시킬 수 있음) 후 `QFEX_AUTOMATION_VERIFIED = true` |
-| `trade edit` (amend) | Q5: MODIFIED에 client id가 보존됨이 확인되면 `QFEX_MODIFY_KEEPS_CLIENT_ID = true` + `capabilities.amend` |
+| **무인 자동화**: 봇, plan, TWAP, DCA, grid, funding-arb, trailing stop, 백그라운드 job (`automationGate` → `assertCanClosePositions`, `startJob`) | Q21은 통과(2026-10-12). 남은 조건: Q2 잔여(flat 상태 resting reduce-only가 포지션을 여는가)·Q4 funding, 그리고 자동화 흐름이 스스로 보호 stop을 거는 구현 → `QFEX_AUTOMATION_VERIFIED = true` |
+| `trade edit`의 reduce-only 주문 amend | Q2 잔여 (일반 LIMIT/ALO amend는 Q5 통과로 열림, 2026-10-12) |
 | `--client-id` (사용자 지정 id) | 해제 없음 — venue id가 유일하지 않음. 생성 id만 사용 |
 | 비-USD quote 마켓 (`SKHYNIX-KRW` 등) | 통화 환산 설계 후 |
 | funding arb / funding 봇의 leg, `arb scan` 순위 | Q4 + 120/168h 연율화 수정 후 `fundingVerified: true` |
@@ -382,7 +382,7 @@ pnpm e2e -- --venue qfex --network testnet --phase trade --dry-run    # 계획 �
 | Q2 | `add_order.reduce_only` wire 타입(bool vs 0/1), 생략 시 기본값, **venue 강제 여부**: reduce-only 수량 > 포지션, 포지션 없음. `take_profit`/`stop_loss` 생략 vs 0. **확인 (production 2026-10-05, primary 계정, GOLD-USD, long 0.003):** wire = JSON boolean(ACK가 `"reduce_only":true` 에코, 모든 `order_response`에 boolean으로 실림) / 포지션 없음 → `INVALID_QUANTITY` 거절 / **수량 0.006 > 포지션 0.003 → ACK, 전량 0.006으로 resting (접수 시 거절·cap 없음)**. **체결 시점 cap — IOC에서 확인 (production 2026-10-05, raw `add_order`):** long 0.003에 SELL LIMIT IOC 0.006 @ 4125 `reduce_only: true` → `ACK`(qty 0.006, rem 0.006, `reduce_only: true`) → `FILLED`(qty 0.003 @ 4145, rem 0.003, trade_id 있음, **`reduce_only: false`**) → `CANCELLED`(qty 0.006, rem 0.003, `reduce_only: true`), 이후 포지션 flat (포지션 크기까지만 체결, 나머지 취소, flip 없음). FILLED 프레임의 `reduce_only: false`는 정상 동작이라 에코 검사는 ACK와 체결이 아닌 상태 프레임만 판정한다. **미검증: 포지션 축소·청산 후 RESTING reduce-only 주문의 동작(나중 체결 시 cap / 취소 여부)**, 생략 시 기본값, TP/SL 생략 vs 0 | IOC만 해제 — `QFEX_REDUCE_ONLY_WIRE = "boolean"` + 어댑터 전송 전 규칙. **resting reduce-only·`scale-tp`는 계속 차단**(`QFEX_RESTING_REDUCE_ONLY_VERIFIED`), 자동화는 `QFEX_AUTOMATION_VERIFIED`. 체결 시 cap은 즉시 체결 주문에서만 확인됨 — resting 주문은 잔여 미검증이라 상수는 열지 않는다 |
 | Q3 | auth 성공·실패 프레임 형태, WS timestamp 허용폭, 1분 미인증 close code | |
 | Q4 | `funding_rate` 단위(`/executions` funding 금액 ÷ 포지션 notional), `funding_rate` vs `next_funding_rate` 중 정산에 쓰이는 값 | **arb / funding 포함** |
-| Q5 | `modify_order`: MODIFIED에 `client_order_id` 보존?, `quantity` 총량/잔량, 응답 순서, `take_profit`/`stop_loss` 생략 시 보존 여부 | **mainnet** (amend 게이트) |
+| Q5 | `modify_order`: MODIFIED에 `client_order_id` 보존?, `quantity` 총량/잔량, 응답 순서, `take_profit`/`stop_loss` 생략 시 보존 여부. **확인 (production 2026-10-12, GOLD-USD):** resting BUY LIMIT 4050 → `modify_order {order_id, symbol, side, order_type, quantity, price:4060, reduce_only:false}` → `order_response` MODIFIED, **새 order_id**(8e4a…, 이전 c563…), **같은 `client_order_id`**. resting reduce-only 주문을 flat 상태에서 교차 가격 4120으로 modify → `INVALID_QUANTITY`(거절, 주문 그대로, 포지션 안 열림). `quantity` 총량/잔량·TP/SL 보존은 미검증 | 해제 — `QFEX_MODIFY_KEEPS_CLIENT_ID = true`, `capabilities.amend: "native"` (reduce-only amend는 계속 거절) |
 | Q6 | `/user/historic-orders` 반영 지연, `terminal_status` / `execution_state` 값 집합 | |
 | Q7 | attached TP/SL로 생긴 stop의 id 수령 경로(`stop_orders` 프레임), 부분/무체결 진입 시 stop 수량, 다른 stop에 미치는 영향 | **mainnet** (attached TP/SL 게이트) |
 | Q8 | `cancel_all_orders`가 stop·TWAP도 취소하는가, 완료 신호 유무 | |
@@ -398,7 +398,7 @@ pnpm e2e -- --venue qfex --network testnet --phase trade --dry-run    # 계획 �
 | Q18 | `client_order_id` 허용 형식·길이 — perp-cli는 UUID 전송 | |
 | Q19 | UAT `api.qfex.io/md/contracts` 500 (2026-10-04) → UAT funding 조회. (`mds.qfex.io`는 정상: 일반 GET은 prod도 503, WS 업그레이드는 101) | UAT funding 조회만 |
 | Q20 | IOC/FOK 프레임 순서 — 전량·부분·무체결 (`FILLED rem>0` / `IOC_PARTIALLY_FILLED` / `IOC_CANCELLED` / `CANCELLED`) | **mainnet** |
-| Q21 | stop 주문 ACK에 `client_order_id`가 에코되는가 | **mainnet** (stop 게이트 + 자동화 게이트 `QFEX_AUTOMATION_VERIFIED`) |
+| Q21 | stop 주문 ACK에 `client_order_id`가 에코되는가. **확인 (production 2026-10-12 ~16:03 UTC, GOLD-USD, scratchpad `qfex-probe.mts`):** `add_order {order_type:"STOP_LOSS", side:"SELL", quantity:0.003, price:3900(트리거), order_time_in_force:"GTC", client_order_id, reduce_only:true}` → `order_response` ACK가 `client_order_id`와 `reduce_only: true`를 에코(`order_origin: "STOP_ORDER"`, order_id b622…), 이후 약 1초마다 `stop_order_response` 프레임(같은 `stop_order_id`, client id 에코, `stop_order_type: "STOPLOSS"`, direction SELL — heartbeat이며 새 상태가 아님). `account orders`에 status untriggered·type STOP_LOSS로 표시. `cancel_stop_order {stop_order_id}` → `ack` 프레임 후 `order_response` CANCELLED(client id 에코) | 해제 — `QFEX_STOP_CLIENT_ID_ECHO = true`: reduce-only stop-market(`trade stop`, `trade tpsl`, `--tp/--sl` 별도 leg) 전송. 자동화 게이트는 그대로 |
 | Q22 | `order_response.user_id` = 계정 id인가 사용자 id인가 (`QFEX_USER_ID_IS_ACCOUNT`) | **mainnet** |
 | Q23 | 체결 후 `/user/positions` 반영 지연(1 s vs 10 s pulse) vs `placePerpVerified` ~10 s 폴링 | **mainnet** |
 
@@ -409,7 +409,10 @@ pnpm e2e -- --venue qfex --network testnet --phase trade --dry-run    # 계획 �
 - [ ] **short 포지션**: sell로 연 포지션의 `trade close` / `reduce` / `flatten`. 부호(Q10)는 확인됨 — production 2026-10-05, short 포지션이 side short로 읽힌다. 세 명령의 short 경로 실행은 남아 있다.
 - [ ] **`trade close-all`**: 포지션 2개 이상에서.
 - [x] **reduce-only 체결 시 cap — IOC**(Q2, raw `add_order`, production 2026-10-05 GOLD-USD): long 0.003에 reduce-only SELL LIMIT IOC 0.006 → 0.003만 체결, 나머지 `CANCELLED`, 포지션 flat (프레임은 §9.4 Q2 행).
-- [ ] **reduce-only 체결 시 cap — resting**(Q2 잔여): 포지션이 줄거나 닫힌 뒤 RESTING reduce-only 주문은 나중 체결 시 cap되는가, 취소되는가. 통과해야 `QFEX_RESTING_REDUCE_ONLY_VERIFIED`를 연다(`limit --reduce-only` GTC / ALO, `scale-tp`). IOC 결과만으로는 열지 않는다.
+- [ ] **reduce-only 체결 시 cap — resting**(Q2 잔여): 포지션이 줄거나 닫힌 뒤 RESTING reduce-only 주문은 나중 체결 시 cap되는가, 취소되는가. 통과해야 `QFEX_RESTING_REDUCE_ONLY_VERIFIED`를 연다(`limit --reduce-only` GTC / ALO, `scale-tp`). IOC 결과만으로는 열지 않는다. 부분 결과: **resting reduce-only (production 2026-10-12, GOLD-USD):** long 0.003에서 reduce-only SELL GTC 0.003 @ 4300을 둔 뒤 일반 매도로 포지션을 닫았더니 그 주문은 **취소되지 않고 OPEN으로 남았다**. flat 상태에서 시장이 그 가격에 닿으면 포지션을 여는지는 여전히 미검증 → `trade close / reduce / close-all`은 flat 심볼에 남은 reduce-only·stop 주문을 WARNING으로 나열하고, `trade flatten`은 취소한다.
+- [x] **stop 주문 상관**(Q21, raw, production 2026-10-12 GOLD-USD): STOP_LOSS ACK·`stop_order_response` heartbeat·`cancel_stop_order` 모두 client id 에코 (§9.4 Q21 행).
+- [x] **modify client id 보존**(Q5, raw, production 2026-10-12 GOLD-USD): MODIFIED = 새 order_id + 같은 client id (§9.4 Q5 행).
+- [ ] **CLI stop / tpsl / edit** (Q21·Q5 해제 후): `trade stop`, `trade tpsl long --tp --sl`, `trade market --sl`, `trade cancel-stop`, `trade edit` — §9.4 증거를 CLI 경로로 재확인.
 - [x] **socket 강제 종료**(Q1 kill 변형, production 2026-10-05, 관측 1회): GTC 주문 후 CLI 프로세스 `kill -9` → 주문이 남았다.
 - [ ] **동시 세션 2개**: 같은 심볼·같은 수량을 두 프로세스에서 동시에 주문 → 각 결과의 `orderId`·fills가 자기 주문 것만인지.
 - [ ] **전송 직후 socket kill**: 주문 전송 직후 네트워크 차단 → 결과 `ORDER_PENDING` + `c:<id>`, 재전송 없음, `trade status c:<id>`로 확정.

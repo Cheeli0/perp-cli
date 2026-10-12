@@ -53,4 +53,10 @@ export interface Strategy {
   init(ctx: StrategyContext, snapshot: EnrichedSnapshot): Promise<void>;
   onTick(ctx: StrategyContext, snapshot: EnrichedSnapshot): Promise<StrategyAction[]>;
   onStop(ctx: StrategyContext): Promise<StrategyAction[]>;
+  /**
+   * true once the strategy has nothing left to do (e.g. DCA placed its --orders total): the
+   * engine runs onStop and ENDS the bot (never returns to monitoring). Absent = runs until an
+   * exit condition / risk limit / signal.
+   */
+  isDone?(ctx: StrategyContext): boolean;
 }

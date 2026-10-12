@@ -1,4 +1,5 @@
 import type { BotConfig, ConditionType, RiskConfig } from "./config.js";
+import { PerpError } from "../errors.js";
 
 export interface Preset {
   name: string;
@@ -315,6 +316,23 @@ export const PRESETS: Preset[] = [
   arbStandard,
   arbAggressive,
 ];
+
+/**
+ * `perp strategy preset --size`: replaces the preset's size field — grid `size` (total base
+ * size, split across the grids), DCA `amount` (base size per order), arb `size_usd` ($ per leg).
+ */
+export function withPresetSize<T extends { strategy: unknown }>(config: T, size: string): T {
+  const n = Number(size);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new PerpError("INVALID_PARAMS", `--size must be a positive number (got ${JSON.stringify(size)})`);
+  }
+  const s = config.strategy as Record<string, unknown>;
+  const field = "size_usd" in s ? "size_usd" : "amount" in s ? "amount" : "size" in s ? "size" : null;
+  if (field === null) {
+    throw new PerpError("INVALID_PARAMS", `preset strategy ${String(s.type)} has no size field to override`);
+  }
+  return { ...config, strategy: { ...s, [field]: n } };
+}
 
 export function getPreset(name: string): Preset | undefined {
   return PRESETS.find(p => p.name === name);

@@ -25,6 +25,11 @@ import { floorToStep, lotStepOf } from "../../exchanges/precision.js";
 import { isQuarantined, quarantineKey, quarantineSymbol } from "../quarantine.js";
 import { SpotPerpExecutor } from "./spot-perp-executor.js";
 import { closePerpVerified, isOutcomeUnknown, placePerpVerified, trimFirstLegToHedge } from "../perp-order.js";
+import { reportedAvgFillPrice } from "../../exchanges/ioc-outcome.js";
+import { recordSpotPerpClose, recordSpotPerpEntry } from "./spot-perp-state.js";
+
+let _posIdCounter = 0;
+function genPosId(): string { return `fa-${Date.now()}-${++_posIdCounter}`; }
 
 /** Consecutive failed closes (spot-perp and perp-perp) before the symbol is quarantined — no retry loop (same bound as funding-arb-v2 / funding-auto). */
 const MAX_CLOSE_FAILURES = 3;
@@ -948,7 +953,10 @@ export class FundingArbStrategy implements Strategy {
       symbol: pos.symbol, spotExchange: exchangeName, perpExchange: pos.shortExchange,
       spotAdapter, perpAdapter, size: pos.size, log: ctx.log,
     });
+    // The pair in the arb state (`arb status` / `arb close`): removed on a full close, legs set to the remainder on a partial one.
+    const pair = { symbol: pos.symbol, spotExchange: exchangeName, perpExchange: pos.shortExchange };
     if (closed.closed) {
+      recordSpotPerpClose(spotAdapter, pair, null, "[ARB]", ctx.log);
       this._closeFailures.delete(pos.symbol);
       return true;
     }
@@ -960,6 +968,7 @@ export class FundingArbStrategy implements Strategy {
       // Partial spot sell: the remainder stays a hedged position (state updated in place).
       ctx.log(`  [ARB] Partial close of ${pos.symbol}: ${closed.remainingSize} remains open (spot + perp)`);
       pos.size = closed.remainingSize;
+      recordSpotPerpClose(spotAdapter, pair, closed.remainingSize, "[ARB]", ctx.log);
       this._closeFailures.delete(pos.symbol);
       return false;
     }
@@ -1089,8 +1098,10 @@ export class FundingArbStrategy implements Strategy {
 
       // Step 2: Buy spot — the hedge is sized to what actually filled (§12.4 #5).
       let hedgeSize: string;
+      let spotFill: { filledSize: number; avgPrice: number | null };
       try {
         const fill = await spotMarketFill(spotAdapter, opp.symbol, "buy", matched.size, spotStep);
+        spotFill = fill;
         hedgeSize = floorToStep(fill.filledSize, perpStep);
         ctx.log(`  [ARB] Bought spot ${fill.filledSize}${fill.status === "partial" ? ` of ${matched.size} (partial)` : ""} ${opp.symbol}`);
         logExecution({ type: "arb_entry", exchange: opp.longExchange, symbol: opp.symbol, side: "buy", size: String(fill.filledSize), notional: matched.notional, status: "success", dryRun: false, meta: { mode: "spot-perp", leg: "spot", fillStatus: fill.status, requestedSize: matched.size, response: fill.raw } });
@@ -1118,9 +1129,13 @@ export class FundingArbStrategy implements Strategy {
 
       // Step 3: Short perp (filled spot size only), verified by the position delta
       let shortHedged = hedgeSize;
+      let perpEntryPrice: number | null;
       try {
         const pf = await placePerpVerified(perpAdapter, opp.shortExchange, perpSymbol, "sell", hedgeSize, { stepSize: perpStep });
         shortHedged = floorToStep(pf.filledSize, perpStep);
+        // The venue-reported average fill of the short (null = not reported, never the protection price).
+        const avg = reportedAvgFillPrice(pf.raw);
+        perpEntryPrice = avg === null ? null : Number(avg);
         if (Number(shortHedged) < Number(hedgeSize)) {
           // Accepted partial fill (≥ 80% measured, or a venue-final partial IOC fill): spot exceeds the short — never resubmit, quarantine the residual.
           this.quarantine(opp.symbol, `perp short filled ${shortHedged} of ${hedgeSize} on ${opp.shortExchange}; spot ${hedgeSize} held on ${exchangeName} — ${floorToStep(Number(hedgeSize) - Number(shortHedged), perpStep)} spot unhedged`, exchangeName, ctx);
@@ -1169,6 +1184,7 @@ export class FundingArbStrategy implements Strategy {
 
       // Track position
       const currentPositions = ctx.state.get("arbOpenPositions") as ArbOpenPosition[];
+      const entryTime = Date.now();
       currentPositions.push({
         symbol: opp.symbol,
         longExchange: opp.longExchange,
@@ -1176,8 +1192,15 @@ export class FundingArbStrategy implements Strategy {
         entrySpread: opp.spread,
         size: shortHedged,
         mode: "spot-perp",
-        entryTime: Date.now(),
+        entryTime,
       });
+      // Recorded in the arb state with the actual legs, so `arb status` confirms it and `arb close` finds it.
+      recordSpotPerpEntry(spotAdapter, {
+        id: genPosId(), symbol: opp.symbol, spotExchange: exchangeName, perpExchange: opp.shortExchange,
+        entryTime, entrySpread: opp.spread,
+        spotSize: spotFill.filledSize, perpSize: Number(shortHedged),
+        spotAvgPrice: spotFill.avgPrice, perpEntryPrice,
+      }, "[ARB]", ctx.log);
       ctx.state.set("arbOpenPositions", currentPositions);
       ctx.state.set("arbPositions", currentPositions.length);
       ctx.log(`  [ARB] Spot-perp position opened! (${currentPositions.length}/${params.max_positions})`);

@@ -179,15 +179,12 @@ describe("reduce-only: pre-send rule on live reads, echo check after the ACK", (
 
   beforeEach(() => { fakeSession.getUserOrders.mockResolvedValue([]); });
 
-  it("the wire-format gate is open; the adapter still reports the stop gate up front (--tp/--sl, trade tpsl)", () => {
+  it("the wire-format and stop gates are open (Q2 wire, Q21 passed); automation stays gated", () => {
     expect(reduceOnlyGateOf(adapter())).toBeNull();
+    expect(stopOrderGateOf(adapter())).toBeNull();
     const automation = automationGateOf(adapter()) as PerpError;
     expect(automation.structured.code).toBe("CAPABILITY_UNSUPPORTED");
     expect(automation.structured.details).toMatchObject({ venue: "qfex", feature: "automation" });
-    const gate = stopOrderGateOf(adapter()) as PerpError;
-    expect(gate.structured.code).toBe("CAPABILITY_UNSUPPORTED");
-    expect(gate.structured.details).toMatchObject({ venue: "qfex", feature: "stopOrder" });
-    expect(gate.structured.remediation).toMatch(/Q21/);
   });
 
   it("reduce-only IOC limit: position and open orders are read, reduce_only: true (boolean) is sent, the ACK echo is accepted", async () => {
@@ -208,8 +205,8 @@ describe("reduce-only: pre-send rule on live reads, echo check after the ACK", (
     const e = await rejection(adapter().placeOrder(roLimit({ tif })));
     expect(e.structured.code).toBe("CAPABILITY_UNSUPPORTED");
     expect(e.structured.details).toMatchObject({ feature: "restingReduceOnly" });
-    expect(e.structured.remediation).toMatch(/Use --tif IOC, or reduce the position now instead: perp trade reduce AAPL <percent> -e qfex/);
-    expect(e.structured.remediation).not.toMatch(/trade tpsl/); // stops are refused on qfex
+    expect(e.structured.remediation).toMatch(/Use --tif IOC, or set a take-profit \/ stop-loss on the position instead: perp trade tpsl AAPL <long\|short> --tp <price> \[--size <qty>\] -e qfex/);
+    expect(e.structured.remediation).toMatch(/trade tpsl/); // stops are placed on qfex (Q21 passed)
     expect(requests.some(q => q.url.pathname === "/user/positions")).toBe(false);
     expect(fakeSession.getUserOrders).not.toHaveBeenCalled();
     notSent();
@@ -485,18 +482,77 @@ describe("reduce-only: pre-send rule on live reads, echo check after the ACK", (
   });
 });
 
-describe("stop orders stay refused (Q21) — and amend (Q5)", () => {
-  it.each([
-    ["TradingV2 reduce-only stop (TP/SL leg)", (a: QfexAdapter) => a.placeOrder(order({ side: "sell", type: "stopMarket", price: null, tif: null, triggerPrice: "300", reduceOnly: true }))],
-    ["legacy stopOrder shim", (a: QfexAdapter) => a.stopOrder("AAPL", "sell", "1", "300", { reduceOnly: true })],
-  ])("%s → unsupported stopOrder, nothing read or sent", async (_n, run) => {
-    const e = await rejection(run(adapter()));
-    expect(e.structured.code).toBe("CAPABILITY_UNSUPPORTED");
-    expect(e.structured.details).toMatchObject({ venue: "qfex", feature: "stopOrder" });
-    expect(e.structured.remediation).toMatch(/Q21/);
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(marketStats).not.toHaveBeenCalled();
-    expect(sessionOpts).toEqual([]);
+describe("stop orders (Q21 passed on production 2026-10-12)", () => {
+  const positions = (rows: unknown) => { routes["GET /user/positions"] = () => reply(200, { balance: {}, positions: rows }); };
+  const long = (position: number) => positions([{ symbol: "AAPL-USD", position, average_price: 330, leverage: 5, unrealised_pnl: 0 }]);
+  const stopAck = (o: Partial<QfexOrderResponse> = {}) => resp({ order_id: "s1", side: "SELL", type: "STOP_LOSS", time_in_force: "GTC", reduce_only: true, quantity: 1, quantity_remaining: 1, price: 300, ...o });
+  const stop = (over: Partial<OrderRequest> = {}) => order({ side: "sell", type: "stopMarket", price: null, tif: null, triggerPrice: "300", reduceOnly: true, ...over });
+
+  it("trade stop below the mark on a long → STOP_LOSS add_order (trigger in price, client id, reduce_only true); listed row → open / final", async () => {
+    long(2);
+    fakeSession.getUserOrders.mockResolvedValueOnce([]).mockResolvedValueOnce([stopAck()]);
+    fakeSession.addOrder.mockResolvedValue(added({ orderId: "s1", responses: [stopAck()] }));
+    const r = await adapter().placeOrder(stop());
+    expect(fakeSession.addOrder.mock.calls[0][0].params).toEqual({ symbol: "AAPL-USD", side: "SELL", order_type: "STOP_LOSS", order_time_in_force: "GTC", quantity: 1, price: 300, client_order_id: CID, reduce_only: true });
+    expect(fakeSession.addOrder.mock.calls[0][0].immediate).toBe(false);
+    expect(r).toMatchObject({ status: "open", finality: "final", orderId: "s1", clientOrderId: CID });
+  });
+
+  it("above the mark on a long → TAKE_PROFIT; an explicit TP/SL leg keeps its kind", async () => {
+    long(2);
+    fakeSession.getUserOrders.mockResolvedValue([]);
+    fakeSession.addOrder.mockResolvedValue(added({ orderId: "s1", responses: [stopAck({ type: "TAKE_PROFIT" })] }));
+    await adapter().placeOrder(stop({ triggerPrice: "350" }));
+    expect(fakeSession.addOrder.mock.calls[0][0].params.order_type).toBe("TAKE_PROFIT");
+    await adapter().placeTpSlLeg({ symbol: "AAPL", closeSide: "sell", size: "1", trigger: "350", kind: "sl", limitPrice: null });
+    expect(fakeSession.addOrder.mock.calls[1][0].params.order_type).toBe("STOP_LOSS");
+  });
+
+  it("not listed yet after the ACK → accepted / pending with the status command", async () => {
+    long(2);
+    fakeSession.getUserOrders.mockResolvedValue([]);
+    fakeSession.addOrder.mockResolvedValue(added({ orderId: "s1", responses: [stopAck()] }));
+    const r = await adapter().placeOrder(stop());
+    expect(r).toMatchObject({ status: "accepted", finality: "pending" });
+    expect(r.execution.notes.join(" ")).toMatch(/perp trade status c:/);
+  });
+
+  it("no position / wrong side / size + other same-type stops > position → refused, nothing sent", async () => {
+    positions([]);
+    fakeSession.getUserOrders.mockResolvedValue([]);
+    expect((await rejection(adapter().placeOrder(stop()))).structured.code).toBe("POSITION_NOT_FOUND");
+    long(2);
+    expect((await rejection(adapter().placeOrder(stop({ side: "buy", triggerPrice: "350" })))).structured.code).toBe("INVALID_PARAMS");
+    fakeSession.getUserOrders.mockResolvedValue([stopAck({ order_id: "old", quantity: 1.5 })]);
+    expect((await rejection(adapter().placeOrder(stop()))).structured.code).toBe("SIZE_TOO_LARGE");
+    expect(fakeSession.addOrder).not.toHaveBeenCalled();
+  });
+
+  it("an ACK without reduce_only true → ORDER_PENDING alarm (never assumed reduce-only)", async () => {
+    long(2);
+    fakeSession.getUserOrders.mockResolvedValue([]);
+    fakeSession.addOrder.mockResolvedValue(added({ orderId: "s1", responses: [stopAck({ reduce_only: false })] }));
+    const e = await rejection(adapter().placeOrder(stop()));
+    expect(e.structured).toMatchObject({ code: "ORDER_PENDING", details: { alarm: "reduceOnlyNotEchoed" } });
+  });
+
+  it("--tp/--sl and trade tpsl legs reach the QFEX adapter through placeTpSlLeg (separateOrders)", async () => {
+    long(2);
+    fakeSession.getUserOrders.mockResolvedValue([]);
+    fakeSession.addOrder.mockResolvedValue(added({ orderId: "s1", responses: [stopAck({ type: "TAKE_PROFIT" })] }));
+    const { placeTpSlLeg } = await import("../../exchanges/legacy-trading-v2.js");
+    await placeTpSlLeg(adapter() as never, "mainnet", { symbol: "AAPL", closeSide: "sell", size: "1", trigger: "350", kind: "tp", limitPrice: null, slippage: SLIP });
+    expect(fakeSession.addOrder.mock.calls[0][0].params).toMatchObject({ order_type: "TAKE_PROFIT", side: "SELL", price: 350, reduce_only: true });
+    await expect(placeTpSlLeg(adapter() as never, "mainnet", { symbol: "AAPL", closeSide: "sell", size: "1", trigger: "350", kind: "tp", limitPrice: "349", slippage: SLIP }))
+      .rejects.toMatchObject({ structured: { details: { feature: "stopLimit" } } });
+  });
+
+  it("the legacy stopOrder shim places the same reduce-only stop", async () => {
+    long(2);
+    fakeSession.getUserOrders.mockResolvedValue([]);
+    fakeSession.addOrder.mockResolvedValue(added({ orderId: "s1", responses: [stopAck()] }));
+    await adapter().stopOrder("AAPL", "sell", "1", "300", { reduceOnly: true });
+    expect(fakeSession.addOrder.mock.calls[0][0].params).toMatchObject({ order_type: "STOP_LOSS", reduce_only: true });
   });
 
   it("stops that open and stop-limit are unsupported too", async () => {
@@ -506,11 +562,6 @@ describe("stop orders stay refused (Q21) — and amend (Q5)", () => {
     expect(stopLimit.structured.details).toMatchObject({ feature: "stopLimit" });
   });
 
-  it("amend is still refused before any read", async () => {
-    const e = await rejection(adapter().editOrder("AAPL", "o1", "330", "1"));
-    expect(e.structured.details).toMatchObject({ venue: "qfex", feature: "amend" });
-    expect(sessionOpts).toEqual([]);
-  });
 });
 
 // ── Market orders ──
@@ -785,13 +836,34 @@ describe("market eligibility from /refdata", () => {
 // ── Amend / cancel / leverage ──
 
 describe("amend, cancel, leverage", () => {
-  it("amend is unsupported (Q5): cancel, then re-place", async () => {
-    const e = await rejection(adapter().amendOrder({ symbol: "AAPL", ref: { kind: "orderId", value: "o1" }, price: "330", size: "1", tif: null }));
-    expect(e.structured.code).toBe("CAPABILITY_UNSUPPORTED");
+  it("amend (Q5 passed): modify_order on the resting LIMIT, the NEW order id is reported with the SAME client id", async () => {
+    const resting = resp({ order_id: "c563", time_in_force: "GTC", price: 333.4, reduce_only: false });
+    fakeSession.getUserOrders.mockResolvedValueOnce([resting]).mockResolvedValueOnce([resp({ order_id: "8e4a", time_in_force: "GTC", price: 330, reduce_only: false })]);
+    fakeSession.modifyOrder.mockResolvedValue(resp({ order_id: "8e4a", status: "MODIFIED", price: 330, time_in_force: "GTC" }));
+    const r = await adapter().amendOrder({ symbol: "AAPL", ref: { kind: "clientOrderId", value: CID }, price: "330", size: "1", tif: null });
+    expect(fakeSession.modifyOrder.mock.calls[0][0]).toMatchObject({ clientOrderId: CID, params: { order_id: "c563", symbol: "AAPL-USD", side: "BUY", order_type: "LIMIT", price: 330, quantity: 1, reduce_only: false } });
+    expect(r).toMatchObject({ orderId: "8e4a", clientOrderId: CID, status: "open", finality: "final" });
+    expect(r.execution.notes.join(" ")).toMatch(/replacedOrderId c563/);
+    expect(qfexVenue.capabilities?.amend).toBe("native");
+  });
+
+  it("amend of a reduce-only order stays refused (production: a crossing modify while flat → INVALID_QUANTITY)", async () => {
+    fakeSession.getUserOrders.mockResolvedValue([resp({ order_id: "r1", time_in_force: "GTC", reduce_only: true })]);
+    const e = await rejection(adapter().amendOrder({ symbol: "AAPL", ref: { kind: "orderId", value: "r1" }, price: "330", size: "1", tif: null }));
     expect(e.structured.details).toMatchObject({ feature: "amend" });
-    expect(e.structured.remediation).toMatch(/perp trade cancel AAPL o1 -e qfex/);
     expect(fakeSession.modifyOrder).not.toHaveBeenCalled();
-    expect(qfexVenue.capabilities?.amend).toBeNull();
+  });
+
+  it("orphanedReduceOnlyOrders lists resting reduce-only and stop rows on a flat symbol only", async () => {
+    routes["GET /user/positions"] = () => reply(200, { balance: {}, positions: [{ symbol: "CL-USD", position: 1, average_price: 90, leverage: 5, unrealised_pnl: 0 }] });
+    fakeSession.getUserOrders.mockResolvedValue([
+      resp({ order_id: "ro", side: "SELL", reduce_only: true, time_in_force: "GTC", price: 4300 }),
+      resp({ order_id: "plain", reduce_only: false }),
+      resp({ order_id: "stp", type: "STOP_LOSS", side: "SELL" }),
+      resp({ order_id: "held", symbol: "CL-USD", reduce_only: true }),
+    ]);
+    const left = await adapter().orphanedReduceOnlyOrders(null);
+    expect(left.map(o => o.orderId)).toEqual(["ro", "stp"]);
   });
 
   it("cancel by client id resolves THE order id first and cancels by order id", async () => {
@@ -806,12 +878,21 @@ describe("amend, cancel, leverage", () => {
     const a = adapter();
     fakeSession.getUserOrders.mockResolvedValueOnce([resp({ order_id: "a" }), resp({ order_id: "b" })]);
     expect((await rejection(a.cancelByRef("AAPL", { kind: "clientOrderId", value: CID }))).structured.code).toBe("EXCHANGE_ERROR");
-    fakeSession.getUserOrders.mockResolvedValueOnce([resp({ order_id: "s1", type: "STOP_LOSS" })]);
+    // Unknown stop cancel, still listed on the re-list → pending.
+    const s1 = resp({ order_id: "s1", type: "STOP_LOSS" });
+    fakeSession.getUserOrders.mockResolvedValueOnce([s1]).mockResolvedValueOnce([s1]);
     fakeSession.cancelStopOrder.mockResolvedValue({ kind: "unknown", reason: "no cancel confirmation" });
     const r = await a.cancelByRef("AAPL", { kind: "orderId", value: "s1" });
     expect(fakeSession.cancelStopOrder).toHaveBeenCalledWith("AAPL-USD", "s1");
     expect(r.cancelled).toEqual([]);
     expect(r.pending).toHaveLength(1);
+    expect(r.pending![0].reason).toMatch(/still listed open/);
+    // Gone from the re-list, but stop orders have no historic record → still pending (unprovable).
+    fakeSession.getUserOrders.mockResolvedValueOnce([s1]).mockResolvedValueOnce([]);
+    routes["GET /user/historic-orders"] = () => reply(200, { count: 0, data: null });
+    const gone = await a.cancelByRef("AAPL", { kind: "orderId", value: "s1" });
+    expect(gone.cancelled).toEqual([]);
+    expect(gone.pending![0].reason).toMatch(/cannot be proven/);
     fakeSession.getUserOrders.mockResolvedValueOnce([]);
     expect((await rejection(a.cancelByRef("AAPL", { kind: "orderId", value: "zz" }))).structured.code).toBe("ORDER_NOT_FOUND");
   });
@@ -822,10 +903,31 @@ describe("amend, cancel, leverage", () => {
     fakeSession.cancelAll.mockResolvedValue({ cancelled: ["a"], frames: [], complete: false, note: "window ended" });
     fakeSession.cancelStopOrder.mockResolvedValue({ kind: "cancelled", frame: resp({ status: "CANCELLED" }) });
     const r = await adapter().cancelAllV2("AAPL");
-    expect(fakeSession.cancelAll).toHaveBeenCalledWith("AAPL-USD", new Set(["a", "b"]));
+    expect(fakeSession.cancelAll).toHaveBeenCalledWith("AAPL-USD", new Set(["a", "b"]), new Set(["a", "b", "s"]));
     expect(r.cancelled.map(c => c.value).sort()).toEqual(["a", "s"]);
     expect(r.pending!.map(p => p.ref?.value)).toEqual(["b"]);
     expect(r.pending![0].reason).toMatch(/still listed open/);
+  });
+
+  it("live 2026-10-12: a stop that vanished after cancel_all with its CANCELLED frame watched is cancelled, not pending", async () => {
+    const before = [resp({ order_id: "tp", type: "TAKE_PROFIT" }), resp({ order_id: "sl", type: "STOP_LOSS" })];
+    fakeSession.getUserOrders.mockResolvedValueOnce(before).mockResolvedValueOnce([before[1]]);
+    fakeSession.cancelAll.mockResolvedValue({ cancelled: ["tp"], frames: [], complete: true, note: null });
+    fakeSession.cancelStopOrder.mockResolvedValue({ kind: "cancelled", frame: resp({ order_id: "sl", status: "CANCELLED" }) });
+    const r = await adapter().cancelAllV2(null);
+    expect(r.cancelled.map(c => c.value).sort()).toEqual(["sl", "tp"]);
+    expect(r.pending).toEqual([]);
+  });
+
+  it("an order gone without a frame is settled from /user/historic-orders (cancelled → cancelled; filled → failed)", async () => {
+    const before = [resp({ order_id: "x", time_in_force: "GTC" }), resp({ order_id: "y", time_in_force: "GTC" })];
+    fakeSession.getUserOrders.mockResolvedValueOnce(before).mockResolvedValueOnce([]);
+    fakeSession.cancelAll.mockResolvedValue({ cancelled: [], frames: [], complete: false, note: "window ended" });
+    const row = (order_id: string, terminal_status: string, filled_qty: number) => ({ order_id, client_order_id: CID, symbol: "AAPL-USD", side: "BUY", type: "LIMIT", time_in_force: "GTC", price: 333.4, quantity: 1, filled_qty, avg_price: null, terminal_status, execution_state: "", status_ts: "" });
+    routes["GET /user/historic-orders"] = () => reply(200, { data: [row("x", "CANCELLED", 0), row("y", "FILLED", 1)] });
+    const r = await adapter().cancelAllV2("AAPL");
+    expect(r.cancelled.map(c => c.value)).toEqual(["x"]);
+    expect(r.failed.map(f => f.ref?.value)).toEqual(["y"]);
   });
 
   it("leverage: cross only, REST POST /user/leverage, bounded by the market maximum", async () => {

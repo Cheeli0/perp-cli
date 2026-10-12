@@ -16,7 +16,7 @@ import { LocalEvmSigner } from "../signer/index.js";
 import type { AgentMeta } from "../settings.js";
 import { isExpired } from "../agent-wallet/expiry.js";
 import { PerpError, classifyError, extractErrorMessage, orderNotSent, orderOutcomeUnknown, sendFailure, unknownActionRemediation, parsePositiveDecimal, DEFINITE_ORDER_FAILURE_CODES, type ErrorCode } from "../errors.js";
-import { parseFiniteVenueNumber } from "../utils/numeric.js";
+import { parseFiniteVenueNumber, venueRateField } from "../utils/numeric.js";
 import type { Network, VenueNetworkConfig } from "./venue.js";
 import {
   lighterFamilyNetworks, LIGHTER_RH_RATE_LIMIT, LIGHTER_RH_RESERVED_KEY_INDEXES,
@@ -2276,7 +2276,7 @@ export class LighterAdapter implements ExchangeAdapter {
       // No rate for this market → leave it out so callers see "unavailable", never a fake 0.
       if (rate == null) continue;
       map.set(symbol, {
-        rate: String(rate),
+        rate: venueRateField(rate, "funding-rates rate", this.name),
         markPrice: fr.mark_price ?? null,
       });
     }

@@ -127,7 +127,7 @@ export async function getMarketSnapshot(
 export function evaluateCondition(
   condition: Condition,
   snapshot: MarketSnapshot,
-  context: { equity: number; startTime: number; peakEquity: number; dailyPnl: number },
+  context: { equity: number | null; startTime: number; peakEquity: number | null; dailyPnl: number },
 ): boolean {
   const val = typeof condition.value === "number" ? condition.value : parseFloat(String(condition.value));
 
@@ -161,11 +161,12 @@ export function evaluateCondition(
     case "rsi_below":
       return !isNaN(snapshot.rsi) && snapshot.rsi < val;
 
+    // Unknown equity (null) never meets an equity condition — neither a fake stop nor a fake entry.
     case "balance_above":
-      return context.equity > val;
+      return context.equity !== null && context.equity > val;
 
     case "balance_below":
-      return context.equity < val;
+      return context.equity !== null && context.equity < val;
 
     case "spread_above":
       // Bid-ask spread percentage, pre-computed from orderbook in snapshot.
@@ -177,7 +178,7 @@ export function evaluateCondition(
     }
 
     case "max_drawdown":
-      return (context.peakEquity - context.equity) > val;
+      return context.equity !== null && context.peakEquity !== null && (context.peakEquity - context.equity) > val;
 
     default:
       return false;
@@ -187,7 +188,7 @@ export function evaluateCondition(
 export function evaluateAllConditions(
   conditions: Condition[],
   snapshot: MarketSnapshot,
-  context: { equity: number; startTime: number; peakEquity: number; dailyPnl: number },
+  context: { equity: number | null; startTime: number; peakEquity: number | null; dailyPnl: number },
   mode: "all" | "any" = "all",
 ): boolean {
   if (conditions.length === 0) return true;

@@ -25,6 +25,9 @@ export const HL_USER_SIGNED: Record<Network, {
   testnet: { hyperliquidChain: "Testnet", signatureChainIdHex: "0x66eee", signatureChainId: 421614 },
 };
 
+/** Hyperliquid client order id (cloid): "0x" + 32 lowercase hex chars (128 bits). */
+export const HL_CLOID_RE = /^0x[0-9a-f]{32}$/;
+
 const publicData: VenuePublicData = {
   async fetchFundingRates(net) {
     return (await import("../../funding/legacy-public.js")).legacyPublicData("hyperliquid").fetchFundingRates(net);
@@ -84,7 +87,11 @@ export const hyperliquidVenue: VenueDefinition = {
     marketOrder: "slippageBounded",
     timeInForce: ["GTC", "IOC", "ALO"],
     reduceOnlyTif: null,
-    clientOrderId: false,
+    // HL docs exchange-endpoint "Place an order": `c` "Cloid (client order id)" — "an optional
+    // 128 bit hex string, e.g. 0x1234567890abcdef1234567890abcdef"; cancelled by `cancelByCloid`,
+    // queried by info `orderStatus` (`oid` "u64 … or 16-byte hex string representing the client
+    // order id"). Native perps and HIP-3 dexes alike (the global asset id selects the dex).
+    clientOrderId: true,
     orderAck: "sync",
     tpsl: "separateOrders",
     amend: "native",

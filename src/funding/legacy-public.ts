@@ -29,6 +29,7 @@
 
 import { HL_MIN_ORDER_VALUE_USD } from "../constants.js";
 import { PerpError } from "../errors.js";
+import { venueRateString } from "../utils/numeric.js";
 import { assertOk } from "../api/public/_http.js";
 import { legacyPublicBaseUrl } from "../api/public/urls.js";
 import { canonicalFor } from "../exchanges/canonical-symbols.js";
@@ -109,6 +110,12 @@ function numStr(v: unknown): string | null {
   return null;
 }
 
+/** A funding rate field: a JSON number without float noise (venueRateString), a numeric string verbatim; else null. */
+function rateStr(v: unknown): string | null {
+  if (typeof v === "number" && Number.isFinite(v)) return venueRateString(v);
+  return numStr(v);
+}
+
 function positiveNumStr(v: unknown): string | null {
   const s = numStr(v);
   return s !== null && Number(s) > 0 ? s : null;
@@ -159,7 +166,7 @@ async function pacificaRows(net: Network): Promise<Row[]> {
         quoteAsset: null,
         markPrice: mark,
         indexPrice: positiveNumStr(p.oracle),
-        fundingRate: numStr(p.next_funding),
+        fundingRate: rateStr(p.next_funding),
         fundingRateBasis: basis,
         settlementIntervalHours: settlement,
         openInterest: numStr(p.open_interest),
@@ -224,7 +231,7 @@ async function hyperliquidRows(net: Network): Promise<Row[]> {
         quoteAsset: null,
         markPrice: mark,
         indexPrice: positiveNumStr(ctx.oraclePx),
-        fundingRate: numStr(ctx.funding),
+        fundingRate: rateStr(ctx.funding),
         fundingRateBasis: basis,
         settlementIntervalHours: settlement,
         openInterest: numStr(ctx.openInterest),
@@ -303,7 +310,7 @@ async function asterRows(net: Network): Promise<Row[]> {
         quoteAsset: s.quoteAsset,
         markPrice: mark,
         indexPrice: positiveNumStr(p.indexPrice),
-        fundingRate: numStr(p.lastFundingRate),
+        fundingRate: rateStr(p.lastFundingRate),
         fundingRateBasis: { kind: "perHours", hours },
         settlementIntervalHours: hours,
         openInterest: null, // per-symbol endpoint only

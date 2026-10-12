@@ -6,6 +6,9 @@
 import type { VenueDefinition, VenuePublicData } from "../venue.js";
 import { BUILDER_FEE_CAPABILITIES } from "../builder-fee.js";
 
+/** Aster client order id (V3 futures "New Order" `newClientOrderId` rule). */
+export const ASTER_CLIENT_ID_RE = /^[.A-Z:/a-z0-9_-]{1,36}$/;
+
 const publicData: VenuePublicData = {
   async fetchFundingRates(net) {
     return (await import("../../funding/legacy-public.js")).legacyPublicData("aster").fetchFundingRates(net);
@@ -151,7 +154,10 @@ export const asterVenue: VenueDefinition = {
     // Live exchangeInfo timeInForce: GTC/IOC/GTX/HIDDEN — no FOK. ALO is the common name for GTX.
     timeInForce: ["GTC", "IOC", "ALO", "GTX"],
     reduceOnlyTif: null,
-    clientOrderId: false,
+    // V3 futures "New Order": `newClientOrderId` "A unique id among open orders. Automatically
+    // generated if not sent. Can only be string following the rule: ^[\\.A-Z\\:/a-z0-9_-]{1,36}$";
+    // "Query Order" / "Cancel Order": "Either `orderId` or `origClientOrderId` must be sent."
+    clientOrderId: true,
     orderAck: "sync",
     tpsl: "separateOrders",
     // PUT /fapi/v3/order (V3 "Modify Order", LIMIT only).

@@ -26,14 +26,25 @@ import {
 
 // ── Result types ──
 
-export interface ExecutionResult {
-  success: boolean;
-  size?: string;
-  notional?: number;
-  error?: string;
-  /** true = outcome unknown or a leg left unhedged: the caller must quarantine the symbol (no retry). */
-  manual?: boolean;
-}
+export type ExecutionResult =
+  | {
+    success: true;
+    /** Perp short size (= the hedged spot, on the perp lot grid). */
+    size: string;
+    notional: number;
+    /** Spot base units bought (the verified fill). */
+    spotSize: number;
+    /** The spot fill's average price; null = the venue reported none. */
+    spotAvgPrice: number | null;
+    /** The venue's entry price of the perp short after the hedge; null = not readable. */
+    perpEntryPrice: number | null;
+  }
+  | {
+    success: false;
+    error: string;
+    /** true = outcome unknown or a leg left unhedged: the caller must quarantine the symbol (no retry). */
+    manual?: boolean;
+  };
 
 /**
  * closed = position fully closed; remainingSize = partially closed, this size is still open (hedged).
@@ -45,9 +56,9 @@ export type CloseResult =
   | { closed: false; remainingSize: string | null; manual: false }
   | { closed: false; remainingSize: null; manual: true; reason: string };
 
-/** Rotation outcome; manual = a leg's state is unknown or unhedged: the caller must quarantine. */
+/** Rotation outcome (ok: the venue's entry price of the new short, null = not readable); manual = a leg's state is unknown or unhedged: the caller must quarantine. */
 export type RotationResult =
-  | { ok: true }
+  | { ok: true; entryPrice: number | null }
   | { ok: false; manual: false }
   | { ok: false; manual: true; reason: string };
 
@@ -265,17 +276,21 @@ export class SpotPerpExecutor {
         return { success: false, error: `perp short: ${msg}` };
       }
 
-      // Position verification
+      // Position verification (+ the venue's entry price of the short, recorded in the arb state)
       invalidateCache("acct");
+      let perpEntryPrice: number | null = null;
       try {
         const perpPositions = await perpAdapter.getPositions();
-        const hasPerp = perpPositions.some(x => matchSymbol(x.symbol, perpSymbol) && parseFloat(x.size) > 0);
-        if (!hasPerp) {
+        const perpPos = perpPositions.find(x => matchSymbol(x.symbol, perpSymbol) && parseFloat(x.size) !== 0);
+        if (!perpPos) {
           log(`  [SPA] WARNING: Perp position not visible (cache delay?)`);
+        } else {
+          const px = Number(perpPos.entryPrice);
+          perpEntryPrice = Number.isFinite(px) && px > 0 ? px : null;
         }
       } catch (err) { log(`  [SPA] Verify error: ${err instanceof Error ? err.message : String(err)}`); }
 
-      return { success: true, size: hedgeSize, notional: matched.notional };
+      return { success: true, size: hedgeSize, notional: matched.notional, spotSize: fill.filledSize, spotAvgPrice: fill.avgPrice, perpEntryPrice };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log(`  [SPA] Open failed: ${msg}`);
@@ -544,6 +559,14 @@ export class SpotPerpExecutor {
       return { ok: false, manual: false };
     }
 
-    return { ok: true };
+    // The new short's entry price (arb state); a failed read is reported as unknown.
+    let entryPrice: number | null = null;
+    try {
+      invalidateCache("acct");
+      const p = (await newAdapter.getPositions()).find(x => matchSymbol(x.symbol, newSym) && parseFloat(x.size) !== 0);
+      const px = Number(p?.entryPrice);
+      entryPrice = Number.isFinite(px) && px > 0 ? px : null;
+    } catch (err) { log(`  [SPA] Rotation: ${newExchange} entry price unreadable (${errText(err)})`); }
+    return { ok: true, entryPrice };
   }
 }

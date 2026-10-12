@@ -1,3 +1,4 @@
+import { ARB_MARGIN_BUFFER, marketLeverageOf, requiredArbMargin } from "../rebalance.js";
 import { ERROR_CODES, PerpError, type ErrorCode } from "../errors.js";
 import { unsupported } from "../exchanges/trading-v2.js";
 import { tradingV2Of } from "../exchanges/legacy-trading-v2.js";
@@ -80,7 +81,7 @@ interface ArbPosition {
   size: number;
   entrySpread: number;
   entryTime: string;
-  entryMarkPrice: number;
+  entryMarkPrice: number | null;
   accumulatedFundingUsd: number;  // estimated funding collected so far
   lastCheckTime: number;          // unix ms of last spread check
 }
@@ -88,7 +89,7 @@ interface ArbPosition {
 // ── Fee-Adjusted Net Spread Calculation ──
 
 import { getTakerFee } from "../constants.js";
-import { assertFundingArbVenue, getVenue, listVenuesWithRole, networkConfig, tryResolveVenueId } from "../exchanges/venue.js";
+import { assertFundingArbVenue, getVenue, listVenuesWithRole, networkConfig, resolveVenueId, tryResolveVenueId } from "../exchanges/venue.js";
 import { sharedApiNetwork } from "../api/public/urls.js";
 import { findSpotQuoteBalance, readSpotQuoteAvailableFresh, requireBotSpotVenue, requireSpotAdapter, spotNetworkOf, spotPairSymbol, spotSharesPerpMargin, sweepSpotQuoteToPerp, transferQuoteToPerp, transferQuoteToSpot } from "../exchanges/spot-factory.js";
 import { fillSizeString, readSpotBalancesFresh, sizeDecimalsOf, spotLotStepOf, spotMarketFill, type SpotFill } from "../exchanges/spot-result.js";
@@ -741,11 +742,36 @@ export function registerArbAutoCommands(
       // simulated entry is never picked up by a live run and a simulated close never drops a
       // real position from tracking.
       const st = createDaemonStateStore(networkOf(program), dryRun, daemonConfig);
+      // State entries the venues do not confirm (no long on longExchange + short on shortExchange):
+      // never counted toward --max-positions, never managed; they still block a new entry on the
+      // same symbol (the state is keyed by symbol). Drop one with: perp arb close <sym> --state-only.
+      const staleSymbols = new Set<string>();
+      const confirmedOnVenues = async (p: ArbPositionState): Promise<boolean> => {
+        try {
+          const [longs, shorts] = await Promise.all([
+            (await getAdapterForExchange(p.longExchange)).getPositions(),
+            (await getAdapterForExchange(p.shortExchange)).getPositions(),
+          ]);
+          const has = (list: { symbol: string; side: string; size: string }[], side: "long" | "short") =>
+            list.some(x => symbolMatch(x.symbol, p.symbol) && x.side === side && Math.abs(Number(x.size)) > 0);
+          if (has(longs, "long") && has(shorts, "short")) { staleSymbols.delete(p.symbol); return true; }
+          if (!staleSymbols.has(p.symbol)) {
+            console.log(chalk.yellow(`  ${new Date().toLocaleTimeString()} STALE STATE: ${p.symbol} (long ${p.longExchange} / short ${p.shortExchange}, since ${p.entryTime}) is not on the venues — not counted, not managed; drop it: perp arb close ${p.symbol} --state-only`));
+          }
+          staleSymbols.add(p.symbol);
+          return false;
+        } catch (e) {
+          // Unknown (read failed): counted, so a possibly-live pair is never doubled.
+          console.log(chalk.yellow(`  ${new Date().toLocaleTimeString()} ${p.symbol}: could not confirm the state entry on the venues (${e instanceof Error ? e.message : String(e)}) — counted as open`));
+          return true;
+        }
+      };
       let daemonState = st.load();
       if (daemonState && daemonState.positions.length > 0) {
-        // Crash recovery: restore positions from persisted state
+        // Crash recovery: restore positions from persisted state — only those the venues confirm.
         for (const persisted of daemonState.positions) {
           if (!isDaemonManaged(persisted)) continue;
+          if (!dryRun && !(await confirmedOnVenues(persisted))) continue;
           openPositions.push({
             symbol: persisted.symbol,
             longExchange: persisted.longExchange,
@@ -820,6 +846,7 @@ export function registerArbAutoCommands(
           for (const persisted of syncState.positions) {
             if (!isDaemonManaged(persisted)) continue;
             if (!openPositions.some(p => p.symbol === persisted.symbol)) {
+              if (!dryRun && !(await confirmedOnVenues(persisted))) continue;
               console.log(chalk.gray(`  ${new Date().toLocaleTimeString()} SYNC: recovering ${persisted.symbol} from state`));
               openPositions.push({
                 symbol: persisted.symbol,
@@ -1096,16 +1123,29 @@ export function registerArbAutoCommands(
             }
           } catch { /* margin check failed, continue without blocking */ }
 
-          // Check for entry conditions
+          // Entry decisions: every monitored symbol that is not entered gets its reason — logged per
+          // symbol for --symbols, summarized per cycle for a full scan (a silent run is impossible).
+          const skipCounts = new Map<string, number>();
+          const skip = (sym: string, reason: string): void => {
+            if (filterSymbols) console.log(chalk.gray(`  ${now} SKIP ${sym}: ${reason}`));
+            else { const k = reason.replace(/[-\d.]+/g, "#"); skipCounts.set(k, (skipCounts.get(k) ?? 0) + 1); }
+          };
+          for (const sym of filterSymbols ?? []) {
+            if (!filtered.some(x => x.symbol === sym)) console.log(chalk.gray(`  ${now} SKIP ${sym}: not in this cycle's funding scan (no rate on two compared venues)`));
+          }
+          if (openPositions.length >= maxPositions) {
+            console.log(chalk.gray(`  ${now} NO ENTRY: max positions reached (${openPositions.length}/${maxPositions}: ${openPositions.map(p => `${p.symbol} ${p.longExchange}/${p.shortExchange}`).join(", ")})`));
+          }
           if (openPositions.length < maxPositions) {
             for (const snap of filtered) {
-              if (openPositions.some(p => p.symbol === snap.symbol)) continue;
+              if (openPositions.some(p => p.symbol === snap.symbol)) { skip(snap.symbol, "already open"); continue; }
               // Global quarantine (design §12.3): unknown / unhedged outcome on this symbol somewhere.
-              if (isQuarantined(snap.symbol, (m) => console.log(chalk.red(m)))) continue;
+              if (isQuarantined(snap.symbol, (m) => console.log(chalk.red(m)))) { skip(snap.symbol, "quarantined"); continue; }
               // A persisted spot-perp position on this symbol (not daemon-managed) blocks entry:
               // the state is keyed by symbol, so a new perp-perp entry would overwrite it.
-              if (syncState?.positions.some(p => p.mode === "spot-perp" && p.symbol === snap.symbol)) continue;
-              if (openPositions.length >= maxPositions) break;
+              if (syncState?.positions.some(p => p.mode === "spot-perp" && p.symbol === snap.symbol)) { skip(snap.symbol, "a spot-perp arb state entry exists for this symbol"); continue; }
+              if (staleSymbols.has(snap.symbol)) { skip(snap.symbol, `a stale arb state entry exists (drop it: perp arb close ${snap.symbol} --state-only)`); continue; }
+              if (openPositions.length >= maxPositions) { skip(snap.symbol, `max positions reached (${maxPositions})`); break; }
 
               // Cooldown: skip if recently closed to prevent close→re-entry loops
               const lastCloseMs = closeCooldowns.get(snap.symbol);
@@ -1129,11 +1169,7 @@ export function registerArbAutoCommands(
 
               // Block entries if either exchange has low margin
               if (blockedExchanges.has(longExchange) || blockedExchanges.has(shortExchange)) {
-                if (!isJson()) {
-                  console.log(chalk.gray(
-                    `  ${now} SKIP ${snap.symbol}: margin too low on ${blockedExchanges.has(longExchange) ? longExchange : shortExchange}`
-                  ));
-                }
+                skip(snap.symbol, `entries blocked on ${blockedExchanges.has(longExchange) ? longExchange : shortExchange} (margin low / venue down)`);
                 continue;
               }
 
@@ -1167,7 +1203,10 @@ export function registerArbAutoCommands(
 
               // --min-spread compares against NET spread (with settle boost applied)
               const effectiveNetSpread = netSpread * settleBoostMultiplier;
-              if (effectiveNetSpread < minSpread) continue;
+              if (effectiveNetSpread < minSpread) {
+                skip(snap.symbol, `net spread ${effectiveNetSpread.toFixed(2)}% < --min-spread ${minSpread}% (gross ${grossSpread.toFixed(2)}%, round-trip cost ${roundTripCost.toFixed(3)}% over ${holdDays}d; long ${longExchange} / short ${shortExchange})`);
+                continue;
+              }
 
               const rateForExch = (e: string) => e === "pacifica" ? snap.pacRate : e === "hyperliquid" ? snap.hlRate : e === "aster" ? snap.astRate : snap.ltRate;
 
@@ -1330,6 +1369,10 @@ export function registerArbAutoCommands(
                 });
               }
             }
+          }
+
+          if (skipCounts.size > 0) {
+            console.log(chalk.gray(`  ${now} NO ENTRY (${[...skipCounts.values()].reduce((x, y) => x + y, 0)} symbols): ${[...skipCounts].map(([k, n]) => `${n}× ${k}`).join("; ")}`));
           }
 
           // Accumulate estimated funding income & show status
@@ -1792,9 +1835,8 @@ export function registerArbAutoCommands(
       const dryRun = isDryRun(program);
 
       // Resolve exchange aliases
-      const aliasMap: Record<string, string> = { hl: "hyperliquid", pac: "pacifica", lt: "lighter" };
-      longExch = aliasMap[longExch.toLowerCase()] || longExch.toLowerCase();
-      shortExch = aliasMap[shortExch.toLowerCase()] || shortExch.toLowerCase();
+      longExch = resolveVenueId(longExch);
+      shortExch = resolveVenueId(shortExch);
 
       // Only venues with a trading role can hold a leg.
       for (const ex of [longExch, shortExch]) {
@@ -1963,7 +2005,8 @@ export function registerArbAutoCommands(
           type: "arb_entry", exchange: `${longExch}+${shortExch}`,
           symbol: sym, side: "entry", size: finalSize,
           status: "success", dryRun: false,
-          meta: { longExch, shortExch, matchedUsd, requested: matchedSize, longSlippage: longCheck.slippagePct, shortSlippage: shortCheck.slippagePct, reconciled, trimmed: res.trimmed },
+          // arbPairId / longExchange / shortExchange: the keys `arb status` provenance matches on.
+          meta: { arbPairId: `${sym}:${longExch}:${shortExch}`, longExchange: longExch, shortExchange: shortExch, longExch, shortExch, matchedUsd, requested: matchedSize, longSlippage: longCheck.slippagePct, shortSlippage: shortCheck.slippagePct, reconciled, trimmed: res.trimmed },
         });
         const result = {
           status: "filled", symbol: sym, size: finalSize, requestedSize: matchedSize, notionalUsd: Math.round(matchedUsd * 100) / 100,
@@ -2022,9 +2065,8 @@ export function registerArbAutoCommands(
       const dryRun = isDryRun(program);
 
       // Resolve exchange aliases
-      const aliasMap: Record<string, string> = { hl: "hyperliquid", pac: "pacifica", lt: "lighter" };
-      spotExch = aliasMap[spotExch.toLowerCase()] || spotExch.toLowerCase();
-      perpExch = aliasMap[perpExch.toLowerCase()] || perpExch.toLowerCase();
+      spotExch = resolveVenueId(spotExch);
+      perpExch = resolveVenueId(perpExch);
 
       // Validate spot exchange: bot/arb spot scope (§12.4 #3) — throws CAPABILITY_UNSUPPORTED
       // for venues without spot or outside the scope (pacifica shared margin, arcus swaps).
@@ -2074,20 +2116,29 @@ export function registerArbAutoCommands(
       const spotTarget = Math.ceil(sizeUsd * 1.1);
       // Separate model: only the shortfall is transferred from the spot venue's perp account.
       const transferWant = isShared ? 0 : Math.max(0, Math.ceil(spotTarget - spotQuoteHave));
-      const perpMarginNeed = sizeUsd * 0.5;
+      // Perp leg margin: notional / the leverage the venue applies to the market × ARB_MARGIN_BUFFER
+      // (requiredArbMargin — the same rule as funding-arb; unknown leverage → 1x). Spot leg: 100%.
+      let perpLeverage: number | null;
+      try {
+        perpLeverage = await marketLeverageOf(perpAdapter, sym);
+      } catch (e) {
+        return fail(`Could not read the ${sym} leverage on ${perpExch}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      const perpMarginNeed = requiredArbMargin(sizeUsd, perpLeverage);
+      const marginText = `~$${perpMarginNeed.toFixed(2)} perp margin (${perpLeverage !== null ? `${perpLeverage}x` : "leverage unknown → 1x"}, ×${ARB_MARGIN_BUFFER} buffer)`;
       if (isShared) {
-        const need = sameVenue ? sizeUsd * 1.5 : sizeUsd;
-        if (spotQuoteHave < need * 0.9) {
-          return fail(`Insufficient balance: have $${spotQuoteHave.toFixed(2)} on ${spotDef.displayName}, need ~$${need.toFixed(0)} (spot${sameVenue ? " + perp margin" : ""})`, { available: spotQuoteHave, required: need });
+        const need = sameVenue ? sizeUsd + perpMarginNeed : sizeUsd;
+        if (spotQuoteHave < need) {
+          return fail(`Insufficient balance: have $${spotQuoteHave.toFixed(2)} on ${spotDef.displayName}, need ~$${need.toFixed(2)} ($${sizeUsd} spot${sameVenue ? ` + ${marginText}` : ""})`, { available: spotQuoteHave, required: need, perpLeverage });
         }
       } else {
         const fromSpotVenuePerp = transferWant + (sameVenue ? perpMarginNeed : 0);
         if (spotVenuePerpAvail < fromSpotVenuePerp) {
-          return fail(`Insufficient balance on ${spotDef.displayName}: spot ${quoteRow?.token ?? "quote"} $${spotQuoteHave.toFixed(2)} + transferable perp $${spotVenuePerpAvail.toFixed(2)}; need $${spotTarget} in spot${sameVenue ? ` + ~$${perpMarginNeed.toFixed(0)} perp margin` : ""}`, { spotQuoteAvail: spotQuoteHave, perpAvail: spotVenuePerpAvail, required: fromSpotVenuePerp });
+          return fail(`Insufficient balance on ${spotDef.displayName}: spot ${quoteRow?.token ?? "quote"} $${spotQuoteHave.toFixed(2)} + transferable perp $${spotVenuePerpAvail.toFixed(2)}; need $${spotTarget} in spot${sameVenue ? ` + ${marginText}` : ""}`, { spotQuoteAvail: spotQuoteHave, perpAvail: spotVenuePerpAvail, required: fromSpotVenuePerp, perpLeverage });
         }
       }
       if (!sameVenue && perpAvail < perpMarginNeed) {
-        return fail(`Insufficient perp balance: have $${perpAvail.toFixed(2)} available on ${perpExch}, need margin for ~$${sizeUsd}`, { perpAvail, required: perpMarginNeed });
+        return fail(`Insufficient perp balance: have $${perpAvail.toFixed(2)} available on ${perpExch}, need ${marginText} for $${sizeUsd}`, { perpAvail, required: perpMarginNeed, perpLeverage });
       }
 
       // 2. Fetch orderbooks simultaneously
@@ -2451,15 +2502,16 @@ export function registerArbAutoCommands(
         p.symbol.toUpperCase() === sym && p.mode === "spot-perp"
       );
 
-      const aliasMap: Record<string, string> = { hl: "hyperliquid", pac: "pacifica", lt: "lighter" };
-      const spotExch = aliasMap[opts_arg.spotExch?.toLowerCase() ?? ""] || opts_arg.spotExch?.toLowerCase() || pos?.spotExchange || pos?.longExchange;
-      const perpExch = aliasMap[opts_arg.perpExch?.toLowerCase() ?? ""] || opts_arg.perpExch?.toLowerCase() || pos?.shortExchange;
+      const venueIdOf = (v: string): string => resolveVenueId(v.replace(/-spot$/i, ""));
+      const spotRaw = opts_arg.spotExch ?? pos?.spotExchange ?? pos?.longExchange;
+      const perpRaw = opts_arg.perpExch ?? pos?.shortExchange;
+      const spotExch = spotRaw === undefined ? undefined : venueIdOf(spotRaw);
+      const perpExch = perpRaw === undefined ? undefined : venueIdOf(perpRaw);
 
       if (!spotExch || !perpExch) {
-        const msg = "Cannot determine exchanges. Specify --spot-exch and --perp-exch, or ensure the position is tracked in state.";
-        if (isJsonFn()) return printJson(jsonOk({ error: msg }));
-        console.log(chalk.red(`  ${msg}`));
-        return;
+        throw new PerpError("INVALID_PARAMS", "Cannot determine the spot and perp exchanges of this spot-perp position", {
+          remediation: `Pass both: perp arb close ${sym} --spot-exch <spot venue> --perp-exch <perp venue>`,
+        });
       }
 
       // Load adapters (bot/arb spot scope — §12.4 #3)

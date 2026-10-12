@@ -13,11 +13,12 @@ import type { EvmSigner } from "../signer/index.js";
 import { LocalEvmSigner } from "../signer/index.js";
 import type { AgentMeta } from "../settings.js";
 import { PerpError, classifyError, orderNotSent, orderOutcomeUnknown, sendFailure } from "../errors.js";
-import { parseFiniteVenueNumber } from "../utils/numeric.js";
+import { parseFiniteVenueNumber, venueRateField } from "../utils/numeric.js";
 import { alignProtectionPrice, floorSize, formatComputedPrice, slippagePrice } from "./precision.js";
 import { unsupported } from "./trading-v2.js";
 import { buildHlUserSignedAction, hlUserSignedNonceField, signHlL1Action, signHlUserSignedAction, type HlSignature, type HlUserSignedType } from "./hl-signing.js";
 import type { Network } from "./venue.js";
+import { HL_CLOID_RE } from "./venues/hyperliquid.js";
 import { rateLimitedError } from "./rate-limiter.js";
 import { fetchAndCache, withCache, TTL_ACCOUNT } from "../cache.js";
 import { approvalFromMax, builderGateOf, hlFeeTenthsBps, NO_BUILDER, requireFeeBps, type BuilderApproval, type BuilderDecision, type BuilderFeeGate, type BuilderTarget } from "./builder-fee.js";
@@ -1061,6 +1062,22 @@ export class HyperliquidAdapter implements ExchangeAdapter {
    * market WITHOUT a position is only readable one coin at a time (info `activeAssetData`
    * {user, coin} → `"leverage": { "type": "cross", "value": 3 }`), so it is not listed here.
    */
+  /**
+   * The leverage this account applies to `symbol`, position or not — info `activeAssetData`
+   * {user, coin} → `"leverage": { "type": "cross", "value": 3 }` (docs info-endpoint/perpetuals).
+   * Unreadable → EXCHANGE_ERROR.
+   */
+  async marketLeverage(symbol: string): Promise<number> {
+    this.ensureAddress();
+    const coin = this._venueCoin(symbol);
+    const r = await this._infoPost({ type: "activeAssetData", user: this._address, coin }) as { leverage?: { value?: unknown } } | null;
+    const v = r?.leverage?.value;
+    if (typeof v !== "number" || !(v >= 1)) {
+      throw new PerpError("EXCHANGE_ERROR", `Hyperliquid activeAssetData ${coin}: unreadable leverage ${JSON.stringify(r?.leverage ?? null)}`, { exchange: "hyperliquid" });
+    }
+    return v;
+  }
+
   async getMarketSettings(): Promise<Array<{ symbol: string; leverage: number; marginMode: "cross" | "isolated" }>> {
     const state = await this._getClearinghouseState();
     if (!Array.isArray(state.assetPositions)) {
@@ -1104,6 +1121,20 @@ export class HyperliquidAdapter implements ExchangeAdapter {
   }
 
   /** HL order id for a cancel: a decimal integer that is exactly representable (else INVALID_PARAMS, nothing sent). */
+  /**
+   * A Hyperliquid client order id (cloid) as sent / queried: "0x" + 32 lowercase hex chars
+   * (exchange-endpoint docs: `c` "an optional 128 bit hex string, e.g.
+   * 0x1234567890abcdef1234567890abcdef"). Anything else → INVALID_PARAMS, nothing sent.
+   */
+  static requireCloid(cloid: string): string {
+    if (!HL_CLOID_RE.test(cloid)) {
+      throw new PerpError("INVALID_PARAMS", `Hyperliquid client order id "${cloid}" must be a 128-bit hex cloid: 0x + 32 lowercase hex chars`, {
+        exchange: "hyperliquid", remediation: "Pass e.g. --client-id 0x1234567890abcdef1234567890abcdef, or use --auto-id (a valid cloid is generated and reported)",
+      });
+    }
+    return cloid;
+  }
+
   private _oidOf(orderId: string): number {
     const n = Number(orderId);
     if (!/^\d+$/.test(orderId) || !Number.isSafeInteger(n)) {
@@ -1168,13 +1199,14 @@ export class HyperliquidAdapter implements ExchangeAdapter {
    * reduceOnly is sent as the order's `r` flag: the venue can only reduce the
    * position with it (never open/flip), so the caller's side is used as given.
    */
-  async marketOrder(symbol: string, side: "buy" | "sell", size: string, opts: { reduceOnly: boolean; slippage: ResolvedSlippage }) {
+  async marketOrder(symbol: string, side: "buy" | "sell", size: string, opts: { reduceOnly: boolean; slippage: ResolvedSlippage; clientOrderId?: string }) {
     // Everything before the signed POST /exchange (signer, `meta` asset id, l2Book reference
     // price, builder approval read) is pre-send: a failed read there (429, transport) is a
     // definite "not sent" (orderNotSent), never a retryable error with an unknown write outcome.
     let action: Record<string, unknown>;
     let sentSize: string;
     let protection: Awaited<ReturnType<HyperliquidAdapter["computeProtectionPrice"]>>;
+    const cloid = opts.clientOrderId === undefined ? null : HyperliquidAdapter.requireCloid(opts.clientOrderId);
     try {
       this.ensureSigner();
       const assetIndex = await this.getAssetIndex(symbol.toUpperCase());
@@ -1189,6 +1221,7 @@ export class HyperliquidAdapter implements ExchangeAdapter {
         size: sentSize,
         orderType: { limit: { tif: "Ioc" } },
         reduceOnly: opts.reduceOnly,
+        cloid,
       })], "na", assetIndex);
     } catch (e) {
       throw orderNotSent("hyperliquid", `market ${side} ${size} ${symbol.toUpperCase()}`, e);
@@ -1200,7 +1233,7 @@ export class HyperliquidAdapter implements ExchangeAdapter {
     // The protection actually sent rides along with the raw response (like Lighter's
     // `protection`) so a TradingV2 wrapper records it in execution; `sentSize` is the
     // size actually sent (floored to szDecimals) that verification compares against.
-    return { ...(result as Record<string, unknown>), protection, sentSize };
+    return { ...(result as Record<string, unknown>), protection, sentSize, ...(cloid !== null ? { clientOrderId: cloid } : {}) };
   }
 
   /**
@@ -1420,6 +1453,8 @@ export class HyperliquidAdapter implements ExchangeAdapter {
     size: string;
     orderType: unknown;
     reduceOnly: boolean;
+    /** Client order id (`c`), already validated; null = none (the key is omitted). */
+    cloid?: string | null;
   }): Record<string, unknown> {
     const trimZeros = (s: string) => {
       if (!s.includes(".")) return s;
@@ -1427,7 +1462,7 @@ export class HyperliquidAdapter implements ExchangeAdapter {
       return n === "-0" ? "0" : n;
     };
     // No "dex" field needed — the global asset index (110000+) encodes the dex
-    return {
+    const wire: Record<string, unknown> = {
       a: opts.assetIndex,
       b: opts.isBuy,
       p: trimZeros(opts.price),
@@ -1435,6 +1470,9 @@ export class HyperliquidAdapter implements ExchangeAdapter {
       r: opts.reduceOnly,
       t: opts.orderType,
     };
+    // `c` last, only when set — the signed msgpack follows key order (python SDK order_request_to_order_wire).
+    if (opts.cloid !== undefined && opts.cloid !== null) wire.c = opts.cloid;
+    return wire;
   }
 
   /**
@@ -1447,9 +1485,10 @@ export class HyperliquidAdapter implements ExchangeAdapter {
     return result;
   }
 
-  async limitOrder(symbol: string, side: "buy" | "sell", price: string, size: string, opts?: { reduceOnly?: boolean; tif?: string }) {
+  async limitOrder(symbol: string, side: "buy" | "sell", price: string, size: string, opts?: { reduceOnly?: boolean; tif?: string; clientOrderId?: string }) {
     // TIF aliases (§13.3): GTC/IOC/ALO or native spellings; FOK → CAPABILITY_UNSUPPORTED.
     let action: Record<string, unknown>;
+    const cloid = opts?.clientOrderId === undefined ? null : HyperliquidAdapter.requireCloid(opts.clientOrderId);
     try { // pre-send (see marketOrder)
       const tif = hlTif(opts?.tif ?? "GTC");
       const reduceOnly = opts?.reduceOnly ?? false;
@@ -1465,12 +1504,37 @@ export class HyperliquidAdapter implements ExchangeAdapter {
         size: roundedSize,
         orderType: { limit: { tif } },
         reduceOnly,
+        cloid,
       })], "na", assetIndex);
     } catch (e) {
       throw orderNotSent("hyperliquid", `limit ${side} ${size} ${symbol.toUpperCase()} @ ${price}`, e);
     }
     // Use _rawPlaceOrder for both DEX and non-DEX (SDK exchange.placeOrder is unavailable)
     const result = await this._rawPlaceOrder({ action });
+    await this._invalidateAccountCache();
+    // The cloid sent rides on the result (`clientOrderId`), like Pacifica's.
+    return cloid !== null ? { ...(result as Record<string, unknown>), clientOrderId: cloid } : result;
+  }
+
+  /**
+   * Cancel one order by client order id — exchange-endpoint docs "Cancel order(s) by cloid":
+   * `{ "type": "cancelByCloid", "cancels": [{ "asset": Number, "cloid": String }] }`. The asset is
+   * the global id, so a HIP-3 dex order is addressed the same way. Per-entry error → ORDER_REJECTED.
+   */
+  async cancelByCloid(symbol: string, cloid: string) {
+    this.ensureSigner();
+    const id = HyperliquidAdapter.requireCloid(cloid);
+    let assetIndex: number;
+    try { // pre-send: the `meta` read behind the asset id
+      assetIndex = await this.getAssetIndex(symbol.toUpperCase());
+    } catch (e) {
+      throw orderNotSent("hyperliquid", `cancel c:${id} ${symbol.toUpperCase()}`, e);
+    }
+    const result = await this._signAndSendAction({
+      type: "cancelByCloid",
+      cancels: [{ asset: assetIndex, cloid: id }],
+    });
+    this._validateVenueAck(result, `cancel c:${id}`);
     await this._invalidateAccountCache();
     return result;
   }
@@ -1605,7 +1669,10 @@ export class HyperliquidAdapter implements ExchangeAdapter {
       throw unsupported("Hyperliquid", "amend", `original order attributes unknown (order ${orderId} reports tif ${JSON.stringify(tif ?? null)})`,
         `Cancel order ${orderId} and place a new order with an explicit --tif`);
     }
-    return this.modifyOrder(symbol, parseInt(orderId), side, price, size, { reduceOnly, tif });
+    // Keep the order's cloid across the modify (the modify carries a full order wire; without
+    // `c` the edited order would lose the id `trade status/cancel c:<cloid>` address it by).
+    const cloid = typeof existing.cloid === "string" && HL_CLOID_RE.test(existing.cloid) ? existing.cloid : null;
+    return this.modifyOrder(symbol, parseInt(orderId), side, price, size, { reduceOnly, tif, ...(cloid !== null ? { cloid } : {}) });
   }
 
   async setLeverage(symbol: string, leverage: number, marginMode: "cross" | "isolated" = "cross") {
@@ -1716,7 +1783,7 @@ export class HyperliquidAdapter implements ExchangeAdapter {
     const history = await this._infoPost({ type: "fundingHistory", coin: this._venueCoin(symbol), startTime: now - 24 * 60 * 60 * 1000 }) as Record<string, unknown>[];
     return (history ?? []).slice(-limit).map((h) => ({
       time: Number(h.time ?? 0),
-      rate: String(h.fundingRate ?? "0"),
+      rate: venueRateField(h.fundingRate, "fundingHistory fundingRate", "hyperliquid"),
       price: null,
     }));
   }
@@ -2051,7 +2118,7 @@ export class HyperliquidAdapter implements ExchangeAdapter {
     newSide: "buy" | "sell",
     newPrice: string,
     newSize: string,
-    opts: { reduceOnly: boolean; tif: HlTif }
+    opts: { reduceOnly: boolean; tif: HlTif; cloid?: string | null }
   ) {
     let assetIndex: number;
     try { // pre-send (see marketOrder)
@@ -2077,6 +2144,7 @@ export class HyperliquidAdapter implements ExchangeAdapter {
           s: trimZeros(floorSize(newSize, hlSizeStep(szDec))), // floored to the lot; 0 → SIZE_TOO_SMALL
           r: opts.reduceOnly,
           t: { limit: { tif: opts.tif } },
+          ...(opts.cloid !== undefined && opts.cloid !== null ? { c: opts.cloid } : {}),
         },
       }],
     };
@@ -2223,8 +2291,10 @@ export class HyperliquidAdapter implements ExchangeAdapter {
   /**
    * Query a specific order by OID.
    */
-  async queryOrder(orderId: number) {
+  /** info `orderStatus`: `oid` "Either u64 representing the order id or 16-byte hex string representing the client order id". */
+  async queryOrder(orderId: number | string) {
     this.ensureAddress();
+    if (typeof orderId === "string") HyperliquidAdapter.requireCloid(orderId);
     const baseUrl = this._testnet
       ? "https://api.hyperliquid-testnet.xyz"
       : "https://api.hyperliquid.xyz";

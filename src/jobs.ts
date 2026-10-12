@@ -254,22 +254,87 @@ export function startJob(opts: StartJobOpts): JobEntry {
   return job;
 }
 
+/** Outcome of stopJob: how the job ended. */
+export interface StopJobResult {
+  /** "notRunning": the session was already gone; "graceful": the job exited after SIGINT within the timeout; "forced": it did not — the session was killed (no cleanup ran). */
+  outcome: "notRunning" | "graceful" | "forced";
+  /** Why a graceful stop could not be attempted / finish (null when graceful / not running). */
+  note: string | null;
+  waitedMs: number;
+}
+
+/** Default wait for a job to finish its own cleanup after SIGINT. */
+export const JOB_STOP_TIMEOUT_MS = 30_000;
+
 /**
- * Stop a running job.
+ * The pid of the job's node process inside the tmux pane: the pane runs
+ * `sh -c "env … node <cli> … | tee -a <log>"`, so it is the pane shell's child that is not `tee`
+ * (`env` execs node, keeping its pid). null when it cannot be identified.
  */
-export function stopJob(id: string): boolean {
-  const job = loadJob(id);
-  if (!job) return false;
-
-  if (tmuxSessionExists(job.tmuxSession)) {
-    try {
-      killTmuxSession(job.tmuxSession);
-    } catch { /* exited between has-session and kill-session */ }
+function jobNodePid(session: string): number | null {
+  const env = scrubSecretEnv(process.env);
+  let panePid: number;
+  try {
+    panePid = Number(execFileSync("tmux", ["list-panes", "-t", assertTmuxSessionName(session), "-F", "#{pane_pid}"], { env, encoding: "utf8" }).trim().split("\n")[0]);
+  } catch {
+    return null;
   }
+  if (!Number.isInteger(panePid) || panePid <= 0) return null;
+  let rows: string;
+  try {
+    rows = execFileSync("ps", ["-o", "pid=,ppid=,comm="], { env, encoding: "utf8" });
+  } catch {
+    return null;
+  }
+  const kids = rows.split("\n").map(l => l.trim().split(/\s+/)).filter(c => c.length >= 3 && Number(c[1]) === panePid);
+  const node = kids.filter(c => !/(^|\/)tee$/.test(c[2]));
+  if (node.length !== 1) return null;
+  const pid = Number(node[0][0]);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
 
+/**
+ * Stop a running job GRACEFULLY: SIGINT to the job's node process (every bot handles it: cancel
+ * its orders, save state), then wait up to `timeoutMs` for the job to exit; only if it is still
+ * running, kill the tmux session ("forced" — the job's own cleanup did not run). Never a silent
+ * kill: the outcome says which happened.
+ */
+export async function stopJob(id: string, timeoutMs: number = JOB_STOP_TIMEOUT_MS): Promise<StopJobResult | null> {
+  const job = loadJob(id);
+  if (!job) return null;
+  const started = Date.now();
+  let result: StopJobResult;
+  if (!tmuxSessionExists(job.tmuxSession)) {
+    result = { outcome: "notRunning", note: null, waitedMs: 0 };
+  } else {
+    const pid = jobNodePid(job.tmuxSession);
+    let note: string | null = null;
+    if (pid === null) note = "the job's process could not be identified in its tmux pane — no SIGINT was sent";
+    else {
+      try {
+        process.kill(pid, "SIGINT");
+      } catch (e) {
+        note = `SIGINT to pid ${pid} failed: ${e instanceof Error ? e.message : String(e)}`;
+      }
+    }
+    if (note === null) {
+      while (tmuxSessionExists(job.tmuxSession) && Date.now() - started < timeoutMs) {
+        await new Promise(r => setTimeout(r, 250));
+      }
+    }
+    if (!tmuxSessionExists(job.tmuxSession)) {
+      result = { outcome: "graceful", note: null, waitedMs: Date.now() - started };
+    } else {
+      try {
+        killTmuxSession(job.tmuxSession);
+      } catch { /* exited between has-session and kill-session */ }
+      result = { outcome: "forced", note: note ?? `the job did not exit within ${Math.round(timeoutMs / 1000)}s of SIGINT`, waitedMs: Date.now() - started };
+    }
+  }
   job.status = "stopped";
+  job.result = { ...(job.result ?? {}), stop: result };
   saveJob(job);
-  return true;
+  return result;
 }
 
 /**
