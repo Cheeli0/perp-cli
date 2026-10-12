@@ -13,7 +13,9 @@
  * Note: deBridge API has strict rate limits (~5 req/min).
  * Tests are structured to minimize API calls and run sequentially.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import { execSync } from "child_process";
+import { PerpError } from "../../errors.js";
 import {
   getDebridgeQuote,
   getCctpQuote,
@@ -265,11 +267,21 @@ describe("Bridge Integration — Read-Only", { timeout: 60000 }, () => {
   // ══════════════════════════════════════════════════════════
 
   describe("edge cases (offline)", () => {
-    it("CCTP same-chain doesn't throw", async () => {
-      const quote = await getCctpQuote("arbitrum", "arbitrum", 100);
-      expect(quote.provider).toBe("cctp");
-      expect(quote.fee).toBeLessThan(1);
-      expect(quote.amountOut).toBeGreaterThan(99);
+    it("CCTP same-chain is refused with INVALID_PARAMS before any network call", async () => {
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+      try {
+        const err = await getCctpQuote("arbitrum", "arbitrum", 100).then(
+          () => { throw new Error("expected getCctpQuote to reject"); },
+          (e: unknown) => e,
+        );
+        expect(err).toBeInstanceOf(PerpError);
+        expect((err as PerpError).structured.code).toBe("INVALID_PARAMS");
+        expect((err as PerpError).structured.status).toBe(400);
+        expect(typeof (err as PerpError).structured.remediation).toBe("string");
+        expect(fetchSpy).not.toHaveBeenCalled();
+      } finally {
+        fetchSpy.mockRestore();
+      }
     });
 
     it("CCTP various amounts", async () => {
@@ -302,11 +314,12 @@ describe("Bridge Integration — Read-Only", { timeout: 60000 }, () => {
   // ══════════════════════════════════════════════════════════
 
   describe("CLI bridge commands", () => {
-    const CLI_CWD = "/Users/hik/Documents/GitHub/pacifica/packages/cli";
+    const CLI_CWD = process.cwd();
     const CLI_CMD = "npx tsx src/index.ts";
+    /** The registry's chain list is the source of truth for `funds bridge chains`. */
+    const REGISTRY_CHAINS = Object.keys(CHAIN_IDS);
 
     function runCliSafe(args: string): { stdout: string; stderr: string; exitCode: number } {
-      const { execSync } = require("child_process");
       try {
         const stdout = execSync(`${CLI_CMD} ${args}`, {
           encoding: "utf-8",
@@ -326,44 +339,58 @@ describe("Bridge Integration — Read-Only", { timeout: 60000 }, () => {
       }
     }
 
-    it("bridge chains: returns chain list as JSON", () => {
-      const { stdout } = runCliSafe("--json bridge chains");
+    it("funds bridge chains: returns the registry chain list as JSON", () => {
+      const { stdout, exitCode } = runCliSafe("--json funds bridge chains");
+      expect(exitCode).toBe(0);
       const parsed = JSON.parse(stdout);
 
       expect(parsed.ok).toBe(true);
-      expect(parsed.data.chains).toBeDefined();
-      expect(parsed.data.usdc).toBeDefined();
-      expect(parsed.data.exchanges).toBeDefined();
-      expect(parsed.data.chains.solana).toBe(7565164);
-      expect(parsed.data.chains.arbitrum).toBe(42161);
+      expect(parsed.data.chains).toEqual(CHAIN_IDS);
+      expect(parsed.data.usdc).toEqual(USDC_ADDRESSES);
+      expect(parsed.data.exchanges).toEqual(EXCHANGE_TO_CHAIN);
     });
 
-    it("bridge chains: text mode has chain names", () => {
-      const { stdout } = runCliSafe("bridge chains");
-
-      expect(stdout).toContain("solana");
-      expect(stdout).toContain("arbitrum");
-      expect(stdout).toContain("ethereum");
+    it("funds bridge chains: text mode lists every registry chain", () => {
+      const { stdout, exitCode } = runCliSafe("funds bridge chains");
+      expect(exitCode).toBe(0);
+      for (const chain of REGISTRY_CHAINS) expect(stdout).toContain(chain);
     });
 
-    it("bridge quote: CCTP route returns JSON (no deBridge API call)", () => {
-      // arbitrum → ethereum uses CCTP, avoids deBridge rate limit
-      const { stdout } = runCliSafe(
-        "--json bridge quote --from arbitrum --to ethereum --amount 500"
+    it("funds bridge quote: CCTP route (arbitrum → base) is among the JSON quotes", () => {
+      // Both ends must be registry chains with a CCTP domain.
+      expect(REGISTRY_CHAINS).toContain("arbitrum");
+      expect(REGISTRY_CHAINS).toContain("base");
+      const { stdout, exitCode } = runCliSafe(
+        "--json funds bridge quote --from arbitrum --to base --amount 500"
       );
+      expect(exitCode).toBe(0);
       const parsed = JSON.parse(stdout);
 
       expect(parsed.ok).toBe(true);
-      expect(parsed.data.provider).toBe("cctp");
-      expect(parsed.data.srcChain).toBe("arbitrum");
-      expect(parsed.data.dstChain).toBe("ethereum");
-      expect(parsed.data.amountIn).toBe(500);
-      expect(parsed.data.fee).toBeLessThan(1); // forwarding fee ~$0.22
-      expect(parsed.data.estimatedTime).toBeGreaterThan(0);
+      expect(Array.isArray(parsed.data.quotes)).toBe(true);
+      const cctp = (parsed.data.quotes as BridgeQuote[]).find((q) => q.provider === "cctp");
+      expect(cctp).toBeDefined();
+      expect(cctp!.srcChain).toBe("arbitrum");
+      expect(cctp!.dstChain).toBe("base");
+      expect(cctp!.amountIn).toBe(500);
+      expect(cctp!.fee).toBeLessThan(1); // forwarding fee ~$0.05-0.22
+      expect(cctp!.estimatedTime).toBeGreaterThan(0);
     });
 
-    it("bridge --help lists subcommands", () => {
-      const { stdout } = runCliSafe("bridge --help");
+    it("funds bridge quote: same-chain route is refused (INVALID_PARAMS, exit 1)", () => {
+      const { stdout, exitCode } = runCliSafe(
+        "--json funds bridge quote --from arbitrum --to arbitrum --amount 500"
+      );
+      expect(exitCode).toBe(1);
+      const parsed = JSON.parse(stdout);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error.code).toBe("INVALID_PARAMS");
+      expect(parsed.error.status).toBe(400);
+      expect(typeof parsed.error.remediation).toBe("string");
+    });
+
+    it("funds bridge --help lists subcommands", () => {
+      const { stdout } = runCliSafe("funds bridge --help");
 
       expect(stdout).toContain("chains");
       expect(stdout).toContain("quote");

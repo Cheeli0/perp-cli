@@ -141,18 +141,20 @@ describe("CLI E2E Integration Tests", { timeout: 30000 }, () => {
 
   describe("--json structured error output", () => {
     it("outputs structured JSON error for a nonexistent plan file", () => {
-      // Use plan validate with a file that does not exist — this triggers
-      // withJsonErrors which wraps the ENOENT in the standard envelope.
+      // Use plan validate with a file that does not exist — a missing plan file
+      // is an input error (INVALID_PARAMS / 400) in the standard envelope, exit 1.
       const { stdout, exitCode } = runCliSafe(
         "--json strategy plan validate /tmp/__nonexistent_cli_test_file_99999.json"
       );
 
-      expect(exitCode).toBe(0);
+      expect(exitCode).not.toBe(0);
 
       const parsed = JSON.parse(stdout);
       expect(parsed.ok).toBe(false);
       expect(parsed.error).toBeDefined();
-      expect(typeof parsed.error.code).toBe("string");
+      expect(parsed.error.code).toBe("INVALID_PARAMS");
+      expect(parsed.error.status).toBe(400);
+      expect(typeof parsed.error.remediation).toBe("string");
       expect(typeof parsed.error.message).toBe("string");
       expect(parsed.error.message).toContain("ENOENT");
       expect(typeof parsed.error.retryable).toBe("boolean");

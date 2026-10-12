@@ -333,7 +333,7 @@ A · B의 남은 것은 새 돈이 필요 없다. A+는 약 $5–7이 든다. D�
 |---|---|---|
 | 1 | 아무것도 커밋되지 않음 (`feat/venue-abstraction`, 미커밋 파일 약 250개 이상) | 기준점 없음. 2026-10-05에 고친 코드도 포함 |
 | 2 | Ondo · QFEX API 키가 채팅에 붙여넣어짐 | 반드시 교체 |
-| 3 | 통합 테스트(`src/__tests__/integration`)의 레거시 테스트 14개 실패, 미분류 | 회귀 판단 불가 |
+| 3 | 통합 테스트 14건 실패 — 2026-10-13 분류: 의도된 변경 뒤 갱신 안 된 테스트 7(`bridge` → `funds bridge` 4, 오류 exit code 1, lighter-rh 추가, network별 arb state), 라이브 마켓 변화 3(TSLA가 HL `xyz` dex에만 있음, `hyna` dex에 BTC 없음), 네트워크 타임아웃 2(10초 한도, spread 조회 단독 ≈ 4.3초), 로컬 `.env` 키 필요 1(`bridge-strict`, SSOT Rule #3에도 어긋남), CCTP 동일 체인 1("offline" 테스트가 실제 fee API를 호출, API 400) | 제품 회귀는 없음. **2026-10-13 수정**: 통합 테스트 167 통과 / 0 실패 / 175 건너뜀(`bridge-strict`는 `PERP_BRIDGE_STRICT=1`일 때만, 읽기 전용, `.env` 키 제거). 함께 수정: plan · 봇 config 파일 없음 → `INVALID_PARAMS`(400), 브리지 동일 체인 → 네트워크 호출 전 `INVALID_PARAMS`. 테스트 타입 검사 `typecheck:test` 추가 — 기존 테스트에 타입 오류 235개(44개 파일)가 남아 CI에는 아직 연결 안 함 |
 | 4 | venue에 남은 키: Pacifica 에이전트 키 8개, Lighter API 키 슬롯 12개, Lighter RH 슬롯 6(revoke 테스트의 임시 키) | 정리 필요 |
 | 5 | `arb close <spot-perp 심볼>`이 여전히 state 파일만 보고 라우팅함. `arb rebalance` / funding-positions의 venue 목록이 여전히 하드코딩 | 같은 종류의 버그(§2.5의 `arb status` / `close`)가 이 경로에는 남아 있음 |
 | 6 | Lighter `account trades`의 거래 수수료는 추정값 (문서 근거 없음) | 표시 값의 정확성 미보장 |

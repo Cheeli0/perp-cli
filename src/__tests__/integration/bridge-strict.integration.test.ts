@@ -1,15 +1,26 @@
 /**
- * Strict Bridge Integration Tests — comprehensive verification using real keys.
+ * Strict Bridge Integration Tests — comprehensive verification against the user's OWN addresses.
  *
- * Uses .env keys for address derivation and balance checks.
- * NO transactions are executed. NO funds are spent.
+ * OPT-IN ONLY: runs when PERP_BRIDGE_STRICT=1, otherwise the whole suite is skipped.
+ *
+ * What it does (all read-only — NO transaction, order, bridge or signed request is ever made,
+ * NO funds are spent, NO private key is read or decrypted):
+ *  - resolves the active OWS master wallet the same way the CLI does (resolveOwsMaster →
+ *    OWS vault public accounts) and reads its PUBLIC EVM + Solana addresses
+ *  - reads USDC / native-gas balances of those addresses over public RPCs
+ *  - fetches bridge quotes (Circle CCTP + HyperCore fees API, deBridge, Relay) for those
+ *    addresses, checks aggregation / best-quote selection and the "sender pays only" fee model
+ *  - reads on-chain code (eth_getCode) of the HyperCore CctpForwarder and the Circle Iris API
+ *
+ * Secrets (SSOT Rule #3): addresses come from the OWS vault (public accounts only). No `.env`
+ * key is read. Without a selected OWS master wallet the suite fails up front with a remediation.
  *
  * Core verification: "sender pays only" — all bridge fees are deducted from
  * the source USDC amount. The recipient receives amountOut without paying
  * any gas or fees on the destination chain.
  *
  * Tests:
- * 1. Key derivation & address consistency
+ * 1. OWS master address resolution & format
  * 2. Real balance checks on all chains
  * 3. CCTP quote API for all routes (including HyperCore)
  * 4. HyperCore CCTP fees API validation
@@ -24,7 +35,6 @@
  * 16. Complete route matrix (all 12 directional pairs)
  */
 import { describe, it, expect, beforeAll } from "vitest";
-import { config } from "dotenv";
 import {
   CHAIN_IDS,
   USDC_ADDRESSES,
@@ -42,43 +52,48 @@ import {
   checkBridgeGasBalance,
   type BridgeQuote,
 } from "../../bridge-engine.js";
-
-// Load .env
-config();
+import { cliCredentialOptsFrom, resolveOwsMaster } from "../../config.js";
+import { PerpError } from "../../errors.js";
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-// ── Derive real addresses from .env keys ──
+/** Explicit opt-in: the suite reads the user's own wallet addresses / balances and hits many live APIs. */
+const STRICT_ENABLED = process.env.PERP_BRIDGE_STRICT === "1";
+if (!STRICT_ENABLED) {
+  console.log("[bridge-strict] skipped — set PERP_BRIDGE_STRICT=1 to run (read-only; uses the active OWS master wallet's public addresses)");
+}
+
+/** The OWS master wallet's PUBLIC address for a venue's chain family (nothing is decrypted). */
+async function owsMasterAddress(venue: "hyperliquid" | "lighter" | "pacifica", vm: "evm" | "svm"): Promise<string> {
+  const master = await resolveOwsMaster(venue, cliCredentialOptsFrom({}));
+  if (master === null) {
+    throw new PerpError("NO_SIGNER_AVAILABLE", `bridge-strict: no OWS master wallet is selected for ${venue}`, {
+      remediation: "Select the master wallet (perp wallet use <name>) — this suite reads only its public addresses",
+    });
+  }
+  if (vm === "evm") return (await import("../../signer/ows-evm.js")).OwsEvmSigner.create(master.wallet).getAddress();
+  return (await import("../../signer/ows-solana.js")).OwsSolanaSigner.create(master.wallet).getPublicKeyBase58();
+}
+
+// ── Real (public) addresses of the OWS master wallet ──
 let solanaAddress: string;
 let evmAddress: string;
 
-describe("Strict Bridge Integration Tests", { timeout: 120000 }, () => {
+describe.skipIf(!STRICT_ENABLED)("Strict Bridge Integration Tests (opt-in: PERP_BRIDGE_STRICT=1)", { timeout: 120000 }, () => {
   // ══════════════════════════════════════════════════════════
-  // 0. Setup: derive addresses from private keys
+  // 0. Setup: public addresses of the active OWS master wallet
   // ══════════════════════════════════════════════════════════
 
   beforeAll(async () => {
-    // Derive Solana address
-    const { Keypair } = await import("@solana/web3.js");
-    const bs58 = await import("bs58");
-    const solanaKey = process.env.pk ?? process.env.PACIFICA_PRIVATE_KEY;
-    if (!solanaKey) throw new Error("Missing 'pk' or 'PACIFICA_PRIVATE_KEY' in .env");
-    const keypair = Keypair.fromSecretKey(bs58.default.decode(solanaKey));
-    solanaAddress = keypair.publicKey.toBase58();
-
-    // Derive EVM address
-    const { ethers } = await import("ethers");
-    const evmKey = process.env.HL_PRIVATE_KEY;
-    if (!evmKey) throw new Error("Missing 'HL_PRIVATE_KEY' in .env");
-    const wallet = new ethers.Wallet(evmKey);
-    evmAddress = wallet.address;
+    solanaAddress = await owsMasterAddress("pacifica", "svm");
+    evmAddress = await owsMasterAddress("hyperliquid", "evm");
   });
 
   // ══════════════════════════════════════════════════════════
-  // 1. Key & Address Validation
+  // 1. OWS Master Address Validation
   // ══════════════════════════════════════════════════════════
 
-  describe("1. Key derivation & address format", () => {
+  describe("1. OWS master address format", () => {
     it("Solana address is valid base58 (32-44 chars)", () => {
       expect(solanaAddress).toBeDefined();
       expect(solanaAddress.length).toBeGreaterThanOrEqual(32);
@@ -91,11 +106,8 @@ describe("Strict Bridge Integration Tests", { timeout: 120000 }, () => {
       expect(evmAddress).toMatch(/^0x[0-9a-fA-F]{40}$/);
     });
 
-    it("HL_PRIVATE_KEY and LIGHTER_PRIVATE_KEY derive same EVM address", async () => {
-      const { ethers } = await import("ethers");
-      const hlWallet = new ethers.Wallet(process.env.HL_PRIVATE_KEY!);
-      const lighterWallet = new ethers.Wallet(process.env.LIGHTER_PRIVATE_KEY!);
-      expect(hlWallet.address).toBe(lighterWallet.address);
+    it("hyperliquid and lighter resolve the same OWS master EVM address", async () => {
+      expect(await owsMasterAddress("lighter", "evm")).toBe(evmAddress);
     });
   });
 
@@ -622,10 +634,10 @@ describe("Strict Bridge Integration Tests", { timeout: 120000 }, () => {
       ).rejects.toThrow();
     });
 
-    it("CCTP same-chain quote still valid", async () => {
-      const quote = await getCctpQuote("arbitrum", "arbitrum", 100);
-      expect(quote.provider).toBe("cctp");
-      expect(quote.amountOut).toBeGreaterThan(0);
+    it("CCTP same-chain quote is refused (INVALID_PARAMS)", async () => {
+      await expect(getCctpQuote("arbitrum", "arbitrum", 100)).rejects.toMatchObject({
+        structured: { code: "INVALID_PARAMS" },
+      });
     });
 
     it("all quotes return gasIncluded field", async () => {

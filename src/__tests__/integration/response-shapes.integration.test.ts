@@ -10,6 +10,29 @@ import {
 import { startEventStream, type StreamEvent } from "../../event-stream.js";
 
 /**
+ * Pick, from live assets, an underlying listed on >= 2 distinct dexes (native "hl" counts as one)
+ * with at least one cross-dex price within `maxGapPct` (same product). Highest combined 24h volume
+ * wins. null = no such underlying at run time (live HIP-3 listings drift).
+ */
+function pickMultiDexUnderlying(assets: DexAsset[], maxGapPct = 2): { base: string; assets: DexAsset[] } | null {
+  const byBase = new Map<string, DexAsset[]>();
+  for (const a of assets) {
+    const list = byBase.get(a.base);
+    if (list) list.push(a); else byBase.set(a.base, [a]);
+  }
+  let best: { base: string; assets: DexAsset[]; volume: number } | null = null;
+  for (const [base, group] of byBase) {
+    if (new Set(group.map(a => a.dex)).size < 2) continue;
+    const close = group.some((a, i) => group.slice(i + 1).some(b =>
+      a.dex !== b.dex && Math.abs(a.markPrice - b.markPrice) / ((a.markPrice + b.markPrice) / 2) * 100 < maxGapPct));
+    if (!close) continue;
+    const volume = group.reduce((s, a) => s + a.volume24h, 0);
+    if (best === null || volume > best.volume) best = { base, assets: group, volume };
+  }
+  return best === null ? null : { base: best.base, assets: best.assets };
+}
+
+/**
  * Integration tests: validate that ALL API response shapes match what
  * user-facing code expects.
  *
@@ -219,20 +242,21 @@ describe("Response Shape Validation (Hyperliquid Mainnet)", () => {
   // ── 5. DexArbPair shape from findDexArbPairs ────────────────────────
 
   describe("5. DexArbPair shape from findDexArbPairs", () => {
-    it("TSLA pairs across dexes have correct shape and constraints", async () => {
+    it("pairs for an underlying on >= 2 dexes have correct shape and constraints", async (ctx) => {
       const allAssets = await fetchAllDexAssets();
-      const tslaAssets = allAssets.filter((a) => a.base === "TSLA");
+      const pick = pickMultiDexUnderlying(allAssets);
+      if (pick === null) {
+        ctx.skip("no underlying is currently listed on >= 2 dexes (incl. native) at a matching price — live HIP-3 listings drifted");
+        return;
+      }
 
-      // TSLA should exist on multiple dexes
-      expect(tslaAssets.length).toBeGreaterThanOrEqual(2);
-
-      const pairs = findDexArbPairs(tslaAssets);
+      const pairs = findDexArbPairs(pick.assets);
       expect(pairs.length).toBeGreaterThanOrEqual(1);
 
       for (const pair of pairs) {
         // underlying: string
         expect(typeof pair.underlying).toBe("string");
-        expect(pair.underlying).toBe("TSLA");
+        expect(pair.underlying).toBe(pick.base);
 
         // long and short: DexAsset objects
         expect(pair.long).toBeTruthy();

@@ -31,6 +31,17 @@ export function assertBridgeNetwork(network: Network): void {
   });
 }
 
+/**
+ * A bridge moves funds between two different chains. Same source and destination is a caller
+ * error, refused before any quote API is called or any key is used.
+ */
+export function assertDistinctBridgeChains(srcChain: string, dstChain: string): void {
+  if (srcChain !== dstChain) return;
+  throw new PerpError("INVALID_PARAMS", `Bridge source and destination chain are the same (${srcChain}) — nothing to bridge`, {
+    remediation: "Pick two different chains with --from / --to (list them with: perp funds bridge chains)",
+  });
+}
+
 // ── Chain constants ──
 
 export const CHAIN_IDS = {
@@ -398,6 +409,7 @@ export async function getDebridgeQuote(
   senderAddress: string,
   recipientAddress: string,
 ): Promise<BridgeQuote> {
+  assertDistinctBridgeChains(srcChain, dstChain);
   const srcChainId = CHAIN_IDS[srcChain as keyof typeof CHAIN_IDS];
   const dstChainId = CHAIN_IDS[dstChain as keyof typeof CHAIN_IDS];
   if (!srcChainId || !dstChainId) throw new Error(`Unsupported chain: ${srcChain} or ${dstChain}`);
@@ -471,6 +483,7 @@ export async function executeDebridgeBridge(
   signerKey: string, // EVM private key or Solana private key (base58)
 ): Promise<BridgeResult> {
   assertBridgeNetwork(network);
+  assertDistinctBridgeChains(bridgeQuote.srcChain, bridgeQuote.dstChain);
   const { srcChain, dstChain, amountIn, amountOut } = bridgeQuote;
   const { senderAddress, recipientAddress, amountRaw } = bridgeQuote.raw as {
     senderAddress: string; recipientAddress: string; amountRaw: string;
@@ -661,6 +674,7 @@ export async function getCctpQuote(
   amountUsdc: number,
   fast: boolean = false,
 ): Promise<BridgeQuote> {
+  assertDistinctBridgeChains(srcChain, dstChain);
   if (!isCctpSupported(srcChain)) throw new Error(`CCTP not supported on ${srcChain}`);
   if (!isCctpSupported(dstChain)) throw new Error(`CCTP not supported on ${dstChain}`);
 
@@ -754,6 +768,7 @@ export async function executeCctpBridge(
   fast: boolean = false,
 ): Promise<BridgeResult> {
   assertBridgeNetwork(network);
+  assertDistinctBridgeChains(srcChain, dstChain);
   // HyperCore route: depositForBurnWithHook via CctpForwarder
   if (dstChain === "hyperliquid") {
     if (srcChain === "solana") {
@@ -1755,6 +1770,7 @@ export async function getRelayQuote(
   senderAddress: string,
   recipientAddress: string,
 ): Promise<BridgeQuote> {
+  assertDistinctBridgeChains(srcChain, dstChain);
   const { quoteRelaySwap } = await import("./relay-swap.js");
   // Verified locally (order id, depository, amounts, recipient) — see relay-swap.ts.
   const q = await quoteRelaySwap({
@@ -1787,6 +1803,7 @@ export async function executeRelayBridge(
   signerKey: string,
 ): Promise<BridgeResult> {
   assertBridgeNetwork(network);
+  assertDistinctBridgeChains(bridgeQuote.srcChain, bridgeQuote.dstChain);
   const { executeRelaySwap, assertRelayMinOut } = await import("./relay-swap.js");
   const q = bridgeQuote.raw as import("./relay-swap.js").RelaySwapQuote;
   assertRelayMinOut(q, null);
@@ -1828,6 +1845,7 @@ export async function getAllQuotes(
   senderAddress: string,
   recipientAddress: string,
 ): Promise<BridgeQuote[]> {
+  assertDistinctBridgeChains(srcChain, dstChain);
   const results = await Promise.allSettled([
     getCctpQuote(srcChain, dstChain, amountUsdc),
     getRelayQuote(srcChain, dstChain, amountUsdc, senderAddress, recipientAddress),
@@ -1879,6 +1897,7 @@ export async function executeBestBridge(
 ): Promise<BridgeResult> {
   // Before quoting: a testnet run must not even look up mainnet routes to sign.
   assertBridgeNetwork(network);
+  assertDistinctBridgeChains(srcChain, dstChain);
   let quote: BridgeQuote;
 
   if (provider) {

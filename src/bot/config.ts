@@ -1,6 +1,6 @@
 import { readFileSync, existsSync } from "node:fs";
 import { parse as parseYaml } from "yaml";
-import { PerpError } from "../errors.js";
+import { PerpError, extractErrorMessage } from "../errors.js";
 import { resolveVenueId, type VenueId } from "../exchanges/venue.js";
 
 // ── Condition types ──
@@ -135,17 +135,29 @@ export function resolveConfigVenue(configExchange: string | null, cli: CliVenueS
 /** Load a bot config; its venue is resolved against the CLI selection (resolveConfigVenue). */
 export function loadBotConfig(pathOrInline: string, cli: CliVenueSelection): BotConfig {
   let raw: Record<string, unknown>;
+  const remediation = "Pass a readable YAML/JSON config file path (or inline JSON). See examples with: perp strategy example";
 
   if (existsSync(pathOrInline)) {
-    const content = readFileSync(pathOrInline, "utf-8");
-    if (pathOrInline.endsWith(".json")) {
-      raw = JSON.parse(content);
-    } else {
-      raw = parseYaml(content) as Record<string, unknown>;
+    let content: string;
+    try {
+      content = readFileSync(pathOrInline, "utf-8");
+    } catch (err) {
+      throw new PerpError("INVALID_PARAMS", `Cannot read bot config file '${pathOrInline}': ${extractErrorMessage(err)}`, { remediation });
+    }
+    try {
+      raw = pathOrInline.endsWith(".json") ? JSON.parse(content) : parseYaml(content) as Record<string, unknown>;
+    } catch (err) {
+      throw new PerpError("INVALID_PARAMS", `Bot config file '${pathOrInline}' is not valid ${pathOrInline.endsWith(".json") ? "JSON" : "YAML"}: ${extractErrorMessage(err)}`, { remediation });
+    }
+  } else if (pathOrInline.trimStart().startsWith("{")) {
+    // Inline JSON config
+    try {
+      raw = JSON.parse(pathOrInline);
+    } catch (err) {
+      throw new PerpError("INVALID_PARAMS", `Inline bot config is not valid JSON: ${extractErrorMessage(err)}`, { remediation });
     }
   } else {
-    // Try parsing as inline JSON
-    raw = JSON.parse(pathOrInline);
+    throw new PerpError("INVALID_PARAMS", `Bot config file not found: '${pathOrInline}'`, { remediation });
   }
 
   return parseBotConfig(raw, cli);

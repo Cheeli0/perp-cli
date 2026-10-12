@@ -157,7 +157,7 @@ describe("Cross-validate: Hyperliquid Spot Adapter", () => {
 
     // Raw API: L2 book for spot ETH
     const rawBook = await hlPost("l2Book", { coin: `@${ethSpotIndex}` }) as {
-      levels?: [[{ px: string; sz: string }], [{ px: string; sz: string }]];
+      levels?: [Array<{ px: string; sz: string }>, Array<{ px: string; sz: string }>];
     };
 
     expect(rawBook.levels).toBeTruthy();
@@ -251,8 +251,8 @@ describe("Cross-validate: Hyperliquid Spot Adapter", () => {
 // ── Lighter Spot Tests (shared adapter to avoid rate limits) ──
 
 describe("Cross-validate: Lighter Spot Adapter", () => {
-  let ltAdapter: Awaited<ReturnType<typeof import("../../exchanges/lighter.js")>>["LighterAdapter"]["prototype"] | null = null;
-  let spotAdapter: Awaited<ReturnType<typeof import("../../exchanges/lighter-spot.js")>>["LighterSpotAdapter"]["prototype"] | null = null;
+  let ltAdapter: InstanceType<typeof import("../../exchanges/lighter.js")["LighterAdapter"]> | null = null;
+  let spotAdapter: InstanceType<typeof import("../../exchanges/lighter-spot.js")["LighterSpotAdapter"]> | null = null;
   let ltInitFailed = false;
 
   beforeAll(async () => {
@@ -438,7 +438,7 @@ describe("Cross-validate: Token Index Verification", () => {
       const rawIdx = meta.universe.findIndex(u => u.name === sym);
       if (rawIdx < 0) continue;
 
-      const adapterIdx = hlAdapter.getAssetIndex ? await (hlAdapter as unknown as { getAssetIndex(s: string): Promise<number> }).getAssetIndex(sym) : rawIdx;
+      const adapterIdx = await hlAdapter.getAssetIndex(sym);
 
       // Index should match
       expect(adapterIdx).toBe(rawIdx);
@@ -567,6 +567,18 @@ describe("Cross-validate: Token Index Verification", () => {
 // ── Spot-Perp Spread Calculation ──
 
 describe("Cross-validate: Spot-Perp Spread Calculation", () => {
+  // One fetchSpotPerpSpreads call hits every perp + bot-spot venue (~4-5 s); fetch once per
+  // option set and share it across the tests below.
+  type SpreadsResult = Awaited<ReturnType<typeof import("../../funding/rates.js")["fetchSpotPerpSpreads"]>>;
+  const MIN_SPREAD = 5;
+  let all: SpreadsResult;
+  let aboveMin: SpreadsResult;
+
+  beforeAll(async () => {
+    const { fetchSpotPerpSpreads } = await import("../../funding/rates.js");
+    all = await fetchSpotPerpSpreads();
+    aboveMin = await fetchSpotPerpSpreads({ minSpread: MIN_SPREAD });
+  }, 60_000);
 
   it("spot-perp spread = |perp funding rate| annualized (spot funding = 0)", async () => {
     // Get HL perp funding rates from raw API
@@ -586,12 +598,8 @@ describe("Cross-validate: Spot-Perp Spread Calculation", () => {
     // Spread = |perp hourly| × 8760 × 100
     const expectedAnnualPct = Math.abs(ethFunding) * 8760 * 100;
 
-    // Now use our fetchSpotPerpSpreads function
-    const { fetchSpotPerpSpreads } = await import("../../funding/rates.js");
-    const { spreads } = await fetchSpotPerpSpreads({ symbols: ["ETH"] });
-
-    // Find ETH spread
-    const ethSpread = spreads.find(s => s.symbol === "ETH");
+    // Now use our fetchSpotPerpSpreads result (shared, all symbols)
+    const ethSpread = all.spreads.find(s => s.symbol === "ETH");
     if (!ethSpread) {
       // ETH might not show up if funding is too low
       console.log(`ETH spot-perp spread not found (funding: ${ethFunding})`);
@@ -620,32 +628,31 @@ describe("Cross-validate: Spot-Perp Spread Calculation", () => {
       expect(ethSpread.direction).toBe("sell-spot-long-perp");
     }
 
-    // Perp exchange should be one of the 3 exchanges
-    expect(["hyperliquid", "lighter", "pacifica"]).toContain(ethSpread.perpExchange);
+    // Perp exchange: a registered venue the function actually fetched rates from (its status is "ok")
+    const { listVenues } = await import("../../exchanges/venue.js");
+    const { listBotSpotVenues } = await import("../../exchanges/spot-factory.js");
+    expect(listVenues().map(v => v.id)).toContain(ethSpread.perpExchange);
+    expect(all.exchangeStatus[ethSpread.perpExchange]).toBe("ok");
 
-    // Spot exchanges should only be hl or lt
+    // Spot exchanges: only bot/arb spot venues (the function's spot-leg scope), each fetched ok
+    const botSpotIds = listBotSpotVenues().map(v => v.id as string);
     for (const spotEx of ethSpread.spotExchanges) {
-      expect(["hyperliquid", "lighter"]).toContain(spotEx);
+      expect(botSpotIds).toContain(spotEx);
+      expect(all.exchangeStatus[`${spotEx}-spot`]).toBe("ok");
     }
   });
 
-  it("all spot-perp spreads have annualSpreadPct >= minSpread", async () => {
-    const minSpread = 5;
-    const { fetchSpotPerpSpreads } = await import("../../funding/rates.js");
-    const { spreads } = await fetchSpotPerpSpreads({ minSpread });
-
-    for (const s of spreads) {
-      expect(s.annualSpreadPct).toBeGreaterThanOrEqual(minSpread);
+  it("all spot-perp spreads have annualSpreadPct >= minSpread", () => {
+    for (const s of aboveMin.spreads) {
+      expect(s.annualSpreadPct).toBeGreaterThanOrEqual(MIN_SPREAD);
       expect(s.bestMarkPrice).toBeGreaterThan(0);
       expect(s.spotExchanges.length).toBeGreaterThan(0);
       expect(s.estHourlyIncomeUsd).toBeGreaterThan(0);
     }
   });
 
-  it("spot-perp spread is sorted by annualSpreadPct descending", async () => {
-    const { fetchSpotPerpSpreads } = await import("../../funding/rates.js");
-    const { spreads } = await fetchSpotPerpSpreads();
-
+  it("spot-perp spread is sorted by annualSpreadPct descending", () => {
+    const { spreads } = all;
     for (let i = 1; i < spreads.length; i++) {
       expect(spreads[i - 1].annualSpreadPct).toBeGreaterThanOrEqual(spreads[i].annualSpreadPct);
     }
@@ -656,16 +663,18 @@ describe("Cross-validate: Spot-Perp Spread Calculation", () => {
 
 describe("Cross-validate: Arb State backward compatibility", () => {
 
-  it("existing state without mode field defaults to perp-perp", async () => {
-    const { writeFileSync, mkdirSync, existsSync, unlinkSync } = await import("fs");
-    const { resolve: pathResolve } = await import("path");
-    const { loadArbState, saveArbState, setStateFilePath, resetStateFilePath } = await import("../../arb/state.js");
+  it("legacy untagged state (no network, no mode) is adopted on mainnet; mode absent → perp-perp", async () => {
+    const { writeFileSync, readFileSync, existsSync, mkdtempSync, rmSync } = await import("fs");
+    const { tmpdir } = await import("os");
+    const { join } = await import("path");
+    const { loadArbState, saveArbState, setStateFilePath, resetStateFilePath, arbStateFilePath } = await import("../../arb/state.js");
+    const { PerpError } = await import("../../errors.js");
 
-    // Create a temp state file with old format (no mode field)
-    const tmpDir = pathResolve(process.env.HOME || "~", ".perp", "test-tmp");
-    if (!existsSync(tmpDir)) mkdirSync(tmpDir, { recursive: true });
-    const tmpFile = pathResolve(tmpDir, "arb-state-test.json");
+    // Isolated temp state path (never the developer's real ~/.perp/arb-state.json)
+    const tmpDir = mkdtempSync(join(tmpdir(), "perp-arb-state-test-"));
+    const tmpFile = join(tmpDir, "arb-state.json");
 
+    // Pre-network format: no `network` tag, positions without `mode`
     const oldState = {
       version: 1,
       lastStartTime: new Date().toISOString(),
@@ -693,18 +702,34 @@ describe("Cross-validate: Arb State backward compatibility", () => {
     setStateFilePath(tmpFile);
 
     try {
-      const loaded = loadArbState();
-      expect(loaded).toBeTruthy();
+      expect(arbStateFilePath("mainnet")).toBe(tmpFile);
+
+      // Testnet refuses while an untagged legacy file exists (never guesses its network)
+      let testnetErr: unknown = null;
+      try { loadArbState("testnet"); } catch (e) { testnetErr = e; }
+      expect(testnetErr).toBeInstanceOf(PerpError);
+      expect((testnetErr as InstanceType<typeof PerpError>).structured.code).toBe("INVALID_PARAMS");
+
+      // Read-only mainnet load tags the copy in memory only; the file stays untagged
+      const ro = loadArbState("mainnet", { readOnly: true });
+      expect(ro).not.toBeNull();
+      expect(ro!.network).toBe("mainnet");
+      expect(JSON.parse(readFileSync(tmpFile, "utf-8")).network).toBeUndefined();
+
+      // Writable mainnet load adopts it: backup copy + file tagged in place
+      const loaded = loadArbState("mainnet");
+      expect(loaded).not.toBeNull();
+      expect(loaded!.network).toBe("mainnet");
+      expect(JSON.parse(readFileSync(tmpFile, "utf-8")).network).toBe("mainnet");
+      expect(existsSync(`${tmpFile}.pre-network.bak`)).toBe(true);
       expect(loaded!.positions.length).toBe(1);
 
-      // mode should be undefined (old format), which defaults to perp-perp
+      // mode absent (old format) — readers resolve it as perp-perp (mcp-server: `pos.mode ?? "perp-perp"`)
       const pos = loaded!.positions[0];
-      expect(pos.mode).toBeUndefined(); // not set in old format
-      // Callers should treat undefined mode as "perp-perp"
-      const effectiveMode = pos.mode ?? "perp-perp";
-      expect(effectiveMode).toBe("perp-perp");
+      expect(pos.mode).toBeUndefined();
+      expect(pos.mode ?? "perp-perp").toBe("perp-perp");
 
-      // Now save a spot-perp position alongside
+      // Save a spot-perp position alongside
       loaded!.positions.push({
         id: "test-2",
         symbol: "BTC",
@@ -722,18 +747,23 @@ describe("Cross-validate: Arb State backward compatibility", () => {
         spotExchange: "hyperliquid",
         spotSymbol: "BTC/USDC",
       });
-      saveArbState(loaded!);
+      saveArbState("mainnet", loaded!);
 
       // Re-load and verify both positions
-      const reloaded = loadArbState();
+      const reloaded = loadArbState("mainnet");
+      expect(reloaded!.network).toBe("mainnet");
       expect(reloaded!.positions.length).toBe(2);
       expect(reloaded!.positions[0].mode).toBeUndefined();
       expect(reloaded!.positions[1].mode).toBe("spot-perp");
       expect(reloaded!.positions[1].spotExchange).toBe("hyperliquid");
       expect(reloaded!.positions[1].spotSymbol).toBe("BTC/USDC");
+
+      // Mainnet state is never read as testnet: the testnet path is separate and empty
+      expect(arbStateFilePath("testnet")).not.toBe(tmpFile);
+      expect(loadArbState("testnet")).toBeNull();
     } finally {
       resetStateFilePath();
-      try { unlinkSync(tmpFile); } catch { /* ignore */ }
+      rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 });

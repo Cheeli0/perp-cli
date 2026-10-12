@@ -21,6 +21,7 @@
     "test:all": "vitest run",
     "e2e": "tsx scripts/e2e/run.ts",
     "e2e:typecheck": "tsc -p scripts/e2e/tsconfig.json",
+    "typecheck:test": "tsc -p tsconfig.test.json",
     "sync-skill-version": "node scripts/sync-skill-version.mjs",
     "prepublishOnly": "node scripts/sync-skill-version.mjs && pnpm run build"
   },

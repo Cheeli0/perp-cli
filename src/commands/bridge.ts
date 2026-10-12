@@ -13,6 +13,7 @@ import {
   checkDebridgeStatus,
   checkBridgeGasBalance,
   assertBridgeNetwork,
+  assertDistinctBridgeChains,
   CHAIN_IDS,
   USDC_ADDRESSES,
   EXCHANGE_TO_CHAIN,
@@ -199,6 +200,7 @@ export function registerFundsBridgeCommands(
     }) => {
       const srcChain = opts.from.toLowerCase();
       const dstChain = opts.to.toLowerCase();
+      assertDistinctBridgeChains(srcChain, dstChain);
       const amount = Number(parsePositiveDecimal(opts.amount, "--amount"));
 
       if (!isJson()) console.log(chalk.cyan(`\n  Fetching quotes: $${amount} USDC ${srcChain} → ${dstChain}...\n`));
@@ -278,6 +280,8 @@ export function registerFundsBridgeCommands(
       assertBridgeNetwork(getNetwork());
       const srcChain = opts.from.toLowerCase();
       const dstChain = opts.to.toLowerCase();
+      // Before any key is loaded or quote fetched.
+      assertDistinctBridgeChains(srcChain, dstChain);
 
       // Relay path: asked for by name, by an asset / min-out flag, or implied by a Relay-only chain.
       const relayRoute = opts.provider?.toLowerCase() === "relay" || opts.fromAsset !== undefined || opts.toAsset !== undefined
@@ -452,7 +456,11 @@ export function registerFundsBridgeCommands(
       const dstChain = EXCHANGE_TO_CHAIN[dstExchange];
       if (!srcChain) throw new Error(`Unknown exchange: ${srcExchange}`);
       if (!dstChain) throw new Error(`Unknown exchange: ${dstExchange}`);
-      if (srcChain === dstChain) throw new Error("Same chain — no bridge needed");
+      if (srcChain === dstChain) {
+        throw new PerpError("INVALID_PARAMS", `${srcExchange} and ${dstExchange} are both on ${srcChain} — no bridge needed`, {
+          remediation: "Pick exchanges on different chains (see: perp funds bridge chains)",
+        });
+      }
 
       const chosenProvider = opts.provider?.toLowerCase() as "cctp" | "relay" | "debridge" | undefined;
       if (chosenProvider && !["cctp", "relay", "debridge"].includes(chosenProvider)) {
