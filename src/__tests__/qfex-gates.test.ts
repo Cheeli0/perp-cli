@@ -12,10 +12,10 @@ import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from "vite
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-const enforceOrderRisk = vi.fn(async () => undefined);
+const enforceOrderRisk = vi.fn(async (..._a: unknown[]) => undefined);
 vi.mock("../trade-validator.js", async (orig) => ({
   ...(await orig<typeof import("../trade-validator.js")>()),
-  enforceOrderRisk: (...a: unknown[]) => enforceOrderRisk(...(a as [])),
+  enforceOrderRisk: (...a: unknown[]) => enforceOrderRisk(...a),
 }));
 
 import "../exchanges/venues/index.js";

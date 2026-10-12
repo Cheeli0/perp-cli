@@ -10,6 +10,7 @@ import { PacificaAdapter, pacificaOrderOutcomeOf } from "../../exchanges/pacific
 import { LighterAdapter, lighterModifyOutcomeOf, lighterEventInfo } from "../../exchanges/lighter.js";
 import { HyperliquidAdapter } from "../../exchanges/hyperliquid.js";
 import type { ExchangeAdapter } from "../../exchanges/interface.js";
+import type { HyperliquidTestAdapter, LighterTestAdapter, PacificaTestAdapter } from "../helpers/internals.js";
 
 afterEach(() => vi.useRealTimers());
 
@@ -64,7 +65,7 @@ describe("pacificaOrderOutcomeOf (history_by_id rows)", () => {
 });
 
 function pacAdapter(history: () => Promise<unknown>) {
-  const a = Object.create(PacificaAdapter.prototype) as PacificaAdapter & Record<string, unknown>;
+  const a = Object.create(PacificaAdapter.prototype) as PacificaTestAdapter;
   const client = {
     createLimitOrder: vi.fn().mockResolvedValue(PAC_ACK),
     createStopOrder: vi.fn().mockResolvedValue({ success: true, data: { order_id: 77 } }),
@@ -167,7 +168,7 @@ describe("Lighter modify outcome (event_info `no`)", () => {
 });
 
 function ltAdapter() {
-  const a = Object.create(LighterAdapter.prototype) as LighterAdapter & Record<string, unknown>;
+  const a = Object.create(LighterAdapter.prototype) as LighterTestAdapter;
   a.name = "lighter";
   a._testnet = false;
   a._apiKeyIndex = 6;
@@ -263,7 +264,7 @@ const HL_STOP_ROW = {
 };
 
 function hlAdapter(info: (body: Record<string, unknown>) => unknown) {
-  const a = Object.create(HyperliquidAdapter.prototype) as HyperliquidAdapter & Record<string, unknown>;
+  const a = Object.create(HyperliquidAdapter.prototype) as HyperliquidTestAdapter;
   a._address = "0xabc";
   a._dex = "";
   a._assetMap = new Map([["SOL-PERP", 5]]);

@@ -393,7 +393,7 @@ describe("AsterAdapter.withdraw", () => {
 
   it("a userSignature that does not recover to the user → SIGNATURE_FAILED before the withdraw request", async () => {
     const v = venue();
-    const forged = { ...masterSigner(), signTypedData: (d: never, t: never, m: never) => new Wallet(`0x${"43".repeat(32)}`).signTypedData(d, t, m) };
+    const forged = { ...masterSigner(), signTypedData: masterSigner(new Wallet(`0x${"43".repeat(32)}`)).signTypedData };
     await expect((await adapter({ master: forged })).withdraw("10", DEPOSITOR)).rejects.toMatchObject({ structured: { code: "SIGNATURE_FAILED" } });
     expect(v.withdrawCalls()).toHaveLength(0);
   });

@@ -42,8 +42,8 @@ const liveBtcBinaryMeta: MockOutcomeMeta = {
 };
 
 function makeAdapter(opts?: { meta?: MockOutcomeMeta; allMids?: Record<string, string>; bookFor?: (coin: string) => unknown; }) {
-  const hlStub = { isTestnet: false } as unknown as Parameters<typeof HyperliquidOutcomeAdapter.prototype.constructor>[0];
-  const adapter = new HyperliquidOutcomeAdapter(hlStub as any);
+  const hlStub = { isTestnet: false } as unknown as ConstructorParameters<typeof HyperliquidOutcomeAdapter>[0];
+  const adapter = new HyperliquidOutcomeAdapter(hlStub);
 
   const meta = opts?.meta ?? liveBtcBinaryMeta;
   const allMids = opts?.allMids ?? {

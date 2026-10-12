@@ -14,6 +14,14 @@ import { PacificaAdapter, pacificaClientOrderId } from "../../exchanges/pacifica
 
 const GTC_CLOID = pacificaClientOrderId("GTC");
 
+/** Writable view of the PacificaAdapter members this fixture sets on a prototype-only instance. */
+type PacificaInternals = {
+  client: PacificaAdapter["client"];
+  account: PacificaAdapter["account"];
+  signMessage: PacificaAdapter["signMessage"];
+  ensureSigner: PacificaAdapter["ensureSigner"];
+};
+
 function adapterWith(opts: {
   original?: Record<string, unknown>;
   filledAtCancel?: string;
@@ -37,11 +45,12 @@ function adapterWith(opts: {
     }))),
     createLimitOrder: vi.fn(opts.createLimitOrder ?? (async () => ({ success: true, data: { order_id: 43 } }))),
   };
-  const a = Object.create(PacificaAdapter.prototype) as PacificaAdapter & Record<string, unknown>;
-  a.client = client;
-  a.account = "acct";
-  a.signMessage = vi.fn();
-  a.ensureSigner = vi.fn();
+  const a = Object.create(PacificaAdapter.prototype) as PacificaAdapter;
+  const ai = a as unknown as PacificaInternals;
+  ai.client = client as unknown as PacificaInternals["client"];
+  ai.account = "acct";
+  ai.signMessage = vi.fn();
+  ai.ensureSigner = vi.fn();
   a.getMarkets = vi.fn().mockResolvedValue([{ symbol: "BTC", stepSize: opts.lot ?? "0.01", sizeDecimals: 2 }]);
   return { a, client };
 }

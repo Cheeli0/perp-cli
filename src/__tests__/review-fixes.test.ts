@@ -78,7 +78,7 @@ describe("L2 — approve --rotate refuses a name registered on another network",
     await expect(approveVenueAgent({
       venue, network: "testnet", master: "main", agentName: "shared", expiresIn: "90d",
       canPerp: true, canSpot: false, canWithdraw: false, rotate: true, passphrase: "pp",
-      apiKeyIndex: null, accountIndex: 0, aster: {}, ondoKey: { keyId: "kTest", secret: "s" },
+      apiKeyIndex: null, accountIndex: 0, forceSlot: false, aster: {}, ondoKey: { keyId: "kTest", secret: "s" },
     })).rejects.toMatchObject({ structured: { code: "INVALID_PARAMS" } });
     expect(store.getVenueAgent(venue, "shared")).toMatchObject({ network: "mainnet" });
   });

@@ -37,12 +37,22 @@ const LT_UNIFIED_ACCOUNT = {
 // sendTx refusal of the s-transfer-in self-transfer (report 2026-10-02T07-12-51-759Z-lighter-rh-testnet).
 const LT_UNIFIED_TRANSFER_MSG = "invalid ToAccount: . You can't transfer from the same account to itself in unified mode with a universal asset";
 
+/** Writable view of the LighterAdapter members these fixtures set on prototype-only instances. */
+type LighterInternals = {
+  name: LighterAdapter["name"];
+  _address: LighterAdapter["_address"];
+  _tradingMode: LighterAdapter["_tradingMode"];
+  _baseUrl: LighterAdapter["_baseUrl"];
+  fetchAccount: LighterAdapter["fetchAccount"];
+};
+
 function ltAccount(acct: Record<string, unknown> | null | Error, address = "0xabf20312dB7A6e807765ee7522E7d8c8DBB637D3") {
-  const a = Object.create(LighterAdapter.prototype) as LighterAdapter & Record<string, unknown>;
-  a.name = "lighter-rh";
-  a._address = address;
-  a._tradingMode = null;
-  a.fetchAccount = vi.fn(async () => { if (acct instanceof Error) throw acct; return acct; });
+  const a = Object.create(LighterAdapter.prototype) as LighterAdapter;
+  const ai = a as unknown as LighterInternals;
+  ai.name = "lighter-rh";
+  ai._address = address;
+  ai._tradingMode = null;
+  ai.fetchAccount = vi.fn(async () => { if (acct instanceof Error) throw acct; return acct; });
   return a;
 }
 
@@ -139,9 +149,10 @@ describe("Lighter sendTx explicit rejection → definite (was UNKNOWN)", () => {
   });
 
   it("perp adapter sendTx (withdraw / leverage path) throws ACTION_REJECTED", async () => {
-    const a = Object.create(LighterAdapter.prototype) as LighterAdapter & Record<string, unknown>;
-    a.name = "lighter-rh";
-    a._baseUrl = "https://api.rh-testnet.lighter.xyz";
+    const a = Object.create(LighterAdapter.prototype) as LighterAdapter;
+    const ai = a as unknown as LighterInternals;
+    ai.name = "lighter-rh";
+    ai._baseUrl = "https://api.rh-testnet.lighter.xyz";
     a.rhRate = vi.fn(async () => {});
     respond(refusal);
     const send = (a as unknown as { sendTx: (s: unknown, k: "order" | "action") => Promise<unknown> }).sendTx.bind(a);
@@ -150,9 +161,10 @@ describe("Lighter sendTx explicit rejection → definite (was UNKNOWN)", () => {
   });
 
   it("spot adapter self-transfer sendTx throws ACTION_REJECTED", async () => {
-    const lt = Object.create(LighterAdapter.prototype) as LighterAdapter & Record<string, unknown>;
-    lt.name = "lighter-rh";
-    lt._baseUrl = "https://api.rh-testnet.lighter.xyz";
+    const lt = Object.create(LighterAdapter.prototype) as LighterAdapter;
+    const lti = lt as unknown as LighterInternals;
+    lti.name = "lighter-rh";
+    lti._baseUrl = "https://api.rh-testnet.lighter.xyz";
     lt.rhRate = vi.fn(async () => {});
     const spot = new LighterSpotAdapter(lt);
     respond(refusal);

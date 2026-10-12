@@ -48,7 +48,7 @@ describe("mintTestUsdc — simulate before send", () => {
   function conn(simErr: unknown) {
     return {
       getLatestBlockhash: vi.fn(async () => ({ blockhash: "11111111111111111111111111111111", lastValidBlockHeight: 1 })),
-      simulateTransaction: vi.fn(async () => ({ value: { err: simErr, logs: ["Program log: x"] } })),
+      simulateTransaction: vi.fn(async (_tx: unknown) => ({ value: { err: simErr, logs: ["Program log: x"] } })),
       sendRawTransaction: vi.fn(async () => "sig123"),
       confirmTransaction: vi.fn(async () => ({ value: { err: null } })),
     };

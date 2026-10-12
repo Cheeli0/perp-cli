@@ -21,6 +21,7 @@ import { cancelIncompleteError } from "../commands/trade.js";
 import { PerpError } from "../errors.js";
 import type { ExchangeAdapter } from "../exchanges/interface.js";
 import { planSpotFunding } from "../../scripts/e2e/lib.js";
+import type { LighterTestAdapter, PacificaTestAdapter } from "./helpers/internals.js";
 
 afterEach(() => vi.useRealTimers());
 
@@ -50,7 +51,7 @@ const LT_COI = 179092073039759;
 const LT_ACK = { code: 200, message: "{\"ratelimit\": \"Ratelimit is off\"}", tx_hash: "014328927b29aa2ad700f3c5729997e930f3bc70d0af879879c71cbb4619dc88cf233a9e30c7f830", predicted_execution_time_ms: 1790920730744 };
 
 function ltAdapter(rows: (idx: number[]) => Promise<Array<Record<string, unknown>>>, tx: () => Promise<unknown> = async () => ({ hash: LT_ACK.tx_hash, status: 2, executed_at: 1, event_info: "{\"ae\":\"\"}" })) {
-  const a = Object.create(LighterAdapter.prototype) as LighterAdapter & Record<string, unknown>;
+  const a = Object.create(LighterAdapter.prototype) as LighterTestAdapter;
   a.name = "lighter";
   a._testnet = false;
   a._apiKeyIndex = 6;
@@ -146,7 +147,7 @@ const PAC_FILLED_ROWS = [
 const PAC_404 = new Error("GET /orders/history_by_id failed (404): {\"success\":false,\"data\":null,\"error\":\"Order history not found for order ID: 999999999\",\"code\":404,\"error_id\":\"unspecified\"}");
 
 function pacAdapter(cancel: () => Promise<unknown>, history: () => Promise<unknown>) {
-  const a = Object.create(PacificaAdapter.prototype) as PacificaAdapter & Record<string, unknown>;
+  const a = Object.create(PacificaAdapter.prototype) as PacificaTestAdapter;
   const client = { cancelOrder: vi.fn(cancel), getOrderHistoryById: vi.fn(history) };
   Object.defineProperty(a, "name", { value: "pacifica" });
   a.client = client;

@@ -10,6 +10,7 @@ import {
 import { LighterSpotAdapter } from "../../exchanges/lighter-spot.js";
 import { lighterFamilyNetworks } from "../../exchanges/venues/lighter-family.js";
 import { PerpError } from "../../errors.js";
+import type { LighterTestAdapter } from "../helpers/internals.js";
 
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
 
@@ -56,7 +57,7 @@ describe("H4: no hardcoded spot decimals", () => {
 
 describe("M6: leverage / withdraw are polled to executed, not reported on the sendTx ack", () => {
   function adapter(tx: unknown) {
-    const a = Object.create(LighterAdapter.prototype) as LighterAdapter & Record<string, unknown>;
+    const a = Object.create(LighterAdapter.prototype) as LighterTestAdapter;
     a.name = "lighter"; a.venueId = "lighter"; a._testnet = false;
     a._network = lighterFamilyNetworks("lighter").mainnet;
     a._apiKeyIndex = 4; a._accountIndex = 42;
@@ -102,7 +103,7 @@ describe("order rows: client order index + market + created-after-send", () => {
   const NOW = 1_800_000_000_000;
   const row = (over: Record<string, unknown> = {}) => ({ client_order_index: 5, order_id: "77", market_index: 1, status: "open", filled_base_amount: "0.0", created_at: NOW / 1000, ...over });
   function adapter(rows: unknown[]) {
-    const a = Object.create(LighterAdapter.prototype) as LighterAdapter & Record<string, unknown>;
+    const a = Object.create(LighterAdapter.prototype) as LighterTestAdapter;
     a.name = "lighter";
     a.getOrdersByClientIndex = vi.fn().mockResolvedValue(rows);
     return a;
@@ -138,7 +139,7 @@ describe("order rows: client order index + market + created-after-send", () => {
 
 describe("getOpenOrders: an order on a market without a positions[] entry is still listed", () => {
   it("one accountActiveOrders read for every perp market (no market_id), symbol from market_index", async () => {
-    const a = Object.create(LighterAdapter.prototype) as LighterAdapter & Record<string, unknown>;
+    const a = Object.create(LighterAdapter.prototype) as LighterTestAdapter;
     a.name = "lighter"; a._address = "0xabc"; a._accountIndex = 42; a._readOnly = false;
     a._marketMap = new Map([["BTC", 1], ["ETH", 2], ["SOL", 3]]);
     a.ensureMarketMap = vi.fn();

@@ -286,7 +286,7 @@ describe("setup copy", () => {
 describe("interactive setup (scripted prompter)", () => {
   function scripted(answers: string[], hidden: string[]) {
     return {
-      ask: vi.fn(async () => {
+      ask: vi.fn(async (_question: string) => {
         if (answers.length === 0) throw new Error("unexpected prompt");
         return answers.shift() as string;
       }),

@@ -31,7 +31,7 @@ function asterLike(limitResult: unknown, marketResult: unknown): ExchangeAdapter
 
 const resting = { orderId: 1, status: "NEW", type: "LIMIT", timeInForce: "GTC", executedQty: "0" };
 const marketFilled = { orderId: 2, status: "FILLED", type: "MARKET", timeInForce: "GTC", executedQty: "0.05" };
-const limit = (side: "buy" | "sell", price: string): StrategyAction => ({ type: "place_order", side, price, size: "0.05", orderType: "limit" });
+const limit = (side: "buy" | "sell", price: string): Extract<StrategyAction, { type: "place_order" }> => ({ type: "place_order", side, price, size: "0.05", orderType: "limit" });
 const market: StrategyAction = { type: "place_order", side: "buy", price: "0", size: "0.05", orderType: "market" };
 
 describe("executeActions fill counting", () => {

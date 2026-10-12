@@ -38,6 +38,9 @@ jobs:
       - name: Type check (tsc strict)
         run: pnpm run build
 
+      - name: Type check tests (tsconfig.test.json)
+        run: pnpm run typecheck:test
+
       - name: SKILL.md version sync check
         # Fails the PR if package.json bumped without re-running
         # scripts/sync-skill-version.mjs. Catches drift between the npm

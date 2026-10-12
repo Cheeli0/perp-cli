@@ -12,6 +12,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { LighterAdapter } from "../exchanges/lighter.js";
 import { ACCOUNT_ORDERS_FILL_SOURCE, LighterSpotAdapter } from "../exchanges/lighter-spot.js";
 import { TX_EVENT_FILL_SOURCE, type SpotOrderResult } from "../exchanges/spot-interface.js";
+import type { LighterSpotTestAdapter, LighterTestAdapter } from "./helpers/internals.js";
 
 afterEach(() => { vi.restoreAllMocks(); });
 
@@ -29,7 +30,7 @@ const COI = LIVE_LIMIT_ROW.client_order_index;
 const executedTx = (eventInfo: Record<string, unknown>) => ({ hash: "h", status: 2, executed_at: 1, event_info: JSON.stringify(eventInfo) });
 
 function build(opts: { rows: Array<Record<string, unknown>>; tx?: Record<string, unknown> | Error; active?: Array<Record<string, unknown>>; inactive?: Array<Record<string, unknown>> }) {
-  const lt = Object.create(LighterAdapter.prototype) as LighterAdapter & Record<string, unknown>;
+  const lt = Object.create(LighterAdapter.prototype) as LighterTestAdapter;
   lt.name = "lighter";
   lt._testnet = false;
   lt._accountIndex = 537;
@@ -41,7 +42,7 @@ function build(opts: { rows: Array<Record<string, unknown>>; tx?: Record<string,
   // Short poll windows: one /tx read.
   lt.txPollAttempts = () => 1;
 
-  const spot = new LighterSpotAdapter(lt) as LighterSpotAdapter & Record<string, unknown>;
+  const spot = new LighterSpotAdapter(lt as unknown as LighterAdapter) as unknown as LighterSpotTestAdapter;
   spot._initialized = true;
   (spot._spotMarketMap as Map<string, number>).set("ETH/USDC", 4098);
   (spot._spotBaseMap as Map<string, string>).set("ETH", "ETH/USDC");
@@ -157,7 +158,7 @@ describe("Lighter spot cancel → venue-final (was pending)", () => {
 });
 
 describe("Lighter spot market IOC: accountOrders row settles a non-'filled' event", () => {
-  const prep = (spot: LighterSpotAdapter & Record<string, unknown>) => {
+  const prep = (spot: LighterSpotTestAdapter) => {
     spot._prepareMarketOrder = vi.fn(async () => ({
       resolved: "ETH/USDC", marketId: 4098, baseAmount: 50, priceTicks: 272700, dec: { size: 4, price: 2 },
       protection: { referencePrice: "2700", protectionPrice: "2727", appliedBps: 100 },

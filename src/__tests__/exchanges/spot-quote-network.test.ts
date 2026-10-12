@@ -28,7 +28,7 @@ describe("network-keyed spot quote", () => {
   it("every Lighter-family spot quote is that network's collateral", () => {
     for (const def of listVenues().filter(v => v.family === "lighter" && v.spot !== null)) {
       for (const net of ["mainnet", "testnet"] as const) {
-        expect(defaultSpotQuote(def, net)).toBe(def.networks[net].collateral[0]);
+        expect(defaultSpotQuote(def, net)).toBe(def.networks[net]!.collateral[0]);
       }
     }
   });

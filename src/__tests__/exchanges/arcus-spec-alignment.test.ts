@@ -272,8 +272,8 @@ describe("Arcus getOrderStatus finality (status read path)", () => {
 
 describe("Arcus getMarketSettings (GET /v1/leverages)", () => {
   it("one row per market: effective leverage + margin mode, symbol from the market id", async () => {
-    const a = adapter() as ArcusAdapter & Record<string, unknown>;
-    a.symbolOf = vi.fn(async (id: number) => (id === 7 ? "TSLA" : "BTC"));
+    const a = adapter();
+    (a as unknown as { symbolOf: ArcusAdapter["symbolOf"] }).symbolOf = vi.fn(async (id: number) => (id === 7 ? "TSLA" : "BTC"));
     fetchMock.mockResolvedValueOnce(reply(200, { address: OWNER, accountIndex: 0, leverages: [
       { marketId: 1, marketDisplayName: "BTC-USD", leverage: 10, isolated: false, marginMode: "CROSS" },
       { marketId: 7, marketDisplayName: "TSLA-USD", leverage: 3, isolated: true, marginMode: "ISOLATED" },
@@ -287,8 +287,8 @@ describe("Arcus getMarketSettings (GET /v1/leverages)", () => {
   });
 
   it("an entry without a readable leverage / margin mode throws", async () => {
-    const a = adapter() as ArcusAdapter & Record<string, unknown>;
-    a.symbolOf = vi.fn(async () => "BTC");
+    const a = adapter();
+    (a as unknown as { symbolOf: ArcusAdapter["symbolOf"] }).symbolOf = vi.fn(async () => "BTC");
     fetchMock.mockResolvedValueOnce(reply(200, { leverages: [{ marketId: 1, marginMode: "CROSS" }] }));
     await expect((a as unknown as { getMarketSettings(): Promise<unknown> }).getMarketSettings()).rejects.toMatchObject({ structured: { code: "EXCHANGE_ERROR" } });
   });

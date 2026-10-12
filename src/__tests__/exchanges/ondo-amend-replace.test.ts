@@ -17,6 +17,15 @@ const N_CLOID = `pcli-n-${"a".repeat(32)}`;
 const P_CLOID = `pcli-p-${"b".repeat(32)}`;
 const PAIR = { market: "TSLA-USD.P", baseIncrement: "0.01", quoteIncrement: "0.05" };
 
+/** Writable view of the OndoAdapter members this fixture sets on a prototype-only instance. */
+type OndoInternals = {
+  venue: OndoAdapter["venue"];
+  caps: OndoAdapter["caps"];
+  network: OndoAdapter["network"];
+  client: OndoAdapter["client"];
+  pairOf: OndoAdapter["pairOf"];
+};
+
 function order(over: Record<string, unknown> = {}) {
   return {
     orderId: "o1", market: PAIR.market, side: "buy", type: "limit", status: "open", price: "100", size: "1",
@@ -32,12 +41,13 @@ function adapterWith(opts: { original?: Record<string, unknown>; cancelled?: Rec
     post: vi.fn(opts.post ?? (async (_p: string, body: Record<string, unknown>) => order({ orderId: "o2", size: body.size, price: body.price, clientOrderId: body.clientOrderId }))),
   };
   const def = getVenue("ondo");
-  const a = Object.create(OndoAdapter.prototype) as OndoAdapter & Record<string, unknown>;
-  a.venue = def;
-  a.caps = requireCapabilities(def);
-  a.network = "mainnet";
-  a.client = client;
-  a.pairOf = vi.fn().mockResolvedValue(PAIR);
+  const a = Object.create(OndoAdapter.prototype) as OndoAdapter;
+  const ai = a as unknown as OndoInternals;
+  ai.venue = def;
+  ai.caps = requireCapabilities(def);
+  ai.network = "mainnet";
+  ai.client = client as unknown as OndoInternals["client"];
+  ai.pairOf = vi.fn().mockResolvedValue(PAIR);
   return { a, client };
 }
 

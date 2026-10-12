@@ -12,22 +12,24 @@ import "../../exchanges/venues/index.js";
 import { PacificaAdapter, requirePacificaClientOrderId, pacificaClientOrderId } from "../../exchanges/pacifica.js";
 import { toTradingV2 } from "../../exchanges/legacy-trading-v2.js";
 import { OndoAdapter } from "../../exchanges/ondo/adapter.js";
+import type { OndoQuery } from "../../exchanges/ondo/client.js";
 import { getVenue, requireCapabilities } from "../../exchanges/venue.js";
 import { validateOrderRequest } from "../../exchanges/trading-v2.js";
 import type { OrderRequest } from "../../exchanges/venue-types.js";
 import { klinesNeedAuth } from "../../exchanges/capabilities.js";
 import type { ExchangeAdapter } from "../../exchanges/interface.js";
+import type { OndoTestAdapter, PacificaTestAdapter } from "../helpers/internals.js";
 
 const UUID = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
 
-function pacifica(client: Record<string, unknown>) {
-  const a = Object.create(PacificaAdapter.prototype) as PacificaAdapter & Record<string, unknown>;
+function pacifica(client: PacificaTestAdapter["client"]) {
+  const a = Object.create(PacificaAdapter.prototype) as PacificaTestAdapter;
   a.ensureSigner = vi.fn();
   a.client = client;
   a.account = "acct";
   a.signMessage = vi.fn();
   a._hasRealKey = true;
-  a.builderCode = vi.fn(async () => undefined);
+  a.builderCode = vi.fn(async () => null);
   a.withOrderOutcome = vi.fn(async (raw: unknown) => raw);
   return a;
 }
@@ -126,7 +128,7 @@ describe("Ondo reduce-only limit orders must be IOC", () => {
   });
 
   it("the adapter refuses before sending (legacy limitOrder shim, default GTC)", async () => {
-    const a = Object.create(OndoAdapter.prototype) as OndoAdapter & Record<string, unknown>;
+    const a = Object.create(OndoAdapter.prototype) as OndoTestAdapter;
     const post = vi.fn();
     a.venue = def; a.caps = caps; a.network = "mainnet"; a.client = { post };
     await expect(a.limitOrder("ETH", "sell", "2850", "0.005", { reduceOnly: true }))
@@ -147,9 +149,9 @@ describe("Ondo cancel-all and klines", () => {
     const row = (orderId: string, type: string, status: string) => ({ orderId, market: "ETH-USD.P", type, status, side: "sell", price: "0", size: "0.005", filledSize: "0", filledCost: "0" });
     const open = [row("o1", "limit", "open")];
     const stops = [row("s1", "stopMarket", "untriggered"), row("t1", "takeProfitMarket", "untriggered")];
-    const getPage = vi.fn(async (_p: string, q: { status: string }) => ({ result: q.status === "open" ? open : stops, nextCursor: null }));
-    const del = vi.fn(async (_p: string, q: { orderIDs: string }) => ({ successfulCancels: q.orderIDs.split(",").map(orderId => ({ orderId })), failedCancels: null }));
-    const a = Object.create(OndoAdapter.prototype) as OndoAdapter & Record<string, unknown>;
+    const getPage = vi.fn(async (_p: string, q: OndoQuery | null) => ({ result: q?.status === "open" ? open : stops, nextCursor: null }));
+    const del = vi.fn(async (_p: string, q: OndoQuery | null) => ({ successfulCancels: String(q?.orderIDs).split(",").map(orderId => ({ orderId })), failedCancels: null }));
+    const a = Object.create(OndoAdapter.prototype) as OndoTestAdapter;
     a.venue = def; a.caps = requireCapabilities(def); a.network = "mainnet"; a.client = { getPage, delete: del };
     const r = await a.cancelAllV2(null);
     expect(del).toHaveBeenCalledWith("/v1/perps/orders/batch", { orderIDs: "o1,s1,t1" });

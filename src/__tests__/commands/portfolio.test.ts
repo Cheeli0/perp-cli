@@ -119,9 +119,10 @@ function makeProgram(adapterFactory?: (exchange: string) => Promise<unknown>) {
     address: "0xDefaultAddr",
   });
 
+  const factory: (exchange: string) => Promise<unknown> = adapterFactory ?? defaultFactory;
   registerPortfolioCommand(
     prog,
-    adapterFactory ?? defaultFactory as never,
+    factory as Parameters<typeof registerPortfolioCommand>[1],
     () => prog.opts().json === true,
     "1.0.0-test",
   );

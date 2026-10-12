@@ -72,6 +72,7 @@ const { registerWalletAgentCommands } = await import("../../commands/agent.js");
 const { getAgent, setAgent, deleteAgent } = await import("../../agent-wallet/store.js");
 const { loadSettings, saveSettings } = await import("../../settings.js");
 import { HyperliquidAdapter } from "../../exchanges/hyperliquid.js";
+import type { PerpError } from "../../errors.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -738,7 +739,7 @@ describe("HyperliquidAdapter: an expired agent never falls through to the master
     expect(adapter.activeSignerTier).toBeNull();
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
-    const err = await adapter.exchangeAction({ type: "cancel", cancels: [{ a: 0, o: 1 }] }).catch(e => e);
+    const err = await adapter.exchangeAction({ type: "cancel", cancels: [{ a: 0, o: 1 }] }).catch((e: unknown) => e) as PerpError;
     expect(err.structured.code).toBe("AGENT_EXPIRED");
     expect(err.structured.remediation).toContain("perp wallet agent approve hyperliquid");
     expect(fetchMock).not.toHaveBeenCalled();

@@ -23,7 +23,7 @@ const params = { symbol: "BTC", amount: "0.1", side: "bid" as const, slippage_pe
 describe("PacificaClient — agent_wallet attachment (agent-mode signing)", () => {
   it("omits agent_wallet for a master/PK signer (account self-signs)", async () => {
     const { client, post, signMessage } = build();
-    await client.createMarketOrder(params, "MasterPubkey", signMessage);
+    await client.createMarketOrder(params, "MasterPubkey", signMessage, null);
     const body = post.mock.calls[0][1] as Record<string, unknown>;
     expect(body.account).toBe("MasterPubkey");
     expect(body.agent_wallet).toBeUndefined();
@@ -32,7 +32,7 @@ describe("PacificaClient — agent_wallet attachment (agent-mode signing)", () =
   it("attaches agent_wallet (account stays master) once an agent wallet is set", async () => {
     const { client, post, signMessage } = build();
     client.setRequestAgentWallet("AgentPubkey");
-    await client.createMarketOrder(params, "MasterPubkey", signMessage);
+    await client.createMarketOrder(params, "MasterPubkey", signMessage, null);
     const body = post.mock.calls[0][1] as Record<string, unknown>;
     expect(body.account).toBe("MasterPubkey");
     expect(body.agent_wallet).toBe("AgentPubkey");
@@ -42,7 +42,7 @@ describe("PacificaClient — agent_wallet attachment (agent-mode signing)", () =
     const { client, post, signMessage } = build();
     client.setRequestAgentWallet("AgentPubkey");
     client.setRequestAgentWallet(undefined);
-    await client.createMarketOrder(params, "MasterPubkey", signMessage);
+    await client.createMarketOrder(params, "MasterPubkey", signMessage, null);
     const body = post.mock.calls[0][1] as Record<string, unknown>;
     expect(body.agent_wallet).toBeUndefined();
   });

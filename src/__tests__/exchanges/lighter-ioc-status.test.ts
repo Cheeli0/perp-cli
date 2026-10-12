@@ -12,6 +12,7 @@ import { placeAndConfirm } from "../../exchanges/trading-v2.js";
 import { getVenue, requireCapabilities } from "../../exchanges/venue.js";
 import { LighterAdapter } from "../../exchanges/lighter.js";
 import type { ExchangeAdapter } from "../../exchanges/interface.js";
+import type { LighterTestAdapter } from "../helpers/internals.js";
 
 afterEach(() => vi.useRealTimers());
 
@@ -41,7 +42,7 @@ const COI = 179092261145328;
 const SEND_ACK = { code: 200, message: "{\"ratelimit\": \"Ratelimit is off\"}", tx_hash: "c8812dd210321edc1b3dca64cf60733c9ff89b7eee090f2247a7de5276f50e5b036fa61c5a21d72e", predicted_execution_time_ms: 1790922611798 };
 
 function ltAdapter(rows: unknown[]) {
-  const a = Object.create(LighterAdapter.prototype) as LighterAdapter & Record<string, unknown>;
+  const a = Object.create(LighterAdapter.prototype) as LighterTestAdapter;
   a.name = "lighter";
   a._testnet = true;
   a._accountIndex = 537;

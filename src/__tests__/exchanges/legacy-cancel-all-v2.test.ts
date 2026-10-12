@@ -13,7 +13,7 @@ import type { ExchangeAdapter, ExchangeOrder } from "../../exchanges/interface.j
 const HL_CANCEL_OK = { status: "ok", response: { type: "cancel", data: { statuses: ["success"] } } };
 
 function ord(orderId: string, symbol = "BTC"): ExchangeOrder {
-  return { orderId, symbol, side: "buy", price: "1", size: "1", filled: "0", status: "open", type: "limit" };
+  return { orderId, symbol, side: "buy", price: "1", size: "1", filled: "0", status: "open", type: "limit", triggerPrice: null };
 }
 
 /** HL-family mock: `lists` are the successive getOpenOrders() results. */

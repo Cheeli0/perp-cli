@@ -86,7 +86,9 @@ const AGENT: AgentMeta = {
   agentName: "default", agentWalletName: "lt-agent", agentEvmAddress: "0x00000000000000000000000000000000000000aa",
   userEvmAddress: "0x00000000000000000000000000000000000000bb", apiKeyIndex: 4, accountIndex: ACCOUNT_INDEX,
   expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
-} as AgentMeta;
+  masterWalletName: "main", owsApiKeyId: "ows_key_test", owsPolicyId: "policy-test", approvedAt: new Date().toISOString(),
+  permissions: { canPerpTrade: true, canSpotTrade: false, canWithdraw: false }, asterApprovalNonce: "0",
+};
 
 /** A fresh adapter per invocation, built the way venues/create-helpers.ts createLighterFamily builds an agent adapter. */
 async function agentAdapter(venue: LighterVenueId): Promise<LighterAdapter> {

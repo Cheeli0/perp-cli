@@ -282,7 +282,7 @@ describe.skipIf(SKIP)("Atomic Commands — Hyperliquid Mainnet", { timeout: 3000
 
         // All parseable
         expect(isNaN(parseFloat(m.markPrice))).toBe(false);
-        expect(isNaN(parseFloat(m.fundingRate))).toBe(false);
+        expect(isNaN(parseFloat(m.fundingRate ?? ""))).toBe(false);
       }
     });
 

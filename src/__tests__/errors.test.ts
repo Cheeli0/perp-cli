@@ -337,7 +337,7 @@ describe("withJsonErrors — PerpError end-to-end (C2)", () => {
     });
 
     expect(logSpy).not.toHaveBeenCalled();
-    const all = errSpy.mock.calls.map(c => String(c[0])).join("\n");
+    const all = errSpy.mock.calls.map((c: unknown[]) => String(c[0])).join("\n");
     expect(all).toContain("Agent expired");
     expect(all).toContain("Remediation: perp wallet agent approve aster --rotate");
   });

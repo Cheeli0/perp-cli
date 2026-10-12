@@ -558,6 +558,17 @@ describe("Aster builder + feeRate", () => {
 
 const PAIR = { market: "TSLA-USD.P", baseIncrement: "0.01", quoteIncrement: "0.05" };
 
+/** Writable view of the OndoAdapter members this fixture sets on a prototype-only instance. */
+type OndoA = InstanceType<typeof OndoAdapter>;
+type OndoInternals = {
+  venue: OndoA["venue"];
+  caps: OndoA["caps"];
+  network: OndoA["network"];
+  client: OndoA["client"];
+  pairOf: OndoA["pairOf"];
+  markPriceOf: OndoA["markPriceOf"];
+};
+
 function ondo() {
   const posts: Array<[string, Record<string, unknown>]> = [];
   const client = {
@@ -569,13 +580,14 @@ function ondo() {
     getPage: vi.fn(async () => ({ result: [{ orderId: "s1", market: PAIR.market, side: "sell", type: "stopMarket", status: "untriggered", size: "1", filledSize: "0", filledCost: "0", reduceOnly: true, closePosition: true, stopOrderType: "stopLoss", triggerPrice: "90" }] })),
   };
   const def = getVenue("ondo");
-  const a = Object.create(OndoAdapter.prototype) as InstanceType<typeof OndoAdapter> & Record<string, unknown>;
-  a.venue = def;
-  a.caps = requireCapabilities(def);
-  a.network = "mainnet";
-  a.client = client;
-  a.pairOf = vi.fn().mockResolvedValue(PAIR);
-  a.markPriceOf = vi.fn().mockResolvedValue("100");
+  const a = Object.create(OndoAdapter.prototype) as InstanceType<typeof OndoAdapter>;
+  const ai = a as unknown as OndoInternals;
+  ai.venue = def;
+  ai.caps = requireCapabilities(def);
+  ai.network = "mainnet";
+  ai.client = client as unknown as OndoInternals["client"];
+  ai.pairOf = vi.fn().mockResolvedValue(PAIR);
+  ai.markPriceOf = vi.fn().mockResolvedValue("100");
   return { a, posts };
 }
 

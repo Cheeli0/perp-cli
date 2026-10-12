@@ -81,20 +81,8 @@ function makePosition(overrides: Partial<ArbPositionState> = {}): ArbPositionSta
   };
 }
 
-// The FundingSnapshot type is not exported from arb-auto, so we recreate it locally for tests.
-interface FundingSnapshot {
-  symbol: string;
-  pacRate: number;
-  hlRate: number;
-  ltRate: number;
-  spread: number;
-  longExch: string;
-  shortExch: string;
-  markPrice: number;
-  pacMarkPrice: number;
-  hlMarkPrice: number;
-  ltMarkPrice: number;
-}
+// The FundingSnapshot type is not exported from arb-auto, so derive it from isSpreadReversed.
+type FundingSnapshot = Parameters<typeof isSpreadReversed>[2];
 
 // ─────────────────────────────────────────────────────────
 // Flow 1: Spread scan → opportunity evaluation → entry decision
@@ -313,6 +301,7 @@ describe("Flow 2: 데몬 라이프사이클 — 진입 → 펀딩 축적 → 스
       shortExch: "pacifica",
       markPrice: 100000,
       pacMarkPrice: 0, hlMarkPrice: 0, ltMarkPrice: 0,
+      astRate: 0, astMarkPrice: 0, astHours: null,
     };
     const reversed = isSpreadReversed("hyperliquid", "pacifica", snapshot);
     expect(reversed).toBe(false);
@@ -383,6 +372,7 @@ describe("Flow 3: 리버설 발생 → 긴급 청산", () => {
       shortExch: "pacifica",
       markPrice: 3200,
       pacMarkPrice: 0, hlMarkPrice: 0, ltMarkPrice: 0,
+      astRate: 0, astMarkPrice: 0, astHours: null,
     };
     const reversed = isSpreadReversed("hyperliquid", "pacifica", snapshot);
     expect(reversed).toBe(true);
@@ -399,6 +389,7 @@ describe("Flow 3: 리버설 발생 → 긴급 청산", () => {
       shortExch: "pacifica",
       markPrice: 3200,
       pacMarkPrice: 0, hlMarkPrice: 0, ltMarkPrice: 0,
+      astRate: 0, astMarkPrice: 0, astHours: null,
     };
     const reversed = isSpreadReversed("hyperliquid", "pacifica", snapshot);
     expect(reversed).toBe(false);
@@ -427,6 +418,7 @@ describe("Flow 3: 리버설 발생 → 긴급 청산", () => {
       shortExch: "pacifica",
       markPrice: 2.5,
       pacMarkPrice: 0, hlMarkPrice: 0, ltMarkPrice: 0,
+      astRate: 0, astMarkPrice: 0, astHours: null,
     };
     expect(isSpreadReversed("hyperliquid", "pacifica", snapshot)).toBe(true);
 
@@ -1054,6 +1046,7 @@ describe("Cross-cutting: edge cases and combined scenarios", () => {
       shortExch: "pacifica",
       markPrice: 150,
       pacMarkPrice: 0, hlMarkPrice: 0, ltMarkPrice: 0,
+      astRate: 0, astMarkPrice: 0, astHours: null,
     };
     // Long LT hourly = 0.0004/8 = 0.00005, short PAC hourly = 0.00001 → reversed
     expect(isSpreadReversed("lighter", "pacifica", snapshot)).toBe(true);

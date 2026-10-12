@@ -133,7 +133,13 @@ describe("LighterAdapter._resolveSigner / activeSignerTier — 3-tier priority",
       expiresAt,
       apiKeyIndex: 5,
       accountIndex: 42,
-    } as AgentMeta;
+      masterWalletName: "main",
+      owsApiKeyId: "ows_key_test",
+      owsPolicyId: "policy-test",
+      approvedAt: new Date().toISOString(),
+      permissions: { canPerpTrade: true, canSpotTrade: false, canWithdraw: false },
+      asterApprovalNonce: "0",
+    };
   }
   type ResolveSigner = () => { tier: "agent" | "master" | "pk" };
   const resolveSigner = (a: LighterAdapter): ResolveSigner =>

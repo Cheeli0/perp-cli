@@ -11,6 +11,7 @@ import "../../exchanges/venues/index.js";
 import { toTradingV2 } from "../../exchanges/legacy-trading-v2.js";
 import { LighterAdapter, lighterTakerFilledBase, lighterEventFilledBase, lighterRowOutcomeOf, lighterEventInfo, lighterEventOrderId, lighterModifyOutcomeOf, lighterOrderIdOf } from "../../exchanges/lighter.js";
 import type { ExchangeAdapter } from "../../exchanges/interface.js";
+import type { LighterTestAdapter } from "../helpers/internals.js";
 
 afterEach(() => vi.useRealTimers());
 
@@ -64,7 +65,7 @@ describe("event_info never yields size − remaining", () => {
 });
 
 function ltAdapter(eventTo: Record<string, unknown> | string, rows: unknown[] | Error) {
-  const a = Object.create(LighterAdapter.prototype) as LighterAdapter & Record<string, unknown>;
+  const a = Object.create(LighterAdapter.prototype) as LighterTestAdapter;
   a.name = "lighter";
   a._testnet = false;
   a._marketDecimals = new Map([["SOL", { size: 3, price: 3 }]]);
@@ -130,7 +131,7 @@ describe("t-alo-cross: crossing post-only → cancelled, filled 0 (the live fail
 });
 
 describe("IOC: a cancelled remainder is never reported as filled", () => {
-  const ioc = (a: LighterAdapter & Record<string, unknown>) =>
+  const ioc = (a: LighterTestAdapter) =>
     run(a.limitOrder("SOL", "buy", "123.624", "0.089", { tif: "IOC", clientOrderIndex: COI })) as Promise<Record<string, unknown>>;
 
   it("partial IOC (event st canceled, rs 0) → iocOutcome from filled_base_amount", async () => {

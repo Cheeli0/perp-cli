@@ -62,10 +62,12 @@ function fakeVenue(input: string | URL | Request, init?: RequestInit): Response 
   }
 }
 
-const AGENT = {
+const AGENT: AgentMeta = {
   agentName: "default", agentWalletName: "hl-agent", agentEvmAddress: "0x00000000000000000000000000000000000000aa",
   userEvmAddress: MASTER, expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
-} as AgentMeta;
+  masterWalletName: "main", owsApiKeyId: "ows_key_test", owsPolicyId: "policy-test", approvedAt: new Date().toISOString(),
+  permissions: { canPerpTrade: true, canSpotTrade: false, canWithdraw: false }, asterApprovalNonce: "0",
+};
 
 /** A fresh adapter per invocation (venues/create-helpers.ts createHyperliquid, agent without a local master). */
 async function agentAdapter(dex: string | null): Promise<HyperliquidAdapter> {

@@ -50,7 +50,7 @@ describe("account settings", () => {
     const a = new AsterAdapter(undefined, false);
     const h = a as unknown as Record<string, unknown>;
     h._resolveSigner = () => ({ tier: "agent" });
-    const get = vi.fn(async () => [
+    const get = vi.fn(async (_path: string) => [
       { symbol: "SOLUSDT", marginType: "isolated", leverage: "3", positionAmt: "0.000", positionSide: "BOTH" },
       { symbol: "BTCUSDT", marginType: "cross", leverage: "10", positionAmt: "0.002", positionSide: "BOTH" },
     ]);

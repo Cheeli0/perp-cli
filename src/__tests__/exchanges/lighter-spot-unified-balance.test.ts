@@ -16,13 +16,14 @@ const LIVE_UNIFIED = {
 
 function build(acct: Record<string, unknown>, venue: "lighter" | "lighter-rh" = "lighter", quote = "USDC") {
   const lt = { name: venue, address: "0xabf20312dB7A6e807765ee7522E7d8c8DBB637D3", accountIndex: 723334, accountCachePrefix: `test-${venue}-${Math.random()}`, collateralSymbol: quote } as unknown as LighterAdapter;
-  const spot = new LighterSpotAdapter(lt) as LighterSpotAdapter & Record<string, unknown>;
-  spot._initialized = true;
+  const spot = new LighterSpotAdapter(lt);
+  const internals = spot as unknown as { _initialized: LighterSpotAdapter["_initialized"]; _restGet: LighterSpotAdapter["_restGet"] };
+  internals._initialized = true;
   const restGet = vi.fn(async (path: string) => {
     if (path === "/account") return { accounts: [acct] };
     throw new Error(`unexpected GET ${path}`);
   });
-  spot._restGet = restGet;
+  internals._restGet = restGet;
   return { spot, restGet };
 }
 

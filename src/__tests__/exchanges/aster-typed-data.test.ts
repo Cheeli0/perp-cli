@@ -524,7 +524,6 @@ describe("EIP-712 hash equivalence via ethers TypedDataEncoder", () => {
 
   it("different nonce → different hash", () => {
     const { domain: d2, types: t2, message: m2 } = buildApproveAgentTypedData({
-      asterChain: "Mainnet",
       ...params,
       nonceMicros: NONCE_MICROS + 1,
     });

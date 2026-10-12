@@ -132,8 +132,8 @@ describe("OndoAdapter.withdraw", () => {
     fetchMock
       .mockResolvedValueOnce(reply(200, { success: true, result: { accountID: "acc1", withdrawalFeeUSD: "2.00" } }))
       .mockResolvedValueOnce(reply(200, { success: true, result: { withdrawal_status: "pending", withdrawal_id: "w1", customer_withdrawal_id: "c1" } }));
-    const a = Object.create(OndoAdapter.prototype) as OndoAdapter & Record<string, unknown>;
-    a.client = client();
+    const a = Object.create(OndoAdapter.prototype) as OndoAdapter;
+    (a as unknown as { client: OndoAdapter["client"] }).client = client();
     const r = await a.withdraw("10", "0x" + "1".repeat(40));
     expect(r).toMatchObject({ withdrawal_id: "w1", withdrawalFeeUSD: "2.00" });
     expect(JSON.parse(fetchMock.mock.calls[1][1].body as string).from).toEqual({ id: "acc1", wallet: "margin" });

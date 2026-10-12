@@ -648,7 +648,7 @@ describe("Test 13: Passphrase non-TTY no creds", () => {
 
     // Mock stdin to emit EOF immediately (no data)
     const origOn = process.stdin.on.bind(process.stdin);
-    vi.spyOn(process.stdin, "on").mockImplementation((event: string, cb: (...args: unknown[]) => void) => {
+    vi.spyOn(process.stdin, "on").mockImplementation((event: string | symbol, cb: (...args: unknown[]) => void) => {
       if (event === "end") {
         setTimeout(() => cb(), 0);
         return process.stdin;

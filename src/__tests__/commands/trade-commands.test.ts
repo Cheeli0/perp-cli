@@ -1246,7 +1246,7 @@ describe("scale-in catch handler — robust error formatting", () => {
 });
 
 describe("scale-tp --size is bounded by the position; trade reduce asks the reduce-only gate up front", () => {
-  const long1 = [{ symbol: "BTC", side: "long", size: "1", entryPrice: "60000", markPrice: "61000", liquidationPrice: "50000", unrealizedPnl: "1000", leverage: 10 }];
+  const long1 = [{ symbol: "BTC", side: "long" as const, size: "1", entryPrice: "60000", markPrice: "61000", liquidationPrice: "50000", unrealizedPnl: "1000", leverage: 10 }];
 
   it("scale-tp --size above the position → SIZE_TOO_LARGE, nothing sent", async () => {
     const adapter = mockAdapter({ ...liveVenue(long1) });

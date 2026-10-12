@@ -315,16 +315,16 @@ describe("BUG 7: cli-spec reads version from package.json", () => {
  * because its per-level try/catch never saw a thrown error.
  */
 describe("HL per-entry acknowledgement is validated on every action path", () => {
-  const OK = (statuses) => ({ status: "ok", response: { type: "order", data: { statuses } } });
+  const OK = (statuses: unknown[]) => ({ status: "ok", response: { type: "order", data: { statuses } } });
   const REJECT = OK([{ error: "Order price cannot be more than 95% away from the reference price" }]);
 
-  const mkAdapter = async (sendResult) => {
+  const mkAdapter = async (sendResult: unknown) => {
     const mod = await import("../exchanges/hyperliquid.js");
     const adapter = Object.create(mod.HyperliquidAdapter.prototype);
     adapter.ensureSigner = vi.fn();
     adapter.getAssetIndex = vi.fn().mockResolvedValue(1);
     adapter.getSzDecimals = vi.fn().mockReturnValue(2);
-    adapter._hlRoundPrice = (n) => String(n);
+    adapter._hlRoundPrice = (n: number) => String(n);
     adapter._invalidateAccountCache = vi.fn();
     adapter._signAndSendAction = vi.fn().mockResolvedValue(sendResult);
     return adapter;

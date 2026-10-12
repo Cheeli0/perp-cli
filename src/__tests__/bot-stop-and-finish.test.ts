@@ -23,7 +23,7 @@ const h = vi.hoisted(() => {
   const execFileSync = vi.fn((cmd: string, args: string[]) => {
     if (cmd === "tmux" && args[0] === "has-session") { if (!st.sessionAlive) throw new Error("no session"); return ""; }
     if (cmd === "tmux" && args[0] === "list-panes") return "4242\n";
-    if (cmd === "tmux" && args[0] === "kill-session") { st.h.st.sessionAlive = false; return ""; }
+    if (cmd === "tmux" && args[0] === "kill-session") { st.sessionAlive = false; return ""; }
     if (cmd === "ps") return "  4242     1 sh\n  4243  4242 node\n  4244  4242 tee\n";
     return "";
   });

@@ -297,11 +297,11 @@ describe("H2 — strategy dry-run", () => {
   });
 
   it("dryRunAdapter blocks every venue write but passes reads through", async () => {
-    const a = dryRunAdapter(stubAdapter as never);
-    expect(() => (a as typeof stubAdapter).marketOrder()).toThrow(/blocked/);
-    expect(() => (a as typeof stubAdapter).withdraw()).toThrow(/blocked/);
-    expect(() => (a as typeof stubAdapter).setLeverage()).toThrow(/blocked/);
-    await expect((a as typeof stubAdapter).getBalance()).resolves.toMatchObject({ equity: "1000" });
+    const a = dryRunAdapter(stubAdapter as never) as unknown as typeof stubAdapter;
+    expect(() => a.marketOrder()).toThrow(/blocked/);
+    expect(() => a.withdraw()).toThrow(/blocked/);
+    expect(() => a.setLeverage()).toThrow(/blocked/);
+    await expect(a.getBalance()).resolves.toMatchObject({ equity: "1000" });
     expect(stubAdapter.marketOrder).not.toHaveBeenCalled();
   });
 
