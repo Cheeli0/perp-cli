@@ -551,8 +551,14 @@ async function verifyRisex(network: Network, opts: VerifyOpts): Promise<VerifyRe
   const v = await verifyRisexAgent(meta);
   const warnings: string[] = [];
   if (!v.active) warnings.push(`RISEx signer ${meta.signerAddress} status is ${String(v.status)} (1 = Active)`);
-  if (!v.tradingOnly) warnings.push(`RISEx signer ${meta.signerAddress} is NOT trading-only on-chain (${JSON.stringify(v.permissions)}) — revoke it`);
   if (v.expired) warnings.push(`RISEx signer ${meta.signerAddress} expired at ${meta.expiresAt}`);
+  if (v.active && (!v.tradingOnly || meta.permissions.tradingOnly !== true)) {
+    // An active signer that can do more than trade is a failure, never ok:true.
+    throw new PerpError("POLICY_DENIED", `RISEx signer ${meta.signerAddress} ("${meta.agentName}") is NOT restricted to trading-only (on-chain ${JSON.stringify(v.permissions)}; recorded tradingOnly=${String(meta.permissions.tradingOnly)})`, {
+      exchange: "risex", signer: meta.signerAddress, permissions: v.permissions,
+      remediation: `Revoke it: perp${network === "testnet" ? " -n testnet" : ""} wallet agent revoke risex ${meta.agentName}, then approve a new one`,
+    });
+  }
   return {
     registered: v.active, count: 1,
     items: [{ agentName: meta.agentName, signer: meta.signerAddress, account: meta.accountAddress, network: meta.network, status: v.status, permissions: v.permissions, tradingOnly: v.tradingOnly, expiresAt: meta.expiresAt }],
@@ -816,7 +822,7 @@ export async function approveVenueAgent(p: ApproveAgentParams): Promise<ApproveA
       });
     }
     const expiresAt = parseExpiresInParam(p.expiresIn);
-    const { approveRisexAgent, revokeRisexAgent, risexAgentWalletName } = await import("../exchanges/risex/agent.js");
+    const { approveRisexAgent, revokeRisexAgent, risexAgentWalletName, risexRotatePreflight } = await import("../exchanges/risex/agent.js");
     acquireLock("risex");
     try {
       const existing = getVenueAgent("risex", agentName);
@@ -826,7 +832,9 @@ export async function approveVenueAgent(p: ApproveAgentParams): Promise<ApproveA
             remediation: `Replace it (revoke the old signer, register a fresh one): perp${p.network === "testnet" ? " -n testnet" : ""} wallet agent approve risex --rotate — or choose another --agent-name`,
           });
         }
-        // Rotate: venue-confirmed revoke of the old signer, then drop its key, then approve.
+        // Rotate: the new signer's checks (pins, maintenance, master gas) pass first, then a
+        // venue-confirmed revoke of the old signer, then drop its key, then approve.
+        await risexRotatePreflight(masterName, p.passphrase, p.network);
         await revokeRisexAgent({ meta: existing, masterOwsWallet: masterName, passphrase: p.passphrase });
         try { loadOws().deleteWallet(existing.agentWalletName); } catch { /* already gone */ }
         deleteVenueAgent("risex", agentName);

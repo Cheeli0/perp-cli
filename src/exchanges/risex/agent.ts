@@ -17,8 +17,10 @@
  *     needs RISE-chain ETH for gas). Re-enabling needs an EnablePermission signed by the ACCOUNT
  *     (a signer-signed one reverts), so a leaked signer key cannot undo the restriction.
  *  5. Prove it: hasPermission(account, signer, p) is true for trading and false for every other p.
- *  Any failure in 4–5 revokes the signer (master-signed, gasless REST) so no full-permission signer
- *  is left behind; if even the revoke fails the error says so loudly.
+ *  A signer that is not Active after polling, or that fails 4–5, is revoked (master-signed, gasless
+ *  REST) and its key deleted (APPROVE_FAILED). Every exit that KEEPS a key (unknown register outcome,
+ *  failed revoke) records its meta with permissions.tradingOnly false, so `wallet agent verify /
+ *  revoke risex` can see it while the adapter refuses to trade with it (POLICY_DENIED).
  *
  * revoke: master signs RevokeSigner; POST /v1/auth/revoke-signer.
  */
@@ -182,95 +184,189 @@ export interface ApproveRisexAgentOpts {
   expiresAt: Date;
 }
 
-/** Full approve with OWS master + OWS agent wallet. Returns the meta (persisting it is the caller's job). */
+/** OWS operations the approve flow needs (the vault in production, a fake in tests). */
+export interface RisexOwsOps {
+  walletExists(name: string): boolean;
+  /** Creates an EVM-capable wallet with the empty passphrase; returns its signer. */
+  createSigner(name: string): EvmSigner;
+  deleteWallet(name: string): void;
+}
+
+/** Everything approve touches, injectable for tests. */
+export interface RisexApproveDeps {
+  master: EvmSigner;
+  ows: RisexOwsOps;
+  client: RisexClient;
+  chain: RisexChainReader;
+  /** Sender of the master's disablePermission transactions for `signer`. */
+  sender(signer: string): DisablePermissionSender;
+  /** Refuses before anything is registered when the master cannot pay the restriction gas. */
+  assertGas(account: string): Promise<void>;
+  /**
+   * Persists the meta of a signer whose key is KEPT after a failure (permissions.tradingOnly false),
+   * so `wallet agent verify / revoke risex` can see it. The adapter refuses such a signer.
+   */
+  saveMeta(meta: RisexAgentMeta): void;
+  sleep(ms: number): Promise<void>;
+  nonceDir?: string;
+}
+
+/**
+ * Checks that refuse without side effects (signing context pins, maintenance, the master's gas):
+ * run before registering — and, for --rotate, before the old signer is revoked.
+ */
+export async function risexApprovePreflight(network: Network, client: RisexClient, account: string, assertGas: (a: string) => Promise<void>): Promise<RisexSigningContext> {
+  const ctx = await loadSigningContext(client, network);
+  await assertGas(account);
+  return ctx;
+}
+
+/** --rotate: the side-effect-free checks for the NEW signer, run before the old one is revoked. */
+export async function risexRotatePreflight(masterOwsWallet: string, passphrase: string | null, network: Network): Promise<void> {
+  const { OwsEvmSigner } = await import("../../signer/ows-evm.js");
+  const account = getAddress(OwsEvmSigner.create(masterOwsWallet, passphrase ?? "").getAddress());
+  await risexApprovePreflight(network, risexClient(network), account, a => assertRestrictGas(network, a));
+}
+
+/** Full approve with OWS master + OWS agent wallet. Returns the meta of a trading-only signer (the caller persists it). */
 export async function approveRisexAgent(opts: ApproveRisexAgentOpts): Promise<RisexAgentMeta> {
+  const { OwsEvmSigner } = await import("../../signer/ows-evm.js");
+  const { loadOws } = await import("../../signer/ows-loader.js");
+  const { setVenueAgent } = await import("../../agent-wallet/store.js");
+  const master = OwsEvmSigner.create(opts.masterOwsWallet, opts.passphrase ?? "");
+  const ows = loadOws();
+  return approveRisexAgentWith(opts, {
+    master,
+    ows: {
+      walletExists: name => ows.listWallets().some((w: { name: string }) => w.name === name),
+      createSigner: name => {
+        const wallet = ows.createWallet(name, "");
+        if (!wallet.accounts.some((a: { chainId: string }) => a.chainId.startsWith("eip155:"))) {
+          try { ows.deleteWallet(name); } catch { /* reported below */ }
+          throw new PerpError("INVALID_PARAMS", `Agent wallet "${name}" has no EVM account`, { remediation: "Check OWS vault configuration" });
+        }
+        return OwsEvmSigner.create(name, "");
+      },
+      deleteWallet: name => ows.deleteWallet(name),
+    },
+    client: risexClient(opts.network),
+    chain: chainReader(opts.network),
+    sender: signer => masterDisablePermissionSender(opts.network, master, signer),
+    assertGas: account => assertRestrictGas(opts.network, account),
+    saveMeta: meta => setVenueAgent("risex", meta),
+    sleep: ms => new Promise(r => setTimeout(r, ms)),
+  });
+}
+
+/** The approve orchestration (see the module doc). */
+export async function approveRisexAgentWith(opts: ApproveRisexAgentOpts, deps: RisexApproveDeps): Promise<RisexAgentMeta> {
   const { network, expiresAt } = opts;
+  const net = network === "testnet" ? " -n testnet" : "";
   const expiration = Math.floor(expiresAt.getTime() / 1000);
   if (!(expiration > Math.floor(Date.now() / 1000) + 60) || expiration > 0xffffffff) {
     throw new PerpError("INVALID_PARAMS", `RISEx signer expiry ${expiresAt.toISOString()} must be in the future (uint32 seconds)`, { remediation: "Use e.g. --expires-in 30d" });
   }
-  const { OwsEvmSigner } = await import("../../signer/ows-evm.js");
-  const { loadOws } = await import("../../signer/ows-loader.js");
-  const master = OwsEvmSigner.create(opts.masterOwsWallet, opts.passphrase ?? "");
+  const { master, ows, client } = deps;
   const account = getAddress(master.getAddress());
-  const client = risexClient(network);
 
   // Everything that can refuse without side effects runs first.
-  const ctx = await loadSigningContext(client, network);
-  await assertRestrictGas(network, account);
+  const ctx = await risexApprovePreflight(network, client, account, deps.assertGas);
 
-  const ows = loadOws();
   const agentWalletName = risexAgentWalletName(opts.masterOwsWallet, network);
-  if (ows.listWallets().some((w: { name: string }) => w.name === agentWalletName)) {
+  if (ows.walletExists(agentWalletName)) {
     throw new PerpError("INVALID_PARAMS", `OWS wallet "${agentWalletName}" already exists`, {
-      remediation: `Replace the existing signer: perp${network === "testnet" ? " -n testnet" : ""} wallet agent approve risex --rotate (or delete an orphan wallet: ows wallet delete ${agentWalletName})`,
+      remediation: `Replace the existing signer: perp${net} wallet agent approve risex --rotate (or delete an orphan wallet: ows wallet delete ${agentWalletName})`,
     });
   }
-  const wallet = ows.createWallet(agentWalletName, "");
-  const evm = wallet.accounts.find((a: { chainId: string }) => a.chainId.startsWith("eip155:"));
-  const dropWallet = () => { try { ows.deleteWallet(agentWalletName); } catch { /* reported by the caller's remediation */ } };
-  if (!evm) {
-    dropWallet();
-    throw new PerpError("INVALID_PARAMS", `Agent wallet "${agentWalletName}" has no EVM account`, { remediation: "Check OWS vault configuration" });
-  }
-  const signer = OwsEvmSigner.create(agentWalletName, "");
+  const signer = ows.createSigner(agentWalletName);
+  const signerAddress = getAddress(signer.getAddress());
+  const dropWallet = () => { try { ows.deleteWallet(agentWalletName); } catch { /* the remediation names the wallet */ } };
+  const metaOf = (tradingOnly: boolean, disabled: number[], verifiedAt: string | null): RisexAgentMeta => ({
+    kind: "risex", agentName: opts.agentName, agentWalletName,
+    signerAddress: signerAddress as `0x${string}`, accountAddress: account as `0x${string}`,
+    expiresAt: new Date(expiration * 1000).toISOString(),
+    permissions: { tradingOnly, disabled, verifiedAt },
+    network, approvedAt: new Date().toISOString(), source: "approved",
+  });
+  const verifyHint = `perp${net} wallet agent verify risex ${opts.agentName}`;
+  const revokeHint = `perp${net} wallet agent revoke risex ${opts.agentName}`;
+  /** A kept key is always recorded (not trading-only → the adapter refuses it). */
+  const keep = (disabled: number[]) => deps.saveMeta(metaOf(false, disabled, null));
+  /** Revoke after a failure; true = proven revoked (key dropped), false = could not (key + meta kept). */
+  const revokeAfterFailure = async (disabled: number[]): Promise<{ revoked: true } | { revoked: false; why: string }> => {
+    try {
+      await revokeSigner({ client, network, ctx: await loadSigningContext(client, network), master, signer: signerAddress, nonceDir: deps.nonceDir });
+      dropWallet();
+      return { revoked: true };
+    } catch (revokeErr) {
+      keep(disabled);
+      return { revoked: false, why: extractErrorMessage(revokeErr) };
+    }
+  };
 
   try {
-    await registerSigner({ client, network, ctx, master, signer, expiration });
+    await registerSigner({ client, network, ctx, master, signer, expiration, nonceDir: deps.nonceDir });
   } catch (e) {
-    // Unknown outcome: the signer may be registered — keep its key.
-    if (!(e instanceof PerpError && e.structured.code === "ORDER_PENDING")) dropWallet();
+    if (e instanceof PerpError && e.structured.code === "ORDER_PENDING") {
+      // Unknown outcome: the signer may be registered — keep its key AND record it.
+      keep([]);
+      throw new PerpError("ORDER_PENDING", e.message, {
+        ...(e.structured.details ?? {}), exchange: "risex", signer: signerAddress,
+        remediation: `Do NOT re-run approve yet. Check ${verifyHint}; if it is registered it is NOT restricted (full permissions): revoke it with ${revokeHint}`,
+      });
+    }
+    dropWallet();
     throw e;
   }
 
   let status: number | null = null;
   for (let i = 0; i < CONFIRM_ATTEMPTS; i++) {
-    status = await sessionKeyStatus(client, account, signer.getAddress());
+    status = await sessionKeyStatus(client, account, signerAddress);
     if (status === STATUS_ACTIVE) break;
-    await new Promise(r => setTimeout(r, CONFIRM_INTERVAL_MS));
+    await deps.sleep(CONFIRM_INTERVAL_MS);
   }
   if (status !== STATUS_ACTIVE) {
-    throw new PerpError("APPROVE_PARTIAL", `RISEx accepted register-signer but ${signer.getAddress()} is not Active yet (status ${String(status)})`, {
+    // It may still activate with FULL permissions: revoke it now (gasless, master-signed).
+    const r = await revokeAfterFailure([]);
+    if (r.revoked) {
+      throw new PerpError("APPROVE_FAILED", `RISEx signer ${signerAddress} did not become Active (status ${String(status)}); it was revoked and its key deleted`, {
+        exchange: "risex", remediation: `Retry: perp${net} wallet agent approve risex`,
+      });
+    }
+    throw new PerpError("APPROVE_PARTIAL", `RISEx signer ${signerAddress} is not Active (status ${String(status)}) and the automatic revoke failed (${r.why})`, {
       exchange: "risex",
-      remediation: `It may still activate with FULL permissions. Revoke it in the RISEx app (or re-run approve after it is Active to restrict it); the key is kept in OWS wallet "${agentWalletName}"`,
+      remediation: `It may activate with FULL permissions. Revoke it: ${revokeHint} (or in the RISEx app). Its key is kept in OWS wallet "${agentWalletName}" and recorded as NOT trading-only`,
     });
   }
 
   let restricted: { disabled: Array<{ permission: number; txHash: string }>; verifiedAt: string };
+  const disabledSoFar: number[] = [];
   try {
+    const send = deps.sender(signerAddress);
     restricted = await restrictSignerToTrading({
-      client, network, ctx, account, signer, chain: chainReader(network),
-      send: masterDisablePermissionSender(network, master, signer.getAddress()),
+      client, network, ctx, account, signer, chain: deps.chain, nonceDir: deps.nonceDir,
+      send: async (permission, slot, signature) => {
+        const h = await send(permission, slot, signature);
+        disabledSoFar.push(permission);
+        return h;
+      },
     });
   } catch (e) {
     const why = extractErrorMessage(e);
-    try {
-      await revokeSigner({ client, network, ctx: await loadSigningContext(client, network), master, signer: signer.getAddress() });
-    } catch (revokeErr) {
-      throw new PerpError("APPROVE_PARTIAL", `RISEx signer ${signer.getAddress()} was registered but could NOT be restricted to trading-only (${why}) and the automatic revoke failed (${extractErrorMessage(revokeErr)})`, {
+    const r = await revokeAfterFailure(disabledSoFar);
+    if (!r.revoked) {
+      throw new PerpError("APPROVE_PARTIAL", `RISEx signer ${signerAddress} was registered but could NOT be restricted to trading-only (${why}) and the automatic revoke failed (${r.why})`, {
         exchange: "risex",
-        remediation: `The signer may hold FULL permissions (including fund movement). Revoke it now in the RISEx app (${account} → API / signers). Its key is in OWS wallet "${agentWalletName}"`,
+        remediation: `The signer may hold FULL permissions (including fund movement). Revoke it now: ${revokeHint} (or in the RISEx app). Its key is kept in OWS wallet "${agentWalletName}" and recorded as NOT trading-only`,
       });
     }
-    dropWallet();
     throw new PerpError("APPROVE_FAILED", `RISEx signer could not be restricted to trading-only (${why}); it was revoked and its key deleted`, {
       exchange: "risex", cause: e instanceof PerpError ? e.structured : undefined,
-      remediation: "Fix the cause above (e.g. RISE-chain ETH for gas on the master wallet), then retry: perp wallet agent approve risex",
+      remediation: `Fix the cause above (e.g. RISE-chain ETH for gas on the master wallet), then retry: perp${net} wallet agent approve risex`,
     });
   }
 
-  return {
-    kind: "risex",
-    agentName: opts.agentName,
-    agentWalletName,
-    signerAddress: getAddress(signer.getAddress()) as `0x${string}`,
-    accountAddress: account as `0x${string}`,
-    expiresAt: new Date(expiration * 1000).toISOString(),
-    permissions: { tradingOnly: true, disabled: RISEX_NON_TRADING_PERMISSIONS.slice(), verifiedAt: restricted.verifiedAt },
-    network,
-    approvedAt: new Date().toISOString(),
-    source: "approved",
-  };
+  return metaOf(true, RISEX_NON_TRADING_PERMISSIONS.slice(), restricted.verifiedAt);
 }
 
 /** Revoke a stored signer with the master wallet that owns it. */

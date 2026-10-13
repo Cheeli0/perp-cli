@@ -198,7 +198,7 @@ export interface RisexAgentMeta {
    * On-chain permission state proven after registration (Authorization.hasPermission):
    * trading-only = only the router permission enabled. Never written from a guess.
    */
-  permissions: { tradingOnly: boolean; disabled: number[]; verifiedAt: string };
+  permissions: { tradingOnly: boolean; disabled: number[]; verifiedAt: string | null };
   network: "mainnet" | "testnet";
   approvedAt: string;
   source: "approved";
