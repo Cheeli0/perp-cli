@@ -7,7 +7,8 @@
  * Composes with HyperliquidAdapter for signing and API access.
  */
 
-import type { SpotAdapter, SpotMarketInfo, SpotBalance } from "./spot-interface.js";
+import type { SpotAdapter, SpotMarketInfo, SpotBalance, SpotHoldingPrice, SpotHoldingPricesCapable } from "./spot-interface.js";
+import { HyperliquidOutcomeAdapter } from "./hyperliquid-outcome.js";
 import type { ResolvedSlippage } from "./slippage.js";
 import { PERP_TO_SPOT_MAP, SPOT_PERP_TOKEN_MAP } from "./spot-interface.js";
 import type { HyperliquidAdapter } from "./hyperliquid.js";
@@ -30,7 +31,7 @@ function hlRoundSize(size: string, szDecimals: number): string {
   return floorSize(size, hlSizeStep(szDecimals));
 }
 
-export class HyperliquidSpotAdapter implements SpotAdapter {
+export class HyperliquidSpotAdapter implements SpotAdapter, SpotHoldingPricesCapable {
   readonly name = "hyperliquid";
   private _hl: HyperliquidAdapter;
   private _spotAssetMap = new Map<string, number>(); // "ETH" → spotIndex (not +10000)
@@ -38,6 +39,7 @@ export class HyperliquidSpotAdapter implements SpotAdapter {
   private _spotDecimals = new Map<string, { size: number; price: number }>();
   private _spotCanonical = new Map<string, boolean>(); // "PURR" → true, "UBTC" → false
   private _initialized = false;
+  private _outcome: HyperliquidOutcomeAdapter | null = null;
   private _cachedMetaCtx: [
     { tokens: Array<{ name: string; index: number; szDecimals?: number }>; universe: Array<{ name: string; tokens: [number, number]; index: number; isCanonical?: boolean }> },
     Array<Record<string, unknown>>,
@@ -156,6 +158,20 @@ export class HyperliquidSpotAdapter implements SpotAdapter {
     }
 
     return markets;
+  }
+
+  /**
+   * Prices of held HIP-4 outcome tokens (`+<encoding>` balance rows — not spot markets) for valuation:
+   * the outcome side's mid in the outcome's quote token (HyperliquidOutcomeAdapter.getBalanceCoinPrices).
+   * Other tokens are not returned (they stay unpriced).
+   */
+  async getHoldingPrices(tokens: readonly string[]): Promise<SpotHoldingPrice[]> {
+    const coins = tokens.filter(t => /^\+\d+$/.test(t));
+    if (coins.length === 0) return [];
+    if (this._outcome === null) this._outcome = new HyperliquidOutcomeAdapter(this._hl);
+    return (await this._outcome.getBalanceCoinPrices(coins)).map(p => ({
+      token: p.coin, quoteToken: p.quoteToken, markPrice: p.quoteToken === null ? null : p.mid,
+    }));
   }
 
   async getSpotOrderbook(symbol: string): Promise<{ bids: [string, string][]; asks: [string, string][] }> {

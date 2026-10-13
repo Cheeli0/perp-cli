@@ -13,6 +13,8 @@
  *  25. In JSON mode the stop summary went only to the log file: it is written to stderr.
  *  26. Equity was reported as 0 all run (a held HIP-4 outcome token has no spot price → botEquity
  *      throws): unknown equity is null, the reason is logged once, and no equity condition fires on it.
+ *  27. The HIP-4 outcome token itself is valued at its outcome mid (getHoldingPrices, quoted in the
+ *      venue's spot quote) — equity known; a token whose price can't be read keeps equity unknown.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -220,6 +222,31 @@ describe("JSON mode stop summary (25) and unknown equity (26)", () => {
       expect(warnings).toHaveLength(1);
       expect(warnings[0]).toMatch(/no market price/);
     } finally { stdout.mockRestore(); stderr.mockRestore(); }
+  }, 20_000);
+
+  it("a held HIP-4 outcome token priced by getHoldingPrices (USDC quote) is valued: equity known; a non-quote-asset price stays unknown", async () => {
+    const holding = (quoteToken: string | null) => ({
+      ...hlSpot([{ token: "+14881", total: "3" }], [{ baseToken: "HYPE", markPrice: "42" }]),
+      getHoldingPrices: vi.fn(async (tokens: readonly string[]) => tokens.map(token => ({ token, quoteToken, markPrice: "0.9" }))),
+    });
+    const a = venue("aster", []);
+    const hl = venue("hyperliquid", []);
+    registerAdapterNetwork(a, "mainnet");
+    const cfg = { ...dcaConfig("t-eq-hip4"), exit_conditions: [{ type: "time_after" as const, value: 0.3 }], strategy: { type: "dca", amount: 0.05, interval_sec: 3600, total_orders: 0, side: "buy" } as never };
+    const run = async () => {
+      const stdout = vi.spyOn(console, "log").mockImplementation(() => {});
+      const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      try {
+        await runBot(a, cfg, undefined, () => {}, new Map([["hyperliquid", hl]]), "json", false);
+        return stdout.mock.calls.map(c => String(c[0])).filter(l => l.startsWith("{")).map(l => JSON.parse(l)).find(j => j.event === "done");
+      } finally { stdout.mockRestore(); stderr.mockRestore(); }
+    };
+    sp.spot = holding("USDC");
+    // aster 100 + hyperliquid 100 (unified: spot USDC shared) + 3 × 0.9 outcome tokens
+    expect((await run()).equity).toBeCloseTo(202.7, 6);
+    expect((sp.spot as ReturnType<typeof holding>).getHoldingPrices).toHaveBeenCalledWith(["+14881"]);
+    sp.spot = holding("USDH");
+    expect((await run()).equity).toBeNull();
   }, 20_000);
 
   it("equity conditions never fire on unknown equity", () => {

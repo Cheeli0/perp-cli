@@ -215,7 +215,7 @@ describe("env vars are not builder / affiliate sources", () => {
     const urls: string[] = [];
     vi.stubGlobal("fetch", vi.fn(async (url: string) => {
       urls.push(url);
-      return { ok: true, json: async () => ({ estimation: { dstChainTokenOut: { amount: "990000" } } }) };
+      return { ok: true, json: async () => ({ estimation: { srcChainTokenIn: { amount: "1000000" }, dstChainTokenOut: { amount: "990000" } }, fixFee: "1000000000000000" }) };
     }));
     await getDebridgeQuote("arbitrum", "base", 1, "0xa", "0xb");
     expect(urls[0]).not.toMatch(/referralCode|affiliateFee/);

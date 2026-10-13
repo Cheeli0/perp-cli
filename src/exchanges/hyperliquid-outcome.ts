@@ -620,6 +620,40 @@ export class HyperliquidOutcomeAdapter implements OutcomeAdapter {
     return { outcome, side, name: o.name, sideName };
   }
 
+  /**
+   * Price of held outcome balance coins (`+<encoding>`, spotClearinghouseState) in the outcome's quote
+   * token: the side's mid `allMids["#<encoding>"]` (docs info-endpoint "Retrieve mids for all coins";
+   * live 2026-10-13 mainnet allMids "#14880": "0.100405", "#14881": "0.899595"). HIP-4 docs: a side
+   * token settles to `settleFraction` (Yes) / `1 - settleFraction` (No) quote tokens and the Yes/No
+   * books are merged (buy Yes at p = sell No at 1 - p), so the mid is the token's value in its quote.
+   * `quoteToken` null = the outcome / side is not in outcomeMeta (outcomeMeta is re-read once when a
+   * coin's outcome is missing — outcomes are deployed after init) or has no quoteToken; `mid` null = no
+   * positive mid. Coins that are not `+<digits>` are not returned. A malformed allMids → EXCHANGE_ERROR.
+   */
+  async getBalanceCoinPrices(coins: readonly string[]): Promise<Array<{ coin: string; quoteToken: string | null; mid: string | null }>> {
+    await this.init();
+    const held = coins.filter((c) => /^\+\d+$/.test(c)).map((coin) => {
+      const enc = Number(coin.slice(1));
+      return { coin, outcome: Math.floor(enc / 10), side: enc % 10, enc };
+    });
+    if (held.length === 0) return [];
+    const find = (outcome: number) => this._outcomeMeta?.outcomes.find((x) => x.outcome === outcome);
+    if (held.some((h) => find(h.outcome) === undefined)) await this._loadOutcomeMeta();
+    const allMids = await this._infoPost({ type: "allMids" });
+    if (allMids === null || typeof allMids !== "object" || Array.isArray(allMids)) {
+      throw new PerpError("EXCHANGE_ERROR", `Hyperliquid allMids returned unexpected shape: ${JSON.stringify(allMids).slice(0, 200)}`, { exchange: "hyperliquid" });
+    }
+    const mids = allMids as Record<string, unknown>;
+    return held.map((h) => {
+      const o = find(h.outcome);
+      const quoteToken = o !== undefined && h.side < o.sideSpecs.length && typeof o.quoteToken === "string" && o.quoteToken.trim() !== ""
+        ? o.quoteToken : null;
+      const raw = mids[`#${h.enc}`];
+      const mid = typeof raw === "string" && Number(raw) > 0 ? raw : null;
+      return { coin: h.coin, quoteToken, mid };
+    });
+  }
+
   private _lookupSideName(outcome: number, side: number): string {
     const o = this._outcomeMeta?.outcomes.find((x) => x.outcome === outcome);
     return o?.sideSpecs[side]?.name ?? `side${side}`;

@@ -435,7 +435,7 @@ describe("AsterAdapter — AC-19 remediation fields", () => {
     expect(e.structured?.remediation ?? "").toContain("--rotate");
   });
 
-  it("withdraw on testnet is the uniform CAPABILITY_UNSUPPORTED (mainnet only; venue withdrawAssets = USDT)", async () => {
+  it("withdraw on testnet is the uniform CAPABILITY_UNSUPPORTED (mainnet only; venue withdrawAssets = USDT, USDC)", async () => {
     makeInitFetch();
     const { AsterAdapter } = await import("../../exchanges/aster.js");
     const ast = new AsterAdapter(undefined, true);
@@ -454,7 +454,7 @@ describe("AsterAdapter — AC-19 remediation fields", () => {
     expect(e.structured?.code ?? "").toBe("CAPABILITY_UNSUPPORTED");
     expect(e.structured?.remediation ?? "").toContain("without -n testnet");
     const { asterVenue } = await import("../../exchanges/venues/aster.js");
-    expect(asterVenue.capabilities?.withdrawAssets).toEqual(["USDT"]);
+    expect(asterVenue.capabilities?.withdrawAssets).toEqual(["USDT", "USDC"]);
   });
 });
 

@@ -678,9 +678,10 @@ export async function openPositionsAtStop(
 
 /**
  * Bot equity in USD. Single-venue bot: the venue's account equity. Multi-venue bot (extra
- * adapters): Σ every venue's account equity + its bot spot holdings — tokens at the spot market
- * price, and the spot quote balance when the spot account is separate from the perp margin
- * (spotSharesPerpMargin false). Any failed read or unpriced token → throws (equity unknown;
+ * adapters): Σ every venue's account equity + its bot spot holdings — tokens at the shared
+ * valuation price (spotMarketsForValuation: spot market price, HIP-4 outcome tokens at their
+ * outcome mid), and the spot quote balance when the spot account is separate from the perp
+ * margin (spotSharesPerpMargin false). Any failed read or unpriced token → throws (equity unknown;
  * never a partial sum that would read as a loss).
  */
 async function botEquity(primary: ExchangeAdapter, extra: Map<string, ExchangeAdapter> | undefined): Promise<number> {
@@ -690,7 +691,7 @@ async function botEquity(primary: ExchangeAdapter, extra: Map<string, ExchangeAd
     return n;
   };
   if (extra === undefined || extra.size === 0) return eq((await primary.getBalance()).equity, primary.name);
-  const { getBotSpotAdapter, isSpotQuoteAsset, spotNetworkOf, spotTokenBase, spotSharesPerpMargin } = await import("../exchanges/spot-factory.js");
+  const { getBotSpotAdapter, isSpotQuoteAsset, spotMarketsForValuation, spotNetworkOf, spotTokenBase, spotSharesPerpMargin } = await import("../exchanges/spot-factory.js");
   const { getVenue } = await import("../exchanges/venue.js");
   const all = new Map<string, ExchangeAdapter>([[primary.name, primary], ...[...extra].filter(([n]) => n !== primary.name)]);
   let total = 0;
@@ -701,7 +702,9 @@ async function botEquity(primary: ExchangeAdapter, extra: Map<string, ExchangeAd
     const def = getVenue(name);
     const net = spotNetworkOf(spot);
     const shared = spotSharesPerpMargin(def, a);
-    const [balances, markets] = await Promise.all([spot.getSpotBalances(), spot.getSpotMarkets()]);
+    // Shared valuation prices (spot markets + held HIP-4 outcome tokens at their outcome mid).
+    const balances = await spot.getSpotBalances();
+    const markets = await spotMarketsForValuation(def, spot, balances, net);
     const price = new Map(markets.map(m => [m.baseToken.toUpperCase(), m.markPrice]));
     for (const b of balances) {
       const qty = Number(b.total);
@@ -916,16 +919,17 @@ async function fetchSpotPositions(
   adapter: ExchangeAdapter,
 ): Promise<import("./tui/index.js").Position[]> {
   // Bot scope (§12.4 #3): only separate/runtime spot venues with transfer.
-  const { getBotSpotAdapter, isSpotQuoteAsset, spotNetworkOf, spotTokenBase } = await import("../exchanges/spot-factory.js");
+  const { getBotSpotAdapter, isSpotQuoteAsset, spotMarketsForValuation, spotNetworkOf, spotTokenBase } = await import("../exchanges/spot-factory.js");
   const { getVenue } = await import("../exchanges/venue.js");
   let raw: import("../exchanges/spot-interface.js").SpotBalance[];
-  let markets: import("../exchanges/spot-interface.js").SpotMarketInfo[];
+  let markets: import("../exchanges/spot-factory.js").SpotValuationPrice[];
   let net: import("../exchanges/venue-types.js").Network;
   try {
     const spot = await getBotSpotAdapter(adapter.name, adapter);
     if (spot === null) return [];
     net = spotNetworkOf(spot);
-    [raw, markets] = await Promise.all([spot.getSpotBalances(), spot.getSpotMarkets()]);
+    raw = await spot.getSpotBalances();
+    markets = await spotMarketsForValuation(getVenue(adapter.name), spot, raw, net);
   } catch (e) {
     // Display-only path: surface the failure instead of hiding it, keep the TUI alive.
     process.stderr.write(`[warn] ${adapter.name} spot positions unavailable: ${e instanceof Error ? e.message : String(e)}\n`);

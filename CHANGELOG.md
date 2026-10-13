@@ -4,6 +4,15 @@ All notable changes to `perp-cli`. Format follows [Keep a Changelog](https://kee
 
 ## [Unreleased]
 
+### FIX: bridge with OWS wallets, deBridge true cost, withdraw / transfer without -e, alerts, Aster USDC withdraw
+
+- **Bridge** (`funds bridge quote|send|exchange`, rebalance auto-bridge): signs with the OWS master (EVM and Solana) instead of treating the `ows:<wallet>` reference as a raw key (was `invalid BytesLike value`, 500). Errors are PerpError (`INVALID_PARAMS`, `INSUFFICIENT_BALANCE`, `NO_BRIDGE_ROUTE`), the selected provider is the one executed, `exchange` help says it is a wallet-to-wallet bridge.
+- **deBridge cost**: quotes use `prependOperatingExpenses=false`, so exactly `--amount` leaves the wallet (live: `true` spent 5.94 USDC for `--amount 5`); the flat `fixFee` is shown as `nativeFee`; quotes rank by amount received minus the native fee in USD (unpriced → ranked last).
+- **`funds withdraw hyperliquid|pacifica`, `funds deposit pacifica`, `funds transfer` (HL)** fetch their own venue — no `-e` needed (dry-run and live now agree).
+- **Aster withdraw**: `--asset USDT|USDC` (an all-USDC account could not withdraw); `user-withdraw-info` numbers parsed.
+- **alerts**: `add --exchange <venue>` stores the filter (it was swallowed by the root `--exchange`); `test` / `start` without a channel fail with `INVALID_PARAMS`.
+- **HIP-4 outcome tokens** valued at their outcome mid (bot equity / portfolio); **HL `account settings`** without a position; **Aster** `liquidationPrice` 0 → null; **rebalance** dry-run reports `simulated`.
+
 ### FIX: mainnet trading-feature pass 2026-10-13
 
 - **`arb close <sym> --spot-exch <venue> --perp-exch <venue>`** closes a spot-perp pair that has no arb-state entry (e.g. opened by a bot), sized from the live positions. Before, it fell through to the perp-perp path and failed with `POSITION_NOT_FOUND`.

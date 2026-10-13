@@ -163,6 +163,25 @@ describe("AsterAdapter.getPositions — parseFiniteVenueNumber guards (Phase 2.4
     expect(pos[0].liquidationPrice).toBe("41250.7");
   });
 
+  it("liquidationPrice \"0\" (Aster: reported as 0 when the value would be negative = no liquidation price) → null", async () => {
+    const ast = await buildAdapter(
+      {
+        totalWalletBalance: "1000", totalUnrealizedProfit: "0",
+        availableBalance: "800", totalInitialMargin: "200",
+        positions: [
+          { symbol: "BTCUSDT", positionAmt: "0.001", entryPrice: "50000", unrealizedProfit: "0", leverage: "10" },
+          { symbol: "ETHUSDT", positionAmt: "0.01", entryPrice: "3000", unrealizedProfit: "0", leverage: "10" },
+        ],
+      },
+      [
+        { symbol: "BTCUSDT", markPrice: "63000.5", liquidationPrice: "0", positionAmt: "0.001" },
+        { symbol: "ETHUSDT", markPrice: "3000", liquidationPrice: "0.00000000", positionAmt: "0.01" },
+      ],
+    );
+    const pos = await ast.getPositions();
+    expect(pos.map(p => [p.symbol, p.markPrice, p.liquidationPrice])).toEqual([["BTC", "63000.5", null], ["ETH", "3000", null]]);
+  });
+
   // Was: "fall back to '0'". A zero is not a neutral default here — risk.ts
   // filters positions on `liquidationPrice !== "N/A" && > 0` and event-stream
   // gates the liquidation warning on `liq > 0`, so a "0" silently drops the

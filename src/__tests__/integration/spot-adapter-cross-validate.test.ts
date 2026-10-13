@@ -2,17 +2,16 @@
  * Cross-validation tests: SpotAdapter vs raw SDK/API responses.
  *
  * Tests call SpotAdapter methods and independently call the exchange APIs,
- * then verify the values match. Requires live API keys.
+ * then verify the values match. Public market data only — the adapters are created read-only
+ * (no key). Secrets (SSOT Rule #3): no `.env` is loaded and no private key is read.
+ * The account-balance case reads the active OWS master wallet's PUBLIC EVM address (nothing is
+ * decrypted, nothing is signed) and runs only with the explicit opt-in PERP_SPOT_XVAL_ACCOUNT=1.
  *
  * Run with: npx vitest run src/__tests__/spot-adapter-cross-validate.test.ts
  */
 import { describe, it, expect, beforeAll } from "vitest";
-import { config } from "dotenv";
-import { resolve } from "path";
-
-// Load env
-config({ path: resolve(process.env.HOME || "~", ".perp", ".env") });
-config();
+import { cliCredentialOptsFrom, resolveOwsMaster } from "../../config.js";
+import { PerpError } from "../../errors.js";
 
 // ── Raw API helpers ──
 
@@ -34,18 +33,21 @@ async function ltGet(path: string, params: Record<string, string> = {}) {
   return res.json();
 }
 
-// ── Key detection ──
+// ── Account opt-in ──
 
-function hasHlKey(): boolean {
-  return !!(process.env.HYPERLIQUID_PRIVATE_KEY || process.env.HL_PRIVATE_KEY || process.env.PRIVATE_KEY);
+/** Explicit opt-in: the balance case reads the user's own (public) HL account state. */
+const ACCOUNT_ENABLED = process.env.PERP_SPOT_XVAL_ACCOUNT === "1";
+
+/** The active OWS master wallet's PUBLIC EVM address (OWS vault public account; nothing is decrypted). */
+async function owsMasterEvmAddress(): Promise<string> {
+  const master = await resolveOwsMaster("hyperliquid", cliCredentialOptsFrom({}));
+  if (master === null) {
+    throw new PerpError("NO_SIGNER_AVAILABLE", "spot-adapter-cross-validate: no OWS master wallet is selected for hyperliquid", {
+      remediation: "Select the master wallet (perp wallet use <name>) — this case reads only its public address",
+    });
+  }
+  return (await import("../../signer/ows-evm.js")).OwsEvmSigner.create(master.wallet).getAddress();
 }
-
-function hasLtKey(): boolean {
-  return !!(process.env.LIGHTER_PRIVATE_KEY || process.env.LT_PRIVATE_KEY);
-}
-
-const HAS_HL_KEY = hasHlKey();
-const HAS_LT_KEY = hasLtKey();
 
 /** Fetch with retry for Lighter rate limits */
 async function ltGetRetry(path: string, params: Record<string, string> = {}, retries = 3): Promise<unknown> {
@@ -55,6 +57,17 @@ async function ltGetRetry(path: string, params: Record<string, string> = {}, ret
     if (i < retries - 1) await new Promise(r => setTimeout(r, 3000 * (i + 1)));
   }
   return ltGet(path, params);
+}
+
+/**
+ * Active spot markets per the venue's own /api/v1/orderBooks (status "active", market_type "spot")
+ * — the explorer list also carries inactive markets (live 2026-10-13: AZTEC/USDC 2055 "inactive"),
+ * which the adapter does not list (lighter-spot.ts: status !== "active" → skipped).
+ */
+async function ltActiveSpotSymbols(): Promise<Set<string>> {
+  const r = await ltGetRetry("/orderBooks") as { order_books?: Array<{ symbol: string; market_type: string; status: string }> };
+  if (!Array.isArray(r.order_books)) throw new Error(`Lighter /orderBooks returned no order_books: ${JSON.stringify(r).slice(0, 200)}`);
+  return new Set(r.order_books.filter(o => o.market_type === "spot" && o.status === "active").map(o => o.symbol.toUpperCase()));
 }
 
 // ── Hyperliquid Spot Tests ──
@@ -103,10 +116,7 @@ describe("Cross-validate: Hyperliquid Spot Adapter", () => {
     // Adapter
     const { HyperliquidAdapter } = await import("../../exchanges/hyperliquid.js");
     const { HyperliquidSpotAdapter } = await import("../../exchanges/hyperliquid-spot.js");
-
-    const pk = process.env.HYPERLIQUID_PRIVATE_KEY || process.env.HL_PRIVATE_KEY || process.env.PRIVATE_KEY
-      || "0x0000000000000000000000000000000000000000000000000000000000000001";
-    const hlAdapter = new HyperliquidAdapter(pk);
+    const hlAdapter = new HyperliquidAdapter();
     await hlAdapter.init();
     const spotAdapter = new HyperliquidSpotAdapter(hlAdapter);
     await spotAdapter.init();
@@ -165,11 +175,9 @@ describe("Cross-validate: Hyperliquid Spot Adapter", () => {
     const rawAsks = rawBook.levels?.[1] ?? [];
 
     // Adapter
-    const pk = process.env.HYPERLIQUID_PRIVATE_KEY || process.env.HL_PRIVATE_KEY || process.env.PRIVATE_KEY
-      || "0x0000000000000000000000000000000000000000000000000000000000000001";
     const { HyperliquidAdapter } = await import("../../exchanges/hyperliquid.js");
     const { HyperliquidSpotAdapter } = await import("../../exchanges/hyperliquid-spot.js");
-    const hlAdapter = new HyperliquidAdapter(pk);
+    const hlAdapter = new HyperliquidAdapter();
     await hlAdapter.init();
     const spotAdapter = new HyperliquidSpotAdapter(hlAdapter);
     await spotAdapter.init();
@@ -204,10 +212,8 @@ describe("Cross-validate: Hyperliquid Spot Adapter", () => {
     }
   });
 
-  it("spot balances match raw spotClearinghouseState API", { skip: !HAS_HL_KEY }, async () => {
-    const pk = process.env.HYPERLIQUID_PRIVATE_KEY || process.env.HL_PRIVATE_KEY || process.env.PRIVATE_KEY!;
-    const { ethers } = await import("ethers");
-    const address = new ethers.Wallet(pk).address;
+  it("spot balances match raw spotClearinghouseState API (opt-in: PERP_SPOT_XVAL_ACCOUNT=1; OWS master public address)", { skip: !ACCOUNT_ENABLED }, async () => {
+    const address = await owsMasterEvmAddress();
 
     // Raw API
     const rawState = await hlPost("spotClearinghouseState", { user: address }) as {
@@ -217,7 +223,8 @@ describe("Cross-validate: Hyperliquid Spot Adapter", () => {
     // Adapter
     const { HyperliquidAdapter } = await import("../../exchanges/hyperliquid.js");
     const { HyperliquidSpotAdapter } = await import("../../exchanges/hyperliquid-spot.js");
-    const hlAdapter = new HyperliquidAdapter(pk);
+    const hlAdapter = new HyperliquidAdapter();
+    hlAdapter.setAddress(address); // read-only: /info reads scoped to the address, no signer
     await hlAdapter.init();
     const spotAdapter = new HyperliquidSpotAdapter(hlAdapter);
     await spotAdapter.init();
@@ -256,12 +263,10 @@ describe("Cross-validate: Lighter Spot Adapter", () => {
   let ltInitFailed = false;
 
   beforeAll(async () => {
-    if (!HAS_LT_KEY) return;
     try {
-      const pk = process.env.LIGHTER_PRIVATE_KEY || process.env.LT_PRIVATE_KEY;
       const { LighterAdapter } = await import("../../exchanges/lighter.js");
       const { LighterSpotAdapter } = await import("../../exchanges/lighter-spot.js");
-      ltAdapter = new LighterAdapter(pk!);
+      ltAdapter = new LighterAdapter("");
       await ltAdapter.init();
       spotAdapter = new LighterSpotAdapter(ltAdapter);
       await spotAdapter.init();
@@ -271,12 +276,13 @@ describe("Cross-validate: Lighter Spot Adapter", () => {
     }
   });
 
-  it("spot markets match explorer API (symbols with /)", { skip: !HAS_LT_KEY }, async () => {
+  it("spot markets match explorer API (symbols with /)", async () => {
     if (ltInitFailed || !spotAdapter) return;
 
     const explorerMarkets = await fetch("https://explorer.elliot.ai/api/markets")
       .then(r => r.json()) as Array<{ symbol: string; market_index: number }>;
-    const rawSpotMarkets = explorerMarkets.filter(m => m.symbol.includes("/"));
+    const active = await ltActiveSpotSymbols();
+    const rawSpotMarkets = explorerMarkets.filter(m => m.symbol.includes("/") && active.has(m.symbol.toUpperCase()));
     expect(rawSpotMarkets.length).toBeGreaterThan(0);
 
     const adapterMarkets = await spotAdapter.getSpotMarkets();
@@ -288,12 +294,13 @@ describe("Cross-validate: Lighter Spot Adapter", () => {
     }
   });
 
-  it("spot orderbook has valid bid/ask structure", { skip: !HAS_LT_KEY }, async () => {
+  it("spot orderbook has valid bid/ask structure", async () => {
     if (ltInitFailed || !spotAdapter) return;
 
     const explorerMarkets = await fetch("https://explorer.elliot.ai/api/markets")
       .then(r => r.json()) as Array<{ symbol: string; market_index: number }>;
-    const spotMarket = explorerMarkets.find(m => m.symbol.includes("/"));
+    const active = await ltActiveSpotSymbols();
+    const spotMarket = explorerMarkets.find(m => m.symbol.includes("/") && active.has(m.symbol.toUpperCase()));
     if (!spotMarket) return;
 
     const rawBook = await ltGetRetry("/orderBookOrders", {
@@ -324,10 +331,7 @@ describe("Cross-validate: Token Index Verification", () => {
     const { SPOT_PERP_TOKEN_MAP } = await import("../../exchanges/spot-interface.js");
     const { HyperliquidAdapter } = await import("../../exchanges/hyperliquid.js");
     const { HyperliquidSpotAdapter } = await import("../../exchanges/hyperliquid-spot.js");
-
-    const pk = process.env.HYPERLIQUID_PRIVATE_KEY || process.env.HL_PRIVATE_KEY || process.env.PRIVATE_KEY
-      || "0x0000000000000000000000000000000000000000000000000000000000000001";
-    const hlAdapter = new HyperliquidAdapter(pk);
+    const hlAdapter = new HyperliquidAdapter();
     await hlAdapter.init();
     const spotAdapter = new HyperliquidSpotAdapter(hlAdapter);
     await spotAdapter.init();
@@ -378,12 +382,9 @@ describe("Cross-validate: Token Index Verification", () => {
   it("HL spot HIP-1 tokens with same ticker as perp are price-validated (TRUMP, BERA, MON rejected)", async () => {
     // These tokens have same ticker on spot and perp but DIFFERENT underlying
     const suspectTokens = ["TRUMP", "BERA", "MON", "PUMP"];
-
-    const pk = process.env.HYPERLIQUID_PRIVATE_KEY || process.env.HL_PRIVATE_KEY || process.env.PRIVATE_KEY
-      || "0x0000000000000000000000000000000000000000000000000000000000000001";
     const { HyperliquidAdapter } = await import("../../exchanges/hyperliquid.js");
     const { HyperliquidSpotAdapter } = await import("../../exchanges/hyperliquid-spot.js");
-    const hlAdapter = new HyperliquidAdapter(pk);
+    const hlAdapter = new HyperliquidAdapter();
     await hlAdapter.init();
     const spotAdapter = new HyperliquidSpotAdapter(hlAdapter);
     await spotAdapter.init();
@@ -420,10 +421,8 @@ describe("Cross-validate: Token Index Verification", () => {
 
   it("HL perp asset indices map to correct mark prices", async () => {
     // Verify that getAssetIndex() returns indices that match the raw API
-    const pk = process.env.HYPERLIQUID_PRIVATE_KEY || process.env.HL_PRIVATE_KEY || process.env.PRIVATE_KEY
-      || "0x0000000000000000000000000000000000000000000000000000000000000001";
     const { HyperliquidAdapter } = await import("../../exchanges/hyperliquid.js");
-    const hlAdapter = new HyperliquidAdapter(pk);
+    const hlAdapter = new HyperliquidAdapter();
     await hlAdapter.init();
 
     // Raw API
@@ -461,7 +460,7 @@ describe("Cross-validate: Token Index Verification", () => {
     }
   });
 
-  it("Lighter perp market_ids map to correct symbols and prices", { skip: !HAS_LT_KEY }, async () => {
+  it("Lighter perp market_ids map to correct symbols and prices", async () => {
     // Raw API: orderBookDetails (with retry for rate limits)
     const rawData = await ltGetRetry("/orderBookDetails") as {
       order_book_details?: Array<{
@@ -475,11 +474,10 @@ describe("Cross-validate: Token Index Verification", () => {
     }
 
     // Adapter — reuse via CLI to avoid init rate limits
-    const pk = process.env.LIGHTER_PRIVATE_KEY || process.env.LT_PRIVATE_KEY;
     const { LighterAdapter } = await import("../../exchanges/lighter.js");
     let ltAdapterLocal: InstanceType<typeof LighterAdapter>;
     try {
-      ltAdapterLocal = new LighterAdapter(pk!);
+      ltAdapterLocal = new LighterAdapter("");
       await ltAdapterLocal.init();
     } catch (e) {
       console.log(`Lighter adapter init failed: ${e instanceof Error ? e.message : e} — skipping`);
@@ -500,18 +498,17 @@ describe("Cross-validate: Token Index Verification", () => {
     }
   });
 
-  it("Lighter spot market_ids from explorer match adapter's internal map", { skip: !HAS_LT_KEY }, async () => {
+  it("Lighter spot market_ids from explorer match adapter's internal map", async () => {
     const explorerMarkets = await fetch("https://explorer.elliot.ai/api/markets")
       .then(r => r.json()) as Array<{ symbol: string; market_index: number }>;
-    const rawSpotMarkets = explorerMarkets.filter(m => m.symbol.includes("/"));
-
-    const pk = process.env.LIGHTER_PRIVATE_KEY || process.env.LT_PRIVATE_KEY;
+    const active = await ltActiveSpotSymbols();
+    const rawSpotMarkets = explorerMarkets.filter(m => m.symbol.includes("/") && active.has(m.symbol.toUpperCase()));
     const { LighterAdapter } = await import("../../exchanges/lighter.js");
     const { LighterSpotAdapter } = await import("../../exchanges/lighter-spot.js");
     let ltAdapterLocal: InstanceType<typeof LighterAdapter>;
     let spotAdapterLocal: InstanceType<typeof LighterSpotAdapter>;
     try {
-      ltAdapterLocal = new LighterAdapter(pk!);
+      ltAdapterLocal = new LighterAdapter("");
       await ltAdapterLocal.init();
       spotAdapterLocal = new LighterSpotAdapter(ltAdapterLocal);
       await spotAdapterLocal.init();

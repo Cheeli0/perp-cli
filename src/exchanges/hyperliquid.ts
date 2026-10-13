@@ -186,6 +186,9 @@ export function hlTriggerKind(side: "buy" | "sell", trigger: number, reference: 
 }
 
 /** HL spot coin names: "@<pair index>" or "<BASE>/<QUOTE>" (e.g. "@107", "PURR/USDC"). Perp coins are neither. */
+/** Markets without a position whose setting `account settings` reads (recent fills, activeAssetData weight 20 each). */
+export const HL_SETTINGS_FILL_MARKETS = 5;
+
 export function hlIsSpotCoin(coin: string): boolean {
   return coin.startsWith("@") || coin.includes("/");
 }
@@ -1056,13 +1059,6 @@ export class HyperliquidAdapter implements ExchangeAdapter {
   }
 
   /**
-   * Per-market leverage / margin mode the venue exposes in one read: the `leverage` object of
-   * every `assetPositions` entry of info `clearinghouseState` (docs info-endpoint/perpetuals:
-   * `"leverage": { "rawUsd": "-95.059824", "type": "isolated", "value": 20 }`). The setting of a
-   * market WITHOUT a position is only readable one coin at a time (info `activeAssetData`
-   * {user, coin} → `"leverage": { "type": "cross", "value": 3 }`), so it is not listed here.
-   */
-  /**
    * The leverage this account applies to `symbol`, position or not — info `activeAssetData`
    * {user, coin} → `"leverage": { "type": "cross", "value": 3 }` (docs info-endpoint/perpetuals).
    * Unreadable → EXCHANGE_ERROR.
@@ -1078,19 +1074,54 @@ export class HyperliquidAdapter implements ExchangeAdapter {
     return v;
   }
 
+  /**
+   * Per-market leverage / margin mode:
+   *  - every market with a position: the `leverage` object of its `assetPositions` entry of info
+   *    `clearinghouseState` (docs info-endpoint/perpetuals: `"leverage": { "rawUsd": "-95.059824",
+   *    "type": "isolated", "value": 20 }`);
+   *  - markets WITHOUT a position the account traded: the HL_SETTINGS_FILL_MARKETS most recently
+   *    traded perp markets of this adapter's dex in info `userFills` ("at most 2000 most recent
+   *    fills"; spot "@<i>" / "BASE/QUOTE", HIP-4 "#<enc>", other dexes and delisted coins are not
+   *    markets of this adapter and are skipped), each read with info `activeAssetData` {user, coin}
+   *    → `"leverage": { "type": "cross", "value": 3 }` (docs info-endpoint/perpetuals; live
+   *    2026-10-13 `{"type":"cross","value":20}` for an account that never set ETH).
+   * Weight (docs "Rate limits and user limits"): clearinghouseState 2 + userFills 20 (+1 per 20
+   * fills) + activeAssetData 20 per market — bounded by HL_SETTINGS_FILL_MARKETS.
+   * An unreadable leverage → EXCHANGE_ERROR.
+   */
   async getMarketSettings(): Promise<Array<{ symbol: string; leverage: number; marginMode: "cross" | "isolated" }>> {
     const state = await this._getClearinghouseState();
     if (!Array.isArray(state.assetPositions)) {
       throw new PerpError("EXCHANGE_ERROR", "Hyperliquid clearinghouseState has no assetPositions list — per-market settings unknown", { exchange: "hyperliquid" });
     }
-    return (state.assetPositions as Record<string, unknown>[]).map((p) => {
-      const pos = (p.position ?? p) as Record<string, unknown>;
-      const lev = pos.leverage as { type?: unknown; value?: unknown } | undefined;
-      if ((lev?.type !== "cross" && lev?.type !== "isolated") || typeof lev.value !== "number" || !(lev.value > 0)) {
-        throw new PerpError("EXCHANGE_ERROR", `Hyperliquid position ${String(pos.coin)}: unreadable leverage ${JSON.stringify(pos.leverage)}`, { exchange: "hyperliquid" });
+    const leverageOf = (lev: unknown, what: string): { leverage: number; marginMode: "cross" | "isolated" } => {
+      const l = lev as { type?: unknown; value?: unknown } | null | undefined;
+      if ((l?.type !== "cross" && l?.type !== "isolated") || typeof l.value !== "number" || !(l.value > 0)) {
+        throw new PerpError("EXCHANGE_ERROR", `Hyperliquid ${what}: unreadable leverage ${JSON.stringify(lev ?? null)}`, { exchange: "hyperliquid" });
       }
-      return { symbol: this._displaySymbol(String(pos.coin)), leverage: lev.value, marginMode: lev.type };
+      return { leverage: l.value, marginMode: l.type };
+    };
+    const rows = (state.assetPositions as Record<string, unknown>[]).map((p) => {
+      const pos = (p.position ?? p) as Record<string, unknown>;
+      return { coin: String(pos.coin), ...leverageOf(pos.leverage, `position ${String(pos.coin)}`) };
     });
+    const held = new Set(rows.map(r => r.coin));
+    const fills = await this._infoPost({ type: "userFills", user: this._address });
+    if (!Array.isArray(fills)) {
+      throw new PerpError("EXCHANGE_ERROR", `Hyperliquid userFills returned no list (got ${JSON.stringify(fills).slice(0, 160)})`, { exchange: "hyperliquid" });
+    }
+    const listed = (coin: string) => this._dex ? coin.startsWith(`${this._dex}:`) && this._assetMap.has(coin) : this._assetMap.has(`${coin}-PERP`);
+    const traded: string[] = [];
+    for (const f of [...(fills as Record<string, unknown>[])].sort((a, b) => Number(b.time) - Number(a.time))) {
+      const coin = String(f.coin);
+      if (traded.length >= HL_SETTINGS_FILL_MARKETS) break;
+      if (!held.has(coin) && !traded.includes(coin) && listed(coin)) traded.push(coin);
+    }
+    for (const coin of traded) {
+      const r = await this._infoPost({ type: "activeAssetData", user: this._address, coin }) as { leverage?: unknown } | null;
+      rows.push({ coin, ...leverageOf(r?.leverage, `activeAssetData ${coin}`) });
+    }
+    return rows.map(r => ({ symbol: this._displaySymbol(r.coin), leverage: r.leverage, marginMode: r.marginMode }));
   }
 
   /**

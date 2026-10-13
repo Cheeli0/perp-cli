@@ -226,12 +226,12 @@ describe("#4 funds withdraw ondo / arcus / aster", () => {
       .rejects.toMatchObject({ structured: { code: "INVALID_PARAMS" } });
   });
 
-  it("aster on testnet → uniform CAPABILITY_UNSUPPORTED, adapter never created; mainnet declares USDT", async () => {
+  it("aster on testnet → uniform CAPABILITY_UNSUPPORTED, adapter never created; mainnet declares USDT, USDC", async () => {
     const get = vi.fn(async () => { throw new Error("must not create an adapter"); });
     await expect(fundsProgram(get, "testnet").parseAsync(["funds", "withdraw", "aster", "5"], { from: "user" }))
       .rejects.toMatchObject({ structured: { code: "CAPABILITY_UNSUPPORTED", details: { venue: "Aster", feature: "withdraw" } } });
     expect(get).not.toHaveBeenCalled();
-    expect(asterVenue.capabilities?.withdrawAssets).toEqual(["USDT"]);
+    expect(asterVenue.capabilities?.withdrawAssets).toEqual(["USDT", "USDC"]);
   });
 
   it("aster --dry-run plans (BNB Chain default) without creating an adapter", async () => {
@@ -240,6 +240,16 @@ describe("#4 funds withdraw ondo / arcus / aster", () => {
     await fundsProgram(get).parseAsync(["--dry-run", "funds", "withdraw", "aster", "5"], { from: "user" });
     expect(get).not.toHaveBeenCalled();
     expect(cap.out()).toMatchObject({ ok: true, data: { dryRun: true, sent: false, venue: "aster", asset: "USDT", amount: "5", chain: "BNB Chain", chainId: 56 } });
+  });
+
+  it("aster --dry-run --asset USDC plans USDC; an unlisted asset is refused before any adapter", async () => {
+    const get = vi.fn(async () => { throw new Error("must not create an adapter"); });
+    const cap = captureJson();
+    await fundsProgram(get).parseAsync(["--dry-run", "funds", "withdraw", "aster", "5", "--chain", "arbitrum", "--asset", "usdc"], { from: "user" });
+    expect(cap.out()).toMatchObject({ ok: true, data: { dryRun: true, sent: false, venue: "aster", asset: "USDC", chainId: 42161 } });
+    await expect(fundsProgram(get).parseAsync(["--dry-run", "funds", "withdraw", "aster", "5", "--asset", "BTC"], { from: "user" }))
+      .rejects.toMatchObject({ structured: { code: "INVALID_PARAMS" } });
+    expect(get).not.toHaveBeenCalled();
   });
 
   it("negative / malformed amounts are refused", async () => {

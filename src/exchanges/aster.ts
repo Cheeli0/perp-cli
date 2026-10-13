@@ -750,9 +750,13 @@ export class AsterAdapter implements ExchangeAdapter {
       try {
         const risk = await this._signedGetEip712("/fapi/v3/positionRisk", {}, r) as Array<Record<string, unknown>>;
         for (const pr of risk ?? []) {
+          // Aster V3 spec (userPositionRisk notes, same field): "`liquidationPrice` is reported as `0`
+          // whenever the underlying value would be negative" — i.e. the position has no liquidation
+          // price (e.g. a small cross long the margin fully covers). 0 is not a price → null.
+          const liq = pr.liquidationPrice != null ? String(pr.liquidationPrice) : null;
           riskMap.set(String(pr.symbol), {
             mark: String(pr.markPrice ?? "0"),
-            liq: pr.liquidationPrice != null ? String(pr.liquidationPrice) : null,
+            liq: liq !== null && liq.trim() !== "" && Number(liq) === 0 ? null : liq,
           });
         }
       } catch (e) {
@@ -1296,21 +1300,26 @@ export class AsterAdapter implements ExchangeAdapter {
 
   // ── Withdraw (mainnet only): POST /fapi/v3/aster/user-withdraw ──
 
-  /** Venue collateral withdrawn by `withdraw` (capabilities.withdrawAssets[0]). */
-  private _withdrawAsset(): string {
+  /** Asset withdrawn by `withdraw`: `requested` (must be in capabilities.withdrawAssets), else withdrawAssets[0]. */
+  private _withdrawAsset(requested?: string): string {
     const assets = asterVenue.capabilities?.withdrawAssets;
     if (assets === null || assets === undefined || assets.length === 0) throw new Error("aster venue definition declares no withdrawAssets");
-    return assets[0];
+    if (requested === undefined) return assets[0];
+    const a = requested.toUpperCase();
+    if (!assets.includes(a)) {
+      throw new PerpError("INVALID_PARAMS", `Aster withdraws ${assets.join(" / ")} only (got "${requested}")`, { exchange: "aster", remediation: `Use --asset ${assets.join(" or --asset ")}` });
+    }
+    return a;
   }
 
   /**
    * Withdrawable perp balance + fee for the withdraw asset on `chain`
    * (POST /fapi/v3/aster/user-withdraw-info, signed by the API wallet). Read-only.
    */
-  async withdrawLimits(chain: AsterFundsChain): Promise<AsterWithdrawLimits> {
+  async withdrawLimits(chain: AsterFundsChain, asset?: string): Promise<AsterWithdrawLimits> {
     requireAsterFundsNetwork(this._testnet ? "testnet" : "mainnet", "withdraw");
     const raw = await this.signedRequest(this._baseUrl, "POST", "/fapi/v3/aster/user-withdraw-info", {});
-    return parseAsterWithdrawLimits(raw, this._withdrawAsset(), ASTER_FUNDS_CHAINS[chain].chainId);
+    return parseAsterWithdrawLimits(raw, this._withdrawAsset(asset), ASTER_FUNDS_CHAINS[chain].chainId);
   }
 
   /** Deposit / withdraw history (POST /fapi/v3/aster/deposit-withdraw-history, signed by the API wallet). Read-only. */
@@ -1329,14 +1338,14 @@ export class AsterAdapter implements ExchangeAdapter {
    * into the signature and the request. Once the request left, an unreadable result is
    * ORDER_PENDING (never resubmit).
    */
-  async withdraw(amount: string, destination: string, opts?: { assetId?: number; routeType?: number; chain?: AsterFundsChain }): Promise<AsterWithdrawResult> {
+  async withdraw(amount: string, destination: string, opts?: { assetId?: number; routeType?: number; chain?: AsterFundsChain; asset?: string }): Promise<AsterWithdrawResult> {
     requireAsterFundsNetwork(this._testnet ? "testnet" : "mainnet", "withdraw");
     if (opts?.assetId !== undefined || opts?.routeType !== undefined) {
-      throw new PerpError("INVALID_PARAMS", "Aster withdraw takes no assetId/routeType (USDT to BNB Chain or Arbitrum)");
+      throw new PerpError("INVALID_PARAMS", "Aster withdraw takes no assetId/routeType (use --asset USDT|USDC and --chain bsc|arbitrum)");
     }
     const chain: AsterFundsChain = opts?.chain === undefined ? "bsc" : opts.chain;
     const pins = ASTER_FUNDS_CHAINS[chain];
-    const asset = this._withdrawAsset();
+    const asset = this._withdrawAsset(opts?.asset);
     const r = this._resolveSigner();
     if (this._agentMeta === undefined || this._agentMeta.permissions.canWithdraw !== true) {
       throw new PerpError("POLICY_DENIED", "The active Aster API wallet was approved without the withdraw permission", {
@@ -1362,7 +1371,7 @@ export class AsterAdapter implements ExchangeAdapter {
       });
     }
 
-    const limits = await this.withdrawLimits(chain);
+    const limits = await this.withdrawLimits(chain, asset);
     assertAsterWithdrawAmount(amount, limits, asset);
 
     const userNonce = (BigInt(Date.now()) * 1000n).toString();

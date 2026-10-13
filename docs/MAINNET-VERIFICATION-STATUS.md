@@ -475,3 +475,41 @@ QFEX 실측 (production raw probe): 손절 ACK가 `client_order_id`를 돌려준
 | 4 | 미실행: claude-agent 전략(Anthropic 키 필요), plan `cancel_order`(단계 참조 기능 없음). 현물(Aster: USDT 필요, Arcus: 발급 키 필요)은 사용자 지시로 이번 범위에서 제외 | 사용자 결정 / 자금 필요 |
 | 6 | QFEX resting reduce-only / scale-tp 게이트 | 실측: resting reduce-only는 포지션이 0이 된 뒤에도 남는다. 나중에 체결될 때의 동작은 미증명이라 게이트 유지 (IOC만 허용). 해제하려면 resting 주문이 실제로 매칭되는 상황의 실험이 필요 |
 | 5 | funding-auto의 `sizeUsd` 기본값 $100 fallback 등 기존 코드의 `?? default` | SSOT 규칙 위반, 정리 필요 |
+
+### 6.4 출금 (2026-10-13, 사용자 승인: 전액 회수, 목적지는 main 지갑 자신의 주소)
+
+| venue | 명령 | 결과 | 도착 확인 (main 지갑) |
+|---|---|---|---|
+| Hyperliquid | `-e hyperliquid funds withdraw hyperliquid 12.22` | `status: ok`. 수수료 $1은 금액에서 차감 | Arbitrum USDC +11.22 |
+| Pacifica | `funds withdraw pacifica 12.98` | `requested_amount 12.98, fee_amount 1` | Solana USDC +11.98 |
+| Lighter | `-e lighter funds withdraw lighter 15.95` | tx 접수 (code 200) | Ethereum USDC +15.95 |
+| Lighter RH | `-e lighter-rh funds withdraw lighter 12.96` | tx 접수 (code 200) | Robinhood Chain USDG (합계로 확인) |
+| Arcus | `funds withdraw arcus 9.94` | withdrawalId 발급, `PENDING` 접수 | Robinhood Chain USDG — Lighter RH와 합쳐 +22.90 (3.7 → 26.6) |
+| Aster | `funds withdraw aster 8.74 --chain arbitrum --asset USDC` | withdrawId 발급, 수수료 0.51 | Arbitrum USDC +8.23 |
+| Ondo | — | **미완료**: `funds address-book add ondo`가 venue에서 거절 (`key_not_allowed_for_action`, API 키로는 주소록 엔드포인트 불가). Ondo 웹앱에서 주소록 등록 필요 | — |
+| QFEX | — | **미완료**: 출금 권한 키와 `settings withdraw.qfex` 게이트 필요 (사용자 작업) | — |
+
+이번에 발견해서 고친 것:
+- Aster 출금이 USDT로 고정 → 계정 증거금이 USDC면 출금 불가. `user-withdraw-info` 원값에 USDC 행(체인 1 / 56 / 4663 / 5042 / 42161)이 있어 `--asset USDT|USDC` 추가.
+- Aster `user-withdraw-info`가 `perpMaxWithdrawAmount` / `withdrawFee`를 JSON number로 보냄 → 파서가 문자열만 받아 `EXCHANGE_ERROR`(전송 전). 숫자도 소수 문자열로 변환하도록 수정.
+- Aster 출금 권한 에이전트(--can-withdraw + IP 화이트리스트)는 출금 후 `approve --rotate --no-withdraw`로 원복 (이전 키는 venue 확인 후 해제).
+
+발견만 한 것: `funds withdraw hyperliquid`의 dry-run은 `-e hyperliquid` 없이 통과하지만 실제 실행은 `Requires --exchange hyperliquid`(`UNKNOWN`, 500)로 거절된다 (전송 없음).
+
+남은 venue 잔고: Ondo ≈ $11.89, QFEX ≈ $10.73, 그 외 venue는 $0.03 미만. HL 현물 HYPE 0.0333(≈ $2.8, HL 현물 최소 주문 $10 미만이라 매도 불가)과 HIP-4 outcome 1주, Pacifica SOL 0.00096은 남아 있다.
+
+### 6.5 추가 검증과 수정 (2026-10-13)
+
+| 항목 | 결과 |
+|---|---|
+| `funds bridge send --from arbitrum --to solana --amount 5` | **수정 후 라이브 성공** (deBridge, Solana USDC +4.996). 수정 전: OWS 지갑이면 `ows:main`을 개인키로 해석해 `UNKNOWN` 500 (`send` / `exchange` / `quote` 공통). 이제 OWS master 서명(`src/bridge-signers.ts`) |
+| deBridge 실제 비용 | 위 전송에서 실제로 **5.9397 USDC + 0.001 ETH**가 나갔는데 견적은 "amountIn 5, fee $0.004"였다 (`prependOperatingExpenses=true`가 운영비를 입력에 더함, `fixFee`는 tx value). 수정: `false`로 정확히 `--amount`만 나가게 하고(운영비는 받는 금액에서 차감), `fixFee`를 `nativeFee`로 표시, 견적 순위를 "받는 금액 − 네이티브 수수료(USD)"로 계산 |
+| `funds rebalance plan` / `execute --withdraw-only` | 라이브: HL $11 입금 → plan `$5 hyperliquid→lighter` → execute가 HL에서 $5 출금(`withdrawn`). dry-run이 `status: "executed"`로 보고하던 것을 `simulated`로 수정. `--auto-bridge` 경로는 Arbitrum ETH 부족(deBridge 고정 수수료로 소진)으로 라이브 미실행 |
+| `funds withdraw hyperliquid` / `pacifica`, `funds transfer`(HL) | 서브명령이 venue를 직접 가져오도록 수정 — `-e` 없이 라이브 출금 성공 (HL 6.0) |
+| alerts | `add` / `list` / `remove` 정상. `--exchange` 필터가 루트 옵션에 먹혀 `"*"`로 저장되던 것 수정. 채널 미설정 시 `test` / `start`가 텍스트 + exit 0이던 것을 `INVALID_PARAMS`로 수정. Telegram / Discord 전송은 토큰이 없어 미실행 |
+| HIP-4 outcome 토큰 평가 | `allMids`의 outcome mid로 평가 → 다중 venue 봇 equity가 다시 계산됨 (+14881 × 1 ≈ $0.90, 읽기 전용 라이브 확인) |
+| HL `account settings` | 포지션이 없어도 최근 거래 마켓(최대 5개)의 레버리지를 `activeAssetData`로 조회 |
+| Aster `liquidationPrice: "0"` | `null`로 보고 (Aster 문서: 값이 음수가 되면 0으로 보고) |
+| `spot-adapter-cross-validate` 테스트 | `.env` 개인키 읽기 제거, 계정 케이스는 OWS 공개 주소 + `PERP_SPOT_XVAL_ACCOUNT=1` |
+
+남은 것: `funds rebalance execute --auto-bridge` 라이브(가스 필요, 가스 사전 점검 없음), HyperCore → Solana CCTP 경로(`bridge exchange --from hyperliquid --to pacifica`)는 주소 인코딩이 의심되나 미검증, Solana v0 트랜잭션의 OWS 서명은 mock 테스트만.

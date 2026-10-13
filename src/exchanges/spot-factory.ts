@@ -19,7 +19,7 @@ import { canonicalFor, isNeverMatch } from "./canonical-symbols.js";
 import { floorSize } from "./precision.js";
 import type { AssetClass, Network, VenueId, VenueMarket } from "./venue-types.js";
 import type { ExchangeAdapter } from "./interface.js";
-import { isSpotFreshBalancesCapable, isSpotPricesCapable, isSpotTransferCapable, MAX_PRICE_DEVIATION_PCT, type SpotAdapter, type SpotBalance, type SpotMarketInfo } from "./spot-interface.js";
+import { isSpotFreshBalancesCapable, isSpotHoldingPricesCapable, isSpotPricesCapable, isSpotTransferCapable, MAX_PRICE_DEVIATION_PCT, type SpotAdapter, type SpotBalance, type SpotMarketInfo } from "./spot-interface.js";
 import { getVenue, listVenues, tryResolveVenueId, type SpotCreateOptions, type VenueDefinition, type VenueSpotDefinition } from "./venue.js";
 import "./venues/index.js";
 
@@ -197,7 +197,7 @@ export function valueSpotBalances(
   def: VenueDefinition,
   net: Network,
   balances: readonly SpotBalance[],
-  markets: readonly SpotMarketInfo[],
+  markets: readonly SpotValuationPrice[],
   warn: (msg: string) => void,
 ): ValuedSpotBalance[] {
   // markPrice null = no usable price (§12 SpotMarketInfo) → the token is excluded below.
@@ -223,16 +223,35 @@ export function valueSpotBalances(
 /** Timeout for one venue's spot valuation (balances + prices) in aggregate views (portfolio, landing). */
 export const SPOT_VALUATION_TIMEOUT_MS = 5_000;
 
+/** The price fields valuation reads (a spot market, or a held token's price — SpotHoldingPrice). */
+export type SpotValuationPrice = Pick<SpotMarketInfo, "baseToken" | "markPrice">;
+
 /**
- * Markets used to price `balances`. Wallet-model venues (Arcus) price only the held
- * non-quote tokens (`getSpotPrices`); exchange venues use `getSpotMarkets()`.
+ * Prices used to value `balances`. Wallet-model venues (Arcus) price only the held
+ * non-quote tokens (`getSpotPrices`); exchange venues use `getSpotMarkets()`, plus — when the
+ * adapter is SpotHoldingPricesCapable — `getHoldingPrices()` for held tokens that are not a spot
+ * market (Hyperliquid HIP-4 outcome tokens). A holding price counts only when it is quoted in one of
+ * the venue's spot quote assets (valued 1:1 like the quote balance); any other quote (or an unknown
+ * one) → markPrice null → the token stays unpriced (never 0).
  */
-export async function spotMarketsForValuation(def: VenueDefinition, spot: SpotAdapter, balances: readonly SpotBalance[]): Promise<SpotMarketInfo[]> {
-  if (requireSpotDefinition(def).accountModel !== "wallet") return spot.getSpotMarkets();
+export async function spotMarketsForValuation(def: VenueDefinition, spot: SpotAdapter, balances: readonly SpotBalance[], net: Network): Promise<SpotValuationPrice[]> {
+  if (requireSpotDefinition(def).accountModel !== "wallet") {
+    const markets = await spot.getSpotMarkets();
+    if (!isSpotHoldingPricesCapable(spot)) return markets;
+    const listed = new Set(markets.map(m => m.baseToken.toUpperCase()));
+    const unlisted = nonQuoteSpotBalances(def, net, balances).map(b => spotTokenBase(b.token)).filter(t => !listed.has(t));
+    if (unlisted.length === 0) return markets;
+    const quotes = spotQuoteAssets(def, net);
+    const held = (await spot.getHoldingPrices(unlisted)).map(p => ({
+      baseToken: p.token,
+      markPrice: p.quoteToken !== null && quotes.includes(p.quoteToken.toUpperCase()) ? p.markPrice : null,
+    }));
+    return [...markets, ...held];
+  }
   if (!isSpotPricesCapable(spot)) {
     throw new Error(`${def.id} is a wallet-model spot venue but its adapter has no getSpotPrices()`);
   }
-  const held = nonQuoteSpotBalances(def, spotNetworkOf(spot), balances).map(b => spotTokenBase(b.token));
+  const held = nonQuoteSpotBalances(def, net, balances).map(b => spotTokenBase(b.token));
   return held.length === 0 ? [] : spot.getSpotPrices(held);
 }
 
@@ -247,9 +266,10 @@ export async function fetchValuedSpotBalances(
   timeoutMs: number = SPOT_VALUATION_TIMEOUT_MS,
 ): Promise<ValuedSpotBalance[]> {
   return withSpotTimeout((async () => {
+    const net = spotNetworkOf(spot);
     const balances = await spot.getSpotBalances();
-    const markets = await spotMarketsForValuation(def, spot, balances);
-    return valueSpotBalances(def, spotNetworkOf(spot), balances, markets, warn);
+    const markets = await spotMarketsForValuation(def, spot, balances, net);
+    return valueSpotBalances(def, net, balances, markets, warn);
   })(), `${def.displayName} spot valuation`, timeoutMs);
 }
 

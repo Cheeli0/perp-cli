@@ -8,6 +8,7 @@ import { printJson, jsonOk } from "../utils.js";
 import { fetchAllFundingRates } from "../funding-rates.js";
 import "../exchanges/venues/index.js";
 import { resolveVenueId, getVenue } from "../exchanges/venue.js";
+import { PerpError } from "../errors.js";
 import { scrubSecretEnv } from "../secret-env.js";
 import { networkOf } from "../cli-flags.js";
 
@@ -117,8 +118,7 @@ export function registerAlertCommands(program: Command, isJson: () => boolean) {
     .action(async () => {
       const settings = loadSettings();
       if (!hasAnyService(settings.alerts)) {
-        console.log(chalk.red("  Not configured. Run: perp alerts setup\n"));
-        return;
+        throw new PerpError("INVALID_PARAMS", "No alert messaging service (Telegram / Discord) is configured", { remediation: "Run: perp alerts setup" });
       }
       const msg = `[TEST] perp-cli alert system is working. ${new Date().toISOString()}`;
       try {
@@ -126,8 +126,9 @@ export function registerAlertCommands(program: Command, isJson: () => boolean) {
         if (isJson()) return printJson(jsonOk({ status: "sent", services: serviceStatus(settings.alerts) }));
         console.log(chalk.green(`  Test message sent! (${serviceStatus(settings.alerts).join(", ")})\n`));
       } catch (err) {
-        if (isJson()) return printJson(jsonOk({ error: String(err) }));
-        console.log(chalk.red(`  Failed: ${err instanceof Error ? err.message : err}\n`));
+        throw new PerpError("EXCHANGE_ERROR", `Test alert failed: ${err instanceof Error ? err.message : String(err)}`, {
+          remediation: "Check the bot token / chat id or webhook: perp alerts setup",
+        });
       }
     });
 
@@ -156,7 +157,11 @@ export function registerAlertCommands(program: Command, isJson: () => boolean) {
       }
 
       // Unknown venue → UNKNOWN_VENUE (a stored rule with a typo would never match).
-      const exchange = opts.exchange ? resolveVenueId(opts.exchange) : "*";
+      // `--exchange` is also the root option (-e, --exchange), which commander gives to the root
+      // program: read it there when it was passed on the command line (never its default venue).
+      const rootExchange = program.getOptionValueSource("exchange") === "cli" ? String(program.opts().exchange) : undefined;
+      const filter = opts.exchange ?? rootExchange;
+      const exchange = filter !== undefined ? resolveVenueId(filter) : "*";
 
       const settings = loadSettings();
       const rule: AlertRule = {
@@ -271,14 +276,12 @@ export function registerAlertCommands(program: Command, isJson: () => boolean) {
       const settings = loadSettings();
 
       if (!hasAnyService(settings.alerts)) {
-        console.log(chalk.red("  No messaging service configured. Run: perp alerts setup\n"));
-        return;
+        throw new PerpError("INVALID_PARAMS", "No alert messaging service (Telegram / Discord) is configured", { remediation: "Run: perp alerts setup" });
       }
 
       const rules = settings.alerts.rules.filter(r => r.enabled);
       if (rules.length === 0) {
-        console.log(chalk.red("  No active alert rules. Add one: perp alerts add ETH 30\n"));
-        return;
+        throw new PerpError("INVALID_PARAMS", "No active alert rules", { remediation: "Add one: perp alerts add ETH 30" });
       }
 
       const intervalSec = parseInt(opts.interval || String(settings.alerts.intervalSec)) || 300;

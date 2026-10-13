@@ -105,6 +105,26 @@ export function isSpotPricesCapable(a: SpotAdapter): a is SpotAdapter & SpotPric
   return typeof (a as unknown as Record<string, unknown>).getSpotPrices === "function";
 }
 
+/**
+ * A held token's price for valuation only — a token the venue holds in spot but does not list as a
+ * spot market (Hyperliquid HIP-4 outcome tokens "+<encoding>"). `quoteToken` = the token its price is
+ * quoted in; null = unknown (then the price is unusable). `markPrice` null = no usable price (Rule #2).
+ */
+export interface SpotHoldingPrice {
+  token: string;
+  quoteToken: string | null;
+  markPrice: string | null;
+}
+
+/** Prices for held tokens without a spot market (valuation: portfolio, bot equity). Unpriceable tokens may be omitted. */
+export interface SpotHoldingPricesCapable {
+  getHoldingPrices(tokens: readonly string[]): Promise<SpotHoldingPrice[]>;
+}
+
+export function isSpotHoldingPricesCapable(a: SpotAdapter): a is SpotAdapter & SpotHoldingPricesCapable {
+  return typeof (a as unknown as Record<string, unknown>).getHoldingPrices === "function";
+}
+
 export function isSpotTransferCapable(a: SpotAdapter): a is SpotAdapter & SpotTransferCapable {
   const r = a as unknown as Record<string, unknown>;
   return typeof r.transferToSpot === "function" && typeof r.transferToPerp === "function";

@@ -105,7 +105,7 @@ describe("pins (venue definition)", () => {
     expect(ASTER_FUNDS_CHAINS.arbitrum.tokens).toEqual({ USDT: "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9", USDC: ARB_USDC });
     expect(asterVenue.networks.mainnet).toMatchObject({ rpcUrl: ASTER_FUNDS_CHAINS.bsc.rpcUrl, depositPins: { chainId: 56, contract: BSC_VAULT, token: BSC_USDT } });
     expect(asterVenue.networks.testnet).toMatchObject({ rpcUrl: null, depositPins: null });
-    expect(asterVenue.capabilities?.withdrawAssets).toEqual(["USDT"]);
+    expect(asterVenue.capabilities?.withdrawAssets).toEqual(["USDT", "USDC"]);
   });
 });
 
@@ -301,6 +301,15 @@ describe("withdraw limits", () => {
     expect(() => funds.parseAsterWithdrawLimits(info, "USDT", 42161)).toThrow(expect.objectContaining({ structured: expect.objectContaining({ code: "INSUFFICIENT_BALANCE" }) }));
     expect(() => funds.parseAsterWithdrawLimits({ balances: { USDT: { chainBalances: { "56": { perpMaxWithdrawAmount: "300" } } } } }, "USDT", 56))
       .toThrow(expect.objectContaining({ structured: expect.objectContaining({ code: "EXCHANGE_ERROR" }) }));
+  });
+
+  it("USDC limits come from the USDC row (live shape 2026-10-13: USDC-only account on Arbitrum)", () => {
+    // Live shape: JSON numbers, not strings.
+    const usdc = { balances: { USDC: { currency: "USDC", chainBalances: { "42161": { chainId: 42161, spotMaxWithdrawAmount: 0, perpMaxWithdrawAmount: 8.7451191, chainLimit: 40.95, withdrawFee: 0.51 } } } } };
+    expect(funds.parseAsterWithdrawLimits(usdc, "USDC", 42161)).toEqual({ max: "8.7451191", fee: "0.51" });
+    const bad = { balances: { USDC: { chainBalances: { "42161": { perpMaxWithdrawAmount: -1, withdrawFee: 0.51 } } } } };
+    expect(() => funds.parseAsterWithdrawLimits(bad, "USDC", 42161)).toThrow(expect.objectContaining({ structured: expect.objectContaining({ code: "EXCHANGE_ERROR" }) }));
+    expect(() => funds.parseAsterWithdrawLimits(usdc, "USDT", 42161)).toThrow(expect.objectContaining({ structured: expect.objectContaining({ code: "INSUFFICIENT_BALANCE" }) }));
   });
 
   it("amount must exceed the fee and not exceed the maximum", () => {

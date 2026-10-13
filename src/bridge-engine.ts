@@ -10,12 +10,143 @@
  * for cross-exchange rebalancing in funding arb.
  */
 
-import { PerpError } from "./errors.js";
+import { PerpError, isConnectFailure, isTransportFailure, orderOutcomeUnknown, sendFailure } from "./errors.js";
 import { loadSettings } from "./settings.js";
 import { getVenue, networkConfig } from "./exchanges/venue.js";
 import "./exchanges/venues/index.js";
 import { HL_USER_SIGNED } from "./exchanges/venues/hyperliquid.js";
 import type { Network } from "./exchanges/venue-types.js";
+import type { JsonRpcProvider } from "ethers";
+import type { Connection, VersionedTransaction } from "@solana/web3.js";
+import type { SolanaSigner } from "./signer/interface.js";
+import { ERC20, assertRpcChainId, erc20Allowance, evmProvider, sendMasterTx } from "./evm-master-tx.js";
+import {
+  isBridgeEvmSigner, isSolanaSigner, pkEvmSigner, pkSolanaSigner, signTypedDataChecked, signVersionedSolanaTx,
+  type BridgeEvmSigner,
+} from "./bridge-signers.js";
+
+/**
+ * What signs a bridge leg: a master-wallet signer (OWS vault signer or raw-key signer from
+ * bridge-signers.ts), or — for legacy callers — a raw private key string (EVM 0x hex, Solana
+ * base58 / JSON). An "ows:<name>" reference is not a key and is refused.
+ */
+export type BridgeSignerInput = string | BridgeEvmSigner | SolanaSigner;
+
+function evmSignerOf(k: BridgeSignerInput): BridgeEvmSigner {
+  if (typeof k === "string") {
+    if (!/^0x[0-9a-fA-F]{64}$/.test(k)) {
+      throw new PerpError("NO_SIGNER_AVAILABLE", "This bridge leg is signed on an EVM chain, and no EVM master signer was supplied", {
+        remediation: "Select the master wallet (perp wallet use <name> or --ows <name>) and run perp funds bridge send / exchange",
+      });
+    }
+    return pkEvmSigner(k);
+  }
+  if (isBridgeEvmSigner(k)) return k;
+  throw new PerpError("NO_SIGNER_AVAILABLE", "This bridge leg is signed on an EVM chain, but a Solana signer was supplied", {
+    remediation: "Pass the master wallet's EVM signer for EVM source chains",
+  });
+}
+
+async function solanaSignerOf(k: BridgeSignerInput): Promise<SolanaSigner> {
+  if (typeof k === "string") {
+    if (k.startsWith("ows:")) {
+      throw new PerpError("NO_SIGNER_AVAILABLE", "This bridge leg is signed on Solana, and an OWS wallet reference (not a signer) was supplied", {
+        remediation: "Select the master wallet (perp wallet use <name> or --ows <name>) and run perp funds bridge send / exchange",
+      });
+    }
+    return pkSolanaSigner(k);
+  }
+  if (isSolanaSigner(k)) return k;
+  throw new PerpError("NO_SIGNER_AVAILABLE", "This bridge leg is signed on Solana, but an EVM signer was supplied", {
+    remediation: "Pass the master wallet's Solana signer for Solana source chains",
+  });
+}
+
+/** The signer's address must be the address the quote / order was built for. */
+function assertSignerIs(chain: string, signerAddress: string, expected: string): void {
+  const same = chain === "solana" ? signerAddress === expected : signerAddress.toLowerCase() === expected.toLowerCase();
+  if (same) return;
+  throw new PerpError("INVALID_PARAMS", `The bridge order was built for sender ${expected}, not the signing wallet's ${chain} address ${signerAddress} — nothing was sent`, {
+    remediation: "Omit --sender (the master wallet's own address is used)",
+  });
+}
+
+/** Chain-checked RPC for an EVM source chain (a wrong endpoint never receives a signed tx). */
+async function bridgeEvmRpc(chain: string): Promise<{ rpc: JsonRpcProvider; chainId: number }> {
+  const chainId = chain === "solana" ? undefined : CHAIN_IDS[chain as keyof typeof CHAIN_IDS];
+  if (chainId === undefined) {
+    throw new PerpError("NO_BRIDGE_ROUTE", `No EVM chain id configured for "${chain}" — nothing was sent`, {
+      remediation: "List supported chains with: perp funds bridge chains",
+    });
+  }
+  const url = requireRpcUrl(chain);
+  const rpc = evmProvider(url, chainId);
+  await assertRpcChainId(rpc, url, chainId, "bridge");
+  return { rpc, chainId };
+}
+
+/**
+ * One master-wallet EVM transaction through sendMasterTx: simulate → gas check → sign → verify
+ * sender → broadcast → receipt. An unreadable outcome after the broadcast is ORDER_PENDING.
+ */
+async function sendBridgeEvmTx(
+  rpc: JsonRpcProvider, chainId: number, chain: string, signer: BridgeEvmSigner, provider: string, label: string,
+  to: string, data: string, value: bigint = 0n,
+): Promise<string> {
+  const { txHash } = await sendMasterTx(rpc, {
+    venue: provider, chainLabel: chain, chainId, from: signer.getAddress(), to, data, value, label,
+  }, tx => signer.signTransaction(tx));
+  return txHash;
+}
+
+/** Approve `spender` for USDC (unlimited, as before) when the allowance is below `minAllowance`. */
+async function ensureUsdcAllowance(
+  rpc: JsonRpcProvider, chainId: number, chain: string, signer: BridgeEvmSigner, provider: string, spender: string, minAllowance: bigint,
+): Promise<void> {
+  const usdc = USDC_ADDRESSES[chain];
+  if (!usdc) throw new PerpError("NO_BRIDGE_ROUTE", `No USDC address for ${chain} — nothing was sent`);
+  const allowance = await erc20Allowance(rpc, usdc, signer.getAddress(), spender);
+  if (allowance >= minAllowance) return;
+  const { MaxUint256 } = await import("ethers");
+  await sendBridgeEvmTx(rpc, chainId, chain, signer, provider, "USDC approve", usdc, ERC20.encodeFunctionData("approve", [spender, MaxUint256]));
+}
+
+function solanaOutcomeUnknown(signature: string, what: string, e: unknown): PerpError {
+  const pending = orderOutcomeUnknown("bridge", `${what} transaction ${signature}`, e,
+    `Do NOT resend — the transaction was broadcast and may still confirm. Check signature ${signature} on a Solana explorer, then the balances, before doing anything else`);
+  return new PerpError("ORDER_PENDING", pending.message, { exchange: "bridge", signature, txHash: signature, remediation: pending.structured.remediation });
+}
+
+/**
+ * Broadcast a fully signed Solana transaction and wait for confirmation. The signature is known
+ * before the send: a transport failure after the request left, or any confirmation failure, is
+ * ORDER_PENDING carrying it (never "failed", never resubmitted).
+ */
+async function sendBridgeSolanaTx(connection: Connection, tx: VersionedTransaction, what: string): Promise<string> {
+  const bs58 = (await import("bs58")).default;
+  const signature = bs58.encode(tx.signatures[0]);
+  try {
+    await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false });
+  } catch (e) {
+    if (isConnectFailure(e)) {
+      throw new PerpError("EXCHANGE_UNREACHABLE", `${what}: could not connect to the Solana RPC — nothing was sent`, { exchange: "bridge" });
+    }
+    if (isTransportFailure(e)) throw solanaOutcomeUnknown(signature, what, e);
+    throw new PerpError("ACTION_REJECTED", `${what}: the Solana RPC refused the transaction (${e instanceof Error ? e.message : String(e)}) — nothing was sent`, { exchange: "bridge" });
+  }
+  let confirmation: { value: { err: unknown } };
+  try {
+    confirmation = await connection.confirmTransaction(signature, "confirmed");
+  } catch (e) {
+    throw solanaOutcomeUnknown(signature, what, e);
+  }
+  if (confirmation.value.err !== null && confirmation.value.err !== undefined) {
+    throw new PerpError("ACTION_REJECTED", `${what}: transaction ${signature} failed on-chain (${JSON.stringify(confirmation.value.err)}) — nothing was moved`, {
+      exchange: "bridge", signature, txHash: signature,
+    });
+  }
+  return signature;
+}
 
 /**
  * Every route in this module is mainnet-only: the RPCs, USDC / CCTP contract
@@ -386,6 +517,11 @@ export interface BridgeQuote {
   estimatedTime: number;  // seconds
   gasIncluded: boolean;   // true = auto-relay (no dst gas needed), false = manual (user pays dst gas)
   gasNote?: string;       // human-readable note about gas/relay
+  /**
+   * A fee paid in the source chain's NATIVE token on top of the USDC amount (deBridge `fixFee`,
+   * sent as the tx value). `usd` is null when no price was read. null = the provider charges none.
+   */
+  nativeFee?: { amount: string; symbol: string; usd: number | null } | null;
   raw: unknown;           // raw API response for execution
 }
 
@@ -427,7 +563,10 @@ export async function getDebridgeQuote(
     srcChainTokenInAmount: amountRaw,
     dstChainId: String(dstChainId),
     dstChainTokenOut: dstToken,
-    prependOperatingExpenses: "true",
+    // false: the operating expenses come out of the amount, so exactly --amount USDC leaves the
+    // wallet. "true" ADDS them to the input (live 2026-10-13: --amount 5 spent 5.939652 USDC while
+    // the quote reported amountIn 5 / fee $0.004).
+    prependOperatingExpenses: "false",
   });
   appendDebridgeBuilderParams(quoteParams);
 
@@ -451,6 +590,21 @@ export async function getDebridgeQuote(
     );
   }
   const amountOut = dstAmountNumber / 1e6;
+  // The USDC actually taken from the wallet must equal the request (prependOperatingExpenses=false).
+  const srcInRaw = (estimation?.srcChainTokenIn as Record<string, unknown> | undefined)?.amount;
+  if (String(srcInRaw) !== amountRaw) {
+    throw new PerpError("EXCHANGE_ERROR", `deBridge quote takes ${JSON.stringify(srcInRaw)} USDC units, not the requested ${amountRaw}`, {
+      remediation: "Use another provider: --provider cctp | relay",
+    });
+  }
+  // fixFee: the protocol's flat fee in the source chain's native token (wei / lamports), paid as tx value.
+  const fixFeeRaw = quote.fixFee;
+  if (typeof fixFeeRaw !== "string" || !/^\d+$/.test(fixFeeRaw)) {
+    throw new PerpError("EXCHANGE_ERROR", `deBridge quote has no readable fixFee (${JSON.stringify(fixFeeRaw)})`);
+  }
+  const nativeSymbol = srcChain === "solana" ? "SOL" : "ETH";
+  const nativeDecimals = srcChain === "solana" ? 9 : 18;
+  const nativeFee = BigInt(fixFeeRaw) === 0n ? null : { amount: formatUnitsPlain(BigInt(fixFeeRaw), nativeDecimals), symbol: nativeSymbol, usd: null };
   const order = quote.order as Record<string, unknown> | undefined;
   const fulfillDelayRaw = Number(order?.approximateFulfillmentDelay);
   // approximateFulfillmentDelay is documented as nice-to-have telemetry;
@@ -468,7 +622,8 @@ export async function getDebridgeQuote(
     fee: amountUsdc - amountOut,
     estimatedTime: fulfillDelay,
     gasIncluded: true,
-    gasNote: "DLN market maker fulfills on destination",
+    gasNote: nativeFee === null ? "DLN market maker fulfills on destination" : `DLN market maker fulfills on destination; plus a flat ${nativeFee.amount} ${nativeFee.symbol} protocol fee (tx value)`,
+    nativeFee,
     raw: { quote, senderAddress, recipientAddress, amountRaw },
   };
 }
@@ -480,7 +635,7 @@ export async function getDebridgeQuote(
 export async function executeDebridgeBridge(
   network: Network,
   bridgeQuote: BridgeQuote,
-  signerKey: string, // EVM private key or Solana private key (base58)
+  signerKey: BridgeSignerInput, // master signer for the source chain (or a raw key)
 ): Promise<BridgeResult> {
   assertBridgeNetwork(network);
   assertDistinctBridgeChains(bridgeQuote.srcChain, bridgeQuote.dstChain);
@@ -488,6 +643,10 @@ export async function executeDebridgeBridge(
   const { senderAddress, recipientAddress, amountRaw } = bridgeQuote.raw as {
     senderAddress: string; recipientAddress: string; amountRaw: string;
   };
+  // Resolve the signer before any create-tx call: the order is built for senderAddress only.
+  const solSigner = srcChain === "solana" ? await solanaSignerOf(signerKey) : null;
+  const evmSigner = srcChain === "solana" ? null : evmSignerOf(signerKey);
+  assertSignerIs(srcChain, solSigner !== null ? solSigner.getPublicKeyBase58() : evmSigner!.getAddress(), senderAddress);
 
   const srcChainId = CHAIN_IDS[srcChain as keyof typeof CHAIN_IDS];
   const dstChainId = CHAIN_IDS[dstChain as keyof typeof CHAIN_IDS];
@@ -498,7 +657,11 @@ export async function executeDebridgeBridge(
   const quote = (bridgeQuote.raw as Record<string, unknown>).quote as Record<string, unknown>;
   const estimation = quote.estimation as Record<string, unknown>;
   const dstOut = estimation?.dstChainTokenOut as Record<string, unknown>;
-  const dstAmount = String(dstOut?.recommendedAmount ?? dstOut?.amount ?? "0");
+  const dstAmountRaw = dstOut?.recommendedAmount ?? dstOut?.amount;
+  if (dstAmountRaw === undefined || !/^\d+$/.test(String(dstAmountRaw))) {
+    throw new PerpError("EXCHANGE_ERROR", `deBridge quote has no readable dstChainTokenOut amount (${JSON.stringify(dstAmountRaw)}) — nothing sent`);
+  }
+  const dstAmount = String(dstAmountRaw);
 
   // Step 2: Create TX
   const createParams = new URLSearchParams({
@@ -511,7 +674,7 @@ export async function executeDebridgeBridge(
     dstChainTokenOutRecipient: recipientAddress,
     srcChainOrderAuthorityAddress: senderAddress,
     dstChainOrderAuthorityAddress: recipientAddress,
-    prependOperatingExpenses: "true",
+    prependOperatingExpenses: "false", // same mode as the quote: exactly amountRaw leaves the wallet
   });
   appendDebridgeBuilderParams(createParams);
 
@@ -525,10 +688,10 @@ export async function executeDebridgeBridge(
   // Step 3: Sign and submit
   let txHash: string;
 
-  if (srcChain === "solana") {
-    txHash = await submitSolanaTransaction(tx, signerKey);
+  if (solSigner !== null) {
+    txHash = await submitSolanaTransaction(tx, solSigner);
   } else {
-    txHash = await submitEvmTransaction(tx, signerKey, srcChain);
+    txHash = await submitEvmTransaction(tx, evmSigner!, srcChain);
   }
 
   return {
@@ -544,25 +707,10 @@ export async function executeDebridgeBridge(
 /**
  * Submit a Solana transaction from deBridge create-tx response.
  */
-async function submitSolanaTransaction(tx: Record<string, unknown>, signerKey: string): Promise<string> {
-  const { Connection, VersionedTransaction, Keypair } = await import("@solana/web3.js");
-  const bs58 = await import("bs58");
+async function submitSolanaTransaction(tx: Record<string, unknown>, signer: SolanaSigner): Promise<string> {
+  const { Connection, VersionedTransaction } = await import("@solana/web3.js");
 
   const connection = new Connection(RPC_URLS.solana, "confirmed");
-
-  // Decode the keypair
-  let keypair: InstanceType<typeof Keypair>;
-  try {
-    // Try base58 first (standard Solana private key format)
-    keypair = Keypair.fromSecretKey(bs58.default.decode(signerKey));
-  } catch {
-    // Try JSON array (Solana CLI format)
-    try {
-      keypair = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(signerKey)));
-    } catch {
-      throw new Error("Invalid Solana private key format");
-    }
-  }
 
   // deBridge returns hex-encoded VersionedTransaction for Solana
   const txData = String(tx.data);
@@ -572,52 +720,28 @@ async function submitSolanaTransaction(tx: Record<string, unknown>, signerKey: s
   // Update blockhash and sign
   const { blockhash } = await connection.getLatestBlockhash();
   transaction.message.recentBlockhash = blockhash;
-  transaction.sign([keypair]);
+  await signVersionedSolanaTx(signer, transaction);
 
-  const signature = await connection.sendTransaction(transaction, { skipPreflight: false });
-  await connection.confirmTransaction(signature, "confirmed");
-
-  return signature;
+  return sendBridgeSolanaTx(connection, transaction, "deBridge order");
 }
 
 /**
  * Submit an EVM transaction from deBridge create-tx response.
  */
-async function submitEvmTransaction(tx: Record<string, unknown>, privateKey: string, chain: string): Promise<string> {
-  const { ethers } = await import("ethers");
+async function submitEvmTransaction(tx: Record<string, unknown>, signer: BridgeEvmSigner, chain: string): Promise<string> {
+  const { parseUnits } = await import("ethers");
+  const { rpc, chainId } = await bridgeEvmRpc(chain);
 
-  const rpc = requireRpcUrl(chain);
-  const provider = new ethers.JsonRpcProvider(rpc);
-  const wallet = new ethers.Wallet(privateKey, provider);
-
-  // Check and approve USDC allowance if needed
-  const usdcAddr = USDC_ADDRESSES[chain];
   const spenderAddr = String(tx.to);
   const value = BigInt(String(tx.value ?? "0"));
 
-  if (usdcAddr && spenderAddr) {
-    const usdc = new ethers.Contract(usdcAddr, [
-      "function allowance(address,address) view returns (uint256)",
-      "function approve(address,uint256) returns (bool)",
-    ], wallet);
-
-    const allowance = await usdc.allowance(wallet.address, spenderAddr);
-    // Approve max if allowance insufficient
-    if (allowance < ethers.parseUnits("1000000", 6)) {
-      const approveTx = await usdc.approve(spenderAddr, ethers.MaxUint256);
-      await approveTx.wait();
-    }
+  // Check and approve USDC allowance if needed (max approval when below 1M USDC, as before)
+  if (USDC_ADDRESSES[chain] && spenderAddr) {
+    await ensureUsdcAllowance(rpc, chainId, chain, signer, "debridge", spenderAddr, parseUnits("1000000", 6));
   }
 
   // Send the bridge transaction
-  const txResponse = await wallet.sendTransaction({
-    to: String(tx.to),
-    data: String(tx.data),
-    value,
-  });
-  const receipt = await txResponse.wait();
-
-  return receipt!.hash;
+  return sendBridgeEvmTx(rpc, chainId, chain, signer, "debridge", "deBridge order", spenderAddr, String(tx.data), value);
 }
 
 // ── Circle CCTP V2 (EVM + Solana) ──
@@ -762,9 +886,9 @@ export async function executeCctpBridge(
   srcChain: string,
   dstChain: string,
   amountUsdc: number,
-  signerKey: string,
+  signerKey: BridgeSignerInput,
   recipientAddress: string,
-  dstSignerKey?: string, // EVM key for receiveMessage (Solana→EVM) or Solana key for receiveMessage (EVM→Solana)
+  dstSignerKey?: BridgeSignerInput, // destination-chain signer for receiveMessage (EVM→Solana standard finality)
   fast: boolean = false,
 ): Promise<BridgeResult> {
   assertBridgeNetwork(network);
@@ -793,23 +917,16 @@ export async function executeCctpBridge(
 
 async function executeCctpSolanaToHyperCore(
   amountUsdc: number,
-  signerKey: string,
+  signerKey: BridgeSignerInput,
   recipientAddress: string, // EVM address for HyperCore perps
 ): Promise<BridgeResult> {
   const { Connection, PublicKey, Keypair, TransactionMessage, VersionedTransaction, SystemProgram } = await import("@solana/web3.js");
-  const bs58 = await import("bs58");
   const { createHash } = await import("crypto");
 
   const connection = new Connection(RPC_URLS.solana, "confirmed");
 
-  // Decode Solana keypair
-  let keypair: InstanceType<typeof Keypair>;
-  try {
-    keypair = Keypair.fromSecretKey(bs58.default.decode(signerKey));
-  } catch {
-    try { keypair = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(signerKey))); }
-    catch { throw new Error("Invalid Solana private key format"); }
-  }
+  const signer = await solanaSignerOf(signerKey);
+  const keypair = { publicKey: new PublicKey(signer.getPublicKeyBase58()) };
 
   const tokenMessengerMinter = new PublicKey(CCTP_SOLANA_TOKEN_MESSENGER_MINTER);
   const messageTransmitterProgram = new PublicKey(CCTP_SOLANA_MESSAGE_TRANSMITTER);
@@ -932,10 +1049,9 @@ async function executeCctpSolanaToHyperCore(
   }).compileToV0Message();
 
   const transaction = new VersionedTransaction(messageV0);
-  transaction.sign([keypair, eventDataKeypair]);
+  await signVersionedSolanaTx(signer, transaction, [eventDataKeypair]);
 
-  const signature = await connection.sendTransaction(transaction, { skipPreflight: false });
-  await connection.confirmTransaction(signature, "confirmed");
+  const signature = await sendBridgeSolanaTx(connection, transaction, "CCTP depositForBurnWithHook (Solana → HyperCore)");
 
   return {
     provider: "cctp (HyperCore)",
@@ -971,16 +1087,16 @@ async function executeCctpHyperCoreToEvm(
   network: Network,
   dstChain: string,
   amountUsdc: number,
-  signerKey: string,
+  signerKey: BridgeSignerInput,
   recipientAddress: string,
 ): Promise<BridgeResult> {
   assertBridgeNetwork(network);
-  const { ethers, Signature: EthSig } = await import("ethers");
+  const { Signature: EthSig } = await import("ethers");
   // HL environment + /exchange host from the venue definition (never a hardcoded "Mainnet").
   const { hyperliquidChain } = HL_USER_SIGNED[network];
   const hlExchangeUrl = `${networkConfig(getVenue("hyperliquid"), network).restUrl}/exchange`;
 
-  const wallet = new ethers.Wallet(signerKey);
+  const signer = evmSignerOf(signerKey);
   const dstDomain = CCTP_DOMAINS[dstChain];
   if (dstDomain === undefined) throw new Error(`No CCTP domain for ${dstChain}`);
 
@@ -1037,28 +1153,34 @@ async function executeCctpHyperCoreToEvm(
     destinationRecipient: recipientAddress,
     addressEncoding: "hex",
     destinationChainId: dstDomain,
-    gasLimit: BigInt(200000),
+    // Plain numbers (not BigInt): the OWS signer serializes typed data as JSON. Both are safe integers.
+    gasLimit: 200000,
     data: "0x",
-    nonce: BigInt(timestamp),
+    nonce: timestamp,
   };
 
-  const sigHex = await wallet.signTypedData(domain, types, message);
+  const sigHex = await signTypedDataChecked(signer, domain, types, message, "HyperCore sendToEvmWithData");
   const sig = EthSig.from(sigHex);
 
-  // Submit to HL exchange API
-  const resp = await fetch(hlExchangeUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      action,
-      nonce: timestamp,
-      signature: { r: sig.r, s: sig.s, v: sig.v },
-    }),
-  });
-
-  const result = await resp.json() as Record<string, unknown>;
+  // Submit to HL exchange API. A failure after the request left is an unknown outcome.
+  let result: Record<string, unknown>;
+  try {
+    const resp = await fetch(hlExchangeUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action,
+        nonce: timestamp,
+        signature: { r: sig.r, s: sig.s, v: sig.v },
+      }),
+    });
+    result = await resp.json() as Record<string, unknown>;
+  } catch (e) {
+    throw sendFailure("hyperliquid", "sendToEvmWithData (HyperCore → EVM bridge)", e,
+      "Do NOT resend — the withdrawal may have been accepted. Check the Hyperliquid account history and the destination balance first");
+  }
   if (result.status !== "ok") {
-    throw new Error(`HyperCore withdrawal failed: ${JSON.stringify(result)}`);
+    throw new PerpError("ACTION_REJECTED", `HyperCore withdrawal rejected: ${JSON.stringify(result)}`, { exchange: "hyperliquid" });
   }
 
   return {
@@ -1079,14 +1201,13 @@ async function executeCctpHyperCoreToEvm(
 async function executeCctpEvmToHyperCore(
   srcChain: string,
   amountUsdc: number,
-  signerKey: string,
+  signerKey: BridgeSignerInput,
   recipientAddress: string,
 ): Promise<BridgeResult> {
   const { ethers } = await import("ethers");
 
-  const srcRpc = requireRpcUrl(srcChain);
-  const srcProvider = new ethers.JsonRpcProvider(srcRpc);
-  const srcWallet = new ethers.Wallet(signerKey, srcProvider);
+  const signer = evmSignerOf(signerKey);
+  const { rpc, chainId: rpcChainId } = await bridgeEvmRpc(srcChain);
 
   const usdcAddr = USDC_ADDRESSES[srcChain];
   if (!usdcAddr) throw new Error(`No USDC address for ${srcChain}`);
@@ -1105,7 +1226,7 @@ async function executeCctpEvmToHyperCore(
 
   const cctpExtensionAddr = CCTP_EXTENSION[srcChain];
 
-  let depositTx;
+  let txHash: string;
   let providerLabel: string;
 
   if (cctpExtensionAddr) {
@@ -1134,58 +1255,50 @@ async function executeCctpEvmToHyperCore(
     };
 
     const receiveAuthValue = {
-      from: srcWallet.address,
+      from: signer.getAddress(),
       to: cctpExtensionAddr,
-      value: amountRaw,
+      // Decimal string (not BigInt): the OWS signer serializes typed data as JSON.
+      value: amountRaw.toString(),
       validAfter,
       validBefore,
       nonce: authNonce,
     };
 
-    const sig = await srcWallet.signTypedData(usdcDomain, receiveAuthTypes, receiveAuthValue);
+    const sig = await signTypedDataChecked(signer, usdcDomain, receiveAuthTypes, receiveAuthValue, "USDC ReceiveWithAuthorization");
     const { v, r, s } = ethers.Signature.from(sig);
 
     const authParams = [amountRaw, validAfter, validBefore, authNonce, v, r, s];
     const burnParams = [amountRaw, HYPERCORE_CCTP_DOMAIN, forwarderBytes32, forwarderBytes32, BigInt(fees.maxFee), 1000, hookData];
 
-    const cctpExtension = new ethers.Contract(cctpExtensionAddr, [
+    const cctpExtension = new ethers.Interface([
       "function batchDepositForBurnWithAuth(tuple(uint256 value, uint256 validAfter, uint256 validBefore, bytes32 nonce, uint8 v, bytes32 r, bytes32 s) authParams, tuple(uint256 amount, uint32 destinationDomain, bytes32 mintRecipient, bytes32 destinationCaller, uint256 maxFee, uint32 minFinalityThreshold, bytes hookData) burnParams)",
-    ], srcWallet);
+    ]);
 
-    depositTx = await cctpExtension.batchDepositForBurnWithAuth(authParams, burnParams);
+    txHash = await sendBridgeEvmTx(rpc, rpcChainId, srcChain, signer, "cctp", "CCTP batchDepositForBurnWithAuth",
+      cctpExtensionAddr, cctpExtension.encodeFunctionData("batchDepositForBurnWithAuth", [authParams, burnParams]));
     providerLabel = "cctp (HyperCore via CctpExtension)";
   } else {
     // ── Path B: approve + depositForBurnWithHook (Base, other EVM chains) ──
     const tokenMessengerAddr = CCTP_TOKEN_MESSENGER[srcChain];
-    if (!tokenMessengerAddr) throw new Error(`CCTP not configured for ${srcChain}`);
+    if (!tokenMessengerAddr) throw new PerpError("NO_BRIDGE_ROUTE", `CCTP not configured for ${srcChain}`);
 
-    const usdc = new ethers.Contract(usdcAddr, [
-      "function allowance(address,address) view returns (uint256)",
-      "function approve(address,uint256) returns (bool)",
-    ], srcWallet);
+    await ensureUsdcAllowance(rpc, rpcChainId, srcChain, signer, "cctp", tokenMessengerAddr, amountRaw);
 
-    const allowance = await usdc.allowance(srcWallet.address, tokenMessengerAddr);
-    if (allowance < amountRaw) {
-      const approveTx = await usdc.approve(tokenMessengerAddr, ethers.MaxUint256);
-      await approveTx.wait();
-    }
-
-    const tokenMessenger = new ethers.Contract(tokenMessengerAddr, [
+    const tokenMessenger = new ethers.Interface([
       "function depositForBurnWithHook(uint256 amount, uint32 destinationDomain, bytes32 mintRecipient, address burnToken, bytes32 destinationCaller, uint256 maxFee, uint32 minFinalityThreshold, bytes hookData) returns (uint64 nonce)",
-    ], srcWallet);
+    ]);
 
-    depositTx = await tokenMessenger.depositForBurnWithHook(
-      amountRaw, HYPERCORE_CCTP_DOMAIN, forwarderBytes32, usdcAddr,
-      forwarderBytes32, BigInt(fees.maxFee), 1000, hookData,
-    );
+    txHash = await sendBridgeEvmTx(rpc, rpcChainId, srcChain, signer, "cctp", "CCTP depositForBurnWithHook", tokenMessengerAddr,
+      tokenMessenger.encodeFunctionData("depositForBurnWithHook", [
+        amountRaw, HYPERCORE_CCTP_DOMAIN, forwarderBytes32, usdcAddr,
+        forwarderBytes32, BigInt(fees.maxFee), 1000, hookData,
+      ]));
     providerLabel = "cctp (HyperCore via depositForBurnWithHook)";
   }
 
-  const receipt = await depositTx.wait();
-
   return {
     provider: providerLabel,
-    txHash: receipt.hash,
+    txHash,
     srcChain,
     dstChain: "hyperliquid",
     amountIn: amountUsdc,
@@ -1199,15 +1312,13 @@ async function executeCctpEvmToEvm(
   srcChain: string,
   dstChain: string,
   amountUsdc: number,
-  signerKey: string,
+  signerKey: BridgeSignerInput,
   recipientAddress: string,
   fast: boolean = false,
 ): Promise<BridgeResult> {
   const { ethers } = await import("ethers");
 
-  const srcRpc = requireRpcUrl(srcChain);
-  const srcProvider = new ethers.JsonRpcProvider(srcRpc);
-  const srcWallet = new ethers.Wallet(signerKey, srcProvider);
+  const signer = evmSignerOf(signerKey);
 
   const usdcAddr = USDC_ADDRESSES[srcChain];
   const tokenMessengerAddr = CCTP_TOKEN_MESSENGER[srcChain];
@@ -1215,28 +1326,22 @@ async function executeCctpEvmToEvm(
   const srcDomain = CCTP_DOMAINS[srcChain];
 
   if (!usdcAddr || !tokenMessengerAddr || dstDomain === undefined || srcDomain === undefined) {
-    throw new Error(`CCTP not configured for ${srcChain} → ${dstChain}`);
+    throw new PerpError("NO_BRIDGE_ROUTE", `CCTP not configured for ${srcChain} → ${dstChain}`);
   }
+  const { rpc, chainId } = await bridgeEvmRpc(srcChain);
 
   // Step 0: Check USDC balance
-  const balance = await getEvmUsdcBalance(srcChain, srcWallet.address);
+  const balance = await getEvmUsdcBalance(srcChain, signer.getAddress());
   if (balance < amountUsdc) {
-    throw new Error(`Insufficient USDC on ${srcChain}: have ${balance.toFixed(2)}, need ${amountUsdc}`);
+    throw new PerpError("INSUFFICIENT_BALANCE", `Insufficient USDC on ${srcChain}: have ${balance.toFixed(2)}, need ${amountUsdc} — nothing was sent`, {
+      remediation: `Fund ${signer.getAddress()} with USDC on ${srcChain}, or lower --amount`,
+    });
   }
 
   const amountRaw = BigInt(Math.round(amountUsdc * 1e6));
 
   // Step 1: Approve USDC
-  const usdc = new ethers.Contract(usdcAddr, [
-    "function allowance(address,address) view returns (uint256)",
-    "function approve(address,uint256) returns (bool)",
-  ], srcWallet);
-
-  const allowance = await usdc.allowance(srcWallet.address, tokenMessengerAddr);
-  if (allowance < amountRaw) {
-    const approveTx = await usdc.approve(tokenMessengerAddr, ethers.MaxUint256);
-    await approveTx.wait();
-  }
+  await ensureUsdcAllowance(rpc, chainId, srcChain, signer, "cctp", tokenMessengerAddr, amountRaw);
 
   // Step 2: Get fee (with forwarding — Circle handles dst mint)
   const finality = fast ? 1000 : 2000;
@@ -1247,16 +1352,15 @@ async function executeCctpEvmToEvm(
   // No manual relay needed. No dst chain gas needed.
   const mintRecipient = ethers.zeroPadValue(recipientAddress, 32);
   const destinationCaller = ethers.ZeroHash; // must be zero for forwarding
-  const tokenMessenger = new ethers.Contract(tokenMessengerAddr, [
+  const tokenMessenger = new ethers.Interface([
     "function depositForBurnWithHook(uint256 amount, uint32 destinationDomain, bytes32 mintRecipient, address burnToken, bytes32 destinationCaller, uint256 maxFee, uint32 minFinalityThreshold, bytes hookData) returns (uint64 nonce)",
-  ], srcWallet);
+  ]);
 
-  const depositTx = await tokenMessenger.depositForBurnWithHook(
-    amountRaw, dstDomain, mintRecipient, usdcAddr,
-    destinationCaller, maxFee, finality, CCTP_FORWARD_HOOK_DATA,
-  );
-  const receipt = await depositTx.wait();
-  const txHash = receipt.hash;
+  const txHash = await sendBridgeEvmTx(rpc, chainId, srcChain, signer, "cctp", "CCTP depositForBurnWithHook", tokenMessengerAddr,
+    tokenMessenger.encodeFunctionData("depositForBurnWithHook", [
+      amountRaw, dstDomain, mintRecipient, usdcAddr,
+      destinationCaller, maxFee, finality, CCTP_FORWARD_HOOK_DATA,
+    ]));
   const feeUsdc = Number(maxFee) / 1e6;
   const providerLabel = fast ? "cctp (fast+forward)" : "cctp (forward)";
 
@@ -1268,32 +1372,27 @@ async function executeCctpEvmToEvm(
 async function executeCctpSolanaToEvm(
   dstChain: string,
   amountUsdc: number,
-  signerKey: string,
+  signerKey: BridgeSignerInput,
   recipientAddress: string,
-  _dstSignerKey?: string, // EVM key for manual receiveMessage (standard finality only)
+  _dstSignerKey?: BridgeSignerInput, // unused: Circle forwarding handles the destination mint
   fast: boolean = false,
 ): Promise<BridgeResult> {
   const { Connection, PublicKey, Keypair, TransactionMessage, VersionedTransaction, SystemProgram } = await import("@solana/web3.js");
-  const bs58 = await import("bs58");
   const { createHash } = await import("crypto");
 
   const connection = new Connection(RPC_URLS.solana, "confirmed");
   const dstDomain = CCTP_DOMAINS[dstChain];
-  if (dstDomain === undefined) throw new Error(`Unknown CCTP domain for ${dstChain}`);
+  if (dstDomain === undefined) throw new PerpError("NO_BRIDGE_ROUTE", `Unknown CCTP domain for ${dstChain}`);
 
-  // Decode Solana keypair
-  let keypair: InstanceType<typeof Keypair>;
-  try {
-    keypair = Keypair.fromSecretKey(bs58.default.decode(signerKey));
-  } catch {
-    try { keypair = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(signerKey))); }
-    catch { throw new Error("Invalid Solana private key format"); }
-  }
+  const signer = await solanaSignerOf(signerKey);
+  const keypair = { publicKey: new PublicKey(signer.getPublicKeyBase58()) };
 
   // Check USDC balance
   const balance = await getSolanaUsdcBalance(keypair.publicKey.toBase58());
   if (balance < amountUsdc) {
-    throw new Error(`Insufficient USDC on Solana: have ${balance.toFixed(2)}, need ${amountUsdc}`);
+    throw new PerpError("INSUFFICIENT_BALANCE", `Insufficient USDC on Solana: have ${balance.toFixed(2)}, need ${amountUsdc} — nothing was sent`, {
+      remediation: `Fund ${keypair.publicKey.toBase58()} with USDC on Solana, or lower --amount`,
+    });
   }
 
   const tokenMessengerMinter = new PublicKey(CCTP_SOLANA_TOKEN_MESSENGER_MINTER);
@@ -1420,10 +1519,9 @@ async function executeCctpSolanaToEvm(
   }).compileToV0Message();
 
   const transaction = new VersionedTransaction(messageV0);
-  transaction.sign([keypair, eventDataKeypair]);
+  await signVersionedSolanaTx(signer, transaction, [eventDataKeypair]);
 
-  const signature = await connection.sendTransaction(transaction, { skipPreflight: false });
-  await connection.confirmTransaction(signature, "confirmed");
+  const signature = await sendBridgeSolanaTx(connection, transaction, "CCTP depositForBurnWithHook (Solana → EVM)");
 
   const feeUsdc = Number(relayFee) / 1e6;
   const providerLabel = fast ? "cctp (fast+forward)" : "cctp (forward)";
@@ -1439,42 +1537,34 @@ async function executeCctpSolanaToEvm(
 async function executeCctpEvmToSolana(
   srcChain: string,
   amountUsdc: number,
-  signerKey: string,
+  signerKey: BridgeSignerInput,
   recipientAddress: string, // Solana base58 pubkey
-  solanaPayerKey?: string, // Solana private key for receiveMessage relay
+  solanaPayerKey?: BridgeSignerInput, // Solana signer for the receiveMessage relay (standard finality)
   fast: boolean = false,
 ): Promise<BridgeResult> {
   const { ethers } = await import("ethers");
 
-  const srcRpc = requireRpcUrl(srcChain);
-  const srcProvider = new ethers.JsonRpcProvider(srcRpc);
-  const srcWallet = new ethers.Wallet(signerKey, srcProvider);
+  const signer = evmSignerOf(signerKey);
 
   const usdcAddr = USDC_ADDRESSES[srcChain];
   const tokenMessengerAddr = CCTP_TOKEN_MESSENGER[srcChain];
   const solanaDomain = CCTP_DOMAINS.solana; // 5
 
-  if (!usdcAddr || !tokenMessengerAddr) throw new Error(`CCTP not configured for ${srcChain}`);
+  if (!usdcAddr || !tokenMessengerAddr) throw new PerpError("NO_BRIDGE_ROUTE", `CCTP not configured for ${srcChain}`);
+  const { rpc, chainId } = await bridgeEvmRpc(srcChain);
 
   // Step 0: Check USDC balance
-  const balance = await getEvmUsdcBalance(srcChain, srcWallet.address);
+  const balance = await getEvmUsdcBalance(srcChain, signer.getAddress());
   if (balance < amountUsdc) {
-    throw new Error(`Insufficient USDC on ${srcChain}: have ${balance.toFixed(2)}, need ${amountUsdc}`);
+    throw new PerpError("INSUFFICIENT_BALANCE", `Insufficient USDC on ${srcChain}: have ${balance.toFixed(2)}, need ${amountUsdc} — nothing was sent`, {
+      remediation: `Fund ${signer.getAddress()} with USDC on ${srcChain}, or lower --amount`,
+    });
   }
 
   const amountRaw = BigInt(Math.round(amountUsdc * 1e6));
 
   // Step 1: Approve USDC
-  const usdc = new ethers.Contract(usdcAddr, [
-    "function allowance(address,address) view returns (uint256)",
-    "function approve(address,uint256) returns (bool)",
-  ], srcWallet);
-
-  const allowance = await usdc.allowance(srcWallet.address, tokenMessengerAddr);
-  if (allowance < amountRaw) {
-    const approveTx = await usdc.approve(tokenMessengerAddr, ethers.MaxUint256);
-    await approveTx.wait();
-  }
+  await ensureUsdcAllowance(rpc, chainId, srcChain, signer, "cctp", tokenMessengerAddr, amountRaw);
 
   // Step 2: Get relay fee (no forwarding — Solana dst not supported)
   const finality = fast ? 1000 : 2000;
@@ -1497,16 +1587,15 @@ async function executeCctpEvmToSolana(
   const mintRecipient = "0x" + Buffer.from(recipientAta.toBytes()).toString("hex");
 
   const destinationCaller = ethers.ZeroHash; // permissionless relay
-  const tokenMessenger = new ethers.Contract(tokenMessengerAddr, [
+  const tokenMessenger = new ethers.Interface([
     "function depositForBurn(uint256 amount, uint32 destinationDomain, bytes32 mintRecipient, address burnToken, bytes32 destinationCaller, uint256 maxFee, uint32 minFinalityThreshold) returns (uint64 nonce)",
-  ], srcWallet);
+  ]);
 
-  const depositTx = await tokenMessenger.depositForBurn(
-    amountRaw, solanaDomain, mintRecipient, usdcAddr,
-    destinationCaller, relayFee, finality,
-  );
-  const receipt = await depositTx.wait();
-  const txHash = receipt.hash;
+  const txHash = await sendBridgeEvmTx(rpc, chainId, srcChain, signer, "cctp", "CCTP depositForBurn", tokenMessengerAddr,
+    tokenMessenger.encodeFunctionData("depositForBurn", [
+      amountRaw, solanaDomain, mintRecipient, usdcAddr,
+      destinationCaller, relayFee, finality,
+    ]));
 
   // Fast finality (1000): Circle auto-relays — done.
   if (fast) {
@@ -1563,19 +1652,15 @@ export async function executeSolanaReceiveMessage(
   messageHex: string,    // "0x..." CCTP message from Iris API
   attestationHex: string, // "0x..." attestation from Iris API
   recipientAddress: string, // Solana wallet pubkey (base58)
-  payerKey: string,        // Solana private key (base58 or JSON array)
+  payerKey: BridgeSignerInput, // Solana master signer (or raw base58 / JSON key)
 ): Promise<string> {
-  const { Connection, PublicKey, Keypair, TransactionMessage, VersionedTransaction, SystemProgram, ComputeBudgetProgram } = await import("@solana/web3.js");
-  const bs58 = await import("bs58");
+  const { Connection, PublicKey, TransactionMessage, VersionedTransaction, SystemProgram, ComputeBudgetProgram } = await import("@solana/web3.js");
   const { createHash } = await import("crypto");
 
   const connection = new Connection(RPC_URLS.solana, "confirmed");
 
-  // Decode payer keypair
-  let payer: InstanceType<typeof Keypair>;
-  try { payer = Keypair.fromSecretKey(bs58.default.decode(payerKey)); }
-  catch { try { payer = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(payerKey))); }
-  catch { throw new Error("Invalid Solana private key format"); } }
+  const payerSigner = await solanaSignerOf(payerKey);
+  const payer = { publicKey: new PublicKey(payerSigner.getPublicKeyBase58()) };
 
   // Parse raw bytes
   const messageBytes = Buffer.from(messageHex.replace("0x", ""), "hex");
@@ -1718,12 +1803,9 @@ export async function executeSolanaReceiveMessage(
   }).compileToV0Message(lookupTables);
 
   const transaction = new VersionedTransaction(messageV0);
-  transaction.sign([payer]);
+  await signVersionedSolanaTx(payerSigner, transaction);
 
-  const signature = await connection.sendTransaction(transaction, { skipPreflight: false });
-  await connection.confirmTransaction(signature, "confirmed");
-
-  return signature;
+  return sendBridgeSolanaTx(connection, transaction, "CCTP receiveMessage (Solana)");
 }
 
 // ── Shared CCTP helpers ──
@@ -1793,31 +1875,25 @@ export async function getRelayQuote(
 }
 
 /**
- * Execute a verified Relay USDC quote with a raw EVM key (legacy bridge callers). Only the
- * verified approve (exact amount, pinned depository) + deposit are signed — never an unlimited
- * approval, never an unchecked target. OWS wallets use `perp funds bridge send --provider relay`.
+ * Execute a verified Relay USDC quote with the master's EVM signer (OWS vault signer or a raw
+ * key). Only the verified approve (exact amount, pinned depository) + deposit are signed — never
+ * an unlimited approval, never an unchecked target.
  */
 export async function executeRelayBridge(
   network: Network,
   bridgeQuote: BridgeQuote,
-  signerKey: string,
+  signerKey: BridgeSignerInput,
 ): Promise<BridgeResult> {
   assertBridgeNetwork(network);
   assertDistinctBridgeChains(bridgeQuote.srcChain, bridgeQuote.dstChain);
   const { executeRelaySwap, assertRelayMinOut } = await import("./relay-swap.js");
   const q = bridgeQuote.raw as import("./relay-swap.js").RelaySwapQuote;
   assertRelayMinOut(q, null);
-  if (!/^0x[0-9a-fA-F]{64}$/.test(signerKey)) {
-    throw new PerpError("NO_SIGNER_AVAILABLE", "This Relay bridge path signs with a raw EVM private key, and none was supplied", {
-      remediation: "With an OWS wallet use: perp funds bridge send --provider relay --from <chain> --to <chain> --amount <n>",
-    });
+  const signer = evmSignerOf(signerKey);
+  if (signer.getAddress().toLowerCase() !== q.sender.toLowerCase()) {
+    throw new PerpError("INVALID_PARAMS", `The Relay quote was built for sender ${q.sender}, not the signing wallet's address ${signer.getAddress()} — nothing was sent`);
   }
-  const { SigningKey, computeAddress } = await import("ethers");
-  const key = new SigningKey(signerKey);
-  if (computeAddress(key).toLowerCase() !== q.sender.toLowerCase()) {
-    throw new PerpError("INVALID_PARAMS", `The Relay quote was built for sender ${q.sender}, not the signing key's address ${computeAddress(key)} — nothing was sent`);
-  }
-  const res = await executeRelaySwap(network, q, async tx => key.sign(tx.unsignedHash).serialized);
+  const res = await executeRelaySwap(network, q, tx => signer.signTransaction(tx));
   return {
     provider: "relay",
     txHash: res.depositTxHash,
@@ -1838,6 +1914,31 @@ export async function executeRelayBridge(
  * Get quotes from ALL available providers in parallel.
  * Returns sorted by amountOut (best first).
  */
+/** Plain decimal string of `raw` / 10^decimals (no exponent, trailing zeros trimmed). */
+function formatUnitsPlain(raw: bigint, decimals: number): string {
+  const base = 10n ** BigInt(decimals);
+  const whole = raw / base;
+  const frac = (raw % base).toString().padStart(decimals, "0").replace(/0+$/, "");
+  return frac === "" ? whole.toString() : `${whole}.${frac}`;
+}
+
+/** USD mid of native tokens (ETH / SOL) from Hyperliquid allMids; a failed read leaves them unpriced. */
+async function nativeUsdPrices(symbols: string[]): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  try {
+    const res = await fetch("https://api.hyperliquid.xyz/info", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "allMids" }) });
+    if (!res.ok) return out;
+    const mids = await res.json() as Record<string, unknown>;
+    for (const sym of symbols) {
+      const px = Number(mids[sym]);
+      if (Number.isFinite(px) && px > 0) out.set(sym, px);
+    }
+  } catch {
+    // Unpriced is reported as usd: null and ranks the quote last — never treated as a zero fee.
+  }
+  return out;
+}
+
 export async function getAllQuotes(
   srcChain: string,
   dstChain: string,
@@ -1857,8 +1958,25 @@ export async function getAllQuotes(
     if (r.status === "fulfilled") quotes.push(r.value);
   }
 
-  // Sort by best deal (highest amountOut)
-  quotes.sort((a, b) => b.amountOut - a.amountOut);
+  // Price native fees (deBridge fixFee) so quotes compare on the same basis; an unpriced native
+  // fee ranks that quote last (its total cost is unknown), never as free.
+  const symbols = [...new Set(quotes.flatMap(q => (q.nativeFee ? [q.nativeFee.symbol] : [])))];
+  if (symbols.length > 0) {
+    const prices = await nativeUsdPrices(symbols);
+    for (const q of quotes) {
+      if (!q.nativeFee) continue;
+      const px = prices.get(q.nativeFee.symbol);
+      q.nativeFee = { ...q.nativeFee, usd: px === undefined ? null : Number(q.nativeFee.amount) * px };
+    }
+  }
+  const net = (q: BridgeQuote): number | null => (q.nativeFee ? (q.nativeFee.usd === null ? null : q.amountOut - q.nativeFee.usd) : q.amountOut);
+  quotes.sort((a, b) => {
+    const na = net(a), nb = net(b);
+    if (na === null && nb === null) return b.amountOut - a.amountOut;
+    if (na === null) return 1;
+    if (nb === null) return -1;
+    return nb - na;
+  });
   return quotes;
 }
 
@@ -1888,10 +2006,10 @@ export async function executeBestBridge(
   srcChain: string,
   dstChain: string,
   amountUsdc: number,
-  signerKey: string,
+  signerKey: BridgeSignerInput,
   senderAddress: string,
   recipientAddress: string,
-  dstSignerKey?: string, // Optional EVM key for manual receiveMessage (standard finality)
+  dstSignerKey?: BridgeSignerInput, // Optional destination-chain signer for manual receiveMessage (standard finality)
   provider?: "cctp" | "relay" | "debridge",
   fast: boolean = false,
 ): Promise<BridgeResult> {
@@ -1904,12 +2022,20 @@ export async function executeBestBridge(
     // User specified a provider — get that specific quote
     const quotes = await getAllQuotes(srcChain, dstChain, amountUsdc, senderAddress, recipientAddress);
     const match = quotes.find(q => q.provider === provider);
-    if (!match) throw new Error(`Provider "${provider}" not available for ${srcChain} → ${dstChain}`);
+    if (!match) {
+      throw new PerpError("NO_BRIDGE_ROUTE", `Provider "${provider}" not available for ${srcChain} → ${dstChain} — nothing was sent`, {
+        remediation: "Drop --provider to use the best available route (see: perp funds bridge quote)",
+      });
+    }
     quote = match;
   } else {
     // Default: prefer deBridge DLN (fastest, ~2s), fallback to best available
     const quotes = await getAllQuotes(srcChain, dstChain, amountUsdc, senderAddress, recipientAddress);
-    if (quotes.length === 0) throw new Error(`No bridge available for ${srcChain} → ${dstChain}`);
+    if (quotes.length === 0) {
+      throw new PerpError("NO_BRIDGE_ROUTE", `No bridge available for ${srcChain} → ${dstChain} — nothing was sent`, {
+        remediation: "Check supported routes: perp funds bridge chains",
+      });
+    }
     quote = quotes.find(q => q.provider === "debridge") ?? quotes[0];
   }
 

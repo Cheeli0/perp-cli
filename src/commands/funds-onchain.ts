@@ -129,12 +129,16 @@ export function registerOnchainFundsCommands(ctx: OnchainFundsContext): void {
     const def = getVenue("aster");
     const assets = def.capabilities?.withdrawAssets;
     if (assets === null || assets === undefined || assets.length === 0) throw new Error("aster declares no withdrawAssets but has a withdraw command");
-    const asset = assets[0];
     supportsDryRun(withdraw.command("aster <amount>"))
-      .description(`Withdraw ${asset} from Aster perps to your own address on BNB Chain or Arbitrum (mainnet only; needs an API wallet approved with --can-withdraw --ip-whitelist; supports --dry-run)`)
+      .description(`Withdraw ${assets.join(" or ")} from Aster perps to your own address on BNB Chain or Arbitrum (mainnet only; needs an API wallet approved with --can-withdraw --ip-whitelist; supports --dry-run)`)
       .option("--chain <chain>", "Destination chain: bsc | arbitrum", "bsc")
+      .option("--asset <asset>", `Asset to withdraw: ${assets.join(" | ")}`, assets[0])
       .option("--to <address>", "Destination EVM address (must be the account's own address — the default)")
-      .action(async (amount: string, opts: { chain: string; to?: string }) => {
+      .action(async (amount: string, opts: { chain: string; asset: string; to?: string }) => {
+        const asset = opts.asset.toUpperCase();
+        if (!assets.includes(asset)) {
+          throw new PerpError("INVALID_PARAMS", `Aster withdraws ${assets.join(" / ")} only (got "${opts.asset}")`, { remediation: `Use --asset ${assets.join(" or --asset ")}` });
+        }
         const net = getNetwork();
         const { requireAsterFundsNetwork, asterFundsChain } = await import("../exchanges/aster-funds.js");
         requireAsterFundsNetwork(net, "withdraw");
@@ -165,7 +169,7 @@ export function registerOnchainFundsCommands(ctx: OnchainFundsContext): void {
           console.log(`  Destination: ${owner} (${pins.label})`);
         }
         try {
-          const result = await adapter.withdraw(amount, owner, { chain });
+          const result = await adapter.withdraw(amount, owner, { chain, asset });
           logExecution({
             type: "bridge", exchange: "aster", symbol: asset, side: "withdraw", size: amount, status: "success", dryRun: false,
             meta: { action: "withdraw", destination: owner, chain, withdrawId: result.withdrawId, fee: result.fee },

@@ -198,8 +198,9 @@ export function registerFundsCommands(
       if (opts.relay) {
         if (!isJson()) console.log(chalk.cyan(`\n  Depositing $${formatUsd(amountNum)} via relayer (gasless)...\n`));
 
-        const adapter = await getAdapter();
-        if (adapter.name !== "pacifica") throw new Error("Requires --exchange pacifica");
+        // The subcommand names the venue: fetch it directly, independent of -e.
+        const adapter = await getAdapterForExchange("pacifica");
+        if (adapter.name !== "pacifica") throw new Error("pacifica venue did not produce a Pacifica adapter");
         const { PacificaAdapter } = await import("../exchanges/pacifica.js");
         const pacAdapter = adapter as InstanceType<typeof PacificaAdapter>;
 
@@ -292,8 +293,9 @@ export function registerFundsCommands(
         console.log(chalk.gray("  Requires: SOL for gas (~0.005 SOL) + USDC on Solana\n"));
       }
 
-      const adapter = await getAdapter();
-      if (adapter.name !== "pacifica") throw new Error("Requires --exchange pacifica");
+      // The subcommand names the venue: fetch it directly, independent of -e.
+      const adapter = await getAdapterForExchange("pacifica");
+      if (adapter.name !== "pacifica") throw new Error("pacifica venue did not produce a Pacifica adapter");
       const { PacificaAdapter: PacAdapterCls } = await import("../exchanges/pacifica.js");
       const pacDirect = adapter as InstanceType<typeof PacAdapterCls>;
 
@@ -844,8 +846,9 @@ export function registerFundsCommands(
         });
       }
       await requireMaster("pacifica", "Pacifica testnet faucet");
-      const adapter = await getAdapter();
-      if (adapter.name !== "pacifica") throw new Error("Requires --exchange pacifica");
+      // The subcommand names the venue: fetch it directly, independent of -e.
+      const adapter = await getAdapterForExchange("pacifica");
+      if (adapter.name !== "pacifica") throw new Error("pacifica venue did not produce a Pacifica adapter");
       const { PacificaAdapter } = await import("../exchanges/pacifica.js");
       const pac = adapter as InstanceType<typeof PacificaAdapter>;
       const { Connection } = await import("@solana/web3.js");
@@ -889,8 +892,9 @@ export function registerFundsCommands(
       }
       await requireMaster("pacifica", "Pacifica withdraw");
 
-      const adapter = await getAdapter();
-      if (!hasPacificaSdk(adapter) || !isWithdrawCapable(adapter)) throw new Error("Requires --exchange pacifica");
+      // The subcommand names the venue: fetch it directly, independent of -e.
+      const adapter = await getAdapterForExchange("pacifica");
+      if (!hasPacificaSdk(adapter) || !isWithdrawCapable(adapter)) throw new Error("pacifica venue did not produce a withdraw-capable Pacifica adapter");
 
       // Pacifica withdrawals always go to the account owner's own wallet.
       const dest = adapter.publicKey;
@@ -937,8 +941,9 @@ export function registerFundsCommands(
       }
       await requireMaster("hyperliquid", "Hyperliquid withdraw");
 
-      const adapter = await getAdapter();
-      if (adapter.name !== "hyperliquid" || !hasEvmAddress(adapter) || !isWithdrawCapable(adapter)) throw new Error("Requires --exchange hyperliquid");
+      // The subcommand names the venue: fetch it directly, independent of -e (like ondo / arcus).
+      const adapter = await getAdapterForExchange("hyperliquid");
+      if (!hasEvmAddress(adapter) || !isWithdrawCapable(adapter)) throw new Error("hyperliquid venue did not produce a withdraw-capable EVM adapter");
 
       const dest = opts.to || adapter.address;
 
@@ -1296,8 +1301,9 @@ export function registerFundsCommands(
       }
       await requireMaster("hyperliquid", "Hyperliquid transfer");
 
-      const adapter = await getAdapter();
-      if (!isUsdTransferCapable(adapter)) throw new Error("Requires --exchange hyperliquid");
+      // Not -e qfex → the Hyperliquid transfer (as the dry-run plan says): fetch it directly, independent of -e.
+      const adapter = await getAdapterForExchange("hyperliquid");
+      if (!isUsdTransferCapable(adapter)) throw new Error("hyperliquid venue did not produce a USD-transfer-capable adapter");
 
       if (!isJson()) console.log(chalk.cyan(`\n  Transferring $${formatUsd(amountNum)} USDC to ${destination}...\n`));
 
@@ -1339,7 +1345,7 @@ export function registerFundsCommands(
             ondo: { chain: "Ethereum", token: "USDC", command: "perp funds withdraw ondo <amount> --to <address>", addressBook: "destination must be listed: perp funds address-book add ondo <master address>" },
             qfex: { chain: "Arbitrum", token: "USDC", command: "perp funds withdraw qfex <amount> --to <allowlisted address>", gate: "settings withdraw.qfex (allowlist, maxPerTx, maxPerDay)", note: "needs a key with the \"Deposit and withdraw\" permission (All accounts access)" },
             arcus: { chain: "Robinhood Chain", token: "USDG", command: "perp funds withdraw arcus <amount>" },
-            aster: { chain: "BNB Chain (default) / Arbitrum", token: "USDT", command: "perp funds withdraw aster <amount> [--chain bsc|arbitrum]", fee: "POST /fapi/v3/aster/user-withdraw-info (taken from the amount)", requires: "mainnet; API wallet approved with --can-withdraw --ip-whitelist; destination = the account's own address" },
+            aster: { chain: "BNB Chain (default) / Arbitrum", token: "USDT (default) / USDC", command: "perp funds withdraw aster <amount> [--chain bsc|arbitrum] [--asset USDT|USDC]", fee: "POST /fapi/v3/aster/user-withdraw-info (taken from the amount)", requires: "mainnet; API wallet approved with --can-withdraw --ip-whitelist; destination = the account's own address" },
           },
         }));
       }
@@ -1409,7 +1415,7 @@ export function registerFundsCommands(
 
       console.log(chalk.white.bold("\n  Aster") + chalk.gray(" → BNB Chain / Arbitrum (USDT, to the account's own address; mainnet only)"));
       console.log(`  Needs an API wallet approved with --can-withdraw --ip-whitelist; fee from user-withdraw-info`);
-      console.log(`  Command: ${chalk.green("perp funds withdraw aster <amount> [--chain bsc|arbitrum]")}`);
+      console.log(`  Command: ${chalk.green("perp funds withdraw aster <amount> [--chain bsc|arbitrum] [--asset USDT|USDC]")}`);
 
       // Transfer + Bridge
       console.log(chalk.white.bold("\n  ── Transfer & Bridge ──\n"));

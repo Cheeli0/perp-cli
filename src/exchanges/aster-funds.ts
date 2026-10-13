@@ -21,6 +21,7 @@
  */
 
 import { Interface, formatUnits, parseUnits, verifyTypedData, zeroPadValue } from "ethers";
+import { venueRateString } from "../utils/numeric.js";
 import { PerpError } from "../errors.js";
 import {
   ERC20, EVM_ADDRESS_RE, assertRpcChainId, erc20Allowance, erc20Balance, erc20Decimals, evmProvider,
@@ -275,8 +276,15 @@ export function parseAsterWithdrawLimits(raw: unknown, asset: string, chainId: n
       exchange: "aster", remediation: "Check the perp balance (perp -e aster account balance) and that the asset can be withdrawn on that chain",
     });
   }
-  const { perpMaxWithdrawAmount: max, withdrawFee: fee } = chain;
-  if (typeof max !== "string" || typeof fee !== "string" || !/^\d+(\.\d+)?$/.test(max) || !/^\d+(\.\d+)?$/.test(fee)) {
+  // The venue sends these as JSON numbers (live 2026-10-13: `"perpMaxWithdrawAmount":8.7451191,
+  // "withdrawFee":0.51`) or numeric strings; either becomes a plain decimal string.
+  const decimal = (v: unknown): string | null => {
+    const str = typeof v === "number" && Number.isFinite(v) && v >= 0 ? venueRateString(v, `aster ${asset} withdraw limit`) : typeof v === "string" ? v : null;
+    return str !== null && /^\d+(\.\d+)?$/.test(str) ? str : null;
+  };
+  const max = decimal(chain.perpMaxWithdrawAmount);
+  const fee = decimal(chain.withdrawFee);
+  if (max === null || fee === null) {
     throw new PerpError("EXCHANGE_ERROR", `aster: user-withdraw-info has no readable perpMaxWithdrawAmount / withdrawFee for ${asset} on chain ${chainId}`, { exchange: "aster" });
   }
   return { max, fee };

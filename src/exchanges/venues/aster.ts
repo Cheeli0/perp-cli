@@ -164,9 +164,11 @@ export const asterVenue: VenueDefinition = {
     amend: "native",
     batchPlaceMax: null,
     marginModes: ["cross", "isolated"],
-    // POST /fapi/v3/aster/user-withdraw (mainnet only — exchanges/aster-funds.ts): USDT to the
-    // account owner's own address on BNB Chain or Arbitrum. Needs an API wallet with canWithdraw.
-    withdrawAssets: ["USDT"],
+    // POST /fapi/v3/aster/user-withdraw (mainnet only — exchanges/aster-funds.ts): USDT (default)
+    // or USDC to the account owner's own address on BNB Chain or Arbitrum. Needs an API wallet
+    // with canWithdraw. USDC: listed by POST /fapi/v3/aster/user-withdraw-info (live 2026-10-13:
+    // USDC on chains 1 / 56 / 4663 / 5042 / 42161 with perpMaxWithdrawAmount + withdrawFee).
+    withdrawAssets: ["USDT", "USDC"],
   },
   // GET /fapi/v1/exchangeInfo rateLimits: REQUEST_WEIGHT 2400/min
   // (ORDERS 1200/min and 300/10s are separate order-count limits, not modeled).
