@@ -4,7 +4,7 @@
  * test key (no network, no real wallet). Live checks are in the integration suite.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Wallet, verifyTypedData, getAddress } from "ethers";
@@ -173,13 +173,20 @@ describe("nonce manager", () => {
     expect(await allocateNonce("testnet", "0xabc", remote, nonceDir)).toEqual({ anchor: 6n, bit: 0 });
   });
 
-  it("a held lock → LOCK_HELD (no pair handed out)", async () => {
-    writeFileSync(join(nonceDir, "mainnet-0xdef.json.lock"), "x");
+  it("a held lock (live holder) → LOCK_HELD (no pair handed out)", async () => {
+    writeFileSync(join(nonceDir, "mainnet-0xdef.json.lock"), `${process.pid}\n${Date.now()}\nother`);
     const t0 = Date.now();
     await expect(allocateNonce("mainnet", "0xdef", async () => ({ anchor: 1n, currentBitmapIndex: 0 }), nonceDir))
       .rejects.toMatchObject({ structured: { code: "LOCK_HELD" } });
     expect(Date.now() - t0).toBeGreaterThanOrEqual(4_000);
   }, 15_000);
+
+  it("a stale lock (holder process gone) is taken over safely", async () => {
+    writeFileSync(join(nonceDir, "mainnet-0xfed.json.lock"), `999999999\n${Date.now()}\ndead`);
+    const slot = await allocateNonce("mainnet", "0xfed", async () => ({ anchor: 1n, currentBitmapIndex: 0 }), nonceDir);
+    expect(slot).toEqual({ anchor: 2n, bit: 0 });
+    expect(readdirSync(nonceDir).filter(f => f.includes(".lock"))).toEqual([]);
+  });
 
   it("concurrent allocations in one process get distinct pairs", async () => {
     const remote = async () => ({ anchor: 2n, currentBitmapIndex: 0 });
@@ -352,6 +359,23 @@ describe("adapter: placeOrder", () => {
     expect(r.execution).toMatchObject({ method: "protectedIoc", protectionPrice: "84259.9", slippageBps: 100 });
   });
 
+  it("the match band is checked on the tick-aligned price actually sent", async () => {
+    // 199 bps fits the 2% band, but on a 1000-tick grid the aligned limit lands outside it.
+    const coarse = MARKETS.map(m => m.market_id === "1" ? { ...m, mark_price: "83425.5", config: { ...m.config, step_price: "1000" } } : m);
+    routeFetch([url => url.pathname === "/v1/markets" ? ok({ markets: coarse }) : undefined, ...base]);
+    const a = await adapter();
+    await expect(a.placeOrder(req({ type: "market", price: null, tif: null, size: "0.0002", slippage: { bps: 199, source: "flag" } })))
+      .rejects.toThrow(/outside RISEx's match price band/);
+  });
+
+  it("malformed venue numbers are errors, never zero / unbounded", async () => {
+    const badLev = MARKETS.map(m => m.market_id === "1" ? { ...m, config: { ...m.config, max_leverage: "abc" } } : m);
+    routeFetch([url => url.pathname === "/v1/markets" ? ok({ markets: badLev }) : undefined, ...base]);
+    await expect((await adapter()).applyLeverage("BTC", 5, null)).rejects.toMatchObject({ structured: { code: "EXCHANGE_ERROR" } });
+    routeFetch([...base, url => url.pathname === "/v1/portfolio/details" ? ok({ summary: {}, positions: [{ market_id: "1", size: "", margin_mode: 0 }] }) : undefined]);
+    await expect((await adapter()).applyLeverage("BTC", 5, null)).rejects.toMatchObject({ structured: { code: "EXCHANGE_ERROR" } });
+  });
+
   it("refusals before signing: wider than the match band, off-tick, below min, reduce-only market, stop orders", async () => {
     routeFetch(base);
     const a = await adapter();
@@ -391,6 +415,24 @@ describe("adapter: placeOrder", () => {
     expect(e.structured.details).toMatchObject({ clientOrderId: "123456789", nonceConsumed: false });
     expect(sends).toBe(1);
     expect(quarantine).toHaveBeenCalledWith("BTC", expect.stringContaining("c:123456789"), expect.any(String));
+  });
+
+  it("unknown outcome with the default quarantine: the quarantine file exists when the error is thrown", async () => {
+    routeFetch([...base,
+      url => url.pathname === "/v1/orders/place" ? err(503, "Unavailable", "E0702 SequencerUnavailable") : undefined,
+    ]);
+    const signer = await LocalEvmSigner.create(Wallet.createRandom().privateKey);
+    const a = new RisexAdapter(getVenue("risex"), "mainnet", {
+      account: ACCOUNT, signer, meta: null, noSignerReason: null, nonceDir, sleep: async () => undefined,
+      chain: { hasPermission: async () => true, isNonceUsed: async () => { throw new Error("rpc down"); } },
+    });
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    const e = await a.placeOrder(req({ clientOrderId: "424242" })).catch((x: unknown) => x as PerpError) as PerpError;
+    expect(e.structured.code).toBe("ORDER_PENDING");
+    expect(e.structured.details).toMatchObject({ nonceConsumed: null, reconcileError: expect.stringContaining("rpc down") });
+    const { QUARANTINE_FILE } = await import("../../bot/quarantine.js");
+    expect(existsSync(QUARANTINE_FILE)).toBe(true);
+    expect(readFileSync(QUARANTINE_FILE, "utf-8")).toContain("c:424242");
   });
 
   it("unknown outcome, nonce consumed and the client id found → reconciled final result", async () => {

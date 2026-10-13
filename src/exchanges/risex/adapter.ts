@@ -19,16 +19,17 @@
  */
 
 import { PerpError, extractErrorMessage } from "../../errors.js";
+import { quarantineSymbol } from "../../bot/quarantine.js";
 import type { RisexAgentMeta } from "../../settings.js";
 import type { EvmSigner } from "../../signer/interface.js";
 import type {
   ExchangeAdapter, ExchangeBalance, ExchangeFundingPayment, ExchangeKline, ExchangeMarketInfo, ExchangeOrder,
   ExchangePosition, ExchangeTrade,
 } from "../interface.js";
-import { alignProtectionPrice, exactUnits, slippagePrice } from "../precision.js";
+import { alignProtectionPrice, exactUnits, mulDecimal, slippagePrice, subDecimal } from "../precision.js";
 import type { ResolvedSlippage } from "../slippage.js";
 import {
-  unsupported, validateLegacyTif, validateOrderRequest, type TradingV2,
+  newVenueClientOrderId, unsupported, validateLegacyTif, validateOrderRequest, type TradingV2,
 } from "../trading-v2.js";
 import type { VenueCapabilities, VenueCreateContext, VenueDefinition } from "../venue.js";
 import { networkConfig, requireCapabilities } from "../venue.js";
@@ -44,7 +45,7 @@ import {
   cancelAllHash, cancelOrderHash, leverageHash, marginModeHash, MARGIN_MODE_CODE, ORDER_TYPE, packOrder, placeOrderHash,
   SIDE, signPermit, STP_EXPIRE_MAKER, TIF_CODE, type NonceSlot, type RisexPermit,
 } from "./typed-data.js";
-import { decOrNull, nsToMs, toPriceTicks, toSizeSteps, trimDecimal, UINT64_MAX, wadToDecimal } from "./units.js";
+import { compareDecimal, decOrNull, nsToMs, toPriceTicks, toSizeSteps, trimDecimal, UINT64_MAX, wadToDecimal } from "./units.js";
 
 const MARKETS_TTL_MS = 30_000;
 /** Permit lifetime: long enough for the server to submit, short enough that an unproven permit expires soon. */
@@ -230,8 +231,8 @@ export class RisexAdapter implements ExchangeAdapter, TradingV2 {
 
   private quarantine(symbol: string, reason: string, remediation: string): void {
     if (this.deps.quarantine) return this.deps.quarantine(symbol, reason, remediation);
-    void import("../../bot/quarantine.js").then(q => q.quarantineSymbol("risex-adapter", symbol, reason, remediation, m => process.stderr.write(`${m}\n`)))
-      .catch(e => process.stderr.write(`[risex] CRITICAL: could not quarantine ${symbol}: ${extractErrorMessage(e)}\n`));
+    // Synchronous: persisted (or logged CRITICAL and held in memory) before the error is thrown.
+    quarantineSymbol("risex-adapter", symbol, reason, remediation, m => process.stderr.write(`${m}\n`));
   }
 
   /** The account reads / permits are for (signer's account, else the master address). */
@@ -485,15 +486,18 @@ export class RisexAdapter implements ExchangeAdapter, TradingV2 {
     let referencePrice: string | null = null;
     if (req.type === "market") {
       const slip = req.slippage as ResolvedSlippage;
-      const band = decOrNull(m.config.match_price_band);
-      if (band !== null && slip.bps > Number(band) * 10_000) {
-        throw new PerpError("INVALID_PARAMS", `slippage ${slip.bps} bps is wider than RISEx's ${sym} match price band (${Number(band) * 10_000} bps)`, {
-          exchange: "risex", remediation: `Use --slippage-bps ${Number(band) * 10_000} or less`,
-        });
-      }
       referencePrice = decOrNull(m.mark_price);
       if (referencePrice === null) throw new PerpError("PRICE_STALE", `RISEx ${sym}: no mark price to bound the market order`, { exchange: "risex" });
       price = alignProtectionPrice(slippagePrice(referencePrice, req.side, slip.bps), m.config.step_price, req.side);
+      // The venue's match band applies to the price actually sent (after tick alignment).
+      const band = decOrNull(m.config.match_price_band);
+      if (band === null) throw new PerpError("EXCHANGE_ERROR", `RISEx ${sym}: market config has no match_price_band — nothing was sent`, { exchange: "risex" });
+      const dev = subDecimal(price, referencePrice).replace(/^-/, "");
+      if (compareDecimal(dev, mulDecimal(band, referencePrice)) > 0) {
+        throw new PerpError("INVALID_PARAMS", `slippage ${slip.bps} bps puts the ${sym} limit ${price} outside RISEx's match price band (${band} of mark ${referencePrice})`, {
+          exchange: "risex", remediation: `Use a smaller --slippage-bps (the band is ${mulDecimal(band, "10000")} bps)`,
+        });
+      }
     } else {
       price = req.price as string;
     }
@@ -502,7 +506,8 @@ export class RisexAdapter implements ExchangeAdapter, TradingV2 {
     const tifCode = tif === "ALO" ? TIF_CODE.GTC : TIF_CODE[tif as keyof typeof TIF_CODE];
     if (tifCode === undefined) throw unsupported(this.venue.displayName, "timeInForce", `time-in-force ${tif} is not offered`, `Use one of: ${this.caps.timeInForce.join(", ")}`);
 
-    const clientOrderId = req.clientOrderId ?? newRisexClientOrderId();
+    // The single client-id generator (trading-v2.ts newVenueClientOrderId, crypto randomness).
+    const clientOrderId = req.clientOrderId ?? newVenueClientOrderId(this.venue);
     if (!/^[1-9]\d{0,19}$/.test(clientOrderId) || BigInt(clientOrderId) > UINT64_MAX) {
       throw new PerpError("INVALID_PARAMS", `RISEx client order id must be a decimal integer 1..2^64-1 (got "${clientOrderId}")`);
     }
@@ -577,17 +582,18 @@ export class RisexAdapter implements ExchangeAdapter, TradingV2 {
   ): Promise<OrderResult> {
     const statusHint = `perp -e risex${this.network === "testnet" ? " -n testnet" : ""} trade status c:${clientOrderId} --symbol ${sym}`;
     let consumed: boolean | null = null;
-    try { consumed = await this.chainRead().isNonceUsed(account, slot); } catch { consumed = null; }
+    let reconcileError: string | null = null;
+    try { consumed = await this.chainRead().isNonceUsed(account, slot); } catch (e) { consumed = null; reconcileError = `nonce read: ${extractErrorMessage(e)}`; }
     if (consumed === true) {
       try {
         const r = await this.getOrderStatus(sym, { kind: "clientOrderId", value: clientOrderId });
         return { ...r, execution: { ...r.execution, ...exec, method, notes: [...r.execution.notes, "reconciled"] } };
-      } catch { /* not provable yet */ }
+      } catch (e) { reconcileError = `order read: ${extractErrorMessage(e)}`; }
     }
     const remediation = `Do NOT resubmit — the order may have been placed (client id ${clientOrderId}). Check: ${statusHint}. Its permit expires ${RISEX_PERMIT_TTL_S}s after signing`;
     this.quarantine(sym, `RISEx order c:${clientOrderId} outcome unknown (${extractErrorMessage(cause.cause)})`, remediation);
     throw new PerpError("ORDER_PENDING", `RISEx place order: outcome unknown — ${extractErrorMessage(cause.cause)}`, {
-      exchange: "risex", clientOrderId, nonce: { anchor: slot.anchor.toString(), bit: slot.bit }, nonceConsumed: consumed, remediation,
+      exchange: "risex", clientOrderId, nonce: { anchor: slot.anchor.toString(), bit: slot.bit }, nonceConsumed: consumed, reconcileError, remediation,
     });
   }
 
@@ -655,13 +661,14 @@ export class RisexAdapter implements ExchangeAdapter, TradingV2 {
   async applyLeverage(symbol: string, leverage: number, marginMode: "cross" | "isolated" | null): Promise<LeverageResult> {
     const { account, signer } = this.requireSigner();
     const m = await this.market(symbol, true);
-    const max = Number(m.config.max_leverage);
+    const max = Number(decReq(m.config.max_leverage, "max_leverage"));
+    if (!Number.isInteger(max) || max < 1) throw new PerpError("EXCHANGE_ERROR", `RISEx ${risexSymbolOf(m)}: max_leverage "${m.config.max_leverage}" is not a positive integer — nothing was sent`, { exchange: "risex" });
     if (!Number.isInteger(leverage) || leverage < 1 || leverage > max) {
       throw new PerpError("INVALID_PARAMS", `RISEx ${risexSymbolOf(m)} leverage must be an integer 1..${max} (got ${leverage})`, { exchange: "risex" });
     }
     const { positions } = await this.portfolio();
     const row = positions.find(p => String(p.market_id) === m.market_id);
-    const hasPosition = row !== undefined && Number(decOrNull(row.size) ?? "0") !== 0;
+    const hasPosition = row !== undefined && Number(decReq(row.size, "position size")) !== 0;
     // A market without account state is in the venue's default margin mode (cross).
     const currentMode: "cross" | "isolated" = row?.margin_mode === 1 ? "isolated" : "cross";
     const raw: unknown[] = [];
@@ -781,7 +788,7 @@ export class RisexAdapter implements ExchangeAdapter, TradingV2 {
 }
 
 function historyStatus(o: Pick<HistoryOrder, "status" | "filled_size">): OrderStatus {
-  const filled = Number(decOrNull(o.filled_size) ?? "0");
+  const filled = Number(decReq(o.filled_size, "order filled_size"));
   switch (o.status) {
     case "ORDER_STATUS_OPEN": return filled > 0 ? "partiallyFilled" : "open";
     case "ORDER_STATUS_FILLED": return "filled";
@@ -796,8 +803,4 @@ export const KLINE_INTERVAL_MS: Readonly<Record<string, number>> = {
   "1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000,
 };
 
-/** Generated client order id: ms timestamp × 1e6 + 6 random digits (a uint64 decimal, < 2^64). */
-export function newRisexClientOrderId(): string {
-  return (BigInt(Date.now()) * 1_000_000n + BigInt(Math.floor(Math.random() * 1_000_000))).toString();
-}
 

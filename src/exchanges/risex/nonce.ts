@@ -8,6 +8,10 @@
  *   next    = local successor when local ≥ base (bit + 1; after bit 207 the next anchor), else base
  * The contract accepts only the current anchor or current + 1, so a successor beyond A + 1 (208
  * permits signed on A + 1 while the chain has not caught up) is refused, never guessed.
+ * `current_bitmap_index` describes the CURRENT anchor A, which perp-cli deliberately never signs on
+ * (developer.rise.trade "Integration" → Nonces: "Sign with nonce_anchor + 1 and start at bit 0 …
+ * starting a fresh anchor guarantees you cannot collide with a permit already in flight"), so it
+ * does not enter the rule. Gaps in a bitmap are harmless (same doc).
  *
  * The allocated pair is persisted BEFORE the caller signs or sends: a pair is handed out once and
  * never reused, even when the send fails or its outcome is unknown (an unknown outcome burns the
@@ -15,7 +19,7 @@
  * The state file holds no secrets.
  */
 
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { PerpError } from "../../errors.js";
 import type { Network } from "../venue-types.js";
@@ -55,19 +59,53 @@ function writeLocal(path: string, slot: NonceSlot): void {
   renameSync(tmp, path);
 }
 
+function pidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
+}
+
+/** A lock is stale when its holder process is gone, or it is older than LOCK_STALE_MS. */
+function lockIsStale(content: string, mtimeMs: number): boolean {
+  const pid = Number(content.split("\n")[0]);
+  return !pidAlive(pid) || Date.now() - mtimeMs > LOCK_STALE_MS;
+}
+
+/**
+ * Take over a stale lock without racing another process doing the same: the lock is RENAMED to a
+ * name unique to this process (atomic — only one taker wins), and only if the moved file is still
+ * the one judged stale is it deleted; a fresh lock moved by mistake is put back (link fails if a
+ * new lock already exists, in which case that one stands).
+ */
+function takeOverStale(lock: string, seen: string): void {
+  const mine = `${lock}.stale.${process.pid}.${Math.random().toString(36).slice(2)}`;
+  try { renameSync(lock, mine); } catch { return; } // another process took it first
+  let moved: string | null = null;
+  try { moved = readFileSync(mine, "utf-8"); } catch { /* vanished */ }
+  if (moved !== null && moved !== seen) {
+    try { linkSync(mine, lock); } catch { /* a newer lock exists: it stands */ }
+  }
+  try { unlinkSync(mine); } catch { /* already gone */ }
+}
+
 async function withLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
   const lock = `${path}.lock`;
   const deadline = Date.now() + LOCK_WAIT_MS;
+  const token = `${process.pid}\n${Date.now()}\n${Math.random().toString(36).slice(2)}`;
   for (;;) {
     try {
-      closeSync(openSync(lock, "wx", 0o600));
+      const fd = openSync(lock, "wx", 0o600);
+      try { writeFileSync(fd, token); } finally { closeSync(fd); }
       break;
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-      let stale = false;
-      try { stale = Date.now() - statSync(lock).mtimeMs > LOCK_STALE_MS; } catch { continue; }
-      if (stale) {
-        try { unlinkSync(lock); } catch { /* removed meanwhile */ }
+      let content: string;
+      let mtimeMs: number;
+      try {
+        content = readFileSync(lock, "utf-8");
+        mtimeMs = statSync(lock).mtimeMs;
+      } catch { continue; } // released between the open and the read: try again
+      if (lockIsStale(content, mtimeMs)) {
+        takeOverStale(lock, content);
         continue;
       }
       if (Date.now() > deadline) {
@@ -81,7 +119,8 @@ async function withLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
   try {
     return await fn();
   } finally {
-    try { unlinkSync(lock); } catch { /* already gone */ }
+    // Release only our own lock (never one a stale-takeover replaced).
+    try { if (readFileSync(lock, "utf-8") === token) unlinkSync(lock); } catch { /* already gone */ }
   }
 }
 

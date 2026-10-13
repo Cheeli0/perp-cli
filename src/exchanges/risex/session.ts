@@ -5,7 +5,7 @@
  */
 
 import { PerpError } from "../../errors.js";
-import { evmProvider } from "../../evm-master-tx.js";
+import { assertRpcChainId, evmProvider } from "../../evm-master-tx.js";
 import type { Network } from "../venue-types.js";
 import type { RisexClient } from "./client.js";
 import { allocateNonce, parseRemoteNonceState } from "./nonce.js";
@@ -73,13 +73,19 @@ export function chainReader(net: Network): RisexChainReader {
     throw new PerpError("NOT_IMPLEMENTED", `RISEx ${net} has no known RPC endpoint`, { exchange: "risex" });
   }
   const rpc = evmProvider(pin.rpcUrl, pin.chainId);
+  const rpcUrl = pin.rpcUrl;
+  // The RPC must serve the pinned chain before any answer from it is trusted (same check as the sender).
+  let chainChecked: Promise<void> | null = null;
+  const checked = () => (chainChecked ??= assertRpcChainId(rpc, rpcUrl, pin.chainId, "risex").catch(e => { chainChecked = null; throw e; }));
   return {
     async hasPermission(account, signer, permission) {
       if (!RISEX_PERMISSION_IDS.includes(permission)) throw new PerpError("INVALID_PARAMS", `RISEx permission ${permission} is not 0..4`);
+      await checked();
       const raw = await rpc.call({ to: pin.auth, data: RISEX_AUTH_IFACE.encodeFunctionData("hasPermission", [account, signer, permission]) });
       return RISEX_AUTH_IFACE.decodeFunctionResult("hasPermission", raw)[0] as boolean;
     },
     async isNonceUsed(account, slot) {
+      await checked();
       const { Interface } = await import("ethers");
       const i = new Interface([NONCE_IFACE_FN]);
       const raw = await rpc.call({ to: pin.auth, data: i.encodeFunctionData("isNonceUsed", [account, slot.anchor, slot.bit]) });

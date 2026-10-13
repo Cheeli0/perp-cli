@@ -137,6 +137,8 @@ export function toRisexVenueMarkets(raw: readonly RisexRawMarket[], warn: (msg: 
       fundingRate: risexHourlyFunding(m),
       fundingRateBasis: RISEX_FUNDING_BASIS,
       settlementIntervalHours: 1,
+      // Base units [inferred: BTC open_interest ≈ 204 vs config.open_interest_limit 750 — contracts,
+      // not USD; the docs do not state the unit], as Hyperliquid publishes it.
       openInterest: decOrNull(m.open_interest),
       volume24h: decOrNull(m.quote_volume_24h),
       tickSize: decOrNull(m.config.step_price),

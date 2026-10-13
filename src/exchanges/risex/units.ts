@@ -83,6 +83,20 @@ export function decOrNull(v: unknown): string | null {
   return /^-?\d+(\.\d+)?$/.test(s) ? s : null;
 }
 
+/** Exact comparison of two plain decimal strings: -1 | 0 | 1. */
+export function compareDecimal(a: string, b: string): -1 | 0 | 1 {
+  const parse = (s: string) => {
+    if (!/^-?\d+(\.\d+)?$/.test(s)) throw new PerpError("EXCHANGE_ERROR", `RISEx: "${s}" is not a decimal`, { exchange: "risex" });
+    const neg = s.startsWith("-");
+    const [ip, fp = ""] = (neg ? s.slice(1) : s).split(".");
+    return { int: BigInt(ip + fp) * (neg ? -1n : 1n), scale: fp.length };
+  };
+  const x = parse(a), y = parse(b);
+  const scale = Math.max(x.scale, y.scale);
+  const xi = x.int * 10n ** BigInt(scale - x.scale), yi = y.int * 10n ** BigInt(scale - y.scale);
+  return xi < yi ? -1 : xi > yi ? 1 : 0;
+}
+
 /** Strip trailing zeros of a plain decimal ("83425.5900" → "83425.59"). */
 export function trimDecimal(s: string): string {
   if (!s.includes(".")) return s;
