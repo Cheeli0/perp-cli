@@ -18,6 +18,7 @@ vi.mock("../../client-id-tracker.js", () => ({
 }));
 
 vi.mock("../../trade-validator.js", () => ({
+  enforceOrderRisk: vi.fn().mockResolvedValue(undefined),
   validateTrade: vi.fn().mockResolvedValue({
     valid: true,
     checks: [],
@@ -169,7 +170,9 @@ describe("market mid", () => {
     const calls = await run(program, ["market", "mid", "BTC"]);
     const output = parseJsonOutput(calls) as { ok: boolean; error?: { code: string } };
     expect(output.ok).toBe(false);
-    expect(output.error?.code).toBe("SYMBOL_NOT_FOUND");
+    // The market exists but has no quotes: no price (PRICE_STALE), not an unknown symbol.
+    expect(output.error?.code).toBe("PRICE_STALE");
+    process.exitCode = undefined; // the error envelope set exit code 1
   });
 
   it("handles ask-only orderbook (no bids)", async () => {

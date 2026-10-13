@@ -142,6 +142,10 @@ export function createMockMarkets(count = 3): ExchangeMarketInfo[] {
     volume24h: "1000000",
     openInterest: "500000",
     maxLeverage: symbol === "BTC" ? 100 : 50,
+    sizeDecimals: null,
+    stepSize: null,
+    fundingHours: null,
+    marginTiers: null,
   }));
 }
 
@@ -170,5 +174,6 @@ export function createMockOrders(count = 2): ExchangeOrder[] {
     filled: "0",
     status: "open",
     type: "limit",
+    triggerPrice: null,
   }));
 }

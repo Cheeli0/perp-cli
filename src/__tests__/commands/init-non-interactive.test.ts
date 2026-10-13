@@ -15,6 +15,7 @@ import { existsSync, mkdirSync, rmSync } from "fs";
 import { resolve } from "path";
 import os from "os";
 import { Command } from "commander";
+import { addRootSafetyOptions } from "../../cli-flags.js";
 
 // ── Stable temp-dir for settings I/O ──────────────────────────────────────
 
@@ -53,6 +54,7 @@ const { loadSettings } = await import("../../settings.js");
 
 function makeProgram() {
   const prog = new Command();
+  addRootSafetyOptions(prog);
   prog.exitOverride();
   prog.configureOutput({ writeErr: () => {}, writeOut: () => {} });
   registerInitCommand(prog);

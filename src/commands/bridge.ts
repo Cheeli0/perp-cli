@@ -1,4 +1,6 @@
+import { parsePositiveDecimal } from "../errors.js";
 import { Command } from "commander";
+import { isDryRun, supportsDryRun } from "../cli-flags.js";
 import chalk from "chalk";
 import { formatUsd, makeTable, printJson, jsonOk } from "../utils.js";
 import { logExecution } from "../execution-log.js";
@@ -10,16 +12,221 @@ import {
   getAllQuotes,
   checkDebridgeStatus,
   checkBridgeGasBalance,
+  assertBridgeNetwork,
+  assertDistinctBridgeChains,
+  assertCctpRouteSupported,
+  parseUsdcAmount,
   CHAIN_IDS,
   USDC_ADDRESSES,
   EXCHANGE_TO_CHAIN,
   type BridgeQuote,
 } from "../bridge-engine.js";
-import type { Exchange } from "../config.js";
+import { cliCredentialOptsFrom, type CliCredentialOpts } from "../config.js";
+import type { Network, VenueId } from "../exchanges/venue-types.js";
+import { PerpError } from "../errors.js";
+import { CCTP_DOMAINS } from "../bridge-engine.js";
+import { RELAY_CHAINS, relayAsset, relayChain, type RelaySwapQuote } from "../relay-swap.js";
+import { bridgeAddress, bridgeVenueForChain, loadBridgeSigner } from "../bridge-signers.js";
+
+/** Chains only the Relay path serves (not in the CCTP / deBridge tables): robinhood, bsc. */
+function relayOnlyChain(chain: string): boolean {
+  return chain in RELAY_CHAINS && !(chain in CCTP_DOMAINS) && !(chain in CHAIN_IDS);
+}
+
+type UsdcProvider = "cctp" | "relay" | "debridge";
+
+function rootCredOpts(cmd: Command): CliCredentialOpts {
+  let root: Command = cmd;
+  while (root.parent) root = root.parent;
+  return cliCredentialOptsFrom(root.opts());
+}
+
+function parseProvider(raw: string | undefined): UsdcProvider | undefined {
+  if (raw === undefined) return undefined;
+  const p = raw.toLowerCase();
+  if (p === "cctp" || p === "relay" || p === "debridge") return p;
+  throw new PerpError("INVALID_PARAMS", `Invalid provider: ${raw}`, { remediation: "Use --provider cctp, relay, or debridge (or omit it for the best quote)" });
+}
+
+/** The quote to execute: the forced provider's, else the best (quotes are sorted by amountOut). */
+function pickQuote(quotes: BridgeQuote[], provider: UsdcProvider | undefined, srcChain: string, dstChain: string): BridgeQuote {
+  if (quotes.length === 0) {
+    throw new PerpError("NO_BRIDGE_ROUTE", `No bridge available for ${srcChain} → ${dstChain}`, {
+      remediation: "Check supported chains / routes: perp funds bridge chains",
+    });
+  }
+  if (provider === undefined) return quotes[0];
+  const match = quotes.find(q => q.provider === provider);
+  if (!match) {
+    throw new PerpError("NO_BRIDGE_ROUTE", `Provider "${provider}" is not available for ${srcChain} → ${dstChain}`, {
+      remediation: `Drop --provider to use the best available route (available: ${quotes.map(q => q.provider).join(", ")})`,
+    });
+  }
+  return match;
+}
+
+/**
+ * JSON view of a quote. A Relay quote's raw payload carries the verified transactions (BigInt
+ * values, not JSON-serializable): shown as step kinds, as `relaySend` does.
+ */
+function quoteJson(q: BridgeQuote): BridgeQuote {
+  if (q.provider !== "relay") return q;
+  const { txs, ...rest } = q.raw as RelaySwapQuote;
+  return { ...q, raw: { ...rest, steps: txs.map(t => t.kind) } };
+}
+
+/** Gas preflight result → INSUFFICIENT_BALANCE before anything is signed. */
+function assertBridgeGas(gasCheck: { ok: boolean; errors: string[] }, needsDstGas: boolean): void {
+  if (gasCheck.ok) return;
+  throw new PerpError("INSUFFICIENT_BALANCE", `Insufficient gas for bridge — nothing was sent:\n${gasCheck.errors.map(e => `  ✗ ${e}`).join("\n")}`, {
+    gas: gasCheck.errors,
+    remediation: needsDstGas
+      ? "Fund the native gas token on the chains listed, or use --fast (Circle auto-relays; no destination gas needed)"
+      : "Fund the native gas token on the chains listed, then retry",
+  });
+}
+
+/** Execute through the engine; ORDER_PENDING (sent, outcome unknown) is logged as unverified, never as failed. */
+async function executeLogged(
+  side: string, amount: string, fast: boolean, run: () => ReturnType<typeof executeBestBridge>,
+): ReturnType<typeof executeBestBridge> {
+  try {
+    const result = await run();
+    logExecution({ type: "bridge", exchange: "bridge", symbol: "USDC", side, size: amount, status: "success", dryRun: false, meta: { provider: result.provider, txHash: result.txHash, fast } });
+    return result;
+  } catch (err) {
+    const pending = err instanceof PerpError && err.structured.code === "ORDER_PENDING";
+    const txHash = err instanceof PerpError ? err.structured.details?.txHash : undefined;
+    logExecution({
+      type: "bridge", exchange: "bridge", symbol: "USDC", side, size: amount, status: pending ? "unverified" : "failed", dryRun: false,
+      error: err instanceof Error ? err.message : String(err),
+      meta: { fast, ...(typeof txHash === "string" ? { txHash } : {}) },
+    });
+    throw err;
+  }
+}
+
+interface RelaySendOpts {
+  from: string; to: string; amount: string;
+  sender?: string; recipient?: string; fromAsset?: string; toAsset?: string; minOut?: string; fast?: boolean;
+}
+
+/**
+ * `funds bridge send` through Relay (any pinned asset pair, EVM origin, OWS master wallet).
+ * Dry run: the verified quote + the output-protection verdict, no key loaded, nothing sent.
+ * Live: sender and recipient are the master wallet's own addresses (no arbitrary recipient).
+ */
+async function relaySend(opts: RelaySendOpts, cmd: Command, isJson: () => boolean, getNetwork: () => Network): Promise<void> {
+  const dryRun = isDryRun(cmd);
+  const src = opts.from.toLowerCase();
+  const dst = opts.to.toLowerCase();
+  const fromAsset = (opts.fromAsset === undefined ? "USDC" : opts.fromAsset).toUpperCase();
+  const toAsset = (opts.toAsset === undefined ? "USDC" : opts.toAsset).toUpperCase();
+  const amount = parsePositiveDecimal(opts.amount, "--amount");
+  const minOut = opts.minOut === undefined ? null : parsePositiveDecimal(opts.minOut, "--min-out");
+  if (opts.fast === true) throw new PerpError("INVALID_PARAMS", "--fast is a CCTP option; Relay fills in seconds", { remediation: "Drop --fast" });
+  const origin = relayChain(src);
+  const dest = relayChain(dst);
+  relayAsset(src, fromAsset);
+  relayAsset(dst, toAsset);
+  if (origin.vm !== "evm") {
+    throw new PerpError("NO_BRIDGE_ROUTE", `Relay: bridging FROM ${origin.label} is not implemented (only EVM-origin deposits are verified and signed)`, {
+      remediation: "Bridge from an EVM chain, or use --provider cctp for a Solana-origin USDC bridge (deBridge from Solana is refused too)",
+    });
+  }
+
+  const credOpts = rootCredOpts(cmd);
+  /** The master wallet's own address on a chain family — public address only, nothing is decrypted. */
+  const ownAddress = async (vm: "evm" | "svm"): Promise<string> => {
+    const { resolveOwsMaster } = await import("../config.js");
+    const m = await resolveOwsMaster("hyperliquid", credOpts);
+    if (m === null) {
+      throw new PerpError("NO_SIGNER_AVAILABLE", "Relay bridging is signed by the OWS master wallet, which is not selected on this computer", {
+        remediation: dryRun
+          ? "For a dry run without a wallet pass both --sender <address> and --recipient <address>; otherwise select the master wallet (--ows <name> / perp wallet use <name>)"
+          : "Import the master wallet into the OWS vault (perp wallet import --name <name> --chain evm), then perp wallet use <name> or pass --ows <name>",
+      });
+    }
+    if (vm === "evm") return (await import("../signer/ows-evm.js")).OwsEvmSigner.create(m.wallet, m.passphrase).getAddress();
+    return (await import("../signer/ows-solana.js")).OwsSolanaSigner.create(m.wallet, m.passphrase).getPublicKeyBase58();
+  };
+  const same = (vm: "evm" | "svm", a: string, b: string): boolean => (vm === "evm" ? a.toLowerCase() === b.toLowerCase() : a === b);
+
+  let sender: string;
+  let recipient: string;
+  if (dryRun) {
+    sender = opts.sender === undefined ? await ownAddress("evm") : opts.sender;
+    recipient = opts.recipient === undefined ? await ownAddress(dest.vm) : opts.recipient;
+  } else {
+    sender = await ownAddress("evm");
+    recipient = await ownAddress(dest.vm);
+    if (opts.sender !== undefined && !same("evm", opts.sender, sender)) {
+      throw new PerpError("INVALID_PARAMS", `--sender ${opts.sender} is not the master wallet (${sender})`, { remediation: "Omit --sender" });
+    }
+    if (opts.recipient !== undefined && !same(dest.vm, opts.recipient, recipient)) {
+      throw new PerpError("POLICY_DENIED", `Relay bridging only pays the master wallet's own ${dest.label} address ${recipient}; --recipient ${opts.recipient} is refused`, {
+        remediation: "Omit --recipient (the master wallet's own address on the destination chain is used)",
+      });
+    }
+  }
+
+  if (!isJson()) console.log(chalk.cyan(`\n  Relay bridge: ${amount} ${fromAsset} (${origin.label}) → ${toAsset} (${dest.label})\n`));
+  const { quoteRelaySwap, relayMinOutVerdict, assertRelayMinOut, executeRelaySwap } = await import("../relay-swap.js");
+  const quote: RelaySwapQuote = await quoteRelaySwap({ from: src, to: dst, fromAsset, toAsset, amount, sender, recipient });
+  const verdict = relayMinOutVerdict(quote, minOut);
+  const { txs, ...quoteView } = quote;
+  const view = { ...quoteView, steps: txs.map(t => t.kind) };
+
+  if (!isJson()) {
+    console.log(`  From:          ${sender} (${origin.label})`);
+    console.log(`  To:            ${recipient} (${dest.label})`);
+    console.log(`  Amount in:     ${quote.amountIn} ${fromAsset}${quote.amountInUsd !== null ? ` (~$${quote.amountInUsd})` : ""}`);
+    console.log(`  Expected out:  ${quote.expectedOut} ${toAsset}${quote.expectedOutUsd !== null ? ` (~$${quote.expectedOutUsd})` : ""}`);
+    console.log(`  Guaranteed:    ${quote.minimumOut} ${toAsset} (protocol-enforced minimum)`);
+    console.log(`  Fees:          relayer $${quote.fees.relayerUsd}${quote.fees.originGasUsd !== null ? `, origin gas ~$${quote.fees.originGasUsd}` : ""}${quote.totalImpactPercent !== null ? ` (total impact ${quote.totalImpactPercent}%)` : ""}`);
+    console.log(`  ETA:           ${quote.timeEstimateSec === null ? "unknown" : `~${quote.timeEstimateSec}s`}`);
+    console.log(`  Steps:         ${view.steps.join(" → ")}`);
+    console.log(`  Min-out check: ${verdict.ok ? chalk.green("ok") : chalk.red("REFUSED")} — ${verdict.reason}\n`);
+  }
+
+  if (dryRun) {
+    logExecution({ type: "bridge", exchange: "bridge", symbol: fromAsset, side: `${src}->${dst}`, size: amount, status: "simulated", dryRun: true, meta: { provider: "relay", requestId: quote.requestId, toAsset } });
+    if (isJson()) return printJson(jsonOk({ dryRun: true, sent: false, provider: "relay", quote: view, minOut: verdict }));
+    console.log(chalk.yellow("  [DRY RUN] Nothing was signed or sent.\n"));
+    return;
+  }
+
+  assertRelayMinOut(quote, minOut);
+  const { loadMasterEvmSigner } = await import("../evm-master-tx.js");
+  const signer = await loadMasterEvmSigner("hyperliquid", credOpts, "Relay bridge");
+  if (!same("evm", signer.getAddress(), sender)) {
+    throw new PerpError("INVALID_PARAMS", `Relay: signer ${signer.getAddress()} is not the quoted sender ${sender} — nothing was sent`, { remediation: "Omit --sender" });
+  }
+  try {
+    const result = await executeRelaySwap(getNetwork(), quote, tx => signer.signTransaction(tx));
+    logExecution({ type: "bridge", exchange: "bridge", symbol: fromAsset, side: `${src}->${dst}`, size: amount, status: "success", dryRun: false, meta: { provider: "relay", requestId: result.requestId, txHash: result.depositTxHash, toAsset } });
+    if (isJson()) return printJson(jsonOk(result));
+    console.log(chalk.green("  Bridge filled."));
+    if (result.approveTxHash !== null) console.log(`  Approve:    ${result.approveTxHash}`);
+    console.log(`  Deposit:    ${result.depositTxHash} (${origin.label})`);
+    for (const h of result.destinationTxHashes) console.log(`  Fill:       ${h} (${dest.label})`);
+    console.log(`  Request id: ${result.requestId}\n`);
+  } catch (err) {
+    const pending = err instanceof PerpError && err.structured.code === "ORDER_PENDING";
+    const txHash = err instanceof PerpError ? err.structured.details?.txHash : undefined;
+    logExecution({
+      type: "bridge", exchange: "bridge", symbol: fromAsset, side: `${src}->${dst}`, size: amount, status: pending ? "unverified" : "failed", dryRun: false,
+      error: err instanceof Error ? err.message : String(err),
+      meta: { provider: "relay", requestId: quote.requestId, toAsset, ...(typeof txHash === "string" ? { txHash } : {}) },
+    });
+    throw err;
+  }
+}
 
 export function registerFundsBridgeCommands(
   parent: Command,
-  isJson: () => boolean
+  isJson: () => boolean,
+  getNetwork: () => Network,
 ) {
   const bridge = parent.command("bridge").description("Cross-chain USDC bridge (multi-provider: cctp, relay, debridge — auto-cheapest)");
 
@@ -30,7 +237,7 @@ export function registerFundsBridgeCommands(
     .description("List supported chains and USDC addresses")
     .action(async () => {
       if (isJson()) {
-        return printJson(jsonOk({ chains: CHAIN_IDS, usdc: USDC_ADDRESSES, exchanges: EXCHANGE_TO_CHAIN }));
+        return printJson(jsonOk({ chains: CHAIN_IDS, usdc: USDC_ADDRESSES, exchanges: EXCHANGE_TO_CHAIN, relay: RELAY_CHAINS }));
       }
 
       console.log(chalk.cyan.bold("\n  Supported Bridge Chains\n"));
@@ -46,7 +253,11 @@ export function registerFundsBridgeCommands(
       for (const [ex, chain] of Object.entries(EXCHANGE_TO_CHAIN)) {
         console.log(`  ${chalk.white.bold(ex.padEnd(14))} → ${chain}`);
       }
-      console.log(chalk.gray("\n  Bridge powered by deBridge DLN (~2s settlement)\n"));
+      console.log(chalk.cyan.bold("\n  Relay chains / assets (--provider relay, --from-asset / --to-asset)\n"));
+      for (const [name, def] of Object.entries(RELAY_CHAINS)) {
+        console.log(`  ${chalk.white.bold(name.padEnd(14))} ${String(def.chainId).padEnd(10)} ${Object.keys(def.assets).join(", ")}`);
+      }
+      console.log(chalk.gray("\n  Providers: Circle CCTP, Relay, deBridge DLN\n"));
     });
 
   // ── bridge quote ──
@@ -57,30 +268,33 @@ export function registerFundsBridgeCommands(
     .requiredOption("--from <chain>", "Source chain (solana, arbitrum, base)")
     .requiredOption("--to <chain>", "Destination chain")
     .requiredOption("--amount <amount>", "USDC amount")
-    .option("--sender <address>", "Source address")
-    .option("--recipient <address>", "Destination address")
+    .option("--sender <address>", "Source address (default: the master wallet's own address on --from; public address only, nothing decrypted)")
+    .option("--recipient <address>", "Destination address (default: the master wallet's own address on --to)")
     .action(async (opts: {
       from: string; to: string; amount: string;
       sender?: string; recipient?: string;
-    }) => {
+    }, cmd: Command) => {
       const srcChain = opts.from.toLowerCase();
       const dstChain = opts.to.toLowerCase();
-      const amount = parseFloat(opts.amount);
+      assertDistinctBridgeChains(srcChain, dstChain);
+      assertCctpRouteSupported(srcChain, dstChain);
+      const amount = parseUsdcAmount(opts.amount, "--amount"); // exact decimal string (≤ 6 decimals)
+
+      // Omitted addresses are the master wallet's own public addresses (OWS: vault account list).
+      const credOpts = rootCredOpts(cmd);
+      const sender = opts.sender ?? await bridgeAddress(srcChain, bridgeVenueForChain(srcChain), credOpts);
+      const recipient = opts.recipient ?? await bridgeAddress(dstChain, bridgeVenueForChain(dstChain), credOpts);
 
       if (!isJson()) console.log(chalk.cyan(`\n  Fetching quotes: $${amount} USDC ${srcChain} → ${dstChain}...\n`));
 
-      const quotes = await getAllQuotes(
-        srcChain, dstChain, amount,
-        opts.sender ?? "0x0000000000000000000000000000000000000000",
-        opts.recipient ?? "0x0000000000000000000000000000000000000000",
-      );
-
-      if (isJson()) return printJson(jsonOk({ quotes }));
+      const quotes = await getAllQuotes(srcChain, dstChain, amount, sender, recipient);
 
       if (quotes.length === 0) {
-        console.log(chalk.red("  No providers available for this route.\n"));
-        return;
+        throw new PerpError("NO_BRIDGE_ROUTE", `No bridge provider quoted ${srcChain} → ${dstChain}`, {
+          remediation: "Check supported chains / routes: perp funds bridge chains",
+        });
       }
+      if (isJson()) return printJson(jsonOk({ quotes: quotes.map(quoteJson) }));
 
       const PROVIDER_NAMES: Record<string, string> = {
         cctp: "Circle CCTP",
@@ -91,7 +305,8 @@ export function registerFundsBridgeCommands(
       const rows = quotes.map((q, i) => {
         const tag = i === 0 ? chalk.green(" ★ BEST") : "";
         const name = PROVIDER_NAMES[q.provider] ?? q.provider;
-        const feeStr = q.fee <= 0 ? chalk.green("FREE") : `$${formatUsd(q.fee)}`;
+        const usdcFee = q.fee <= 0 && !q.nativeFee ? chalk.green("FREE") : `$${formatUsd(q.fee)}`;
+          const feeStr = q.nativeFee ? `${usdcFee} + ${q.nativeFee.amount} ${q.nativeFee.symbol}${q.nativeFee.usd !== null ? ` (≈$${formatUsd(q.nativeFee.usd)})` : " (unpriced)"}` : usdcFee;
         const pct = ((q.fee / q.amountIn) * 100).toFixed(2);
         const gasTag = q.gasIncluded
           ? chalk.green("included")
@@ -105,7 +320,7 @@ export function registerFundsBridgeCommands(
         ];
       });
 
-      console.log(chalk.cyan.bold(`  Bridge Quotes: $${formatUsd(amount)} USDC ${srcChain} → ${dstChain}\n`));
+      console.log(chalk.cyan.bold(`  Bridge Quotes: $${formatUsd(Number(amount))} USDC ${srcChain} → ${dstChain}\n`));
       console.log(makeTable(["Provider", "Receive", "Fee", "ETA", "Dst Gas"], rows));
 
       // Show gas notes per provider
@@ -122,84 +337,58 @@ export function registerFundsBridgeCommands(
 
   // ── bridge send ──
 
-  bridge
-    .command("send")
-    .description("Execute a USDC bridge transaction")
+  supportsDryRun(bridge.command("send"))
+    .description("Execute a bridge transaction — USDC by default; any pinned asset pair through Relay with --from-asset / --to-asset (supports --dry-run: quotes only, nothing sent)")
     .requiredOption("--from <chain>", "Source chain")
     .requiredOption("--to <chain>", "Destination chain")
-    .requiredOption("--amount <amount>", "USDC amount")
-    .option("--sender <address>", "Source address (auto-detected from key)")
-    .option("--recipient <address>", "Destination address")
+    .requiredOption("--amount <amount>", "Amount of the source asset (USDC unless --from-asset)")
+    .option("--from-asset <symbol>", "Relay: source asset (e.g. USDG, USDC, USDT, ETH; default USDC)")
+    .option("--to-asset <symbol>", "Relay: destination asset (e.g. USDC, USDT, SOL, ETH; default USDC)")
+    .option("--min-out <amount>", "Relay: minimum output accepted, in the destination asset (required for stable → native)")
+    .option("--sender <address>", "Source address (auto-detected from key; live: must be this wallet's own address)")
+    .option("--recipient <address>", "Destination address (live: must be this wallet's own address on the destination chain; any other is refused)")
     .option("--provider <name>", "Force provider: cctp, relay, debridge (default: cheapest)")
     .option("--fast", "Use fast finality (~1-2 min, $1-1.3 fee, auto-relay). Default: standard (~13-20 min, $0.01, manual relay)")
-    .option("--dry-run", "Show quotes without executing")
     .action(async (opts: {
       from: string; to: string; amount: string;
-      sender?: string; recipient?: string; provider?: string; fast?: boolean; dryRun?: boolean;
-    }) => {
+      sender?: string; recipient?: string; provider?: string; fast?: boolean;
+      fromAsset?: string; toAsset?: string; minOut?: string;
+    }, cmd: Command) => {
+      const dryRun = isDryRun(cmd);
+      // Mainnet-only routes: refuse -n testnet before any key is loaded.
+      assertBridgeNetwork(getNetwork());
       const srcChain = opts.from.toLowerCase();
       const dstChain = opts.to.toLowerCase();
-      const amount = parseFloat(opts.amount);
-      if (isNaN(amount) || amount <= 0) throw new Error("Invalid amount");
+      // Before any key is loaded or quote fetched.
+      assertDistinctBridgeChains(srcChain, dstChain);
+      assertCctpRouteSupported(srcChain, dstChain);
 
-      const chosenProvider = opts.provider?.toLowerCase() as "cctp" | "relay" | "debridge" | undefined;
-      if (chosenProvider && !["cctp", "relay", "debridge"].includes(chosenProvider)) {
-        throw new Error(`Invalid provider: ${opts.provider}. Use cctp, relay, or debridge.`);
+      // Relay path: asked for by name, by an asset / min-out flag, or implied by a Relay-only chain.
+      const relayRoute = opts.provider?.toLowerCase() === "relay" || opts.fromAsset !== undefined || opts.toAsset !== undefined
+        || opts.minOut !== undefined || relayOnlyChain(srcChain) || relayOnlyChain(dstChain);
+      if (relayRoute) {
+        if (opts.provider !== undefined && opts.provider.toLowerCase() !== "relay") {
+          throw new PerpError("INVALID_PARAMS", `--from-asset / --to-asset / --min-out and the ${relayOnlyChain(srcChain) ? srcChain : dstChain} chain are served by Relay only, not "${opts.provider}"`, {
+            remediation: "Use --provider relay (or drop --provider)",
+          });
+        }
+        return relaySend(opts, cmd, isJson, getNetwork);
       }
+      const amount = parseUsdcAmount(opts.amount, "--amount"); // exact decimal string (≤ 6 decimals)
+      const chosenProvider = parseProvider(opts.provider);
 
-      // Load the appropriate private key
-      const { loadPrivateKey, parseSolanaKeypair } = await import("../config.js");
-
-      let senderAddress: string;
-      let recipientAddress: string;
-      let signerKey: string;
-
-      if (srcChain === "solana") {
-        const pk = await loadPrivateKey("pacifica");
-        const keypair = parseSolanaKeypair(pk);
-        senderAddress = opts.sender ?? keypair.publicKey.toBase58();
-        signerKey = pk;
-      } else {
-        const exchange = "hyperliquid" as const;
-        const pk = await loadPrivateKey(exchange);
-        const { ethers } = await import("ethers");
-        const wallet = new ethers.Wallet(pk);
-        senderAddress = opts.sender ?? wallet.address;
-        signerKey = pk;
-      }
-
-      // Determine recipient address and destination signer key
-      let dstSignerKey: string | undefined;
-      if (opts.recipient) {
-        recipientAddress = opts.recipient;
-      } else if (dstChain === "solana") {
-        const pk = await loadPrivateKey("pacifica");
-        const keypair = parseSolanaKeypair(pk);
-        recipientAddress = keypair.publicKey.toBase58();
-        dstSignerKey = pk;
-      } else {
-        const exchange = "hyperliquid" as const;
-        const pk = await loadPrivateKey(exchange);
-        const { ethers } = await import("ethers");
-        recipientAddress = new ethers.Wallet(pk).address;
-        dstSignerKey = pk;
-      }
+      // Addresses are public (review L3): an address passed with --sender / --recipient needs no
+      // wallet at all, and an omitted one is the master's own public address (OWS: the vault's
+      // account list; nothing is decrypted). Signers are only loaded after the dry-run return.
+      const credOpts = rootCredOpts(cmd);
+      const addressOf = (chain: string): Promise<string> => bridgeAddress(chain, bridgeVenueForChain(chain), credOpts);
+      const senderAddress = opts.sender ?? await addressOf(srcChain);
+      const recipientAddress = opts.recipient ?? await addressOf(dstChain);
 
       // Fetch all quotes
       if (!isJson()) console.log(chalk.cyan(`\n  Bridge: $${amount} USDC ${srcChain} → ${dstChain}\n`));
       const quotes = await getAllQuotes(srcChain, dstChain, amount, senderAddress, recipientAddress);
-
-      if (quotes.length === 0) throw new Error(`No bridge available for ${srcChain} → ${dstChain}`);
-
-      // Pick the quote to use
-      let selectedQuote: BridgeQuote;
-      if (chosenProvider) {
-        const match = quotes.find(q => q.provider === chosenProvider);
-        if (!match) throw new Error(`Provider "${chosenProvider}" not available for this route`);
-        selectedQuote = match;
-      } else {
-        selectedQuote = quotes[0]; // best (sorted by amountOut)
-      }
+      const selectedQuote = pickQuote(quotes, chosenProvider, srcChain, dstChain);
 
       const PROVIDER_NAMES: Record<string, string> = {
         cctp: "Circle CCTP",
@@ -212,7 +401,8 @@ export function registerFundsBridgeCommands(
         const rows = quotes.map((q) => {
           const name = PROVIDER_NAMES[q.provider] ?? q.provider;
           const selected = q.provider === selectedQuote.provider;
-          const feeStr = q.fee <= 0 ? chalk.green("FREE") : `$${formatUsd(q.fee)}`;
+          const usdcFee = q.fee <= 0 && !q.nativeFee ? chalk.green("FREE") : `$${formatUsd(q.fee)}`;
+          const feeStr = q.nativeFee ? `${usdcFee} + ${q.nativeFee.amount} ${q.nativeFee.symbol}${q.nativeFee.usd !== null ? ` (≈$${formatUsd(q.nativeFee.usd)})` : " (unpriced)"}` : usdcFee;
           const pct = ((q.fee / q.amountIn) * 100).toFixed(2);
           const tag = selected ? chalk.green(" ← selected") : "";
           const gasTag = q.gasIncluded
@@ -235,38 +425,44 @@ export function registerFundsBridgeCommands(
         console.log(`  To:       ${recipientAddress}\n`);
       }
 
-      if (opts.dryRun) {
-        if (isJson()) return printJson(jsonOk({ quotes, selected: selectedQuote.provider }));
+      if (dryRun) {
+        if (isJson()) return printJson(jsonOk({ dryRun: true, sent: false, quotes: quotes.map(quoteJson), selected: selectedQuote.provider }));
         console.log(chalk.yellow("  [DRY RUN] Transaction not executed.\n"));
         return;
       }
 
-      // Gas balance preflight check
-      const needsDstGas = !selectedQuote.gasIncluded;
-      const gasCheck = await checkBridgeGasBalance(srcChain, senderAddress, dstChain, recipientAddress, needsDstGas);
-      if (!gasCheck.ok) {
-        const msg = gasCheck.errors.map(e => `  ✗ ${e}`).join("\n");
-        if (isJson()) return printJson({ ok: false, error: { code: "INSUFFICIENT_BALANCE", message: "Insufficient gas for transaction", details: gasCheck.errors }, meta: { timestamp: new Date().toISOString() } });
-        console.log(chalk.red("\n  Insufficient gas for bridge:\n"));
-        console.log(chalk.red(msg));
-        if (needsDstGas) {
-          console.log(chalk.yellow("\n  Tip: use --fast to skip destination gas (Circle auto-relays)\n"));
-        }
-        process.exitCode = 1;
-        return;
+      // Own-address rule (same as the Relay path): a live bridge only moves funds from and to this
+      // wallet's own addresses. --sender / --recipient may name them, nothing else.
+      const sameAddr = (chain: string, a: string, b: string): boolean => chain === "solana" ? a === b : a.toLowerCase() === b.toLowerCase();
+      const ownSender = await addressOf(srcChain);
+      if (!sameAddr(srcChain, senderAddress, ownSender)) {
+        throw new PerpError("POLICY_DENIED", `Bridging signs with this wallet's own ${srcChain} address ${ownSender}; --sender ${senderAddress} is refused. Nothing was sent`, {
+          remediation: "Omit --sender (the wallet's own address on the source chain is used)",
+        });
       }
+      const ownRecipient = await addressOf(dstChain);
+      if (!sameAddr(dstChain, recipientAddress, ownRecipient)) {
+        throw new PerpError("POLICY_DENIED", `Bridging only pays this wallet's own ${dstChain} address ${ownRecipient}; --recipient ${recipientAddress} is refused. Nothing was sent`, {
+          remediation: "Omit --recipient (the wallet's own address on the destination chain is used)",
+        });
+      }
+
+      // Gas balance preflight check (before any signer is loaded)
+      const needsDstGas = !selectedQuote.gasIncluded;
+      assertBridgeGas(await checkBridgeGasBalance(srcChain, senderAddress, dstChain, recipientAddress, needsDstGas), needsDstGas);
+
+      // Master signers (live only): OWS vault signer, or a raw-key signer. The destination signer
+      // claims on the destination chain (CCTP EVM → Solana standard finality).
+      const signer = await loadBridgeSigner(srcChain, bridgeVenueForChain(srcChain), credOpts);
+      const dstSigner = await loadBridgeSigner(dstChain, bridgeVenueForChain(dstChain), credOpts);
 
       const providerName = PROVIDER_NAMES[selectedQuote.provider] ?? selectedQuote.provider;
       if (!isJson()) console.log(chalk.yellow(`  Executing via ${providerName}...\n`));
 
-      let result: Awaited<ReturnType<typeof executeBestBridge>>;
-      try {
-        result = await executeBestBridge(srcChain, dstChain, amount, signerKey, senderAddress, recipientAddress, dstSignerKey, chosenProvider, !!opts.fast);
-        logExecution({ type: "bridge", exchange: "bridge", symbol: "USDC", side: `${srcChain}->${dstChain}`, size: String(amount), status: "success", dryRun: false, meta: { provider: result.provider, txHash: result.txHash, fast: !!opts.fast } });
-      } catch (err) {
-        logExecution({ type: "bridge", exchange: "bridge", symbol: "USDC", side: `${srcChain}->${dstChain}`, size: String(amount), status: "failed", dryRun: false, error: err instanceof Error ? err.message : String(err) });
-        throw err;
-      }
+      // The provider shown as "selected" is the one executed.
+      const result = await executeLogged(`${srcChain}->${dstChain}`, amount, !!opts.fast, () => executeBestBridge(
+        getNetwork(), srcChain, dstChain, amount, signer, senderAddress, recipientAddress, dstSigner, selectedQuote.provider, !!opts.fast,
+      ));
 
       if (isJson()) return printJson(jsonOk(result));
 
@@ -281,74 +477,59 @@ export function registerFundsBridgeCommands(
 
   // ── bridge between exchanges (shortcut) ──
 
-  bridge
-    .command("exchange")
-    .description("Bridge USDC between exchanges (shortcut)")
-    .requiredOption("--from <exchange>", "Source exchange (pacifica, hyperliquid, lighter)")
+  supportsDryRun(bridge.command("exchange"))
+    .description("Bridge the master wallet's own USDC between the chains two exchanges settle on (wallet → wallet; does not withdraw from or deposit into Pacifica / Lighter — see --help; supports --dry-run: quotes only, nothing sent)")
+    .requiredOption("--from <exchange>", `Source exchange (${Object.keys(EXCHANGE_TO_CHAIN).join(", ")})`)
     .requiredOption("--to <exchange>", "Destination exchange")
     .requiredOption("--amount <amount>", "USDC amount")
     .option("--provider <name>", "Force provider: cctp, relay, debridge (default: cheapest)")
     .option("--fast", "Use fast finality (~1-2 min, $1-1.3 fee, auto-relay)")
-    .option("--dry-run", "Show quotes without executing")
-    .action(async (opts: { from: string; to: string; amount: string; provider?: string; fast?: boolean; dryRun?: boolean }) => {
+    .addHelpText("after", [
+      "",
+      "What this moves:",
+      ...Object.entries(EXCHANGE_TO_CHAIN).map(([ex, chain]) => `  ${ex.padEnd(12)} → ${chain}`),
+      "  pacifica / lighter: the master wallet's own USDC on Solana / Arbitrum (NOT the exchange account).",
+      "    Withdraw first (perp funds withdraw ...) and deposit after arrival (perp funds deposit ...).",
+      "  hyperliquid: HyperCore itself — --from spends the HyperCore spot USDC balance,",
+      "    --to credits the HyperCore perps balance (CCTP forwarder).",
+      "Same as: perp funds bridge send --from <chain> --to <chain> (sender / recipient = the master's own addresses).",
+    ].join("\n"))
+    .action(async (opts: { from: string; to: string; amount: string; provider?: string; fast?: boolean }, cmd: Command) => {
+      const dryRun = isDryRun(cmd);
+      // Mainnet-only routes: refuse -n testnet before any key is loaded.
+      assertBridgeNetwork(getNetwork());
       const srcExchange = opts.from.toLowerCase();
       const dstExchange = opts.to.toLowerCase();
       const srcChain = EXCHANGE_TO_CHAIN[srcExchange];
       const dstChain = EXCHANGE_TO_CHAIN[dstExchange];
-      if (!srcChain) throw new Error(`Unknown exchange: ${srcExchange}`);
-      if (!dstChain) throw new Error(`Unknown exchange: ${dstExchange}`);
-      if (srcChain === dstChain) throw new Error("Same chain — no bridge needed");
-
-      const chosenProvider = opts.provider?.toLowerCase() as "cctp" | "relay" | "debridge" | undefined;
-      if (chosenProvider && !["cctp", "relay", "debridge"].includes(chosenProvider)) {
-        throw new Error(`Invalid provider: ${opts.provider}. Use cctp, relay, or debridge.`);
+      for (const [ex, chain] of [[srcExchange, srcChain], [dstExchange, dstChain]] as const) {
+        if (chain === undefined) {
+          throw new PerpError("INVALID_PARAMS", `Unknown exchange for bridging: ${ex}`, {
+            remediation: `Use one of: ${Object.keys(EXCHANGE_TO_CHAIN).join(", ")} (see: perp funds bridge chains)`,
+          });
+        }
+      }
+      if (srcChain === dstChain) {
+        throw new PerpError("INVALID_PARAMS", `${srcExchange} and ${dstExchange} are both on ${srcChain} — no bridge needed`, {
+          remediation: "Pick exchanges on different chains (see: perp funds bridge chains)",
+        });
       }
 
-      const amount = parseFloat(opts.amount);
+      assertCctpRouteSupported(srcChain, dstChain);
+      const chosenProvider = parseProvider(opts.provider);
+
+      const amount = parseUsdcAmount(opts.amount, "--amount"); // exact decimal string (≤ 6 decimals)
       if (!isJson()) console.log(chalk.cyan(`\n  Bridge: $${amount} USDC ${srcExchange} (${srcChain}) → ${dstExchange} (${dstChain})\n`));
 
-      // Load keys
-      const { loadPrivateKey, parseSolanaKeypair } = await import("../config.js");
-      let senderAddress: string;
-      let recipientAddress: string;
-      let signerKey: string;
-
-      // Source
-      if (srcChain === "solana") {
-        const pk = await loadPrivateKey("pacifica");
-        senderAddress = parseSolanaKeypair(pk).publicKey.toBase58();
-        signerKey = pk;
-      } else {
-        const pk = await loadPrivateKey(srcExchange as Exchange);
-        const { ethers } = await import("ethers");
-        senderAddress = new ethers.Wallet(pk).address;
-        signerKey = pk;
-      }
-
-      // Destination
-      let dstSignerKey: string | undefined;
-      if (dstChain === "solana") {
-        const pk = await loadPrivateKey("pacifica");
-        recipientAddress = parseSolanaKeypair(pk).publicKey.toBase58();
-        dstSignerKey = pk;
-      } else {
-        const pk = await loadPrivateKey(dstExchange as Exchange);
-        const { ethers } = await import("ethers");
-        recipientAddress = new ethers.Wallet(pk).address;
-        dstSignerKey = pk;
-      }
+      // The master wallet's own public addresses (OWS: vault account list; nothing is decrypted).
+      const credOpts = rootCredOpts(cmd);
+      const srcVenue = bridgeVenueForChain(srcChain, srcExchange as VenueId);
+      const dstVenue = bridgeVenueForChain(dstChain, dstExchange as VenueId);
+      const senderAddress = await bridgeAddress(srcChain, srcVenue, credOpts);
+      const recipientAddress = await bridgeAddress(dstChain, dstVenue, credOpts);
 
       const quotes = await getAllQuotes(srcChain, dstChain, amount, senderAddress, recipientAddress);
-      if (quotes.length === 0) throw new Error(`No bridge available for ${srcChain} → ${dstChain}`);
-
-      let selectedQuote: BridgeQuote;
-      if (chosenProvider) {
-        const match = quotes.find(q => q.provider === chosenProvider);
-        if (!match) throw new Error(`Provider "${chosenProvider}" not available for this route`);
-        selectedQuote = match;
-      } else {
-        selectedQuote = quotes[0];
-      }
+      const selectedQuote = pickQuote(quotes, chosenProvider, srcChain, dstChain);
 
       const PROVIDER_NAMES: Record<string, string> = {
         cctp: "Circle CCTP",
@@ -360,7 +541,8 @@ export function registerFundsBridgeCommands(
         const rows = quotes.map((q) => {
           const name = PROVIDER_NAMES[q.provider] ?? q.provider;
           const selected = q.provider === selectedQuote.provider;
-          const feeStr = q.fee <= 0 ? chalk.green("FREE") : `$${formatUsd(q.fee)}`;
+          const usdcFee = q.fee <= 0 && !q.nativeFee ? chalk.green("FREE") : `$${formatUsd(q.fee)}`;
+          const feeStr = q.nativeFee ? `${usdcFee} + ${q.nativeFee.amount} ${q.nativeFee.symbol}${q.nativeFee.usd !== null ? ` (≈$${formatUsd(q.nativeFee.usd)})` : " (unpriced)"}` : usdcFee;
           const pct = ((q.fee / q.amountIn) * 100).toFixed(2);
           const tag = selected ? chalk.green(" ← selected") : "";
           const gasTag = q.gasIncluded
@@ -380,38 +562,26 @@ export function registerFundsBridgeCommands(
         }
       }
 
-      if (opts.dryRun) {
-        if (isJson()) return printJson(jsonOk({ quotes, selected: selectedQuote.provider }));
+      if (dryRun) {
+        if (isJson()) return printJson(jsonOk({ dryRun: true, sent: false, quotes: quotes.map(quoteJson), selected: selectedQuote.provider }));
         console.log(chalk.yellow("  [DRY RUN] Not executed.\n"));
         return;
       }
 
-      // Gas balance preflight check
+      // Gas balance preflight check (before any signer is loaded)
       const needsDstGas = !selectedQuote.gasIncluded;
-      const gasCheck = await checkBridgeGasBalance(srcChain, senderAddress, dstChain, recipientAddress, needsDstGas);
-      if (!gasCheck.ok) {
-        const msg = gasCheck.errors.map(e => `  ✗ ${e}`).join("\n");
-        if (isJson()) return printJson({ ok: false, error: { code: "INSUFFICIENT_BALANCE", message: "Insufficient gas for transaction", details: gasCheck.errors }, meta: { timestamp: new Date().toISOString() } });
-        console.log(chalk.red("\n  Insufficient gas for bridge:\n"));
-        console.log(chalk.red(msg));
-        if (needsDstGas) {
-          console.log(chalk.yellow("\n  Tip: use --fast to skip destination gas (Circle auto-relays)\n"));
-        }
-        process.exitCode = 1;
-        return;
-      }
+      assertBridgeGas(await checkBridgeGasBalance(srcChain, senderAddress, dstChain, recipientAddress, needsDstGas), needsDstGas);
+
+      const signer = await loadBridgeSigner(srcChain, srcVenue, credOpts);
+      const dstSigner = await loadBridgeSigner(dstChain, dstVenue, credOpts);
 
       const providerName = PROVIDER_NAMES[selectedQuote.provider] ?? selectedQuote.provider;
       if (!isJson()) console.log(chalk.yellow(`  Executing via ${providerName}...\n`));
 
-      let result: Awaited<ReturnType<typeof executeBestBridge>>;
-      try {
-        result = await executeBestBridge(srcChain, dstChain, amount, signerKey, senderAddress, recipientAddress, dstSignerKey, chosenProvider, !!opts.fast);
-        logExecution({ type: "bridge", exchange: "bridge", symbol: "USDC", side: `${srcExchange}->${dstExchange}`, size: String(amount), status: "success", dryRun: false, meta: { provider: result.provider, txHash: result.txHash, fast: !!opts.fast } });
-      } catch (err) {
-        logExecution({ type: "bridge", exchange: "bridge", symbol: "USDC", side: `${srcExchange}->${dstExchange}`, size: String(amount), status: "failed", dryRun: false, error: err instanceof Error ? err.message : String(err) });
-        throw err;
-      }
+      // The provider shown as "selected" is the one executed.
+      const result = await executeLogged(`${srcExchange}->${dstExchange}`, amount, !!opts.fast, () => executeBestBridge(
+        getNetwork(), srcChain, dstChain, amount, signer, senderAddress, recipientAddress, dstSigner, selectedQuote.provider, !!opts.fast,
+      ));
 
       if (isJson()) return printJson(jsonOk(result));
 
@@ -420,10 +590,13 @@ export function registerFundsBridgeCommands(
       console.log(`  Provider: ${result.provider}`);
       if (result.receiveTxHash) {
         console.log(`  Receive:  ${result.receiveTxHash} (${dstChain})`);
-        console.log(chalk.green(`  USDC arrived on ${dstExchange}!`));
       }
-      console.log(chalk.gray(`\n  After arrival, deposit into ${dstExchange}:`));
-      console.log(chalk.gray(`  perp funds deposit ${dstExchange} ${opts.amount}\n`));
+      if (dstChain === "hyperliquid") {
+        console.log(chalk.gray(`\n  USDC is credited to the HyperCore perps balance on arrival.\n`));
+      } else {
+        console.log(chalk.gray(`\n  This moved wallet USDC on ${dstChain} only — the ${dstExchange} account is not funded yet.`));
+        console.log(chalk.gray(`  After arrival, deposit separately: perp funds deposit ${dstExchange} --help\n`));
+      }
     });
 
   // ── bridge status ──

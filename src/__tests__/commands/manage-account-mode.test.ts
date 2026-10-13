@@ -117,7 +117,7 @@ describe("wallet manage account-mode standard", () => {
     // Sequence the fetch mock so the prev-mode read returns "standard" and the
     // /exchange POST returns ok.
     let call = 0;
-    const fetchMock = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+    const fetchMock = vi.fn<(url: string, init?: RequestInit) => Promise<unknown>>().mockImplementation(async (_url: string, init?: RequestInit) => {
       call++;
       // First N reads might be /info userAbstraction (prev-mode capture).
       // Treat any GET-less POST without action.type === "userSetAbstraction"
@@ -153,7 +153,7 @@ describe("wallet manage account-mode standard", () => {
     ]);
 
     // Find the /exchange POST that contains the userSetAbstraction action.
-    const setCall = fetchMock.mock.calls.find(([, init]: [string, RequestInit]) => {
+    const setCall = fetchMock.mock.calls.find(([, init]) => {
       const body = init?.body ? JSON.parse(init.body as string) : {};
       return body?.action?.type === "userSetAbstraction";
     });
@@ -166,7 +166,8 @@ describe("wallet manage account-mode standard", () => {
     expect(body.action.abstraction).toBe("disabled"); // "standard" → "disabled"
     expect(body.action.hyperliquidChain).toBe("Mainnet");
     expect(body.action.signatureChainId).toBe("0xa4b1");
-    expect(body.action.user).toBe("0xMasterHLAddr0000000000000000000000000001");
+    // hyperliquid-python-sdk user_set_abstraction: user is the lower-cased master address.
+    expect(body.action.user).toBe("0xMasterHLAddr0000000000000000000000000001".toLowerCase());
     expect(typeof body.action.nonce).toBe("number");
     expect(body.nonce).toBe(body.action.nonce);
     expect(body.signature.r).toBeTruthy();
@@ -181,9 +182,13 @@ describe("wallet manage account-mode standard", () => {
     expect(parsed.primaryType).toBe("HyperliquidTransaction:UserSetAbstraction");
     expect(parsed.types["HyperliquidTransaction:UserSetAbstraction"]).toEqual([
       { name: "hyperliquidChain", type: "string" },
+      { name: "user", type: "address" },
       { name: "abstraction", type: "string" },
       { name: "nonce", type: "uint64" },
     ]);
+    // `user` is part of the signed struct (USER_SET_ABSTRACTION_SIGN_TYPES); leaving it out makes
+    // HL recover a different signer.
+    expect(parsed.message.user).toBe(body.action.user);
     expect(parsed.domain.chainId).toBe(42161);
     expect(parsed.domain.name).toBe("HyperliquidSignTransaction");
     expect(parsed.message.abstraction).toBe("disabled");
@@ -198,7 +203,7 @@ describe("wallet manage account-mode rejects unknown mode", () => {
   it("invalid mode → INVALID_PARAMS without calling fetch", async () => {
     setupOwsForSign();
 
-    const fetchMock = vi.fn();
+    const fetchMock = vi.fn<(url: string, init?: RequestInit) => Promise<unknown>>();
     vi.stubGlobal("fetch", fetchMock);
 
     const errLines: string[] = [];
@@ -217,7 +222,7 @@ describe("wallet manage account-mode rejects unknown mode", () => {
     ])).rejects.toThrow(/process\.exit/);
 
     // No /exchange call should have been made — validation rejects upstream.
-    const exchangeCalls = fetchMock.mock.calls.filter(([url]: [string]) => url.includes("/exchange"));
+    const exchangeCalls = fetchMock.mock.calls.filter(([url]) => url.includes("/exchange"));
     expect(exchangeCalls.length).toBe(0);
 
     // INVALID_PARAMS surfaced to stderr in JSON envelope.
@@ -233,7 +238,7 @@ describe("wallet manage account-mode merges parent --passphrase via optsWithGlob
   it("parent-side --passphrase reaches OwsEvmSigner without falling back to PASSPHRASE_REQUIRED", async () => {
     setupOwsForSign();
 
-    const fetchMock = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+    const fetchMock = vi.fn<(url: string, init?: RequestInit) => Promise<unknown>>().mockImplementation(async (_url: string, init?: RequestInit) => {
       const body = init?.body ? JSON.parse(init.body as string) : {};
       if (body?.type === "userAbstraction") {
         return {
@@ -268,7 +273,7 @@ describe("wallet manage account-mode merges parent --passphrase via optsWithGlob
     // didn't bail with PASSPHRASE_REQUIRED).
     expect(mockOws.signTypedData).toHaveBeenCalled();
     // And the unified mode wired through to abstraction="unifiedAccount".
-    const setCall = fetchMock.mock.calls.find(([, init]: [string, RequestInit]) => {
+    const setCall = fetchMock.mock.calls.find(([, init]) => {
       const body = init?.body ? JSON.parse(init.body as string) : {};
       return body?.action?.type === "userSetAbstraction";
     });

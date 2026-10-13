@@ -4,9 +4,11 @@
  * Outcome markets are fully-collateralized binary/range contracts that settle
  * within a fixed range. Asset id encoding: `100,000,000 + (10 * outcome + side)`.
  *
- * Probe-confirmed facts (mainnet 2026-05-03):
- *  - Quote token: USDH (NOT USDC)
- *  - Min order notional: $10 USDH (price * size >= 10)
+ * Facts:
+ *  - Quote token: PER OUTCOME — `outcomeMeta.outcomes[].quoteToken` (live 2026-10-12: every listed
+ *    outcome "USDC"; docs info-endpoint/spot settledOutcome spec: `"quoteToken": "USDC"`). Never assumed.
+ *  - Min order value: 10 quote tokens (docs error-responses MinTradeSpotNtl: "Order must have minimum
+ *    value of 10 {quote_token}.")
  *  - No leverage / no liquidation
  *  - Order/cancel action shape identical to spot
  *  - Coin name: `#<encoding>` (l2Book/candle/allMids), `+<encoding>` (spot balance)
@@ -21,13 +23,15 @@ export interface OutcomeSideInfo {
   encoding: number;
   /** Asset id = 100,000,000 + encoding */
   assetId: number;
-  /** Last known mid price (USDH per share, e.g., "0.583") — undefined if unloaded */
+  /** Last known mid price (quote token per share, e.g., "0.583") — undefined if unloaded */
   mid?: string;
 }
 
 export interface OutcomeMarketInfo {
   /** Outcome id from `outcomeMeta.outcomes[].outcome` */
   outcome: number;
+  /** Quote token of this outcome (outcomeMeta `quoteToken`, e.g. "USDC"). */
+  quoteToken: string;
   /** Display name (e.g., "Recurring") */
   name: string;
   /** Raw description string (e.g., "class:priceBinary|underlying:BTC|expiry:20260504-0600|targetPrice:78213|period:1d") */
@@ -55,7 +59,7 @@ export interface OutcomePosition {
   encoding: number;
   /** Shares held (from spotClearinghouseState `total`) */
   size: string;
-  /** Cumulative USDH paid in (from `entryNtl`) */
+  /** Cumulative quote token paid in (from `entryNtl`) */
   entryNotional: string;
   /** Last known mid price — undefined if unloaded */
   markPrice?: string;
@@ -126,7 +130,9 @@ export interface OutcomeAdapter {
   getOrderbook(outcome: number, side: number): Promise<OutcomeOrderbook>;
   /** Combined view: all sides' books in parallel + underlying mark price gap + expiry. */
   getView(outcome: number, depth?: number): Promise<OutcomeView>;
-  /** Place a limit order. Throws INVALID_PARAMS if `price * size < 10` USDH. */
+  /** The outcome's quote token (outcomeMeta `quoteToken`); unknown outcome / missing → throws. */
+  quoteTokenOf(outcome: number): string;
+  /** Place a limit order. Throws INVALID_PARAMS if `price * size < 10` quote tokens. */
   placeOrder(opts: {
     outcome: number;
     side: number;

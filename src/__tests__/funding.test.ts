@@ -24,9 +24,11 @@ describe("getFundingHours", () => {
     expect(getFundingHours("lighter")).toBe(8);
   });
 
-  it("defaults to 1 for unknown exchanges (main exchanges are hourly)", () => {
-    expect(getFundingHours("binance")).toBe(1);
-    expect(getFundingHours("unknown_dex")).toBe(1);
+  // CHANGELOG (Unreleased): "Funding normalization throws UNKNOWN_VENUE for unknown venue refs
+  // instead of assuming an 8h basis" — never a silent default basis.
+  it("throws UNKNOWN_VENUE for unknown exchanges (no assumed basis)", () => {
+    expect(() => getFundingHours("binance")).toThrow(expect.objectContaining({ structured: expect.objectContaining({ code: "UNKNOWN_VENUE" }) }));
+    expect(() => getFundingHours("unknown_dex")).toThrow(/unknown venue reference "unknown_dex"/);
   });
 
   it("is case-insensitive", () => {
@@ -56,9 +58,9 @@ describe("toHourlyRate", () => {
     expect(hourly).toBeCloseTo(0.0002 / 8);
   });
 
-  it("divides by 1 for unknown exchanges (default)", () => {
-    const hourly = toHourlyRate(0.0001, "someExchange");
-    expect(hourly).toBeCloseTo(0.0001);
+  // CHANGELOG: funding normalization throws UNKNOWN_VENUE for unknown venue refs.
+  it("throws UNKNOWN_VENUE for unknown exchanges (no default divisor)", () => {
+    expect(() => toHourlyRate(0.0001, "someExchange")).toThrow(expect.objectContaining({ structured: expect.objectContaining({ code: "UNKNOWN_VENUE" }) }));
   });
 
   it("handles zero rate", () => {

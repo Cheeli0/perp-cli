@@ -33,7 +33,8 @@ interface PositionSnapshot {
   size: string;
   entryPrice: string;
   unrealizedPnl: string;
-  liquidationPrice: string;
+  /** null = venue reports no liquidation price for this position */
+  liquidationPrice: string | null;
 }
 
 interface OrderSnapshot {
@@ -66,6 +67,8 @@ export async function startEventStream(
   let prevOrders = new Map<string, OrderSnapshot>();
   let prevBalance: ExchangeBalance | null = null;
   let cycle = 0;
+  // One-time notice per stream (one adapter = one venue) when the venue reports no liquidation price.
+  let warnedNoLiquidationPrice = false;
 
   const poll = async () => {
     cycle++;
@@ -121,6 +124,15 @@ export async function startEventStream(
 
       // ── Liquidation warnings ──
       for (const p of positions) {
+        // No liquidation price from the venue → no distance to measure. Checked
+        // before Number() because Number(null) === 0 would look like a real price.
+        if (p.liquidationPrice === null) {
+          if (!warnedNoLiquidationPrice) {
+            warnedNoLiquidationPrice = true;
+            console.warn(`[event-stream] ${adapter.name} does not report liquidation prices (first: ${p.symbol}) — liquidation warnings are unavailable for this venue`);
+          }
+          continue;
+        }
         const mark = Number(p.markPrice);
         const liq = Number(p.liquidationPrice);
         // Rule #2: a NaN mark or liq would silently fail the `> 0` checks
@@ -128,13 +140,17 @@ export async function startEventStream(
         // critical-distance liquidation_warning the user depends on.
         // Surface the corruption explicitly so the stream layer doesn't
         // hide a failed alert.
-        if (!Number.isFinite(mark) || !Number.isFinite(liq)) {
-          if (p.liquidationPrice !== "N/A") {
-            console.warn(`[event-stream] non-finite mark/liquidation for ${p.symbol} on ${adapter.name} (mark=${p.markPrice}, liq=${p.liquidationPrice}) — skipping liquidation distance check`);
-          }
+        //
+        // Strict policy (qa/2026-05-16): an empty-string markPrice or
+        // liquidationPrice is also corruption — `Number("") === 0` would
+        // pass the `Number.isFinite` check, then `mark > 0` would be
+        // false, silently skipping the alert without surfacing the
+        // payload break. Add an explicit "" check to the rejection bucket.
+        if (p.markPrice === "" || p.liquidationPrice === "" || !Number.isFinite(mark) || !Number.isFinite(liq)) {
+          console.warn(`[event-stream] non-finite mark/liquidation for ${p.symbol} on ${adapter.name} (mark=${p.markPrice}, liq=${p.liquidationPrice}) — skipping liquidation distance check`);
           continue;
         }
-        if (mark > 0 && liq > 0 && p.liquidationPrice !== "N/A") {
+        if (mark > 0 && liq > 0) {
           const distancePct = Math.abs(mark - liq) / mark * 100;
           if (distancePct < 3) {
             emit({
@@ -198,7 +214,15 @@ export async function startEventStream(
         const availPrev = Number(prevBalance.available);
         // Rule #2: a NaN delta would silently fail the `> 0.01` threshold,
         // suppressing balance_update events. Surface the corruption.
-        if (!Number.isFinite(equityNow) || !Number.isFinite(equityPrev) ||
+        //
+        // Strict policy (qa/2026-05-16): "" coerces to 0 via Number(""),
+        // so `Math.abs(0 - prev)` could pass the `> 0.01` check and emit
+        // a misleading balance_update with `data.equity = ""`. Reject ""
+        // upfront so the corruption is visible, not laundered into a
+        // synthetic delta event.
+        const empties = balance.equity === "" || prevBalance.equity === "" ||
+                        balance.available === "" || prevBalance.available === "";
+        if (empties || !Number.isFinite(equityNow) || !Number.isFinite(equityPrev) ||
             !Number.isFinite(availNow)  || !Number.isFinite(availPrev)) {
           console.warn(`[event-stream] non-finite balance values for ${adapter.name} (equity=${balance.equity}/${prevBalance.equity}, available=${balance.available}/${prevBalance.available}) — skipping balance_update emit`);
         } else {
@@ -253,8 +277,18 @@ export async function startEventStream(
   // Polling loop
   while (!opts.signal?.aborted) {
     await new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, intervalMs);
-      opts.signal?.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
+      const signal = opts.signal;
+      let timer: ReturnType<typeof setTimeout>;
+      const onAbort = () => { clearTimeout(timer); resolve(); };
+      // When the timer wins the race, remove the abort listener so it does not
+      // accumulate on the (long-lived) signal across polling iterations.
+      // When abort wins, { once: true } removes it. Either way the signal is
+      // left with zero listeners from this iteration — no MaxListeners leak.
+      timer = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, intervalMs);
+      signal?.addEventListener("abort", onAbort, { once: true });
     });
     if (opts.signal?.aborted) break;
     await poll();

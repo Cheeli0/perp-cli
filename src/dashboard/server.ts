@@ -62,6 +62,8 @@ export interface DashboardSnapshot {
     dexAssets: DexAssetRow[];
     dexNames: string[];
     exchangeStatus: Record<string, string>;
+    /** Error message per venue (or "funding" when the whole fetch failed). */
+    exchangeErrors: Record<string, string>;
   };
 }
 
@@ -73,7 +75,7 @@ export interface DashboardOpts {
 }
 
 // Cached arb data (polled less frequently)
-let cachedArb: DashboardSnapshot["arb"] = { opportunities: [], dexArb: [], dexAssets: [], dexNames: [], exchangeStatus: {} };
+let cachedArb: DashboardSnapshot["arb"] = { opportunities: [], dexArb: [], dexAssets: [], dexNames: [], exchangeStatus: {}, exchangeErrors: {} };
 // Cached market data (polled with arb cycle — market metadata rarely changes)
 const cachedMarkets = new Map<string, ExchangeMarketInfo[]>();
 
@@ -105,11 +107,13 @@ async function pollArbData(): Promise<DashboardSnapshot["arb"]> {
   const opportunities: ArbOpportunity[] = [];
   const dexArb: DexArbOpportunity[] = [];
   let exchangeStatus: Record<string, string> = {};
+  let exchangeErrors: Record<string, string> = {};
 
   try {
     const { fetchAllFundingRates } = await import("../funding/rates.js");
     const snapshot = await fetchAllFundingRates({ minSpread: 5 });
     exchangeStatus = snapshot.exchangeStatus;
+    exchangeErrors = snapshot.exchangeErrors;
 
     for (const sym of snapshot.symbols.slice(0, 20)) {
       opportunities.push({
@@ -126,8 +130,9 @@ async function pollArbData(): Promise<DashboardSnapshot["arb"]> {
         })),
       });
     }
-  } catch {
-    // funding rates unavailable
+  } catch (e) {
+    exchangeStatus = { funding: "error" };
+    exchangeErrors = { funding: e instanceof Error ? e.message : String(e) };
   }
 
   const dexAssets: DexAssetRow[] = [];
@@ -164,8 +169,8 @@ async function pollArbData(): Promise<DashboardSnapshot["arb"]> {
       const row: DexAssetRow = {
         base,
         dexes: assets.map((a) => {
-          // All dex funding rates are already per-hour, same as hyperliquid
-          const ann = annualizeRate(a.fundingRate, "hyperliquid");
+          // Venue ref: "hyperliquid" for native, "hl:<dex>" for HIP-3 (same basis, §10.1)
+          const ann = annualizeRate(a.fundingRate, a.dex === "hl" ? "hyperliquid" : `hl:${a.dex}`);
           return { dex: a.dex, rate: a.fundingRate, annualizedPct: ann, markPrice: a.markPrice, oi: a.openInterest };
         }),
       };
@@ -182,7 +187,7 @@ async function pollArbData(): Promise<DashboardSnapshot["arb"]> {
   }
 
   const dexNames = [...dexNamesSet].sort();
-  return { opportunities, dexArb, dexAssets: dexAssets.slice(0, 30), dexNames, exchangeStatus };
+  return { opportunities, dexArb, dexAssets: dexAssets.slice(0, 30), dexNames, exchangeStatus, exchangeErrors };
 }
 
 /**

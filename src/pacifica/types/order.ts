@@ -29,6 +29,8 @@ export interface StopOrderParams {
     amount: string;
     limit_price?: string;
     client_order_id?: string;
+    /** Trigger price source: "mark_price" (default) | "last_trade_price" | "mid_price". */
+    trigger_price_type?: string;
   };
 }
 
@@ -60,9 +62,10 @@ export interface TWAPParams {
   client_order_id?: string;
 }
 
+/** POST /orders/twap/cancel — pacifica-fi/python-sdk rest/cancel_twap_order.py signs {symbol, order_id}. */
 export interface CancelTWAPParams {
   symbol: string;
-  twap_order_id: number;
+  order_id: number;
 }
 
 export interface TPSLParams {

@@ -9,6 +9,7 @@
 import { WebSocket as NodeWebSocket } from "ws";
 import type { ExchangeBalance, ExchangePosition, ExchangeOrder } from "../exchanges/index.js";
 import type { DashboardExchange } from "./server.js";
+import type { LighterAdapter } from "../exchanges/lighter.js";
 
 export interface WsFeedState {
   balance: ExchangeBalance;
@@ -250,7 +251,7 @@ class HyperliquidFeed extends ExchangeWsFeed {
               size: String(Math.abs(szi)),
               entryPrice: pos.entryPx ?? "0",
               markPrice: String(pos.positionValue ? (Number(pos.positionValue) / Math.abs(szi)).toFixed(2) : "0"),
-              liquidationPrice: pos.liquidationPx ?? "N/A",
+              liquidationPrice: pos.liquidationPx ?? null, // HL sends null when there is no liquidation price
               unrealizedPnl: pos.unrealizedPnl ?? "0",
               leverage: Number((ap.leverage as Record<string, { value?: number }>)?.value ?? 1),
             };
@@ -269,6 +270,7 @@ class HyperliquidFeed extends ExchangeWsFeed {
           filled: "0",
           status: "open",
           type: String(o.orderType ?? "limit"),
+          triggerPrice: o.isTrigger === true && Number(o.triggerPx) > 0 ? String(o.triggerPx) : null,
         }));
       }
 
@@ -437,7 +439,7 @@ class PacificaFeed extends ExchangeWsFeed {
           size: String(size),
           entryPrice: String(entryPrice),
           markPrice: mark ?? "0",
-          liquidationPrice: String(p.l ?? p.liquidation_price ?? "N/A"),
+          liquidationPrice: p.l != null ? String(p.l) : p.liquidation_price != null ? String(p.liquidation_price) : null,
           unrealizedPnl: pnl.toFixed(4),
           leverage: Number(p.leverage ?? 1),
         };
@@ -458,6 +460,7 @@ class PacificaFeed extends ExchangeWsFeed {
         filled: String(o.f ?? o.filled ?? "0"),
         status: "open",
         type: String(o.ot ?? o.order_type ?? ""),
+        triggerPrice: Number(o.sp ?? o.stop_price) > 0 ? String(o.sp ?? o.stop_price) : null,
       }));
     this.emitUpdate();
   }
@@ -469,8 +472,8 @@ class PacificaFeed extends ExchangeWsFeed {
   }
 }
 
-// ── Lighter WS Feed ──
-// WS: wss://mainnet.zklighter.elliot.ai/stream
+// ── Lighter WS Feed (lighter, lighter-rh) ──
+// WS: the adapter's venue+network config (venues/lighter-family.ts); null → REST
 // Auth: signer.createAuthToken() passed as `auth` field in subscribe messages
 // Channels: account_all_positions/{index} (auth), account_all_orders/{index} (auth),
 //           user_stats/{index} (public — balance info)
@@ -484,7 +487,16 @@ class LighterFeed extends ExchangeWsFeed {
     this.accountIndex = Number(adapter._accountIndex ?? -1);
   }
 
-  get wsUrl() { return "wss://mainnet.zklighter.elliot.ai/stream"; }
+  /** Venue+network WS URL from the adapter's network config; null = none published. */
+  private get configuredWsUrl(): string | null {
+    return (this.exchange.adapter as unknown as Pick<LighterAdapter, "network">).network.wsUrl;
+  }
+
+  get wsUrl(): string {
+    const url = this.configuredWsUrl;
+    if (url === null) throw new Error(`${this.exchange.name}: no WebSocket URL for this network`);
+    return url;
+  }
 
   private async getAuthToken(): Promise<string | null> {
     try {
@@ -502,7 +514,7 @@ class LighterFeed extends ExchangeWsFeed {
   }
 
   async connect(): Promise<void> {
-    if (this.accountIndex < 0) {
+    if (this.accountIndex < 0 || this.configuredWsUrl === null) {
       this.startRestFallback();
       return;
     }
@@ -612,7 +624,7 @@ class LighterFeed extends ExchangeWsFeed {
               markPrice: posSize !== 0
                 ? String((Number(p.position_value ?? 0) / Math.abs(posSize)).toFixed(4))
                 : "0",
-              liquidationPrice: String(p.liquidation_price || "N/A"),
+              liquidationPrice: p.liquidation_price ? String(p.liquidation_price) : null,
               unrealizedPnl: String(p.unrealized_pnl ?? "0"),
               leverage: Number(p.initial_margin_fraction ?? 0) > 0
                 ? Math.round(10000 / Number(p.initial_margin_fraction))
@@ -639,6 +651,7 @@ class LighterFeed extends ExchangeWsFeed {
             filled: String(o.filled_base_amount ?? "0"),
             status: "open",
             type: String(o.type ?? "limit"),
+            triggerPrice: Number(o.trigger_price) > 0 ? String(o.trigger_price) : null,
           }));
         this.emitUpdate();
       }
@@ -663,7 +676,7 @@ export class WsFeedManager {
         feed = new HyperliquidFeed(ex, handler);
       } else if (ex.name === "pacifica") {
         feed = new PacificaFeed(ex, handler);
-      } else if (ex.name === "lighter") {
+      } else if (ex.name === "lighter" || ex.name === "lighter-rh") {
         feed = new LighterFeed(ex, handler);
       } else {
         // Unknown exchange — REST fallback only

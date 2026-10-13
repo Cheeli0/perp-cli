@@ -1,41 +1,52 @@
 /**
- * Real-time 3-DEX funding rate comparison.
+ * Real-time cross-venue funding rate comparison.
  *
- * Fetches funding rates from Pacifica, Hyperliquid, and Lighter in parallel,
- * normalizes them to comparable hourly rates, and identifies arbitrage
- * opportunities across exchanges.
+ * Fans out over every venue with the "marketData" role (design §10.6) using
+ * each venue's `publicData.fetchFundingRates(net)`, normalizes every row to a
+ * per-hour rate with the row's own basis (Lighter
+ * family 8h, Aster per-symbol), and matches markets across venues by
+ * `canonical` (null → excluded, §10.9).
+ *
+ * A venue that fails is reported in `exchangeStatus` ("error") and
+ * `exchangeErrors` (message) — its rows are absent, never silently empty.
  */
 
-import { toHourlyRate, annualizeRate, computeAnnualSpread, estimateHourlyFunding } from "./normalize.js";
-import {
-  fetchPacificaPrices, fetchHyperliquidMeta,
-  fetchLighterOrderBookDetails, fetchLighterFundingRates as fetchLtFundingRates,
-} from "../shared-api.js";
+import { annualizeHourlyRate, estimateHourlyFundingFromHourly } from "./normalize.js";
 import { getHistoricalAverages, type HistoricalAverages } from "./history.js";
 import { SPOT_PERP_TOKEN_MAP, MAX_PRICE_DEVIATION_PCT } from "../exchanges/index.js";
-
-// ── API URLs (centralized in shared-api.ts) ──
+import { getVenue, listVenuesWithRole, READ_ONLY_CREDENTIALS, type VenueDefinition } from "../exchanges/venue.js";
+import { rateToHourly, type FundingRateBasis, type Network, type VenueFundingRate, type VenueId } from "../exchanges/venue-types.js";
+import { ensureVenuesRegistered } from "../exchanges/venues/index.js";
+import { sharedApiNetwork } from "../api/public/urls.js";
+import { PerpError } from "../errors.js";
 
 // ── Types ──
 
 export interface ExchangeFundingRate {
-  exchange: "pacifica" | "hyperliquid" | "lighter" | "aster";
+  exchange: VenueId;
+  /** Venue display symbol (e.g. "kPEPE", "BTC"). */
   symbol: string;
-  fundingRate: number;       // raw rate (period depends on exchange)
-  hourlyRate: number;        // normalized to per-hour
+  /** Cross-venue matching key (canonical-symbols.ts). */
+  canonical: string;
+  fundingRate: number;       // raw quoted rate (period given by `basis`)
+  basis: FundingRateBasis;   // what one quoted rate covers
+  hourlyRate: number;        // normalized to per-hour with `basis`
   annualizedPct: number;     // annualized percentage
   markPrice: number;
-  nextFundingTime?: number;  // unix ms, if available
-  historicalAvg?: HistoricalAverages;  // avg rates over time windows
+  nextFundingTime: number | null;  // unix ms; null = venue does not publish it
+  historicalAvg: HistoricalAverages | null;  // avg rates over time windows
+  /** false = the venue's funding rate is unverified (VenueDefinition.fundingVerified) — shown only on explicit request. */
+  fundingVerified: boolean;
 }
 
 export interface SymbolFundingComparison {
+  /** Canonical symbol shared by every row. */
   symbol: string;
   rates: ExchangeFundingRate[];
   maxSpreadAnnual: number;      // annualized spread between extremes
   longExchange: string;         // go long where funding is lowest (you get paid)
   shortExchange: string;        // go short where funding is highest (you get paid)
-  bestMarkPrice: number;        // best available mark price (prefer HL)
+  bestMarkPrice: number;        // mark price of the most liquid venue present (MARK_PRICE_PREFERENCE)
   estHourlyIncomeUsd: number;   // estimated hourly income for $1000 notional
 }
 
@@ -43,6 +54,8 @@ export interface FundingRateSnapshot {
   timestamp: string;
   symbols: SymbolFundingComparison[];
   exchangeStatus: Record<string, "ok" | "error">;
+  /** Error message per venue whose status is "error" (§10.13 #3). */
+  exchangeErrors: Record<string, string>;
 }
 
 // ── Default top symbols to track ──
@@ -53,187 +66,175 @@ export const TOP_SYMBOLS = [
   "APT", "OP", "FIL", "AAVE", "MKR",
 ];
 
-// ── Fetchers (using shared-api.ts) ──
+/** Mark-price source preference for `bestMarkPrice` (most liquid first). */
+const MARK_PRICE_PREFERENCE: readonly VenueId[] = [
+  "hyperliquid", "pacifica", "lighter", "aster", "lighter-rh", "ondo", "arcus", "qfex",
+];
 
-async function fetchPacificaRates(): Promise<ExchangeFundingRate[]> {
-  try {
-    const assets = await fetchPacificaPrices();
-    return assets.map(p => {
-      const hourly = toHourlyRate(p.funding, "pacifica");
-      return {
-        exchange: "pacifica" as const,
-        symbol: p.symbol,
-        fundingRate: p.funding,
-        hourlyRate: hourly,
-        annualizedPct: annualizeRate(p.funding, "pacifica"),
-        markPrice: p.mark,
-        nextFundingTime: p.nextFunding,
-      };
-    });
-  } catch {
-    return [];
-  }
+// ── Per-venue fetch ──
+
+function errorMessage(e: unknown): string {
+  if (e instanceof PerpError) return e.structured.message;
+  return e instanceof Error ? e.message : String(e);
 }
 
-async function fetchHyperliquidRates(): Promise<ExchangeFundingRate[]> {
-  try {
-    const assets = await fetchHyperliquidMeta();
-    return assets.map(a => {
-      const hourly = toHourlyRate(a.funding, "hyperliquid");
-      return {
-        exchange: "hyperliquid" as const,
-        symbol: a.symbol,
-        fundingRate: a.funding,
-        hourlyRate: hourly,
-        annualizedPct: annualizeRate(a.funding, "hyperliquid"),
-        markPrice: a.markPx,
-      };
-    });
-  } catch {
-    return [];
+/**
+ * Funding rows for one venue, normalized. Rows the venue publishes without a
+ * mark price are priced from the same venue's markets (by venueSymbol); rows
+ * still unpriced, or without a canonical symbol, are excluded (never 0).
+ */
+async function fetchVenueRates(def: VenueDefinition, net: Network): Promise<ExchangeFundingRate[]> {
+  const rows = await def.publicData.fetchFundingRates(net);
+  let markBySymbol: Map<string, string> | null = null;
+  if (rows.some(r => r.markPrice === null)) {
+    const markets = await def.publicData.fetchMarkets(net);
+    markBySymbol = new Map(markets.map(m => [m.venueSymbol, m.markPrice]));
   }
+
+  const out: ExchangeFundingRate[] = [];
+  const unpriced: string[] = [];
+  for (const r of rows) {
+    if (r.canonical === null) continue; // not matchable across venues
+    const markRaw = r.markPrice !== null ? r.markPrice : markBySymbol?.get(r.venueSymbol);
+    const markPrice = markRaw === undefined ? NaN : Number(markRaw);
+    if (!Number.isFinite(markPrice) || markPrice <= 0) { unpriced.push(r.symbol); continue; }
+    out.push(toExchangeRate(r, r.canonical, markPrice, def.fundingVerified));
+  }
+  if (unpriced.length > 0) {
+    console.warn(`[${def.id}] excluded ${unpriced.length} funding row(s) without a mark price: ${unpriced.join(", ")}`);
+  }
+  return out;
 }
 
-async function fetchLighterRates(): Promise<ExchangeFundingRate[]> {
-  // Outer try/catch returning [] is intentional graceful degradation; see
-  // fetchAsterRates for the same pattern. Inside, SSOT rule #2 applies —
-  // skip rows whose mark price cannot be resolved instead of 0-coercing.
-  try {
-    const [details, funding] = await Promise.all([
-      fetchLighterOrderBookDetails(),
-      fetchLtFundingRates(),
-    ]);
-
-    const priceMap = new Map(details.map(d => [d.marketId, d.lastTradePrice]));
-    const symMap = new Map(details.map(d => [d.marketId, d.symbol]));
-
-    const out: ExchangeFundingRate[] = [];
-    for (const fr of funding) {
-      const symbol = fr.symbol || symMap.get(fr.marketId) || "";
-      if (!symbol) continue;
-      const rate = fr.rate;
-      // Prefer fr.markPrice; fall back to orderBook last-trade as a documented
-      // price-source preference (NOT an error fallback).
-      const directMark = fr.markPrice;
-      const fallbackMark = priceMap.get(fr.marketId);
-      let markPrice: number | undefined;
-      if (directMark !== null && Number.isFinite(directMark) && directMark > 0) {
-        markPrice = directMark;
-      } else if (fallbackMark !== undefined && Number.isFinite(fallbackMark) && fallbackMark > 0) {
-        markPrice = fallbackMark;
-      }
-      if (!Number.isFinite(rate) || markPrice === undefined) continue;
-      out.push({
-        exchange: "lighter" as const,
-        symbol,
-        fundingRate: rate,
-        hourlyRate: toHourlyRate(rate, "lighter"),
-        annualizedPct: annualizeRate(rate, "lighter"),
-        markPrice,
-      });
-    }
-    return out;
-  } catch {
-    return [];
+function toExchangeRate(r: VenueFundingRate, canonical: string, markPrice: number, fundingVerified: boolean): ExchangeFundingRate {
+  const fundingRate = Number(r.rate);
+  if (!Number.isFinite(fundingRate)) {
+    throw new PerpError("EXCHANGE_ERROR", `${r.venue} ${r.symbol}: non-numeric funding rate "${r.rate}"`);
   }
+  const hourlyRate = rateToHourly(fundingRate, r.basis);
+  return {
+    exchange: r.venue,
+    symbol: r.symbol,
+    canonical,
+    fundingRate,
+    basis: r.basis,
+    hourlyRate,
+    annualizedPct: annualizeHourlyRate(hourlyRate),
+    markPrice,
+    nextFundingTime: r.nextFundingTime,
+    historicalAvg: null,
+    fundingVerified,
+  };
 }
 
-async function fetchAsterRates(): Promise<ExchangeFundingRate[]> {
-  // Outer try/catch returning [] is intentional graceful degradation: when
-  // the entire endpoint is unreachable, the cross-DEX comparison should
-  // continue with the remaining venues.
-  // Inside the try block, SSOT rule #2 applies — refuse to silently 0-coerce
-  // missing markPrice / lastFundingRate, since those values feed downstream
-  // sizing and any 0 corrupts the comparison.
-  try {
-    const [premiums, tickers] = await Promise.all([
-      fetch("https://fapi.asterdex.com/fapi/v1/premiumIndex").then(r => r.json()) as Promise<Array<Record<string, unknown>>>,
-      fetch("https://fapi.asterdex.com/fapi/v1/ticker/24hr").then(r => r.json()) as Promise<Array<Record<string, unknown>>>,
-    ]);
-
-    const priceMap = new Map<string, number>();
-    for (const t of tickers ?? []) {
-      const last = Number(t.lastPrice);
-      if (Number.isFinite(last) && last > 0) priceMap.set(String(t.symbol), last);
+/**
+ * Fetch every venue in `venues` concurrently; failures land in status/errors.
+ * Venues whose funding is unverified (VenueDefinition.fundingVerified false — QFEX until its
+ * rate unit is confirmed) are DROPPED unless `includeUnverified`: every consumer that ranks,
+ * alerts on or trades funding spreads (arb scan, MCP, alerts, dashboard, portfolio) leaves it
+ * false. Only explicit, labelled reads pass true (`arb scan --include-unverified`).
+ */
+export async function fetchVenuesRates(venues: VenueDefinition[], net: Network, includeUnverified: boolean): Promise<{
+  rates: ExchangeFundingRate[];
+  exchangeStatus: Record<string, "ok" | "error">;
+  exchangeErrors: Record<string, string>;
+}> {
+  venues = venues.filter(v => v.fundingVerified || includeUnverified);
+  const settled = await Promise.allSettled(venues.map(v => fetchVenueRates(v, net)));
+  const exchangeStatus: Record<string, "ok" | "error"> = {};
+  const exchangeErrors: Record<string, string> = {};
+  const rates: ExchangeFundingRate[] = [];
+  settled.forEach((res, i) => {
+    const id = venues[i].id;
+    if (res.status === "fulfilled") {
+      exchangeStatus[id] = "ok";
+      rates.push(...res.value);
+    } else {
+      exchangeStatus[id] = "error";
+      exchangeErrors[id] = errorMessage(res.reason);
     }
+  });
+  return { rates, exchangeStatus, exchangeErrors };
+}
 
-    const out: ExchangeFundingRate[] = [];
-    for (const p of premiums ?? []) {
-      const rawSymbol = String(p.symbol ?? "");
-      if (!rawSymbol.endsWith("USDT")) continue;
-      const fundingRate = Number(p.lastFundingRate);
-      // Prefer premiumIndex.markPrice; fall back to ticker.lastPrice as a
-      // documented price-source preference (NOT an error fallback).
-      const markFromPremium = Number(p.markPrice);
-      const markPrice = Number.isFinite(markFromPremium) && markFromPremium > 0
-        ? markFromPremium
-        : priceMap.get(rawSymbol);
-      if (!Number.isFinite(fundingRate) || markPrice === undefined || !Number.isFinite(markPrice) || markPrice <= 0) {
-        continue;
-      }
-      const symbol = rawSymbol.replace(/USDT$/, "");
-      const nextFundingTimeRaw = Number(p.nextFundingTime);
-      out.push({
-        exchange: "aster" as const,
-        symbol,
-        fundingRate,
-        hourlyRate: toHourlyRate(fundingRate, "aster"),
-        annualizedPct: annualizeRate(fundingRate, "aster"),
-        markPrice,
-        nextFundingTime: Number.isFinite(nextFundingTimeRaw) ? nextFundingTimeRaw : 0,
-      });
+const _warnedPriceMismatch = new Set<string>();
+
+/**
+ * Same canonical ticker on two venues is not proof of the same asset (e.g. two
+ * unrelated tokens both listed as "PRL"). Within a canonical group, drop any
+ * venue whose mark price deviates more than MAX_PRICE_DEVIATION_PCT from the
+ * group median, with a one-time stderr warning per (symbol, venue).
+ */
+function dropPriceOutliers(canonical: string, list: ExchangeFundingRate[]): ExchangeFundingRate[] {
+  if (list.length < 2) return list;
+  const sorted = list.map(r => r.markPrice).sort((x, y) => x - y);
+  const mid = sorted.length % 2 === 1
+    ? sorted[(sorted.length - 1) / 2]
+    : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2;
+  if (!(mid > 0)) return list;
+  return list.filter(r => {
+    const devPct = Math.abs(r.markPrice - mid) / mid * 100;
+    if (devPct <= MAX_PRICE_DEVIATION_PCT) return true;
+    const key = `${canonical}:${r.exchange}`;
+    if (!_warnedPriceMismatch.has(key)) {
+      _warnedPriceMismatch.add(key);
+      process.stderr.write(`[funding] excluded ${r.exchange} ${canonical}: mark ${r.markPrice} deviates ${devPct.toFixed(1)}% from cross-venue median ${mid} (likely a different asset with the same ticker)\n`);
     }
-    return out;
-  } catch {
-    return [];
+    return false;
+  });
+}
+
+function groupByCanonical(rates: ExchangeFundingRate[], symbols: string[] | undefined): Map<string, ExchangeFundingRate[]> {
+  const out = new Map<string, ExchangeFundingRate[]>();
+  for (const r of rates) {
+    if (symbols && !symbols.includes(r.canonical)) continue;
+    const list = out.get(r.canonical);
+    if (list) list.push(r);
+    else out.set(r.canonical, [r]);
   }
+  for (const [canonical, list] of [...out]) {
+    const kept = dropPriceOutliers(canonical, list);
+    if (kept.length === 0) out.delete(canonical); // every venue disagreed — not comparable
+    else out.set(canonical, kept);
+  }
+  return out;
+}
+
+function bestMarkPrice(rates: ExchangeFundingRate[]): number {
+  const rank = (id: VenueId) => MARK_PRICE_PREFERENCE.indexOf(id);
+  return [...rates].sort((a, b) => rank(a.exchange) - rank(b.exchange))[0].markPrice;
 }
 
 // ── Core comparison logic ──
 
 /**
- * Fetch funding rates from all 3 DEXs in parallel, normalize, and compare.
+ * Fetch funding rates from every market-data venue in parallel, normalize, and compare.
  * Returns rates sorted by max spread (descending).
+ * @param opts.network defaults to the network the CLI selected (setSharedApiNetwork)
  */
 export async function fetchAllFundingRates(opts?: {
-  symbols?: string[];      // filter to these symbols (default: all)
+  symbols?: string[];      // filter to these canonical symbols (default: all)
   minSpread?: number;      // minimum annualized spread % to include
+  network?: Network;
+  /** Also fetch venues whose funding rate is unverified (default false — see fetchVenuesRates). */
+  includeUnverified?: boolean;
 }): Promise<FundingRateSnapshot> {
-  const exchangeStatus: Record<string, "ok" | "error"> = {};
+  ensureVenuesRegistered();
+  const net = opts?.network ?? sharedApiNetwork();
+  const { rates: allRates, exchangeStatus, exchangeErrors } =
+    await fetchVenuesRates(listVenuesWithRole("marketData"), net, opts?.includeUnverified === true);
 
-  const [pacRates, hlRates, ltRates, astRates] = await Promise.all([
-    fetchPacificaRates().then(r => { exchangeStatus.pacifica = r.length > 0 ? "ok" : "error"; return r; }),
-    fetchHyperliquidRates().then(r => { exchangeStatus.hyperliquid = r.length > 0 ? "ok" : "error"; return r; }),
-    fetchLighterRates().then(r => { exchangeStatus.lighter = r.length > 0 ? "ok" : "error"; return r; }),
-    fetchAsterRates().then(r => { exchangeStatus.aster = r.length > 0 ? "ok" : "error"; return r; }),
-  ]);
+  const rateMap = groupByCanonical(allRates, opts?.symbols);
 
-  const allRates = [...pacRates, ...hlRates, ...ltRates, ...astRates];
-
-  // Build per-symbol rate map
-  const rateMap = new Map<string, ExchangeFundingRate[]>();
-  for (const r of allRates) {
-    if (!r.symbol) continue;
-    if (opts?.symbols && !opts.symbols.includes(r.symbol.toUpperCase())) continue;
-    const key = r.symbol.toUpperCase();
-    if (!rateMap.has(key)) rateMap.set(key, []);
-    rateMap.get(key)!.push(r);
-  }
-
-  // Attach historical averages when available
-  try {
-    const symbols = Array.from(rateMap.keys());
-    const exchanges = ["pacifica", "hyperliquid", "lighter", "aster"];
-    const historicals = getHistoricalAverages(symbols, exchanges);
-    for (const [, rates] of rateMap) {
-      for (const r of rates) {
-        const key = `${r.symbol.toUpperCase()}:${r.exchange}`;
-        const avg = historicals.get(key);
-        if (avg) r.historicalAvg = avg;
-      }
-    }
-  } catch {
-    // Non-critical
+  // Attach historical averages (keyed by venue symbol + venue, as saved by saveFundingSnapshot)
+  const grouped = [...rateMap.values()].flat();
+  const historicals = getHistoricalAverages(
+    [...new Set(grouped.map(r => r.symbol.toUpperCase()))],
+    [...new Set(grouped.map(r => r.exchange))],
+  );
+  for (const r of grouped) {
+    const avg = historicals.get(`${r.symbol.toUpperCase()}:${r.exchange}`);
+    if (avg) r.historicalAvg = avg;
   }
 
   const comparisons: SymbolFundingComparison[] = [];
@@ -247,28 +248,25 @@ export async function fetchAllFundingRates(opts?: {
     rates.sort((a, b) => a.hourlyRate - b.hourlyRate);
     const lowest = rates[0];
     const highest = rates[rates.length - 1];
+    // The median filter alone lets a 2-venue group through at up to 2 × MAX_PRICE_DEVIATION_PCT
+    // apart (each side deviates half the gap): the CHOSEN pair must itself agree on price.
+    const pairGapPct = Math.abs(lowest.markPrice - highest.markPrice) / ((lowest.markPrice + highest.markPrice) / 2) * 100;
+    if (!(pairGapPct <= MAX_PRICE_DEVIATION_PCT)) {
+      const key = `${symbol}:${lowest.exchange}:${highest.exchange}`;
+      if (!_warnedPriceMismatch.has(key)) {
+        _warnedPriceMismatch.add(key);
+        process.stderr.write(`[funding] excluded ${symbol} ${lowest.exchange}↔${highest.exchange}: pair mark gap ${pairGapPct.toFixed(1)}% > ${MAX_PRICE_DEVIATION_PCT}%\n`);
+      }
+      continue;
+    }
 
-    const maxSpreadAnnual = computeAnnualSpread(
-      highest.fundingRate, highest.exchange,
-      lowest.fundingRate, lowest.exchange,
-    );
-
+    const maxSpreadAnnual = annualizeHourlyRate(highest.hourlyRate - lowest.hourlyRate);
     if (maxSpreadAnnual < minSpread) continue;
-
-    // Best mark price: prefer HL (most liquid), then PAC, then LT
-    const hlRate = rates.find(r => r.exchange === "hyperliquid");
-    const pacRate = rates.find(r => r.exchange === "pacifica");
-    const ltRate = rates.find(r => r.exchange === "lighter");
-    const bestMarkPrice = hlRate?.markPrice || pacRate?.markPrice || ltRate?.markPrice || 0;
 
     // Estimate hourly income for $1000 notional arb
     const notional = 1000;
-    const longIncome = estimateHourlyFunding(
-      lowest.fundingRate, lowest.exchange, notional, "long",
-    );
-    const shortIncome = estimateHourlyFunding(
-      highest.fundingRate, highest.exchange, notional, "short",
-    );
+    const longIncome = estimateHourlyFundingFromHourly(lowest.hourlyRate, notional, "long");
+    const shortIncome = estimateHourlyFundingFromHourly(highest.hourlyRate, notional, "short");
     const estHourlyIncomeUsd = -(longIncome + shortIncome); // negate because income = -cost
 
     comparisons.push({
@@ -277,7 +275,7 @@ export async function fetchAllFundingRates(opts?: {
       maxSpreadAnnual,
       longExchange: lowest.exchange,   // long where funding is lowest
       shortExchange: highest.exchange, // short where funding is highest
-      bestMarkPrice,
+      bestMarkPrice: bestMarkPrice(rates),
       estHourlyIncomeUsd,
     });
   }
@@ -289,14 +287,15 @@ export async function fetchAllFundingRates(opts?: {
     timestamp: new Date().toISOString(),
     symbols: comparisons,
     exchangeStatus,
+    exchangeErrors,
   };
 }
 
 /**
- * Fetch rates for a single symbol across all exchanges.
+ * Fetch rates for a single (canonical) symbol across all exchanges.
  */
-export async function fetchSymbolFundingRates(symbol: string): Promise<SymbolFundingComparison | null> {
-  const snapshot = await fetchAllFundingRates({ symbols: [symbol.toUpperCase()] });
+export async function fetchSymbolFundingRates(symbol: string, includeUnverified = false): Promise<SymbolFundingComparison | null> {
+  const snapshot = await fetchAllFundingRates({ symbols: [symbol.toUpperCase()], includeUnverified });
   return snapshot.symbols[0] ?? null;
 }
 
@@ -325,7 +324,7 @@ export interface SpotPerpSpread {
 /**
  * Fetch spot+perp funding rate spreads.
  * Since spot has 0 funding cost, the spread is simply |perp funding rate|.
- * Only includes symbols available on at least one spot exchange (HL or LT).
+ * Only includes symbols available on at least one bot spot venue (def.spot, §12.4 #3).
  *
  * Key safety checks:
  * - U-token mapping: UBTC→BTC, UETH→ETH, USOL→SOL, UFART→FARTCOIN
@@ -335,91 +334,56 @@ export interface SpotPerpSpread {
 export async function fetchSpotPerpSpreads(opts?: {
   symbols?: string[];
   minSpread?: number;
-}): Promise<{ timestamp: string; spreads: SpotPerpSpread[] }> {
-  // Fetch all perp funding rates
-  const [hlRates, ltRates, pacRates] = await Promise.all([
-    fetchHyperliquidRates(),
-    fetchLighterRates(),
-    fetchPacificaRates(),
-  ]);
+  network?: Network;
+}): Promise<{
+  timestamp: string;
+  spreads: SpotPerpSpread[];
+  exchangeStatus: Record<string, "ok" | "error">;
+  exchangeErrors: Record<string, string>;
+}> {
+  // Spot legs come from the venue definitions (def.spot, §12): only bot/arb spot venues
+  // (separate/runtime account + transfer, §12.4 #3). Perp legs: those venues + pacifica.
+  ensureVenuesRegistered();
+  const net = opts?.network ?? sharedApiNetwork();
+  const { listBotSpotVenues, requireSpotAdapter, defaultSpotQuote } = await import("../exchanges/spot-factory.js");
+  const spotVenues = listBotSpotVenues();
+  const perpVenueIds = new Set<VenueId>(["hyperliquid", "lighter", "pacifica", ...spotVenues.map(v => v.id)]);
+  const { rates: perpRates, exchangeStatus, exchangeErrors } = await fetchVenuesRates(
+    [...perpVenueIds].map(id => getVenue(id)),
+    net,
+    false,
+  );
 
-  // Build actual spot availability maps + spot prices for cross-validation
-  // hlSpotByPerp: perpSymbol → { spotToken, exchange }
-  const hlSpotByPerp = new Map<string, string>(); // perpSymbol → spotTokenName
-  const hlSpotPrices = new Map<string, number>();  // perpSymbol → spot mid price
-  const ltSpotSymbols = new Set<string>();
-  const ltSpotPrices = new Map<string, number>();   // symbol → spot mid price
-
-  try {
-    // HL: spotMetaAndAssetCtxs → universe + prices in one call
-    const hlMetaCtx = await fetch("https://api.hyperliquid.xyz/info", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ type: "spotMetaAndAssetCtxs" }),
-    }).then(r => r.json()) as [
-      {
-        tokens: Array<{ name: string; index: number }>;
-        universe: Array<{ tokens: [number, number]; index: number }>;
-      },
-      Array<{ markPx?: string; midPx?: string }>,
-    ];
-    const meta = hlMetaCtx[0];
-    const ctxs = hlMetaCtx[1] ?? [];
-    const tokenNames = new Map<number, string>();
-    for (const t of meta.tokens ?? []) tokenNames.set(t.index, t.name);
-    const usdcIdx = meta.tokens?.find(t => t.name === "USDC")?.index ?? 0;
-
-    // We need to match universe entries to ctxs by index.
-    // API returns ctxs in same order as universe entries.
-    for (let i = 0; i < (meta.universe ?? []).length; i++) {
-      const u = meta.universe[i];
-      if (u.tokens[1] !== usdcIdx) continue; // only /USDC pairs
-      const base = tokenNames.get(u.tokens[0])?.toUpperCase();
-      if (!base) continue;
-
-      const ctx = ctxs[i];
-      const spotPrice = Number(ctx?.midPx ?? ctx?.markPx ?? 0);
-
-      // Map to perp symbol: UBTC→BTC, or direct if no mapping
-      const perpSymbol = SPOT_PERP_TOKEN_MAP[base] ?? base;
-      // Only keep the best-priced entry per perp symbol (prefer higher-volume)
-      if (!hlSpotByPerp.has(perpSymbol) || spotPrice > 0) {
-        hlSpotByPerp.set(perpSymbol, base);
-        if (spotPrice > 0) hlSpotPrices.set(perpSymbol, spotPrice);
+  // Spot availability + prices per venue: perpSymbol → candidate spot prices (U-tokens map
+  // UBTC→BTC; several spot tokens may claim one perp symbol). A failure is reported as
+  // "<venue>-spot" in status/errors.
+  const spotPricesByVenue = new Map<VenueId, Map<string, number[]>>();
+  await Promise.all(spotVenues.map(async def => {
+    try {
+      if (def.create === null) throw new Error(`${def.id} has no adapter`);
+      const perp = await def.create({ network: net, credentials: READ_ONLY_CREDENTIALS, noAgent: true, hlDex: null, readOnly: true, noBuilder: true });
+      const spot = await requireSpotAdapter(def.id, perp);
+      const quote = defaultSpotQuote(def, net);
+      const byPerp = new Map<string, number[]>();
+      for (const m of await spot.getSpotMarkets()) {
+        if (m.quoteToken.toUpperCase() !== quote || m.markPrice === null) continue; // null = no price → cannot be validated
+        const px = Number(m.markPrice);
+        if (!Number.isFinite(px) || px <= 0) continue; // no price → cannot be validated → not a candidate
+        const base = m.baseToken.toUpperCase();
+        const perpSymbol = SPOT_PERP_TOKEN_MAP[base] ?? base;
+        const list = byPerp.get(perpSymbol);
+        if (list) list.push(px); else byPerp.set(perpSymbol, [px]);
       }
+      spotPricesByVenue.set(def.id, byPerp);
+      exchangeStatus[`${def.id}-spot`] = "ok";
+    } catch (e) {
+      exchangeStatus[`${def.id}-spot`] = "error";
+      exchangeErrors[`${def.id}-spot`] = errorMessage(e);
     }
-  } catch { /* non-critical */ }
+  }));
 
-  try {
-    // LT: explorer API → symbols with "/"
-    const ltMarkets = await fetch("https://explorer.elliot.ai/api/markets")
-      .then(r => r.json()) as Array<{ symbol: string }>;
-    for (const m of ltMarkets) {
-      if (m.symbol.includes("/")) {
-        ltSpotSymbols.add(m.symbol.split("/")[0].toUpperCase());
-      }
-    }
-    // Fetch LT spot prices from orderbook for price validation
-    for (const sym of ltSpotSymbols) {
-      try {
-        const book = await fetch(`https://mainnet.zklighter.elliot.ai/api/v1/orderBookOrders?market_id=${
-          // We don't have market_id here, skip detailed price fetch for LT
-          // LT tokens (ETH, LINK, etc.) are direct names, low risk of mismatch
-          ""
-        }`);
-        // Skip — LT uses direct token names, not indices
-      } catch { /* skip */ }
-    }
-  } catch { /* non-critical */ }
-
-  // Merge all perp rates by symbol
-  const perpRateMap = new Map<string, ExchangeFundingRate[]>();
-  for (const r of [...hlRates, ...ltRates, ...pacRates]) {
-    if (!r.symbol) continue;
-    if (opts?.symbols && !opts.symbols.includes(r.symbol.toUpperCase())) continue;
-    const key = r.symbol.toUpperCase();
-    if (!perpRateMap.has(key)) perpRateMap.set(key, []);
-    perpRateMap.get(key)!.push(r);
-  }
+  // Merge all perp rates by canonical symbol
+  const perpRateMap = groupByCanonical(perpRates, opts?.symbols);
 
   const spreads: SpotPerpSpread[] = [];
   const minSpread = opts?.minSpread ?? 0;
@@ -428,27 +392,16 @@ export async function fetchSpotPerpSpreads(opts?: {
     rates.sort((a, b) => Math.abs(b.hourlyRate) - Math.abs(a.hourlyRate));
     const bestPerp = rates[0];
 
-    // Spot exchanges: only include if symbol has a verified spot market
+    // Spot exchanges: only include if the symbol has a spot market whose price is within
+    // MAX_PRICE_DEVIATION_PCT of the perp mark (same ticker, different token — e.g. HIP-1
+    // TRUMP ≠ perp TRUMP — is skipped).
     const uniqueSpot: string[] = [];
-
-    // HL spot: check U-token mapped availability
-    if (hlSpotByPerp.has(symbol)) {
-      // Price cross-validation: spot price must be close to perp mark price
-      const spotPrice = hlSpotPrices.get(symbol);
-      const perpPrice = bestPerp.markPrice;
-      if (spotPrice && perpPrice > 0) {
-        const deviation = Math.abs(spotPrice - perpPrice) / perpPrice * 100;
-        if (deviation <= MAX_PRICE_DEVIATION_PCT) {
-          uniqueSpot.push("hyperliquid");
-        }
-        // else: same ticker, different token (e.g., HIP-1 TRUMP ≠ perp TRUMP) → skip
-      } else if (spotPrice === undefined) {
-        // No price data (empty orderbook) → skip, can't verify
-      }
+    const perpPrice = bestPerp.markPrice;
+    for (const [venueId, byPerp] of spotPricesByVenue) {
+      const prices = byPerp.get(symbol);
+      if (!prices || !(perpPrice > 0)) continue;
+      if (prices.some(px => Math.abs(px - perpPrice) / perpPrice * 100 <= MAX_PRICE_DEVIATION_PCT)) uniqueSpot.push(venueId);
     }
-
-    // LT spot: direct token names, low mismatch risk
-    if (ltSpotSymbols.has(symbol)) uniqueSpot.push("lighter");
 
     if (uniqueSpot.length === 0) continue;
 
@@ -480,5 +433,7 @@ export async function fetchSpotPerpSpreads(opts?: {
   return {
     timestamp: new Date().toISOString(),
     spreads,
+    exchangeStatus,
+    exchangeErrors,
   };
 }

@@ -6,6 +6,11 @@ import { validateBotToken as validateDiscordBot, sendDiscordDM, openDMChannel, t
 import { validateTelegramBot, sendTelegramMessage, getRecentChatId, type TelegramConfig } from "../telegram.js";
 import { printJson, jsonOk } from "../utils.js";
 import { fetchAllFundingRates } from "../funding-rates.js";
+import "../exchanges/venues/index.js";
+import { resolveVenueId, getVenue } from "../exchanges/venue.js";
+import { PerpError } from "../errors.js";
+import { scrubSecretEnv } from "../secret-env.js";
+import { networkOf } from "../cli-flags.js";
 
 function ask(rl: ReturnType<typeof createInterface>, question: string): Promise<string> {
   return new Promise((resolve) => rl.question(question, (answer) => resolve(answer.trim())));
@@ -113,8 +118,7 @@ export function registerAlertCommands(program: Command, isJson: () => boolean) {
     .action(async () => {
       const settings = loadSettings();
       if (!hasAnyService(settings.alerts)) {
-        console.log(chalk.red("  Not configured. Run: perp alerts setup\n"));
-        return;
+        throw new PerpError("INVALID_PARAMS", "No alert messaging service (Telegram / Discord) is configured", { remediation: "Run: perp alerts setup" });
       }
       const msg = `[TEST] perp-cli alert system is working. ${new Date().toISOString()}`;
       try {
@@ -122,8 +126,9 @@ export function registerAlertCommands(program: Command, isJson: () => boolean) {
         if (isJson()) return printJson(jsonOk({ status: "sent", services: serviceStatus(settings.alerts) }));
         console.log(chalk.green(`  Test message sent! (${serviceStatus(settings.alerts).join(", ")})\n`));
       } catch (err) {
-        if (isJson()) return printJson(jsonOk({ error: String(err) }));
-        console.log(chalk.red(`  Failed: ${err instanceof Error ? err.message : err}\n`));
+        throw new PerpError("EXCHANGE_ERROR", `Test alert failed: ${err instanceof Error ? err.message : String(err)}`, {
+          remediation: "Check the bot token / chat id or webhook: perp alerts setup",
+        });
       }
     });
 
@@ -135,7 +140,7 @@ export function registerAlertCommands(program: Command, isJson: () => boolean) {
     .argument("[symbol]", "Symbol to monitor (e.g. ETH, BTC)")
     .argument("[threshold]", "Annual funding rate % threshold")
     .option("--all", "Monitor all symbols")
-    .option("--exchange <ex>", "Filter by exchange (hl, pac, lt)")
+    .option("--exchange <ex>", "Filter by venue id or alias (e.g. hl, pac, lt, ast, lighter-rh, ondo, arcus, qfex)")
     .option("--below", "Alert when rate drops below threshold (default: above)")
     .action((symbol: string | undefined, thresholdStr: string | undefined, opts: { all?: boolean; exchange?: string; below?: boolean }) => {
       const sym = opts.all ? "*" : symbol?.toUpperCase();
@@ -151,8 +156,12 @@ export function registerAlertCommands(program: Command, isJson: () => boolean) {
         return;
       }
 
-      const aliasMap: Record<string, string> = { hl: "hyperliquid", pac: "pacifica", lt: "lighter" };
-      const exchange = opts.exchange ? (aliasMap[opts.exchange.toLowerCase()] || opts.exchange.toLowerCase()) : "*";
+      // Unknown venue → UNKNOWN_VENUE (a stored rule with a typo would never match).
+      // `--exchange` is also the root option (-e, --exchange), which commander gives to the root
+      // program: read it there when it was passed on the command line (never its default venue).
+      const rootExchange = program.getOptionValueSource("exchange") === "cli" ? String(program.opts().exchange) : undefined;
+      const filter = opts.exchange ?? rootExchange;
+      const exchange = filter !== undefined ? resolveVenueId(filter) : "*";
 
       const settings = loadSettings();
       const rule: AlertRule = {
@@ -267,14 +276,12 @@ export function registerAlertCommands(program: Command, isJson: () => boolean) {
       const settings = loadSettings();
 
       if (!hasAnyService(settings.alerts)) {
-        console.log(chalk.red("  No messaging service configured. Run: perp alerts setup\n"));
-        return;
+        throw new PerpError("INVALID_PARAMS", "No alert messaging service (Telegram / Discord) is configured", { remediation: "Run: perp alerts setup" });
       }
 
       const rules = settings.alerts.rules.filter(r => r.enabled);
       if (rules.length === 0) {
-        console.log(chalk.red("  No active alert rules. Add one: perp alerts add ETH 30\n"));
-        return;
+        throw new PerpError("INVALID_PARAMS", "No active alert rules", { remediation: "Add one: perp alerts add ETH 30" });
       }
 
       const intervalSec = parseInt(opts.interval || String(settings.alerts.intervalSec)) || 300;
@@ -283,28 +290,22 @@ export function registerAlertCommands(program: Command, isJson: () => boolean) {
       // ── Background mode: launch in tmux ──
       if (opts.background) {
         const { execSync } = await import("child_process");
-        try { execSync("which tmux", { stdio: "ignore" }); } catch {
+        try { execSync("which tmux", { stdio: "ignore", env: scrubSecretEnv(process.env) }); } catch {
           console.log(chalk.red("  tmux required for --background. Install: brew install tmux\n"));
           return;
         }
 
         const session = `perp-alerts-${Date.now().toString(36)}`;
-        const nodeCmd = process.argv[0];
-        const cliPath = process.argv[1];
-        const args = [
+        // The daemon reads public funding rates + settings.json only: no key material is
+        // handed to it (SSOT Rule #3) — launchTmuxChild strips secret env vars.
+        const { launchTmuxChild } = await import("../jobs.js");
+        launchTmuxChild(session, [
+          // Same network as the parent (review L6): the daemon reads that network's funding rates.
+          "-n", networkOf(program),
           "alerts", "start",
           "--interval", String(intervalSec),
           "--cooldown", String(cooldownMin),
-        ].join(" ");
-
-        // Pass through env vars for keys
-        // L2 agent key + indices now live in ~/.perp keystore + settings.agents (SSOT Rule #3),
-        // not env. Only Tier 3 master PKs need passthrough.
-        const envKeys = ["LIGHTER_PRIVATE_KEY", "HL_PRIVATE_KEY", "PACIFICA_PRIVATE_KEY", "ASTER_PRIVATE_KEY", "PRIVATE_KEY"];
-        const envStr = envKeys.filter(k => process.env[k]).map(k => `${k}='${process.env[k]}'`).join(" ");
-
-        const cmd = `${envStr} ${nodeCmd} ${cliPath} ${args}`;
-        execSync(`tmux new-session -d -s ${session} '${cmd.replace(/'/g, "'\\''")}'`);
+        ], null, false);
 
         if (isJson()) return printJson(jsonOk({ status: "started", session, rules: rules.length, interval: intervalSec }));
         console.log(chalk.green(`\n  Alert daemon started in background.`));
@@ -358,7 +359,7 @@ export function registerAlertCommands(program: Command, isJson: () => boolean) {
                 cooldowns.set(cooldownKey, Date.now());
                 alertCount++;
 
-                const exAbbr = rate.exchange === "pacifica" ? "PAC" : rate.exchange === "hyperliquid" ? "HL" : "LT";
+                const exAbbr = getVenue(rate.exchange).displayName;
                 const sign = rate.annualizedPct > 0 ? "+" : "";
                 const msg = [
                   `${comparison.symbol} funding alert`,
@@ -400,8 +401,8 @@ export function registerAlertCommands(program: Command, isJson: () => boolean) {
     .action(async () => {
       const { execSync } = await import("child_process");
       try {
-        const sessions = execSync("tmux list-sessions -F '#{session_name}'", { encoding: "utf-8" })
-          .trim().split("\n").filter(s => s.startsWith("perp-alerts-"));
+        const sessions = execSync("tmux list-sessions -F '#{session_name}'", { encoding: "utf-8", env: scrubSecretEnv(process.env) })
+          .trim().split("\n").filter(s => /^perp-alerts-[A-Za-z0-9_-]+$/.test(s));
 
         if (sessions.length === 0) {
           if (isJson()) return printJson(jsonOk({ status: "none" }));
@@ -409,8 +410,9 @@ export function registerAlertCommands(program: Command, isJson: () => boolean) {
           return;
         }
 
+        const { killTmuxSession } = await import("../jobs.js");
         for (const session of sessions) {
-          try { execSync(`tmux kill-session -t ${session}`); } catch { /* already dead */ }
+          try { killTmuxSession(session); } catch { /* already dead */ }
         }
 
         if (isJson()) return printJson(jsonOk({ status: "stopped", sessions }));

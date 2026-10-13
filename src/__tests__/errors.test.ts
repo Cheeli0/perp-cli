@@ -73,6 +73,26 @@ describe("classifyError — pattern matching", () => {
     expect(classifyError(new Error("Risk limit violation")).code).toBe("RISK_VIOLATION");
   });
 
+  it("classifies AEAD/decryption failure as INVALID_PASSPHRASE", () => {
+    // The exact NAPI error message thrown by @open-wallet-standard/core
+    // when the AEAD tag check fails (wrong passphrase or tampered ciphertext).
+    const r = classifyError(new Error("decryption failed: aead::Error"));
+    expect(r.code).toBe("INVALID_PASSPHRASE");
+    expect(r.status).toBe(401);
+    expect(r.retryable).toBe(false);
+    expect(r.remediation).toMatch(/passphrase/i);
+  });
+
+  it("INVALID_PASSPHRASE matches generic 'decryption failed' messages too", () => {
+    expect(classifyError(new Error("Decryption failed")).code).toBe("INVALID_PASSPHRASE");
+    expect(classifyError(new Error("decryption error: tag mismatch")).code).toBe("INVALID_PASSPHRASE");
+  });
+
+  it("INVALID_PASSPHRASE is distinct from PASSPHRASE_REQUIRED", () => {
+    expect(classifyError(new Error("passphrase required")).code).toBe("PASSPHRASE_REQUIRED");
+    expect(classifyError(new Error("aead::Error")).code).toBe("INVALID_PASSPHRASE");
+  });
+
   it("returns EXCHANGE_ERROR when exchange is known but message is unrecognized", () => {
     const r = classifyError(new Error("Something weird happened"), "hyperliquid");
     expect(r.code).toBe("EXCHANGE_ERROR");
@@ -130,6 +150,60 @@ describe("ERROR_CODES coverage", () => {
         expect(allowed, `${key} has retryable=true but unexpected status ${entry.status}`).toBe(true);
       }
     }
+  });
+
+  // Regression guard for 198f196: the ad-hoc strings "FATAL" (index.ts
+  // top-level catch) and "INVALID_EXCHANGE" (market hip3 path) used to ship
+  // via `jsonError(code as never, ...)` without being registered in
+  // ERROR_CODES — they slipped past the type system and reached callers as
+  // codes with no status/retryable/remediation. The fix routes both through
+  // existing registered codes (classifyError for the catch-all; INVALID_PARAMS
+  // with remediation for hip3). Pin the absence to prevent reintroduction.
+  it("ad-hoc codes retired in 198f196 are not in ERROR_CODES", () => {
+    const retired = ["FATAL", "INVALID_EXCHANGE"];
+    for (const code of retired) {
+      expect(
+        Object.prototype.hasOwnProperty.call(ERROR_CODES, code),
+        `${code} was retired in 198f196 — must not be reintroduced as a registered code`,
+      ).toBe(false);
+    }
+  });
+});
+
+describe("classifyError — never returns an unregistered code (198f196 regression guard)", () => {
+  // Before 198f196, the top-level catch in src/index.ts hard-coded
+  // jsonError("FATAL", msg) for any non-PerpError thrown out of an action,
+  // so a typo'd Lighter symbol shipped as { code: "FATAL" } — no status,
+  // no retryable, no remediation. The fix routes such errors through
+  // classifyError. Pin that the classifier output is always a registered
+  // ERROR_CODES entry, regardless of input shape.
+
+  it("a network-flavored Error becomes EXCHANGE_UNREACHABLE (registered), not 'FATAL'", () => {
+    const r = classifyError(new Error("fetch failed: ECONNREFUSED"));
+    expect(r.code).toBe("EXCHANGE_UNREACHABLE");
+    expect(ERROR_CODES).toHaveProperty(r.code);
+  });
+
+  it("a typo'd symbol Error becomes SYMBOL_NOT_FOUND (registered), not 'FATAL'", () => {
+    const r = classifyError(new Error("Symbol BTCUSDX not found"));
+    expect(r.code).toBe("SYMBOL_NOT_FOUND");
+    expect(ERROR_CODES).toHaveProperty(r.code);
+  });
+
+  it("a wholly unknown Error message falls back to UNKNOWN (registered), not 'FATAL'", () => {
+    const r = classifyError(new Error("something went wrong in a way nobody pattern-matched"));
+    expect(r.code).toBe("UNKNOWN");
+    expect(ERROR_CODES).toHaveProperty(r.code);
+  });
+
+  it("a non-Error thrown value (string / object) still resolves to a registered code", () => {
+    // Defensive: pre-fix code path would have called String(err) and
+    // labeled "FATAL". Now `classifyError` handles non-Error inputs
+    // via extractErrorMessage + pattern matching.
+    const r1 = classifyError("raw string thrown");
+    expect(ERROR_CODES).toHaveProperty(r1.code);
+    const r2 = classifyError({ message: "raw object thrown" });
+    expect(ERROR_CODES).toHaveProperty(r2.code);
   });
 });
 
@@ -263,7 +337,7 @@ describe("withJsonErrors — PerpError end-to-end (C2)", () => {
     });
 
     expect(logSpy).not.toHaveBeenCalled();
-    const all = errSpy.mock.calls.map(c => String(c[0])).join("\n");
+    const all = errSpy.mock.calls.map((c: unknown[]) => String(c[0])).join("\n");
     expect(all).toContain("Agent expired");
     expect(all).toContain("Remediation: perp wallet agent approve aster --rotate");
   });

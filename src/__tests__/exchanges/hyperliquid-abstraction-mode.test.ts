@@ -5,12 +5,12 @@
  *  - "unifiedAccount"  → "unified"
  *  - "portfolioMargin" → "portfolio"
  *  - "disabled"        → "standard"
- *  - "default"         → "standard"  (legacy v0.12.9)
- *  - "dexAbstraction"  → "unified"   (C3 fix: legacy 4th HL mode)
+ *  - "default"         → "default"   (unset mode is NOT assumed standard/unified)
+ *  - "dexAbstraction"  → "dexAbstraction" (discontinued 4th mode; NOT unified — USDC stays in the perp balance)
  *  - unknown           → throws PerpError(INVALID_PARAMS)
  *
  * The cache layer is bypassed by stubbing `withCache` to invoke the producer
- * directly; SDK construction is short-circuited by setting walletAddress.
+ * directly.
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
 
@@ -53,14 +53,14 @@ describe("HyperliquidAdapter._getAbstractionMode — C3 mapping", () => {
     await expect(hl._getAbstractionMode()).resolves.toBe("standard");
   });
 
-  it("'default' maps to 'standard' (v0.12.9 regression guard)", async () => {
+  it("'default' stays 'default' (unset mode is not assumed)", async () => {
     const hl = await buildAdapter("default");
-    await expect(hl._getAbstractionMode()).resolves.toBe("standard");
+    await expect(hl._getAbstractionMode()).resolves.toBe("default");
   });
 
-  it("'dexAbstraction' maps to 'unified' (C3 fix: legacy 4th HL mode)", async () => {
+  it("'dexAbstraction' stays 'dexAbstraction' — never treated as unified", async () => {
     const hl = await buildAdapter("dexAbstraction");
-    await expect(hl._getAbstractionMode()).resolves.toBe("unified");
+    await expect(hl._getAbstractionMode()).resolves.toBe("dexAbstraction");
   });
 
   it("unknown mode throws INVALID_PARAMS with remediation", async () => {
@@ -95,9 +95,7 @@ describe("HyperliquidAdapter.isUnifiedAccount — derived from abstraction mode 
     hl.setAddress("0xabcdef0000000000000000000000000000000001");
     (hl as unknown as { _infoPost: (b: unknown) => Promise<unknown> })._infoPost =
       vi.fn().mockResolvedValue("disabled");
-    // Stub sdk.connect / asset map loader so init() reaches the mode lookup
-    (hl as unknown as { sdk: { connect: () => Promise<void> }; _loadAssetMap: () => Promise<void> }).sdk =
-      { connect: vi.fn().mockResolvedValue(undefined) } as unknown as { connect: () => Promise<void> };
+    // Stub the asset map loader so init() reaches the mode lookup
     (hl as unknown as { _loadAssetMap: () => Promise<void> })._loadAssetMap =
       vi.fn().mockResolvedValue(undefined);
 
@@ -111,8 +109,7 @@ describe("HyperliquidAdapter.isUnifiedAccount — derived from abstraction mode 
     hl.setAddress("0xabcdef0000000000000000000000000000000002");
     (hl as unknown as { _infoPost: (b: unknown) => Promise<unknown> })._infoPost =
       vi.fn().mockResolvedValue("default");
-    (hl as unknown as { sdk: { connect: () => Promise<void> }; _loadAssetMap: () => Promise<void> }).sdk =
-      { connect: vi.fn().mockResolvedValue(undefined) } as unknown as { connect: () => Promise<void> };
+    // Stub the asset map loader so init() reaches the mode lookup
     (hl as unknown as { _loadAssetMap: () => Promise<void> })._loadAssetMap =
       vi.fn().mockResolvedValue(undefined);
 
@@ -126,8 +123,7 @@ describe("HyperliquidAdapter.isUnifiedAccount — derived from abstraction mode 
     hl.setAddress("0xabcdef0000000000000000000000000000000003");
     (hl as unknown as { _infoPost: (b: unknown) => Promise<unknown> })._infoPost =
       vi.fn().mockResolvedValue("unifiedAccount");
-    (hl as unknown as { sdk: { connect: () => Promise<void> }; _loadAssetMap: () => Promise<void> }).sdk =
-      { connect: vi.fn().mockResolvedValue(undefined) } as unknown as { connect: () => Promise<void> };
+    // Stub the asset map loader so init() reaches the mode lookup
     (hl as unknown as { _loadAssetMap: () => Promise<void> })._loadAssetMap =
       vi.fn().mockResolvedValue(undefined);
 
@@ -141,8 +137,7 @@ describe("HyperliquidAdapter.isUnifiedAccount — derived from abstraction mode 
     hl.setAddress("0xabcdef0000000000000000000000000000000004");
     (hl as unknown as { _infoPost: (b: unknown) => Promise<unknown> })._infoPost =
       vi.fn().mockResolvedValue("portfolioMargin");
-    (hl as unknown as { sdk: { connect: () => Promise<void> }; _loadAssetMap: () => Promise<void> }).sdk =
-      { connect: vi.fn().mockResolvedValue(undefined) } as unknown as { connect: () => Promise<void> };
+    // Stub the asset map loader so init() reaches the mode lookup
     (hl as unknown as { _loadAssetMap: () => Promise<void> })._loadAssetMap =
       vi.fn().mockResolvedValue(undefined);
 
@@ -150,21 +145,20 @@ describe("HyperliquidAdapter.isUnifiedAccount — derived from abstraction mode 
     expect(hl.isUnifiedAccount).toBe(true);
   });
 
-  it("HIP-3 dex account (standard semantics) → isUnifiedAccount === false", async () => {
+  it("HIP-3 dex adapter still queries the per-user mode → unified user → isUnifiedAccount === true", async () => {
     const { HyperliquidAdapter } = await import("../../exchanges/hyperliquid.js");
     const hl = new HyperliquidAdapter(undefined, false);
     hl.setAddress("0xabcdef0000000000000000000000000000000005");
-    hl.setDex("km"); // any HIP-3 dex name → _getAbstractionMode short-circuits to "standard"
-    // _infoPost is still consulted by other paths; not by mode lookup for dex
-    (hl as unknown as { _infoPost: (b: unknown) => Promise<unknown> })._infoPost =
-      vi.fn().mockResolvedValue("unifiedAccount"); // even if venue would say unified, dex short-circuits
-    (hl as unknown as { sdk: { connect: () => Promise<void> }; _loadAssetMap: () => Promise<void> }).sdk =
-      { connect: vi.fn().mockResolvedValue(undefined) } as unknown as { connect: () => Promise<void> };
+    hl.setDex("km"); // abstraction is per user, not per dex — no short-circuit
+    const infoPost = vi.fn().mockResolvedValue("unifiedAccount");
+    (hl as unknown as { _infoPost: (b: unknown) => Promise<unknown> })._infoPost = infoPost;
+    // Stub the asset map loader so init() reaches the mode lookup
     (hl as unknown as { _loadAssetMap: () => Promise<void> })._loadAssetMap =
       vi.fn().mockResolvedValue(undefined);
 
     await hl.init();
-    expect(hl.isUnifiedAccount).toBe(false);
+    expect(hl.isUnifiedAccount).toBe(true);
+    expect(infoPost).toHaveBeenCalledWith({ type: "userAbstraction", user: "0xabcdef0000000000000000000000000000000005" });
   });
 
   it("read-only init (no address) leaves default false (no userAbstraction call)", async () => {
@@ -173,8 +167,7 @@ describe("HyperliquidAdapter.isUnifiedAccount — derived from abstraction mode 
     // No setAddress() before init — read-only path
     const infoPost = vi.fn().mockResolvedValue("unifiedAccount");
     (hl as unknown as { _infoPost: (b: unknown) => Promise<unknown> })._infoPost = infoPost;
-    (hl as unknown as { sdk: { connect: () => Promise<void> }; _loadAssetMap: () => Promise<void> }).sdk =
-      { connect: vi.fn().mockResolvedValue(undefined) } as unknown as { connect: () => Promise<void> };
+    // Stub the asset map loader so init() reaches the mode lookup
     (hl as unknown as { _loadAssetMap: () => Promise<void> })._loadAssetMap =
       vi.fn().mockResolvedValue(undefined);
 

@@ -1,9 +1,31 @@
 import { Command } from "commander";
+import { isDryRun, supportsDryRun } from "../cli-flags.js";
 import { readFileSync } from "fs";
 import type { ExchangeAdapter } from "../exchanges/index.js";
 import { printJson, jsonOk, jsonError, withJsonErrors } from "../utils.js";
 import { validatePlan, executePlan, type ExecutionPlan } from "../plan-executor.js";
+import { PerpError, extractErrorMessage } from "../errors.js";
 import chalk from "chalk";
+
+/** Read and JSON-parse a plan file (`-` = stdin). A missing / unreadable / malformed file is an input error. */
+function readPlanFile(file: string): unknown {
+  const source = file === "-" ? "stdin" : `'${file}'`;
+  let raw: string;
+  try {
+    raw = file === "-" ? readFileSync(0, "utf-8") : readFileSync(file, "utf-8");
+  } catch (err) {
+    throw new PerpError("INVALID_PARAMS", `Cannot read plan file ${source}: ${extractErrorMessage(err)}`, {
+      remediation: "Check the path (or pass - to read the plan from stdin). Generate a template with: perp strategy plan example",
+    });
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    throw new PerpError("INVALID_PARAMS", `Plan file ${source} is not valid JSON: ${extractErrorMessage(err)}`, {
+      remediation: "Fix the JSON. Generate a template with: perp strategy plan example",
+    });
+  }
+}
 
 export function registerStrategyPlanCommands(
   parent: Command,
@@ -18,8 +40,7 @@ export function registerStrategyPlanCommands(
     .description("Validate a JSON execution plan without executing")
     .action(async (file: string) => {
       await withJsonErrors(isJson(), async () => {
-        const raw = file === "-" ? readFileSync(0, "utf-8") : readFileSync(file, "utf-8");
-        const planData = JSON.parse(raw);
+        const planData = readPlanFile(file) as ExecutionPlan;
         const result = validatePlan(planData);
 
         if (isJson()) return printJson(jsonOk(result));
@@ -37,18 +58,17 @@ export function registerStrategyPlanCommands(
     });
 
   // ── plan execute ──
-  plan
-    .command("execute <file>")
-    .description("Execute a JSON plan (use - for stdin)")
-    .option("--dry-run", "Simulate without executing trades")
-    .action(async (file: string, opts: { dryRun?: boolean }) => {
+  supportsDryRun(plan.command("execute <file>"))
+    .description("Execute a JSON plan (use - for stdin; supports --dry-run)")
+    .action(async (file: string, _opts: Record<string, never>, cmd: Command) => {
+      const dryRun = isDryRun(cmd);
       await withJsonErrors(isJson(), async () => {
-        const raw = file === "-" ? readFileSync(0, "utf-8") : readFileSync(file, "utf-8");
-        const planData = JSON.parse(raw) as ExecutionPlan;
+        const planData = readPlanFile(file) as ExecutionPlan;
 
         // Validate first
         const validation = validatePlan(planData);
         if (!validation.valid) {
+          process.exitCode = 1;
           if (isJson()) return printJson(jsonError("INVALID_PARAMS", `Plan validation failed: ${validation.errors.join("; ")}`));
           console.error(chalk.red(`\n  Plan validation failed:`));
           for (const err of validation.errors) console.error(chalk.red(`    • ${err}`));
@@ -59,15 +79,31 @@ export function registerStrategyPlanCommands(
         const log = isJson() ? () => {} : (msg: string) => console.log(chalk.gray(`  ${msg}`));
 
         if (!isJson()) {
-          console.log(chalk.cyan.bold(`\n  Executing plan (${planData.steps.length} steps)${opts.dryRun ? " [DRY RUN]" : ""}...\n`));
+          console.log(chalk.cyan.bold(`\n  Executing plan (${planData.steps.length} steps)${dryRun ? " [DRY RUN]" : ""}...\n`));
         }
 
         const result = await executePlan(adapter, planData, {
-          dryRun: opts.dryRun,
+          dryRun,
           log,
         });
 
-        if (isJson()) return printJson(jsonOk(result));
+        // Unknown / quarantined / failed outcomes must not look like success to scripts.
+        const bad = result.status === "pending" || result.status === "quarantined" || result.status === "failed" || result.status === "partial";
+        const badCode = result.status === "pending" ? "ORDER_PENDING"
+          : result.status === "quarantined" ? "ORDER_PARTIAL"
+          : result.status === "partial" ? "ORDER_PARTIAL"
+          : "ORDER_REJECTED";
+        const badRemediation = result.status === "pending" || result.status === "quarantined"
+          ? "An order outcome is unknown or a symbol was quarantined — do NOT re-run the plan. Check positions, then: perp strategy quarantine"
+          : "Check the failed step and current positions before re-running";
+        if (isJson()) {
+          if (bad) {
+            printJson(jsonError(badCode, `Plan ended with status "${result.status}"`, { details: { result }, remediation: badRemediation }));
+            process.exitCode = 1;
+            return;
+          }
+          return printJson(jsonOk(result));
+        }
 
         // Pretty print results
         for (const step of result.steps) {
@@ -85,6 +121,10 @@ export function registerStrategyPlanCommands(
           : result.status === "partial" ? chalk.yellow
           : chalk.red;
         console.log(`\n  Status: ${statusColor(result.status)} | ${result.totalDurationMs}ms\n`);
+        if (bad) {
+          console.log(chalk.red(`  ${badRemediation}\n`));
+          process.exitCode = 1;
+        }
       });
     });
 

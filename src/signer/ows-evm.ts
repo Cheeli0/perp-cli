@@ -1,5 +1,6 @@
 import type { EvmSigner } from "./interface.js";
 import { loadOws } from "./ows-loader.js";
+import type { Transaction } from "ethers";
 
 /**
  * EVM signer backed by Open Wallet Standard.
@@ -57,6 +58,18 @@ export class OwsEvmSigner implements EvmSigner {
     return canonicalizeOwsSignature(result);
   }
 
+  /**
+   * Sign an unsigned EVM transaction (on-chain txs sent by the master wallet — Lighter RH
+   * deposit, design §13). The digest is computed HERE from the transaction (`unsignedHash`),
+   * so callers can never feed an arbitrary 32-byte hash to the master key. Returns the
+   * 65-byte 0x signature; the caller attaches it and checks the recovered sender.
+   */
+  async signTransaction(tx: Transaction): Promise<string> {
+    const digest = unsignedTxDigest(tx);
+    const ows = loadOws();
+    return canonicalizeOwsSignature(ows.signHash(this._walletName, "ethereum", digest, this._passphrase));
+  }
+
   async signMessage(message: string | Uint8Array): Promise<string> {
     const ows = loadOws();
 
@@ -102,4 +115,14 @@ function inferEip712DomainType(key: string): string {
     case "salt": return "bytes32";
     default: return "string";
   }
+}
+
+/**
+ * The signing digest of an unsigned, chain-bound EVM transaction. Refuses an already-signed
+ * tx or one without a chainId (replayable across chains).
+ */
+export function unsignedTxDigest(tx: Transaction): string {
+  if (tx.signature !== null) throw new Error("unsignedTxDigest: transaction is already signed");
+  if (tx.chainId === 0n) throw new Error("unsignedTxDigest: transaction has no chainId (replay-unsafe)");
+  return tx.unsignedHash;
 }

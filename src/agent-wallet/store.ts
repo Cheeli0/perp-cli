@@ -1,8 +1,9 @@
 import { existsSync, mkdirSync, writeFileSync, readFileSync, unlinkSync } from "fs";
 import { resolve } from "path";
-import type { AgentMeta } from "../settings.js";
+import type { AgentMeta, AgentSource, AnyAgentMeta, ArcusAgentMeta, OndoAgentMeta, QfexAgentMeta } from "../settings.js";
 import { loadSettings, saveSettings } from "../settings.js";
 import { PerpError } from "../errors.js";
+import type { Network } from "../exchanges/venue-types.js";
 
 const PERP_DIR = resolve(process.env["HOME"] ?? "~", ".perp");
 const LOCKS_DIR = resolve(PERP_DIR, "locks");
@@ -103,9 +104,19 @@ function isPidAlive(pid: number): boolean {
  * Returns the specific named agent, or the first non-partial agent when
  * agentName is omitted.
  */
+/** Venues whose agents use a non-legacy meta shape (see getVenueAgent). */
+const NON_LEGACY_AGENT_VENUES = new Set(["ondo", "arcus", "qfex"]);
+
+function assertLegacyAgentVenue(exchange: string): void {
+  if (NON_LEGACY_AGENT_VENUES.has(exchange)) {
+    throw new PerpError("INVALID_PARAMS", `${exchange} agents use a venue-specific meta; call getVenueAgent("${exchange}")`);
+  }
+}
+
 export function getAgent(exchange: string, agentName?: string): AgentMeta | null {
+  assertLegacyAgentVenue(exchange);
   const settings = loadSettings();
-  const byExchange = settings.agents?.[exchange as keyof typeof settings.agents];
+  const byExchange = settings.agents?.[exchange as keyof typeof settings.agents] as Record<string, AgentMeta> | undefined;
   if (!byExchange) return null;
 
   if (agentName !== undefined) {
@@ -122,6 +133,69 @@ export function getAgent(exchange: string, agentName?: string): AgentMeta | null
 }
 
 /**
+ * Venues whose agent approve/rotate was hardwired to mainnet endpoints before
+ * agent records carried `network` — an untagged record of these venues was
+ * provably registered on mainnet.
+ */
+const PRE_TAG_MAINNET_ONLY_VENUES = new Set(["aster", "hyperliquid", "pacifica"]);
+
+/**
+ * Network a legacy-shaped agent is registered on, or null when it cannot be
+ * classified (an untagged Lighter-family record, whose approve always honored -n).
+ */
+export function recordedAgentNetworkOf(exchange: string, meta: AgentMeta): Network | null {
+  if (meta.network !== undefined) return meta.network;
+  if (PRE_TAG_MAINNET_ONLY_VENUES.has(exchange)) return "mainnet";
+  return null;
+}
+
+/**
+ * How an agent record got here (AgentMeta.source). Records written before the field existed were
+ * all created by `wallet agent approve` (master-signed on this machine), except Ondo keys, which
+ * are always created in the Ondo Perps web app.
+ */
+export function agentSourceOf(exchange: string, meta: AnyAgentMeta): AgentSource {
+  if (meta.source !== undefined) return meta.source;
+  return exchange === "ondo" || exchange === "qfex" ? "imported" : "approved";
+}
+
+/**
+ * Network a legacy-shaped agent is registered on. Untagged Lighter-family
+ * records (whose approve always honored -n) cannot be classified and throw.
+ */
+export function agentNetworkOf(exchange: string, meta: AgentMeta): Network {
+  const recorded = recordedAgentNetworkOf(exchange, meta);
+  if (recorded !== null) return recorded;
+  throw new PerpError("AGENT_NOT_REGISTERED", `${exchange} agent "${meta.agentName}" has no recorded network (registered before network tagging)`, {
+    remediation: `Set "network": "mainnet" or "testnet" on settings.agents["${exchange}"]["${meta.agentName}"] in ~/.perp/settings.json, or re-register it: perp [-n testnet] wallet agent rotate ${exchange} ${meta.agentName}`,
+  });
+}
+
+/** Throws AGENT_NOT_REGISTERED when `meta` was registered on a different network than `network`. */
+export function assertAgentNetwork(exchange: string, meta: AgentMeta, network: Network): void {
+  const registered = agentNetworkOf(exchange, meta);
+  if (registered !== network) {
+    throw new PerpError("AGENT_NOT_REGISTERED", `${exchange} agent "${meta.agentName}" is registered on ${registered}, not ${network}`, {
+      remediation: registered === "mainnet"
+        ? `Run without -n testnet to use or manage it, or register a testnet agent: perp -n testnet wallet agent approve ${exchange}`
+        : `Run with -n testnet to use or manage it, or register a mainnet agent: perp wallet agent approve ${exchange}`,
+    });
+  }
+}
+
+/** First non-partial agent of `exchange` registered on `network`, or null. */
+export function getAgentForNetwork(exchange: string, network: Network): AgentMeta | null {
+  assertLegacyAgentVenue(exchange);
+  const settings = loadSettings();
+  const byExchange = settings.agents?.[exchange as keyof typeof settings.agents] as Record<string, AgentMeta> | undefined;
+  if (!byExchange) return null;
+  for (const meta of Object.values(byExchange)) {
+    if (meta.status !== "partial" && agentNetworkOf(exchange, meta) === network) return meta;
+  }
+  return null;
+}
+
+/**
  * Persist an agent meta entry for the given exchange.
  * Acquires a lockfile before writing to prevent concurrent races (AC-14).
  *
@@ -130,6 +204,7 @@ export function getAgent(exchange: string, agentName?: string): AgentMeta | null
  * double-acquire or release.
  */
 export function setAgent(exchange: string, meta: AgentMeta): void {
+  assertLegacyAgentVenue(exchange);
   const alreadyLocked = callerHoldsLock(exchange);
   if (!alreadyLocked) {
     acquireLock(exchange);
@@ -181,6 +256,7 @@ export function listAgents(
   const result: Array<{ exchange: string; meta: AgentMeta }> = [];
   for (const [ex, agents] of Object.entries(settings.agents)) {
     if (exchange !== undefined && ex !== exchange) continue;
+    if (NON_LEGACY_AGENT_VENUES.has(ex)) continue; // listed by listVenueAgents()
     if (agents && typeof agents === "object") {
       for (const meta of Object.values(agents as Record<string, AgentMeta>)) {
         result.push({ exchange: ex, meta });
@@ -188,4 +264,61 @@ export function listAgents(
     }
   }
   return result;
+}
+
+// ── Venue-specific agent metas (Ondo HMAC key, Arcus Ed25519 key) ──
+
+type VenueAgentMap = { ondo: OndoAgentMeta; arcus: ArcusAgentMeta; qfex: QfexAgentMeta };
+
+/** Named agent, or the only/first registered one when agentName is omitted. */
+export function getVenueAgent<V extends keyof VenueAgentMap>(venue: V, agentName?: string): VenueAgentMap[V] | null {
+  const settings = loadSettings();
+  const byVenue = settings.agents?.[venue] as Record<string, VenueAgentMap[V]> | undefined;
+  if (!byVenue) return null;
+  if (agentName !== undefined) return byVenue[agentName] ?? null;
+  const first = Object.values(byVenue)[0];
+  return first === undefined ? null : first;
+}
+
+/** First Ondo/Arcus agent registered on `network` (meta.network), or null — never another network's key. */
+export function getVenueAgentForNetwork<V extends keyof VenueAgentMap>(venue: V, network: Network): VenueAgentMap[V] | null {
+  const settings = loadSettings();
+  const byVenue = settings.agents?.[venue] as Record<string, VenueAgentMap[V]> | undefined;
+  if (!byVenue) return null;
+  const match = Object.values(byVenue).find(m => m.network === network);
+  return match === undefined ? null : match;
+}
+
+export function setVenueAgent<V extends keyof VenueAgentMap>(venue: V, meta: VenueAgentMap[V]): void {
+  const alreadyLocked = callerHoldsLock(venue);
+  if (!alreadyLocked) acquireLock(venue);
+  try {
+    const settings = loadSettings();
+    if (!settings.agents) settings.agents = {};
+    const map = (settings.agents[venue] ?? {}) as Record<string, VenueAgentMap[V]>;
+    map[meta.agentName] = meta;
+    (settings.agents as Record<string, unknown>)[venue] = map;
+    saveSettings(settings);
+  } finally {
+    if (!alreadyLocked) releaseLock(venue);
+  }
+}
+
+export function deleteVenueAgent(venue: keyof VenueAgentMap, agentName: string): boolean {
+  const settings = loadSettings();
+  const byVenue = settings.agents?.[venue] as Record<string, unknown> | undefined;
+  if (!byVenue || !(agentName in byVenue)) return false;
+  delete byVenue[agentName];
+  saveSettings(settings);
+  return true;
+}
+
+export function listVenueAgents(): Array<{ exchange: keyof VenueAgentMap; meta: OndoAgentMeta | ArcusAgentMeta | QfexAgentMeta }> {
+  const settings = loadSettings();
+  const out: Array<{ exchange: keyof VenueAgentMap; meta: OndoAgentMeta | ArcusAgentMeta | QfexAgentMeta }> = [];
+  for (const v of ["ondo", "arcus", "qfex"] as const) {
+    const m = settings.agents?.[v] as Record<string, OndoAgentMeta | ArcusAgentMeta | QfexAgentMeta> | undefined;
+    if (m) for (const meta of Object.values(m)) out.push({ exchange: v, meta });
+  }
+  return out;
 }

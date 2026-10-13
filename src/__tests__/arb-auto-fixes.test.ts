@@ -55,7 +55,7 @@ function initState() {
     minSpread: 30, closeSpread: 5, size: 100,
     holdDays: 7, bridgeCost: 0.5, maxPositions: 5, settleStrategy: "aware",
   });
-  saveArbState(state);
+  saveArbState("mainnet", state);
   return state;
 }
 
@@ -83,10 +83,10 @@ describe("Fix 1-1/1-2: State persistence after entry and close", () => {
     initState();
 
     // Simulate what daemon does after entry
-    addPosition(makePosition({ symbol: "BTC", longSize: 0.01, shortSize: 0.01 }));
+    addPosition("mainnet", makePosition({ symbol: "BTC", longSize: 0.01, shortSize: 0.01 }));
 
     // Simulate crash + reload (new context)
-    const recovered = loadArbState();
+    const recovered = loadArbState("mainnet");
     expect(recovered).not.toBeNull();
     expect(recovered!.positions).toHaveLength(1);
     expect(recovered!.positions[0].symbol).toBe("BTC");
@@ -96,17 +96,17 @@ describe("Fix 1-1/1-2: State persistence after entry and close", () => {
   it("removePosition persists and position is gone after reload", () => {
     initState();
 
-    addPosition(makePosition({ symbol: "ETH" }));
-    addPosition(makePosition({ symbol: "BTC" }));
+    addPosition("mainnet", makePosition({ symbol: "ETH" }));
+    addPosition("mainnet", makePosition({ symbol: "BTC" }));
 
     // Verify both exist
-    expect(getPositions()).toHaveLength(2);
+    expect(getPositions("mainnet")).toHaveLength(2);
 
     // Simulate what daemon does after successful close
-    removePosition("ETH");
+    removePosition("mainnet", "ETH");
 
     // Simulate crash + reload
-    const recovered = loadArbState();
+    const recovered = loadArbState("mainnet");
     expect(recovered!.positions).toHaveLength(1);
     expect(recovered!.positions[0].symbol).toBe("BTC");
   });
@@ -114,13 +114,13 @@ describe("Fix 1-1/1-2: State persistence after entry and close", () => {
   it("close failure should NOT remove position from state", () => {
     initState();
 
-    addPosition(makePosition({ symbol: "SOL" }));
-    addPosition(makePosition({ symbol: "BTC" }));
+    addPosition("mainnet", makePosition({ symbol: "SOL" }));
+    addPosition("mainnet", makePosition({ symbol: "BTC" }));
 
     // Simulate: close failed, so we do NOT call removePosition
     // (position stays in state for retry next cycle)
 
-    const state = loadArbState();
+    const state = loadArbState("mainnet");
     expect(state!.positions).toHaveLength(2);
     expect(state!.positions.map(p => p.symbol).sort()).toEqual(["BTC", "SOL"]);
   });
@@ -129,15 +129,15 @@ describe("Fix 1-1/1-2: State persistence after entry and close", () => {
     initState();
 
     // Entry
-    addPosition(makePosition({ symbol: "ETH", accumulatedFunding: 1.5 }));
-    expect(getPositions()).toHaveLength(1);
+    addPosition("mainnet", makePosition({ symbol: "ETH", accumulatedFunding: 1.5 }));
+    expect(getPositions("mainnet")).toHaveLength(1);
 
     // Close success
-    removePosition("ETH");
-    expect(getPositions()).toHaveLength(0);
+    removePosition("mainnet", "ETH");
+    expect(getPositions("mainnet")).toHaveLength(0);
 
     // Reload
-    const recovered = loadArbState();
+    const recovered = loadArbState("mainnet");
     expect(recovered!.positions).toHaveLength(0);
   });
 });
@@ -230,14 +230,14 @@ describe("Fix 2-2: Daemon↔CLI state sync", () => {
     initState();
 
     // Daemon adds positions
-    addPosition(makePosition({ symbol: "ETH" }));
-    addPosition(makePosition({ symbol: "BTC" }));
+    addPosition("mainnet", makePosition({ symbol: "ETH" }));
+    addPosition("mainnet", makePosition({ symbol: "BTC" }));
 
     // Simulate CLI `perp arb close ETH` — calls removePosition
-    removePosition("ETH");
+    removePosition("mainnet", "ETH");
 
     // Daemon reloads state at next cycle
-    const state = loadArbState();
+    const state = loadArbState("mainnet");
     const persistedSymbols = new Set(state!.positions.map(p => p.symbol));
 
     // Daemon's in-memory list would have ["ETH", "BTC"]
@@ -252,13 +252,13 @@ describe("Fix 2-2: Daemon↔CLI state sync", () => {
     initState();
 
     // Daemon has ETH in memory
-    addPosition(makePosition({ symbol: "ETH" }));
+    addPosition("mainnet", makePosition({ symbol: "ETH" }));
 
     // Another process adds SOL (e.g. manual CLI entry)
-    addPosition(makePosition({ symbol: "SOL" }));
+    addPosition("mainnet", makePosition({ symbol: "SOL" }));
 
     // Daemon reloads state
-    const state = loadArbState();
+    const state = loadArbState("mainnet");
     const persistedSymbols = state!.positions.map(p => p.symbol);
 
     // Daemon's in-memory only has ETH

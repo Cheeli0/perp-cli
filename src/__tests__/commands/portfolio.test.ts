@@ -8,6 +8,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { Command } from "commander";
 import { Readable } from "stream";
+import { addRootSafetyOptions } from "../../cli-flags.js";
 
 // ── Mock shared-api (ping functions) BEFORE module imports ────────────────
 
@@ -55,6 +56,16 @@ vi.mock("../../exchanges/lighter-spot.js", () => ({
   })),
 }));
 
+// ── Mock configured-venue discovery ────────────────────────────────────────
+// Default scope = "all venues with configured credentials" (listConfiguredAccountVenues).
+// Tests run with an isolated HOME (helpers/isolate-home.ts), so pin the configured
+// set to the 4 legacy venues instead of depending on the developer's real keys.
+
+vi.mock("../../config.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../config.js")>()),
+  listConfiguredAccountVenues: vi.fn(async () => ["pacifica", "hyperliquid", "lighter", "aster"]),
+}));
+
 // ── Mock dashboard (runServe path not tested here) ─────────────────────────
 
 vi.mock("../../dashboard/index.js", () => ({
@@ -97,7 +108,8 @@ function makeMockAdapter(opts: {
 function makeProgram(adapterFactory?: (exchange: string) => Promise<unknown>) {
   const prog = new Command();
   prog.exitOverride();
-  prog
+  // Root -n / --dry-run like the real program (portfolio --health reads the validated network).
+  addRootSafetyOptions(prog)
     .option("-e, --exchange <exchange>", "Exchange", "pacifica")
     .option("--json", "JSON output");
 
@@ -109,9 +121,10 @@ function makeProgram(adapterFactory?: (exchange: string) => Promise<unknown>) {
     address: "0xDefaultAddr",
   });
 
+  const factory: (exchange: string) => Promise<unknown> = adapterFactory ?? defaultFactory;
   registerPortfolioCommand(
     prog,
-    adapterFactory ?? defaultFactory as never,
+    factory as Parameters<typeof registerPortfolioCommand>[1],
     () => prog.opts().json === true,
     "1.0.0-test",
   );
@@ -213,6 +226,59 @@ describe("Test 1: Default snapshot (all 4 exchanges)", () => {
     const totals = data.totals as Record<string, number>;
     // Each exchange has equity=500, no spot, so total = 4 * 500 = 2000
     expect(totals.accountValueUsd).toBeCloseTo(2000);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 1b: positions[] entries carry liquidationPrice (qa/2026-05-16)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("Test 1b: positions[] surfaces liquidationPrice from adapter", () => {
+  // Prior to qa/2026-05-16 the portfolio map dropped `liquidationPrice` from
+  // each position entry — surfaced by docker QA cross-validation against
+  // `account positions` which DID include the field. Pinning here so the
+  // field passes through end-to-end and the portfolio UI can show
+  // liq-distance without a second adapter round-trip.
+  it("includes liquidationPrice in each positions[] entry alongside markPrice/entryPrice", async () => {
+    const factory = vi.fn().mockResolvedValue({
+      getBalance: vi.fn().mockResolvedValue(makeBalance("100")),
+      getPositions: vi.fn().mockResolvedValue([
+        {
+          symbol: "BTC", side: "long", size: "0.5",
+          entryPrice: "50000", markPrice: "51000",
+          liquidationPrice: "40000",
+          unrealizedPnl: "500", leverage: 10,
+        },
+      ]),
+      getOpenOrders: vi.fn().mockResolvedValue([]),
+      getFundingPayments: vi.fn().mockResolvedValue([]),
+      address: "0xAddr",
+    });
+
+    const prog = makeProgram(factory as never);
+    const { captured, restore } = captureOutput();
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("exit"); }) as never);
+
+    try {
+      await prog.parseAsync(["node", "perp", "-e", "hyperliquid", "--json", "portfolio"]);
+    } finally {
+      restore();
+      exitSpy.mockRestore();
+    }
+
+    const envelope = parseEnvelope(captured.stdoutLines);
+    expect(envelope.ok).toBe(true);
+    const data = envelope.data as Record<string, unknown>;
+    const exchanges = data.exchanges as Array<Record<string, unknown>>;
+    const positions = exchanges[0].positions as Array<Record<string, unknown>>;
+    expect(positions).toHaveLength(1);
+    expect(positions[0]).toMatchObject({
+      symbol: "BTC",
+      entryPrice: "50000",
+      markPrice: "51000",
+      liquidationPrice: "40000",
+      unrealizedPnl: "500",
+    });
   });
 });
 

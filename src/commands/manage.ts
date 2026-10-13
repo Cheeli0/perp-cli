@@ -1,13 +1,18 @@
 import { Command } from "commander";
+import { isDryRun, networkOf, supportsDryRun } from "../cli-flags.js";
 import type { ExchangeAdapter } from "../exchanges/index.js";
-import { printJson, jsonOk, jsonError } from "../utils.js";
+import { printJson, jsonOk, jsonError, withJsonErrors } from "../utils.js";
 import chalk from "chalk";
 import { hasPacificaSdk } from "../exchanges/capabilities.js";
-import { PerpError } from "../errors.js";
-import { loadSettings } from "../settings.js";
+import { PerpError, classifyError, parsePositiveDecimal } from "../errors.js";
+import { unsupported } from "../exchanges/trading-v2.js";
+import { loadSettings, saveSettings } from "../settings.js";
 import { resolvePassphrase } from "../agent-wallet/passphrase.js";
 import { runHlSetAbstractionFlow, type HlAbstractionMode } from "./agent.js";
-import { HyperliquidAdapter } from "../exchanges/hyperliquid.js";
+import { HyperliquidAdapter, hlAbstractionCachePrefix } from "../exchanges/hyperliquid.js";
+import { invalidateCache } from "../cache.js";
+import { LighterAdapter } from "../exchanges/lighter.js";
+import { resolveVenueId } from "../exchanges/venue.js";
 
 export function registerWalletManageCommands(
   parent: Command,
@@ -15,7 +20,7 @@ export function registerWalletManageCommands(
   isJson: () => boolean,
   getPacificaAdapter: () => unknown
 ) {
-  const manage = parent.command("manage").description("Exchange account settings (margin, subaccount, API keys, builder, account-mode) — Pacifica + Lighter + Hyperliquid");
+  const manage = parent.command("manage").description("Exchange account settings (margin, subaccount, API keys, builder-owner tools, account-mode) — Pacifica + Lighter + Hyperliquid");
 
   // Ensure adapter is initialized before accessing PacificaAdapter
   async function pac() {
@@ -65,18 +70,17 @@ export function registerWalletManageCommands(
   // Subaccounts
   const sub = manage.command("sub").description("Subaccount management");
 
+  // Gated. Docs (rest-api/subaccounts/create-subaccount): "Both the main account and subaccount
+  // must sign to establish the relationship." perp-cli has no keypair source for the subaccount
+  // signature, so the request cannot be built.
   sub
     .command("create <name>")
-    .description("Create a subaccount")
-    .action(async (name: string) => {
-      const a = await pac();
-      const result = await a.sdk.createSubaccount(
-        name,
-        a.publicKey,
-        a.signer
-      );
-      if (isJson()) return printJson(jsonOk(result));
-      console.log(chalk.green(`\n  Subaccount "${name}" created.\n`));
+    .description("Create a subaccount (not supported: the subaccount wallet must co-sign — use the Pacifica web app)")
+    .action(async (_name: string) => {
+      await pac();
+      throw unsupported("Pacifica", "subaccountCreate",
+        "creating a subaccount needs a signature from the subaccount wallet as well as the main account, and perp-cli only holds the main account signer",
+        "Create the subaccount in the Pacifica web app, then use: perp wallet manage sub list / sub transfer");
     });
 
   sub
@@ -94,11 +98,18 @@ export function registerWalletManageCommands(
 
   sub
     .command("transfer <from> <to> <amount>")
-    .description("Transfer funds between accounts")
+    .description("Transfer USDC between a main account and its subaccounts (<from> must be the signing account)")
     .action(async (from: string, to: string, amount: string) => {
       const a = await pac();
+      // Docs (subaccount-fund-transfer): the sender is the signing "account"; there is no from field.
+      if (from !== a.publicKey) {
+        throw new PerpError("INVALID_PARAMS", `Pacifica transfers are sent by the signing account (${a.publicKey}); <from> was ${from}`, {
+          exchange: "pacifica",
+          remediation: "Pass the active account as <from>, or run the command with the sender's wallet",
+        });
+      }
       const result = await a.sdk.transferFunds(
-        { from_account: from, to_account: to, amount },
+        { to_account: to, amount: parsePositiveDecimal(amount, "transfer amount") },
         a.publicKey,
         a.signer
       );
@@ -114,97 +125,60 @@ export function registerWalletManageCommands(
   // Lake (liquidity vaults)
   const lake = manage.command("lake").description("Lake (liquidity vault) management");
 
+  // Field names per docs.pacifica.fi rest-api/vaults (create-vault / deposit-to-vault / withdraw-from-vault).
   lake
-    .command("create <symbol> <amount>")
-    .description("Create a new lake")
-    .action(async (symbol: string, amount: string) => {
+    .command("create")
+    .description("Create a new vault (lake)")
+    .option("--manager <address>", "Manager address (omit to create a fresh vault with no manager)")
+    .option("--nickname <name>", "Display name for the vault")
+    .option("--initial-deposit <amount>", "Seed deposit in USDC from the creator")
+    .action(async (opts: { manager?: string; nickname?: string; initialDeposit?: string }) => {
       const a = await pac();
       const result = await a.sdk.createLake(
-        { symbol: symbol.toUpperCase(), amount },
+        {
+          manager: opts.manager === undefined ? null : opts.manager,
+          nickname: opts.nickname === undefined ? null : opts.nickname,
+          initial_deposit: opts.initialDeposit === undefined ? null : parsePositiveDecimal(opts.initialDeposit, "--initial-deposit"),
+        },
         a.publicKey,
         a.signer
       );
       if (isJson()) return printJson(jsonOk(result));
-      console.log(chalk.green(`\n  Lake created for ${symbol.toUpperCase()} with $${amount}.\n`));
+      console.log(chalk.green(`\n  Vault created.\n`));
+      console.log(JSON.stringify(result, null, 2));
     });
 
   lake
-    .command("deposit <lakeId> <amount>")
-    .description("Deposit to a lake")
-    .action(async (lakeId: string, amount: string) => {
+    .command("deposit <lake> <amount>")
+    .description("Deposit USDC into a vault (<lake> = vault address)")
+    .action(async (lakeAddress: string, amount: string) => {
       const a = await pac();
       const result = await a.sdk.depositToLake(
-        { lake_id: lakeId, amount },
+        { lake: lakeAddress, amount: parsePositiveDecimal(amount, "deposit amount") },
         a.publicKey,
         a.signer
       );
       if (isJson()) return printJson(jsonOk(result));
-      console.log(chalk.green(`\n  Deposited $${amount} to lake ${lakeId}.\n`));
+      console.log(chalk.green(`\n  Deposited $${amount} to vault ${lakeAddress}.\n`));
     });
 
   lake
-    .command("withdraw <lakeId> <amount>")
-    .description("Withdraw from a lake")
-    .action(async (lakeId: string, amount: string) => {
+    .command("withdraw <lake> <shares>")
+    .description("Redeem vault shares (<lake> = vault address, <shares> = number of shares, not USDC)")
+    .action(async (lakeAddress: string, shares: string) => {
       const a = await pac();
       const result = await a.sdk.withdrawFromLake(
-        { lake_id: lakeId, amount },
+        { lake: lakeAddress, shares: parsePositiveDecimal(shares, "shares") },
         a.publicKey,
         a.signer
       );
       if (isJson()) return printJson(jsonOk(result));
-      console.log(chalk.green(`\n  Withdrew $${amount} from lake ${lakeId}.\n`));
+      console.log(chalk.green(`\n  Redeemed ${shares} shares from vault ${lakeAddress}.\n`));
     });
 
-  // Builder Codes
-  const builder = manage.command("builder").description("Builder code management (Pacifica)");
-
-  builder
-    .command("approve <code> <maxFeeRate>")
-    .description("Approve a builder code (e.g. approve MYCODE 0.001)")
-    .action(async (code: string, maxFeeRate: string) => {
-      const a = await pac();
-      const result = await a.sdk.approveBuilderCode(
-        { builder_code: code, max_fee_rate: maxFeeRate },
-        a.publicKey,
-        a.signer
-      );
-      if (isJson()) return printJson(jsonOk(result));
-      console.log(chalk.green(`\n  Builder code "${code}" approved (max fee: ${maxFeeRate}).\n`));
-    });
-
-  builder
-    .command("revoke <code>")
-    .description("Revoke a builder code")
-    .action(async (code: string) => {
-      const a = await pac();
-      const result = await a.sdk.revokeBuilderCode(
-        { builder_code: code },
-        a.publicKey,
-        a.signer
-      );
-      if (isJson()) return printJson(jsonOk(result));
-      console.log(chalk.green(`\n  Builder code "${code}" revoked.\n`));
-    });
-
-  builder
-    .command("list")
-    .description("List approved builder codes")
-    .action(async () => {
-      const a = await pac();
-      const result = await a.sdk.getBuilderApprovals(a.publicKey);
-      if (isJson()) return printJson(jsonOk(result));
-      const approvals = result as { builder_code: string; max_fee_rate: string; description?: string }[];
-      if (!Array.isArray(approvals) || approvals.length === 0) {
-        console.log(chalk.gray("\n  No builder codes approved.\n"));
-        return;
-      }
-      console.log(chalk.cyan.bold("\n  Approved Builder Codes\n"));
-      for (const b of approvals) {
-        console.log(`  ${chalk.white(b.builder_code.padEnd(16))} max_fee: ${b.max_fee_rate}  ${chalk.gray(b.description || "")}`);
-      }
-      console.log();
-    });
+  // Pacifica builder-OWNER tools. A user's builder approval / revoke / status is
+  // `perp wallet builder approve|revoke|status <venue>` (settings builder.<venue>).
+  const builder = manage.command("builder").description("Pacifica builder-owner tools (overview, trades, leaderboard, update-fee). Approve / revoke / status: perp wallet builder");
 
   builder
     .command("overview")
@@ -251,7 +225,7 @@ export function registerWalletManageCommands(
     });
 
   // Referral
-  const referral = manage.command("referral").description("Referral code management (Pacifica)");
+  const referral = manage.command("referral").description("Referral codes (Pacifica claim; Hyperliquid/Lighter explicit set)");
 
   referral
     .command("claim <code>")
@@ -267,22 +241,75 @@ export function registerWalletManageCommands(
       console.log(chalk.green(`\n  Referral code "${code}" claimed!\n`));
     });
 
+  // Explicit referral apply (HL / Lighter). Never done on adapter creation: this
+  // signs and sends one referral action with the active signer. Supports --dry-run.
+  supportsDryRun(
+    referral
+      .command("set [code]")
+      .description("Hyperliquid / Lighter: sign + send a one-time referral action (default code: settings referralCodes.<venue>; supports --dry-run)")
+      .action(async (codeArg: string | undefined, _opts: unknown, cmd: Command) => {
+        await withJsonErrors(isJson(), async () => {
+          const venue = resolveVenueId(String(cmd.optsWithGlobals().exchange));
+          if (venue !== "hyperliquid" && venue !== "lighter") {
+            throw new PerpError("CAPABILITY_UNSUPPORTED", `referral set supports hyperliquid and lighter (got ${venue})`, {
+              remediation: "Run with -e hyperliquid or -e lighter (Pacifica: perp -e pacifica wallet manage referral claim <code>)",
+            });
+          }
+          const code = codeArg ?? loadSettings().referralCodes[venue];
+          if (!code) {
+            throw new PerpError("INVALID_PARAMS", `No ${venue} referral code given and settings referralCodes.${venue} is empty`, {
+              remediation: `Pass a code: perp -e ${venue} wallet manage referral set <code>`,
+            });
+          }
+          const network = networkOf(cmd);
+          const plan = { venue, network, code, action: venue === "hyperliquid" ? "setReferrer" : "referral/use" };
+          if (isDryRun(cmd)) {
+            if (isJson()) return printJson(jsonOk({ dryRun: true, sent: false, ...plan }));
+            console.log(chalk.yellow(`\n  [dry-run] Would sign + send ${plan.action} with code "${code}" on ${venue} (${network}). Nothing sent.\n`));
+            return;
+          }
+          // The referral is the account owner's action — never signed with an imported agent / API key.
+          const { cliCredentialOptsFrom, requireMasterWallet } = await import("../config.js");
+          await requireMasterWallet(venue, cliCredentialOptsFrom(cmd.optsWithGlobals()), `${venue} referral set`);
+          const adapter = await getAdapter();
+          let result: unknown;
+          if (venue === "hyperliquid") {
+            if (!(adapter instanceof HyperliquidAdapter)) throw new Error("hyperliquid venue did not produce a HyperliquidAdapter");
+            result = await adapter.setReferrer(code);
+          } else {
+            if (!(adapter instanceof LighterAdapter)) throw new Error("lighter venue did not produce a LighterAdapter");
+            if (adapter.isReadOnly) {
+              throw new PerpError("NO_SIGNER_AVAILABLE", "Lighter referral needs a signer (agent API key)", {
+                remediation: "Register one first: perp wallet agent approve lighter",
+              });
+            }
+            result = await adapter.useReferralCode(code);
+          }
+          const s = loadSettings();
+          s.referralApplied[venue] = true;
+          saveSettings(s);
+          if (isJson()) return printJson(jsonOk({ sent: true, ...plan, result }));
+          console.log(chalk.green(`\n  ${venue} referral code "${code}" applied.\n`));
+        });
+      }),
+  );
+
   // API Keys
   const apikey = manage.command("apikey").description("API key management");
 
   apikey
-    .command("create <name> <maxFeeRate>")
-    .description("Create an API key")
-    .action(async (name: string, maxFeeRate: string) => {
+    .command("create")
+    .description("Create an API Config Key (rate-limit key; up to 5 per account)")
+    .action(async () => {
       const a = await pac();
+      // Docs (api/rate-limits/api-config-keys): no name / fee-rate field — the signed payload is empty.
       const result = await a.sdk.createApiKey(
-        name,
-        maxFeeRate,
         a.publicKey,
         a.signer
       );
       if (isJson()) return printJson(jsonOk(result));
-      console.log(chalk.green(`\n  API key "${name}" created.\n`));
+      console.log(chalk.green(`\n  API Config Key created.\n`));
+      console.log(JSON.stringify(result, null, 2));
     });
 
   apikey
@@ -337,9 +364,9 @@ export function registerWalletManageCommands(
       const useJson = opts.json ?? isJson();
       // C5 fix: parent --passphrase shadows subcommand flag in Commander v13.
       // Merge parent + subcommand opts so --passphrase works on either side.
-      const mergedOpts = command.optsWithGlobals() as { passphrase?: string; network?: string };
+      const mergedOpts = command.optsWithGlobals() as { passphrase?: string };
       const passphraseFlag = mergedOpts.passphrase ?? opts.passphrase;
-      const network = mergedOpts.network ?? "mainnet";
+      const network = networkOf(command);
       const isTestnet = network === "testnet";
 
       // ── Show branch (no positional arg) ─────────────────────────────────
@@ -369,7 +396,8 @@ export function registerWalletManageCommands(
             });
           }
           adapter.setAddress(evmAccount.address);
-          const current = await adapter._getAbstractionMode();
+          // The command that reports the mode never answers from the disk cache.
+          const current = await adapter._getAbstractionMode({ fresh: true });
           if (useJson) {
             return printJson(jsonOk({ mode: current, master: masterName, address: evmAccount.address, network: isTestnet ? "testnet" : "mainnet" }));
           }
@@ -381,9 +409,7 @@ export function registerWalletManageCommands(
           return;
         } catch (err) {
           if (useJson) {
-            const e = err instanceof PerpError
-              ? err.structured
-              : { code: "UNKNOWN", message: err instanceof Error ? err.message : String(err) };
+            const e = classifyError(err);
             console.error(JSON.stringify(jsonError(e.code as never, e.message)));
             process.exit(1);
           }
@@ -422,7 +448,7 @@ export function registerWalletManageCommands(
         }
 
         // Capture previous mode (best-effort — info-only, do NOT block on read).
-        let prevMode: HlAbstractionMode | null = null;
+        let prevMode: HlAbstractionMode | "default" | "dexAbstraction" | null = null;
         try {
           const readAdapter = new HyperliquidAdapter(undefined, isTestnet);
           const { loadOws } = await import("../signer/ows-loader.js");
@@ -433,7 +459,7 @@ export function registerWalletManageCommands(
           );
           if (evmAccount) {
             readAdapter.setAddress(evmAccount.address);
-            prevMode = await readAdapter._getAbstractionMode();
+            prevMode = await readAdapter._getAbstractionMode({ fresh: true });
           }
         } catch {
           // Best-effort previous-mode capture. SSOT Rule #2 forbids fallback
@@ -442,12 +468,19 @@ export function registerWalletManageCommands(
           prevMode = null;
         }
 
-        const result = await runHlSetAbstractionFlow({
-          masterName,
-          passphrase: passphrase ?? "",
-          mode: newMode,
-          isTestnet,
-        });
+        // The cached mode (HL_ABSTRACTION_TTL_MS) is dropped whatever the outcome: a sent action
+        // whose answer was lost may have changed the mode.
+        let result: Awaited<ReturnType<typeof runHlSetAbstractionFlow>>;
+        try {
+          result = await runHlSetAbstractionFlow({
+            masterName,
+            passphrase: passphrase ?? "",
+            mode: newMode,
+            isTestnet,
+          });
+        } finally {
+          invalidateCache(hlAbstractionCachePrefix(network));
+        }
 
         if (useJson) {
           return printJson(jsonOk({
@@ -467,9 +500,7 @@ export function registerWalletManageCommands(
         console.log(`  New mode:  ${chalk.cyan(result.mode)} ${chalk.gray(`(${result.abstraction})`)}\n`);
       } catch (err) {
         if (useJson) {
-          const e = err instanceof PerpError
-            ? err.structured
-            : { code: "UNKNOWN", message: err instanceof Error ? err.message : String(err) };
+          const e = classifyError(err);
           console.error(JSON.stringify(jsonError(e.code as never, e.message)));
           process.exit(1);
         }

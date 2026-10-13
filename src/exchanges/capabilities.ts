@@ -52,7 +52,8 @@ export interface EvmAddressCapable {
 }
 
 export interface QueryOrderCapable {
-  queryOrder(orderId: number): Promise<unknown>;
+  /** Order id (u64) or, on Hyperliquid, a client order id (cloid) string. */
+  queryOrder(orderId: number | string): Promise<unknown>;
 }
 
 export interface UsdTransferCapable {
@@ -109,4 +110,12 @@ export function isQueryOrderCapable(adapter: ExchangeAdapter): adapter is Exchan
 
 export function isUsdTransferCapable(adapter: ExchangeAdapter): adapter is ExchangeAdapter & UsdTransferCapable {
   return typeof (adapter as unknown as Record<string, unknown>).usdTransfer === "function";
+}
+
+/**
+ * true when the venue's kline endpoint needs account credentials (Ondo GET /v1/perps/candles):
+ * `market kline` then uses the credentialed adapter instead of the keyless public one.
+ */
+export function klinesNeedAuth(adapter: ExchangeAdapter): boolean {
+  return (adapter as unknown as Record<string, unknown>).klinesRequireAuth === true;
 }

@@ -1,3 +1,4 @@
+import { fstatSync } from "node:fs";
 import { PerpError } from "../errors.js";
 
 const REMEDIATION =
@@ -7,7 +8,7 @@ const REMEDIATION =
  * Resolve master passphrase from (in precedence order):
  *   1. opts.flag  (--passphrase)
  *   2. process.env.OWS_PASSPHRASE
- *   3. stdin (only if process.stdin.isTTY === false)
+ *   3. stdin (only when stdin is not a TTY — Node leaves isTTY undefined for pipes/files)
  *
  * Returns null if no path provides one AND stdin IS TTY (caller may prompt).
  * Throws PASSPHRASE_REQUIRED with remediation if no path provides one AND
@@ -25,8 +26,16 @@ export async function resolvePassphrase(opts: { flag?: string }): Promise<string
     return process.env["OWS_PASSPHRASE"] ?? "";
   }
 
-  // 3. stdin pipe — only when stdin is not a TTY
-  if (process.stdin.isTTY === false) {
+  // 3. stdin pipe — only when stdin is not a TTY. Node sets isTTY only for a TTY;
+  // a pipe or redirected file leaves it undefined, so test `!== true`.
+  if (process.stdin.isTTY !== true) {
+    // Read only a real pipe or redirected file. Anything else (/dev/null, a socket,
+    // an inherited never-closing stream) has no passphrase to give — reading it could block forever.
+    if (!stdinIsPipeOrFile()) {
+      throw new PerpError("PASSPHRASE_REQUIRED", "No passphrase provided and stdin is not a terminal or a pipe", {
+        remediation: REMEDIATION,
+      });
+    }
     const piped = await readStdin();
     if (piped !== null) {
       return piped;
@@ -39,6 +48,11 @@ export async function resolvePassphrase(opts: { flag?: string }): Promise<string
 
   // stdin IS TTY — caller decides whether to prompt interactively
   return null;
+}
+
+function stdinIsPipeOrFile(): boolean {
+  const st = fstatSync(0);
+  return st.isFIFO() || st.isFile();
 }
 
 /**

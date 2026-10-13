@@ -1,3 +1,4 @@
+import { symbolMatch } from "../utils.js";
 import type { ExchangeAdapter } from "../exchanges/index.js";
 import type { Condition } from "./config.js";
 
@@ -5,7 +6,7 @@ export interface MarketSnapshot {
   price: number;
   high24h: number;
   low24h: number;
-  volume24h: number;
+  volume24h: number;     // NaN if the venue does not publish 24h volume (same convention as rsi)
   fundingRate: number;
   volatility24h: number; // (high - low) / price * 100
   rsi: number;           // 14-period RSI from 1h candles (NaN if insufficient data)
@@ -63,15 +64,18 @@ export async function getMarketSnapshot(
   symbol: string,
 ): Promise<MarketSnapshot> {
   const markets = await adapter.getMarkets();
-  const m = markets.find(mk => mk.symbol.toUpperCase() === symbol.toUpperCase());
+  const m = markets.find(mk => symbolMatch(mk.symbol, symbol));
 
   if (!m) {
     throw new Error(`Market "${symbol}" not found on ${adapter.name}`);
   }
 
   const price = parseFloat(m.markPrice);
-  const fundingRate = parseFloat(m.fundingRate ?? "0");
-  const volume24h = parseFloat(m.volume24h);
+  // Unknown funding (venue publishes none, e.g. QFEX) → NaN, never 0: a 0 would satisfy
+  // "funding below X" conditions on a rate nobody reported. NaN makes every comparison false.
+  const fundingRate = m.fundingRate === null ? NaN : parseFloat(m.fundingRate);
+  // Unknown volume → NaN, never 0: a 0 would read as "no liquidity" to volume conditions.
+  const volume24h = m.volume24h === null ? NaN : parseFloat(m.volume24h);
 
   // Try to get kline data for 24h high/low + RSI
   let high24h = price;
@@ -124,7 +128,7 @@ export async function getMarketSnapshot(
 export function evaluateCondition(
   condition: Condition,
   snapshot: MarketSnapshot,
-  context: { equity: number; startTime: number; peakEquity: number; dailyPnl: number },
+  context: { equity: number | null; startTime: number; peakEquity: number | null; dailyPnl: number },
 ): boolean {
   const val = typeof condition.value === "number" ? condition.value : parseFloat(String(condition.value));
 
@@ -158,11 +162,12 @@ export function evaluateCondition(
     case "rsi_below":
       return !isNaN(snapshot.rsi) && snapshot.rsi < val;
 
+    // Unknown equity (null) never meets an equity condition — neither a fake stop nor a fake entry.
     case "balance_above":
-      return context.equity > val;
+      return context.equity !== null && context.equity > val;
 
     case "balance_below":
-      return context.equity < val;
+      return context.equity !== null && context.equity < val;
 
     case "spread_above":
       // Bid-ask spread percentage, pre-computed from orderbook in snapshot.
@@ -174,7 +179,7 @@ export function evaluateCondition(
     }
 
     case "max_drawdown":
-      return (context.peakEquity - context.equity) > val;
+      return context.equity !== null && context.peakEquity !== null && (context.peakEquity - context.equity) > val;
 
     default:
       return false;
@@ -184,7 +189,7 @@ export function evaluateCondition(
 export function evaluateAllConditions(
   conditions: Condition[],
   snapshot: MarketSnapshot,
-  context: { equity: number; startTime: number; peakEquity: number; dailyPnl: number },
+  context: { equity: number | null; startTime: number; peakEquity: number | null; dailyPnl: number },
   mode: "all" | "any" = "all",
 ): boolean {
   if (conditions.length === 0) return true;

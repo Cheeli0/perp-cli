@@ -1,4 +1,5 @@
 import { Command } from "commander";
+import { isDryRun, supportsDryRun } from "../cli-flags.js";
 import chalk from "chalk";
 import { formatUsd, makeTable, printJson, jsonOk } from "../utils.js";
 import type { ExchangeAdapter } from "../exchanges/index.js";
@@ -9,13 +10,17 @@ import {
   estimateMoveTime,
   type RebalanceMove,
 } from "../rebalance.js";
-import { EXCHANGE_TO_CHAIN, executeBestBridge } from "../bridge-engine.js";
-import { loadPrivateKey, parseSolanaKeypair, type Exchange } from "../config.js";
+import { EXCHANGE_TO_CHAIN, assertBridgeNetwork, executeBestBridge } from "../bridge-engine.js";
+import type { Network } from "../exchanges/venue-types.js";
+import { cliCredentialOptsFrom, type CliCredentialOpts, type Exchange } from "../config.js";
+import type { BridgeEvmSigner } from "../bridge-signers.js";
+import type { SolanaSigner } from "../signer/interface.js";
 
 export function registerFundsRebalanceCommands(
   parent: Command,
   getAdapterForExchange: (exchange: string) => Promise<ExchangeAdapter>,
-  isJson: () => boolean
+  isJson: () => boolean,
+  getNetwork: () => Network,
 ) {
   const rebalance = parent.command("rebalance").description("Cross-exchange balance management");
 
@@ -146,19 +151,21 @@ export function registerFundsRebalanceCommands(
 
   // ── rebalance execute ──
 
-  rebalance
-    .command("execute")
-    .description("Execute rebalancing (withdraw → bridge → deposit)")
+  supportsDryRun(rebalance.command("execute"))
+    .description("Execute rebalancing (withdraw → bridge → deposit; supports --dry-run)")
     .option("--exchanges <list>", "Comma-separated exchanges", "pacifica,hyperliquid,lighter,aster")
     .option("--min-move <usd>", "Minimum move amount ($)", "50")
     .option("--reserve <usd>", "Keep at least this much per exchange ($)", "20")
-    .option("--dry-run", "Show what would happen without executing")
     .option("--withdraw-only", "Only execute withdrawals (manual bridge + deposit)")
     .option("--auto-bridge", "Auto-bridge via deBridge DLN (withdraw → bridge in one step)")
     .action(async (opts: {
       exchanges: string; minMove: string; reserve: string;
-      dryRun?: boolean; withdrawOnly?: boolean; autoBridge?: boolean;
-    }) => {
+      withdrawOnly?: boolean; autoBridge?: boolean;
+    }, cmd: Command) => {
+      const dryRun = isDryRun(cmd);
+      // --auto-bridge signs mainnet-only bridge routes: refuse -n testnet up front,
+      // before any withdrawal is sent (not after, as a per-move bridge_failed).
+      if (opts.autoBridge && !dryRun) assertBridgeNetwork(getNetwork());
       const exchangeNames = opts.exchanges.split(",").map((e) => e.trim());
       const adapters = new Map<string, ExchangeAdapter>();
 
@@ -194,7 +201,7 @@ export function registerFundsRebalanceCommands(
       for (const move of plan.moves) {
         if (!isJson()) console.log(chalk.white.bold(`  $${move.amount} ${move.from} → ${move.to}`));
 
-        if (opts.dryRun) {
+        if (dryRun) {
           if (!isJson()) console.log(chalk.yellow("    [DRY RUN] Skipped.\n"));
           moveResults.push({ from: move.from, to: move.to, amount: move.amount, status: "dry_run" });
           continue;
@@ -236,12 +243,14 @@ export function registerFundsRebalanceCommands(
             if (!isJson()) console.log(chalk.gray(`    Step 2: Bridging $${move.amount} (${srcChain} → ${dstChain})...`));
 
             // Load keys for bridge
-            const { senderAddress, recipientAddress, signerKey, dstSignerKey } = await loadBridgeKeys(
-              move.from as Exchange, move.to as Exchange, srcChain, dstChain,
+            let root: Command = cmd;
+            while (root.parent) root = root.parent;
+            const { senderAddress, recipientAddress, signer, dstSigner } = await loadBridgeKeys(
+              move.from as Exchange, move.to as Exchange, srcChain, dstChain, cliCredentialOptsFrom(root.opts()),
             );
 
             const result = await executeBestBridge(
-              srcChain, dstChain, move.amount, signerKey, senderAddress, recipientAddress, dstSignerKey,
+              getNetwork(), srcChain, dstChain, move.amount, signer, senderAddress, recipientAddress, dstSigner,
             );
 
             if (!isJson()) {
@@ -264,7 +273,7 @@ export function registerFundsRebalanceCommands(
         }
       }
 
-      if (isJson()) return printJson(jsonOk({ status: "executed", moves: moveResults }));
+      if (isJson()) return printJson(jsonOk({ status: dryRun ? "simulated" : "executed", dryRun, sent: !dryRun, moves: moveResults }));
       console.log(chalk.cyan("  Rebalance initiated. Monitor progress with 'perp funds rebalance check'.\n"));
     });
 }
@@ -284,8 +293,9 @@ async function executeWithdraw(
     case "pacifica": {
       if (!hasPacificaSdk(adapter)) throw new Error("Invalid adapter");
       const sdk = adapter.sdk as Record<string, (...args: any[]) => any>;
+      // Pacifica withdraws to the account owner's own wallet (no destination field).
       await sdk.withdraw(
-        { amount: String(move.amount), dest_address: adapter.publicKey },
+        { amount: String(move.amount) },
         adapter.publicKey,
         adapter.signer,
       );
@@ -307,41 +317,23 @@ async function executeWithdraw(
 }
 
 /**
- * Load sender/recipient addresses and signer key for a bridge move.
+ * Sender / recipient (the master wallet's own public addresses) and master signers for a bridge
+ * move: OWS vault signers for an OWS master, raw-key signers for a raw-key master.
  */
 async function loadBridgeKeys(
   srcExchange: Exchange,
   dstExchange: Exchange,
   srcChain: string,
   dstChain: string,
-): Promise<{ senderAddress: string; recipientAddress: string; signerKey: string; dstSignerKey?: string }> {
-  let senderAddress: string;
-  let recipientAddress: string;
-  let signerKey: string;
-  let dstSignerKey: string | undefined;
-
-  // Source
-  if (srcChain === "solana") {
-    const pk = await loadPrivateKey("pacifica");
-    senderAddress = parseSolanaKeypair(pk).publicKey.toBase58();
-    signerKey = pk;
-  } else {
-    const pk = await loadPrivateKey(srcExchange);
-    const { ethers } = await import("ethers");
-    senderAddress = new ethers.Wallet(pk).address;
-    signerKey = pk;
-  }
-
-  // Destination
-  if (dstChain === "solana") {
-    const pk = await loadPrivateKey("pacifica");
-    recipientAddress = parseSolanaKeypair(pk).publicKey.toBase58();
-  } else {
-    const pk = await loadPrivateKey(dstExchange);
-    const { ethers } = await import("ethers");
-    recipientAddress = new ethers.Wallet(pk).address;
-    dstSignerKey = pk; // For auto receiveMessage
-  }
-
-  return { senderAddress, recipientAddress, signerKey, dstSignerKey };
+  credOpts: CliCredentialOpts,
+): Promise<{ senderAddress: string; recipientAddress: string; signer: BridgeEvmSigner | SolanaSigner; dstSigner: BridgeEvmSigner | SolanaSigner }> {
+  const { bridgeAddress, bridgeVenueForChain, loadBridgeSigner } = await import("../bridge-signers.js");
+  const srcVenue = bridgeVenueForChain(srcChain, srcExchange);
+  const dstVenue = bridgeVenueForChain(dstChain, dstExchange);
+  return {
+    senderAddress: await bridgeAddress(srcChain, srcVenue, credOpts),
+    recipientAddress: await bridgeAddress(dstChain, dstVenue, credOpts),
+    signer: await loadBridgeSigner(srcChain, srcVenue, credOpts),
+    dstSigner: await loadBridgeSigner(dstChain, dstVenue, credOpts),
+  };
 }

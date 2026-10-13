@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+import { getEventListeners } from "node:events";
 import { startEventStream, type StreamEvent } from "../event-stream.js";
 
 function mockAdapter(overrides?: Record<string, any>) {
@@ -289,6 +290,206 @@ describe("startEventStream — liquidation warnings", () => {
   });
 });
 
+describe("startEventStream — non-finite numeric guards (Rule #2)", () => {
+  // Regression coverage for the guards added in ed533cb at
+  // src/event-stream.ts:131-136 (mark/liq) and 201-203 (balance). A NaN
+  // would silently fail `> 0` / `> 0.01` comparisons (NaN comparisons are
+  // always false), suppressing the very alerts users rely on. The fix
+  // surfaces corruption via `console.warn` and skips the affected branch.
+
+  it("suppresses liquidation_warning / margin_call when markPrice is NaN, logs warn", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const events: StreamEvent[] = [];
+    const controller = new AbortController();
+
+    const adapter = mockAdapter({
+      getPositions: vi.fn().mockImplementation(async () => {
+        controller.abort();
+        // NaN-producing markPrice; finite liqPrice. Pre-fix code computed
+        // `(NaN - 92) / NaN * 100` → NaN, which would silently fail every
+        // `< 3` and `< 10` comparison, hiding the alert.
+        return [{ symbol: "SOL", side: "long", size: "10", entryPrice: "95", unrealizedPnl: "50", liquidationPrice: "92", markPrice: "NaN" }];
+      }),
+    });
+
+    await startEventStream(adapter, {
+      intervalMs: 1,
+      onEvent: (e) => events.push(e),
+      signal: controller.signal,
+    });
+
+    expect(events.filter((e) => e.type === "liquidation_warning" || e.type === "margin_call")).toHaveLength(0);
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/non-finite mark\/liquidation for SOL on test/));
+    warn.mockRestore();
+  });
+
+  it("suppresses liquidation_warning when markPrice is the empty string '' (qa/2026-05-16 strict policy)", async () => {
+    // Number("") === 0 in JS — pre-fix code would pass the finiteness check,
+    // then `mark > 0` would be false, silently skipping the alert without
+    // surfacing the payload break. Strict policy now adds an explicit ""
+    // rejection at event-stream.ts:131-134.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const events: StreamEvent[] = [];
+    const controller = new AbortController();
+
+    const adapter = mockAdapter({
+      getPositions: vi.fn().mockImplementation(async () => {
+        controller.abort();
+        return [{ symbol: "ETH", side: "long", size: "1", entryPrice: "3000", unrealizedPnl: "0", liquidationPrice: "2700", markPrice: "" }];
+      }),
+    });
+
+    await startEventStream(adapter, {
+      intervalMs: 1,
+      onEvent: (e) => events.push(e),
+      signal: controller.signal,
+    });
+
+    expect(events.filter((e) => e.type === "liquidation_warning" || e.type === "margin_call")).toHaveLength(0);
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/non-finite mark\/liquidation for ETH/));
+    warn.mockRestore();
+  });
+
+  it("suppresses liquidation_warning when liquidationPrice is non-numeric (not 'N/A')", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const events: StreamEvent[] = [];
+    const controller = new AbortController();
+
+    const adapter = mockAdapter({
+      getPositions: vi.fn().mockImplementation(async () => {
+        controller.abort();
+        return [{ symbol: "BTC", side: "long", size: "1", entryPrice: "50000", unrealizedPnl: "0", liquidationPrice: "garbage", markPrice: "50000" }];
+      }),
+    });
+
+    await startEventStream(adapter, {
+      intervalMs: 1,
+      onEvent: (e) => events.push(e),
+      signal: controller.signal,
+    });
+
+    expect(events.filter((e) => e.type === "liquidation_warning" || e.type === "margin_call")).toHaveLength(0);
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/non-finite mark\/liquidation for BTC/));
+    warn.mockRestore();
+  });
+
+  // CHANGELOG (Unreleased): "position fields are null when the venue does not publish them
+  // (liquidationPrice, …) instead of "0" / "N/A" / "-" strings". The old 'N/A' sentinel is
+  // now null: not corruption, so no per-poll non-finite warn — one notice per stream that
+  // liquidation warnings are unavailable, and never a Number(null) === 0 "price".
+  it("null liquidationPrice (venue does not report it): one notice per stream, no per-poll warn, no liquidation events", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const controller = new AbortController();
+    const events: Array<{ type: string }> = [];
+    let polls = 0;
+
+    const adapter = mockAdapter({
+      getPositions: vi.fn().mockImplementation(async () => {
+        if (++polls >= 3) controller.abort();
+        return [{ symbol: "BTC", side: "long", size: "1", entryPrice: "50000", unrealizedPnl: "0", liquidationPrice: null, markPrice: "NaN" }];
+      }),
+    });
+
+    await startEventStream(adapter, {
+      intervalMs: 1,
+      onEvent: (e) => { events.push(e as { type: string }); },
+      signal: controller.signal,
+    });
+
+    expect(polls).toBeGreaterThanOrEqual(2);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/does not report liquidation prices/));
+    expect(warn).not.toHaveBeenCalledWith(expect.stringMatching(/non-finite/));
+    expect(events.filter((e) => e.type === "liquidation_warning" || e.type === "margin_call")).toHaveLength(0);
+    warn.mockRestore();
+  });
+
+  it("suppresses balance_update when current balance has a non-finite field, logs warn", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const events: StreamEvent[] = [];
+    const controller = new AbortController();
+    let callNum = 0;
+
+    const adapter = mockAdapter({
+      getBalance: vi.fn().mockImplementation(async () => {
+        callNum++;
+        if (callNum === 1) return { equity: "1000.00", available: "800.00", marginUsed: "200", unrealizedPnl: "0" };
+        controller.abort();
+        // Second cycle: venue returned a corrupt equity. Pre-fix code would
+        // compute `Math.abs(NaN - 1000) = NaN`, fail `NaN > 0.01`, and
+        // silently swallow the balance_update.
+        return { equity: "NaN", available: "850", marginUsed: "200", unrealizedPnl: "0" };
+      }),
+    });
+
+    await startEventStream(adapter, {
+      intervalMs: 1,
+      onEvent: (e) => events.push(e),
+      signal: controller.signal,
+    });
+
+    expect(events.filter((e) => e.type === "balance_update")).toHaveLength(0);
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/non-finite balance values for test/));
+    warn.mockRestore();
+  });
+
+  it("suppresses balance_update when current equity is the empty string '' (qa/2026-05-16 strict policy)", async () => {
+    // Pre-fix: Number("") === 0, so `Math.abs(0 - 1000) = 1000 > 0.01` would
+    // fire a balance_update event with data.equity="" — laundering corruption
+    // as a synthetic delta. Strict policy at event-stream.ts:204-209 catches
+    // the "" upfront and skips the emit with a warn instead.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const events: StreamEvent[] = [];
+    const controller = new AbortController();
+    let callNum = 0;
+
+    const adapter = mockAdapter({
+      getBalance: vi.fn().mockImplementation(async () => {
+        callNum++;
+        if (callNum === 1) return { equity: "1000.00", available: "800.00", marginUsed: "200", unrealizedPnl: "0" };
+        controller.abort();
+        return { equity: "", available: "850", marginUsed: "200", unrealizedPnl: "0" };
+      }),
+    });
+
+    await startEventStream(adapter, {
+      intervalMs: 1,
+      onEvent: (e) => events.push(e),
+      signal: controller.signal,
+    });
+
+    expect(events.filter((e) => e.type === "balance_update")).toHaveLength(0);
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/non-finite balance values for test/));
+    warn.mockRestore();
+  });
+
+  it("suppresses balance_update when previous balance was non-finite (recovery cycle should not re-emit)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const events: StreamEvent[] = [];
+    const controller = new AbortController();
+    let callNum = 0;
+
+    const adapter = mockAdapter({
+      getBalance: vi.fn().mockImplementation(async () => {
+        callNum++;
+        if (callNum === 1) return { equity: "NaN", available: "800.00", marginUsed: "200", unrealizedPnl: "0" };
+        controller.abort();
+        return { equity: "1050.50", available: "850", marginUsed: "200", unrealizedPnl: "50" };
+      }),
+    });
+
+    await startEventStream(adapter, {
+      intervalMs: 1,
+      onEvent: (e) => events.push(e),
+      signal: controller.signal,
+    });
+
+    expect(events.filter((e) => e.type === "balance_update")).toHaveLength(0);
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+});
+
 describe("startEventStream — error handling", () => {
   it("emits error event when adapter throws", async () => {
     const events: StreamEvent[] = [];
@@ -312,5 +513,44 @@ describe("startEventStream — error handling", () => {
     const errors = events.filter(e => e.type === "error");
     expect(errors.length).toBeGreaterThanOrEqual(1);
     expect(errors[0].data.message).toContain("API unreachable");
+  });
+});
+
+describe("startEventStream — abort listener lifecycle (MaxListeners leak guard)", () => {
+  // Regression guard for the qa/2026-05-16 fix in the polling loop. Pre-fix the
+  // loop attached a fresh `abort` listener to the (long-lived) signal every
+  // iteration but relied solely on { once: true } to clean it up — which fires
+  // only on abort, never on the timer branch that wins every normal cycle. By
+  // cycle 11 Node emitted "MaxListenersExceededWarning: 11 abort listeners
+  // added to [AbortSignal]" and the listeners leaked for the lifetime of the
+  // stream. The fix detaches the listener in the timer branch, so at any
+  // sampling point at most one is attached.
+  it("does not accumulate abort listeners across many polling cycles", async () => {
+    const controller = new AbortController();
+    let maxObserved = 0;
+    let pollCount = 0;
+
+    const adapter = mockAdapter({
+      getPositions: vi.fn().mockImplementation(async () => {
+        pollCount++;
+        const n = getEventListeners(controller.signal, "abort").length;
+        if (n > maxObserved) maxObserved = n;
+        // Run well past Node's default MaxListeners=10 so a leak is unmissable.
+        if (pollCount >= 15) controller.abort();
+        return [];
+      }),
+    });
+
+    await startEventStream(adapter, {
+      intervalMs: 1,
+      onEvent: () => {},
+      signal: controller.signal,
+    });
+
+    // Pre-fix: ~14 listeners observed by cycle 15 (and a console warning at 11).
+    // Post-fix: the timer branch detaches its listener each cycle, so the signal
+    // never carries more than the single in-flight one between samples.
+    expect(pollCount).toBeGreaterThanOrEqual(15);
+    expect(maxObserved).toBeLessThanOrEqual(1);
   });
 });

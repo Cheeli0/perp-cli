@@ -25,6 +25,7 @@ const EXPIRED_MS = 1714234567890;
 
 describe("buildApproveAgentTypedData — perp-only (no IpWhitelist, no Builder)", () => {
   const result = buildApproveAgentTypedData({
+    asterChain: "Mainnet",
     user: USER,
     agentAddress: AGENT,
     agentName: "perp-cli-aster",
@@ -115,6 +116,7 @@ describe("buildApproveAgentTypedData — perp-only (no IpWhitelist, no Builder)"
 
 describe("buildApproveAgentTypedData — empty-string IpWhitelist", () => {
   const result = buildApproveAgentTypedData({
+    asterChain: "Mainnet",
     user: USER,
     agentAddress: AGENT,
     agentName: "perp-cli-aster",
@@ -155,6 +157,7 @@ describe("buildApproveAgentTypedData — empty-string IpWhitelist", () => {
 
 describe("buildApproveAgentTypedData — full Builder triple", () => {
   const result = buildApproveAgentTypedData({
+    asterChain: "Mainnet",
     user: USER,
     agentAddress: AGENT,
     agentName: "perp-cli-aster",
@@ -202,6 +205,7 @@ describe("buildApproveAgentTypedData — full Builder triple", () => {
 
   it("Builder without BuilderName omits BuilderName", () => {
     const noBuilderName = buildApproveAgentTypedData({
+      asterChain: "Mainnet",
       user: USER,
       agentAddress: AGENT,
       agentName: "perp-cli-aster",
@@ -224,6 +228,7 @@ describe("buildApproveAgentTypedData — full Builder triple", () => {
 
 describe("buildDelAgentTypedData", () => {
   const result = buildDelAgentTypedData({
+    asterChain: "Mainnet",
     user: USER,
     agentAddress: AGENT,
     nonceMicros: NONCE_MICROS,
@@ -251,7 +256,7 @@ describe("buildDelAgentTypedData", () => {
     expect(result.message["Nonce"]).toBe(String(NONCE_MICROS));
   });
 
-  it("message contains AsterChain defaulting to Mainnet", () => {
+  it("message carries the explicit AsterChain (required, no default)", () => {
     expect(result.message["AsterChain"]).toBe("Mainnet");
   });
 
@@ -364,6 +369,7 @@ describe("buildOrderTypedData", () => {
 
 describe("buildApproveBuilderTypedData", () => {
   const result = buildApproveBuilderTypedData({
+    asterChain: "Mainnet",
     builder: BUILDER,
     maxFeeRate: "0.0005",
     user: USER,
@@ -391,7 +397,7 @@ describe("buildApproveBuilderTypedData", () => {
     expect(result.message["MaxFeeRate"]).toBe("0.0005");
   });
 
-  it("message.AsterChain defaults to Mainnet", () => {
+  it("message.AsterChain is the explicit (required) value", () => {
     expect(result.message["AsterChain"]).toBe("Mainnet");
   });
 
@@ -402,6 +408,7 @@ describe("buildApproveBuilderTypedData", () => {
 
   it("BuilderName included when provided", () => {
     const withName = buildApproveBuilderTypedData({
+      asterChain: "Mainnet",
       builder: BUILDER,
       maxFeeRate: "0.0005",
       builderName: "HypurrQuant",
@@ -424,6 +431,7 @@ describe("buildApproveBuilderTypedData", () => {
 
 describe("uint256 decimal-string regression (BigInt guard)", () => {
   const result = buildApproveAgentTypedData({
+    asterChain: "Mainnet",
     user: USER,
     agentAddress: AGENT,
     agentName: "perp-cli-aster",
@@ -489,6 +497,7 @@ describe("chainId differentiation between ASTER_DOMAIN_A and ASTER_DOMAIN_B", ()
 
 describe("EIP-712 hash equivalence via ethers TypedDataEncoder", () => {
   const params = {
+    asterChain: "Mainnet" as const,
     user: USER,
     agentAddress: AGENT,
     agentName: "perp-cli-aster",
@@ -528,6 +537,7 @@ describe("EIP-712 hash equivalence via ethers TypedDataEncoder", () => {
 
 describe("PascalCase key invariant in EIP-712 message", () => {
   const result = buildApproveAgentTypedData({
+    asterChain: "Mainnet",
     user: USER,
     agentAddress: AGENT,
     agentName: "perp-cli-aster",
@@ -580,6 +590,7 @@ describe("PascalCase key invariant in EIP-712 message", () => {
 
 describe("deterministic ordering of types array", () => {
   const result = buildApproveAgentTypedData({
+    asterChain: "Mainnet",
     user: USER,
     agentAddress: AGENT,
     agentName: "perp-cli-aster",
@@ -622,6 +633,7 @@ describe("deterministic ordering of types array", () => {
 
   it("field-name array with IpWhitelist + full Builder triple matches expected sequence", () => {
     const full = buildApproveAgentTypedData({
+      asterChain: "Mainnet",
       user: USER,
       agentAddress: AGENT,
       agentName: "perp-cli-aster",

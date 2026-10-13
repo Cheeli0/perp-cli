@@ -10,6 +10,7 @@ import { existsSync, mkdirSync, rmSync } from "fs";
 import { resolve } from "path";
 import os from "os";
 import { Command } from "commander";
+import { addRootSafetyOptions } from "../../cli-flags.js";
 
 // ── Stable temp-dir for settings I/O ──────────────────────────────────────
 
@@ -42,6 +43,8 @@ const FAKE_RAW_SIG_HEX = "1aee1548148536475582711c39958806646195b294c0bbc0d52ed8
                         "5240c82244cf8e1e0d4387d107ef558090bae5d6a603235750e93ee0be1b1bbf";
 
 const mockOws = {
+  listWallets: vi.fn((): Array<{ name: string }> => []),
+  deleteWallet: vi.fn(),
   createWallet: vi.fn(),
   createPolicy: vi.fn(),
   createApiKey: vi.fn(),
@@ -70,11 +73,15 @@ vi.mock("node:readline/promises", () => ({
 
 const mockLtSetupApiKey = vi.fn();
 const mockLtInit = vi.fn();
+const mockLtListApiKeys = vi.fn();
+// Simulated on-chain slot → public key map (what GET /apikeys would list). A successful
+// setupApiKey (ChangePubKey) writes the new public key into its slot.
+const mockChainSlots = new Map<number, string>();
 let mockAccountIndex = 42;
 
 vi.mock("../../exchanges/lighter.js", () => {
   class MockLighterAdapter {
-    name = "lighter";
+    name: string = "lighter";
     chain = "ethereum";
     aliases = ["lt"] as const;
     accountIndex: number;
@@ -84,14 +91,28 @@ vi.mock("../../exchanges/lighter.js", () => {
     private _agentApiKey: string | undefined;
     private _useNoAgent = false;
 
+    collateralSymbol = "USDC";
     constructor(_evmKey: string, _testnet?: boolean, _opts?: { apiKey?: string; accountIndex?: number }) {
       this.accountIndex = mockAccountIndex;
+    }
+
+    // Lighter-family venues are built with LighterAdapter.forVenue(venue, …) (design §10:
+    // one adapter class serves lighter and lighter-rh); the approve flow uses it.
+    static forVenue(venue: string, evmKey: string, testnet: boolean, opts?: { apiKey?: string; accountIndex?: number }): MockLighterAdapter {
+      const a = new MockLighterAdapter(evmKey, testnet, opts);
+      a.name = venue;
+      return a;
     }
 
     setSigner(_signer: unknown): void { /* no-op */ }
     async init(): Promise<void> { mockLtInit(); }
     async setupApiKey(slot: number): Promise<{ privateKey: string; publicKey: string }> {
-      return mockLtSetupApiKey(slot);
+      const r = await mockLtSetupApiKey(slot);
+      mockChainSlots.set(slot, r.publicKey);
+      return r;
+    }
+    async listApiKeys(): Promise<Array<{ apiKeyIndex: number; publicKey: string }>> {
+      return mockLtListApiKeys();
     }
     setAgentSigner(meta: unknown, apiKey: string): void {
       this._agentMeta = meta;
@@ -118,6 +139,7 @@ const { LighterAdapter } = await import("../../exchanges/lighter.js");
 
 function makeProgram() {
   const prog = new Command();
+  addRootSafetyOptions(prog);
   prog.exitOverride();
   const walletCmd = prog.command("wallet").description("Wallet management");
   registerWalletAgentCommands(walletCmd, () => false);
@@ -141,6 +163,7 @@ function makeLtAgentMeta(name = "perp-cli-lt", apiKeyIndex = 5) {
     permissions: { canPerpTrade: true, canSpotTrade: false, canWithdraw: false },
     asterApprovalNonce: String(Date.now()),
     status: "active" as const,
+    network: "mainnet" as const,
   };
 }
 
@@ -166,6 +189,9 @@ function setupOkLtSdk() {
 beforeEach(() => {
   mkdirSync(resolve(TEST_HOME, ".perp"), { recursive: true });
   vi.clearAllMocks();
+  mockChainSlots.clear();
+  mockLtListApiKeys.mockImplementation(async () =>
+    [...mockChainSlots].map(([apiKeyIndex, publicKey]) => ({ apiKeyIndex, publicKey })));
   vi.unstubAllEnvs();
   vi.stubEnv("HOME", TEST_HOME);
   Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
@@ -364,28 +390,69 @@ describe("Test 5: LT approve persists accountIndex from adapter init", () => {
 // Test 6: LT revoke happy path (AC-35)
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe("Test 6: LT revoke happy path (AC-35)", () => {
-  it("clears local settings entry (Lighter has no on-chain revoke)", async () => {
+describe("Test 6: LT revoke kills the slot (M2)", () => {
+  it("ChangePubKeys the slot to a throwaway key, deletes the keystore file and the record", async () => {
     setupOkOws();
+    setupOkLtSdk();
     setAgent("lighter", makeLtAgentMeta("perp-cli-lt", 5));
+    const { saveLighterFamilyKey, lighterFamilyKeystorePath } = await import("../../agent-wallet/lighter-keystore.js");
+    saveLighterFamilyKey("lighter", "mainnet", 42, 5, "ab".repeat(20), "");
+    expect(existsSync(lighterFamilyKeystorePath("lighter", "mainnet", 42, 5))).toBe(true);
 
-    // No fetch should be called for LT revoke (it's local-only).
-    const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
-
+    const out: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...a) => { out.push(a.map(String).join(" ")); });
     vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("process.exit"); }) as never);
     vi.spyOn(process.stderr, "write").mockImplementation(() => true);
 
-    const prog = makeProgram();
-    await prog.parseAsync([
-      "node", "perp", "wallet", "agent", "revoke", "lighter", "perp-cli-lt",
-      "--passphrase", "testpass",
-      "--json",
+    await makeProgram().parseAsync([
+      "node", "perp", "wallet", "agent", "revoke", "lighter", "perp-cli-lt", "--passphrase", "testpass", "--json",
     ]);
 
+    // Slot 5 re-keyed (the returned private key is discarded), keystore + record gone.
+    expect(mockLtSetupApiKey).toHaveBeenCalledWith(5);
+    expect(existsSync(lighterFamilyKeystorePath("lighter", "mainnet", 42, 5))).toBe(false);
     expect(getAgent("lighter", "perp-cli-lt")).toBeNull();
-    // LT revoke is local-only — no network call expected.
-    expect(fetchMock).not.toHaveBeenCalled();
+    const env = JSON.parse(out.find(l => l.includes('"ok"'))!);
+    expect(env.data.revoked).toBe(true);
+    expect(out.join("\n")).not.toContain("ab".repeat(20));
+  });
+
+  it("ChangePubKey rejected → APPROVE_FAILED, record and keystore kept (no false 'revoked')", async () => {
+    setupOkOws();
+    mockLtInit.mockResolvedValue(undefined);
+    mockLtSetupApiKey.mockRejectedValue(new Error("ChangePubKey sendTx failed (500)"));
+    setAgent("lighter", makeLtAgentMeta("perp-cli-lt", 5));
+    const { saveLighterFamilyKey, lighterFamilyKeystorePath } = await import("../../agent-wallet/lighter-keystore.js");
+    saveLighterFamilyKey("lighter", "mainnet", 42, 5, "ab".repeat(20), "");
+
+    const out: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((c: string | Uint8Array) => { out.push(String(c)); return true; });
+    vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("process.exit"); }) as never);
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+    await expect(makeProgram().parseAsync([
+      "node", "perp", "wallet", "agent", "revoke", "lighter", "perp-cli-lt", "--passphrase", "testpass", "--json",
+    ])).rejects.toThrow("process.exit");
+
+    const env = JSON.parse(out.find(l => l.includes('"ok":false'))!);
+    expect(env.error.code).toBe("APPROVE_FAILED");
+    expect(env.error.remediation).toMatch(/may still be authorized/);
+    expect(getAgent("lighter", "perp-cli-lt")).not.toBeNull();
+    expect(existsSync(lighterFamilyKeystorePath("lighter", "mainnet", 42, 5))).toBe(true);
+  });
+
+  it("--force clears local state but says the key was NOT revoked", async () => {
+    setupOkOws();
+    setAgent("lighter", makeLtAgentMeta("perp-cli-lt", 5));
+    const out: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...a) => { out.push(a.map(String).join(" ")); });
+    vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("process.exit"); }) as never);
+    await makeProgram().parseAsync([
+      "node", "perp", "wallet", "agent", "revoke", "lighter", "perp-cli-lt", "--force", "--json",
+    ]);
+    expect(mockLtSetupApiKey).not.toHaveBeenCalled();
+    const env = JSON.parse(out.find(l => l.includes('"ok"'))!);
+    expect(env.data).toMatchObject({ revoked: false, localOnly: true });
   });
 });
 
@@ -439,10 +506,11 @@ describe("Test 8: LT rotate (AC-36)", () => {
 
     const meta = getAgent("lighter", "perp-cli-lt");
     expect(meta).toBeTruthy();
-    // Rotate clears existing then approves at next free slot. After delete, only
-    // slot 4 is "used" by the env-default reservation, so next free is 5.
-    expect(meta!.apiKeyIndex).toBe(5);
-    expect(mockLtSetupApiKey).toHaveBeenCalledWith(5);
+    // Rotate re-keys slot 5 to a throwaway key (revoke), so slot 5 is occupied ON-CHAIN;
+    // the auto pick must skip it (and the env-default slot 4) → 6.
+    expect(meta!.apiKeyIndex).toBe(6);
+    expect(mockLtSetupApiKey).toHaveBeenNthCalledWith(1, 5);
+    expect(mockLtSetupApiKey).toHaveBeenNthCalledWith(2, 6);
   });
 });
 
@@ -648,5 +716,202 @@ describe("Test 15: LT approve APPROVE_PARTIAL when ChangePubKey fails", () => {
     expect(threw).toBe(true);
     expect(stderrOutput.join("")).toContain("APPROVE_PARTIAL");
     expect(getAgent("lighter", "perp-cli-lt-fail")).toBeNull();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Review N1 / L1 / L2: on-chain slot occupancy, revoke settlement check,
+// keystore-save failure after ChangePubKey
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function runCli(args: string[]): Promise<{ env: { ok: boolean; data?: Record<string, unknown>; error?: { code: string; message: string; remediation?: string } } | null; threw: boolean }> {
+  const out: string[] = [];
+  vi.spyOn(process.stdout, "write").mockImplementation((c: string | Uint8Array) => { out.push(String(c)); return true; });
+  vi.spyOn(console, "log").mockImplementation((...a) => { out.push(a.map(String).join(" ")); });
+  vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("process.exit"); }) as never);
+  vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+  let threw = false;
+  try {
+    await makeProgram().parseAsync(["node", "perp", ...args]);
+  } catch {
+    threw = true;
+  }
+  const line = out.find((l) => l.includes('"ok"'));
+  return { env: line ? JSON.parse(line) : null, threw };
+}
+
+const APPROVE_LT = ["wallet", "agent", "approve", "lighter", "--master", "main", "--agent-name", "lt-new", "--expires-in", "90d", "--passphrase", "testpass", "--json"];
+
+describe("N1: LT approve never overwrites an in-use on-chain slot", () => {
+  it("auto pick skips slots that hold an on-chain key no local agent tracks", async () => {
+    setupOkOws();
+    setupOkLtSdk();
+    mockChainSlots.set(5, "0x" + "11".repeat(20)); // e.g. the web app's key
+    mockChainSlots.set(6, "0x" + "22".repeat(20));
+    const { env } = await runCli(APPROVE_LT);
+    expect(env?.ok).toBe(true);
+    expect(mockLtSetupApiKey).toHaveBeenCalledTimes(1);
+    expect(mockLtSetupApiKey).toHaveBeenCalledWith(7);
+    expect(getAgent("lighter", "lt-new")!.apiKeyIndex).toBe(7);
+  });
+
+  it("an all-zero public key on a slot counts as free", async () => {
+    setupOkOws();
+    setupOkLtSdk();
+    mockChainSlots.set(5, "0".repeat(80));
+    const { env } = await runCli(APPROVE_LT);
+    expect(env?.ok).toBe(true);
+    expect(mockLtSetupApiKey).toHaveBeenCalledWith(5);
+  });
+
+  it("explicit --api-key-index on an occupied slot is refused without --force (nothing signed)", async () => {
+    setupOkOws();
+    setupOkLtSdk();
+    mockChainSlots.set(9, "0x" + "11".repeat(20));
+    const { env, threw } = await runCli([...APPROVE_LT, "--api-key-index", "9"]);
+    expect(threw).toBe(true);
+    expect(env?.error?.code).toBe("INVALID_PARAMS");
+    expect(env?.error?.message).toMatch(/slot 9 .*already holds an on-chain API key/);
+    expect(env?.error?.remediation).toMatch(/--force/);
+    expect(mockLtSetupApiKey).not.toHaveBeenCalled();
+    expect(getAgent("lighter", "lt-new")).toBeNull();
+  });
+
+  it("--force deliberately overwrites an occupied slot", async () => {
+    setupOkOws();
+    setupOkLtSdk();
+    mockChainSlots.set(9, "0x" + "11".repeat(20));
+    const { env } = await runCli([...APPROVE_LT, "--api-key-index", "9", "--force"]);
+    expect(env?.ok).toBe(true);
+    expect(mockLtSetupApiKey).toHaveBeenCalledWith(9);
+    expect(getAgent("lighter", "lt-new")!.apiKeyIndex).toBe(9);
+  });
+
+  it("a slot held by a local agent on the SAME network is refused even with --force", async () => {
+    setupOkOws();
+    setupOkLtSdk();
+    setAgent("lighter", makeLtAgentMeta("held", 9));
+    mockChainSlots.set(9, "abcdef1234567890" + "0".repeat(64));
+    const { env, threw } = await runCli([...APPROVE_LT, "--api-key-index", "9", "--force"]);
+    expect(threw).toBe(true);
+    expect(env?.error?.code).toBe("INVALID_PARAMS");
+    expect(env?.error?.message).toMatch(/held by local mainnet agent "held"/);
+    expect(env?.error?.remediation).toMatch(/rotate lighter held/);
+    expect(mockLtSetupApiKey).not.toHaveBeenCalled();
+  });
+
+  it("an unreadable key list fails the approve before any signing", async () => {
+    setupOkOws();
+    setupOkLtSdk();
+    mockLtListApiKeys.mockRejectedValue(new Error("GET /apikeys failed (503)"));
+    const { env, threw } = await runCli(APPROVE_LT);
+    expect(threw).toBe(true);
+    expect(env?.ok).toBe(false);
+    expect(mockLtSetupApiKey).not.toHaveBeenCalled();
+  });
+});
+
+describe("L1: LT revoke deletes the local key only after the slot shows the replacement key", () => {
+  async function seed(): Promise<string> {
+    setupOkOws();
+    setupOkLtSdk();
+    setAgent("lighter", makeLtAgentMeta("perp-cli-lt", 5));
+    const { saveLighterFamilyKey, lighterFamilyKeystorePath } = await import("../../agent-wallet/lighter-keystore.js");
+    saveLighterFamilyKey("lighter", "mainnet", 42, 5, "ab".repeat(20), "");
+    return lighterFamilyKeystorePath("lighter", "mainnet", 42, 5);
+  }
+  const REVOKE = ["wallet", "agent", "revoke", "lighter", "perp-cli-lt", "--passphrase", "testpass", "--json"];
+
+  it("slot still shows the OLD key after sendTx → APPROVE_PARTIAL, keystore + record kept", async () => {
+    const ks = await seed();
+    mockLtListApiKeys.mockResolvedValue([{ apiKeyIndex: 5, publicKey: "abcdef1234567890" + "0".repeat(64) }]);
+    const { env, threw } = await runCli(REVOKE);
+    expect(threw).toBe(true);
+    expect(env?.error?.code).toBe("APPROVE_PARTIAL");
+    expect(env?.error?.remediation).toMatch(/Local key kept/);
+    expect(existsSync(ks)).toBe(true);
+    expect(getAgent("lighter", "perp-cli-lt")).not.toBeNull();
+    // The slot is polled for the documented 30 s settlement window before the verdict.
+    expect(mockLtListApiKeys.mock.calls.length).toBeGreaterThan(5);
+  }, 45_000);
+
+  it("the slot shows the old key first and the replacement on a later read → revoked", async () => {
+    const ks = await seed();
+    const real = mockLtListApiKeys.getMockImplementation();
+    let reads = 0;
+    mockLtListApiKeys.mockImplementation(async (...args: unknown[]) => {
+      if (reads++ === 0) return [{ apiKeyIndex: 5, publicKey: "abcdef1234567890" + "0".repeat(64) }];
+      if (real === undefined) throw new Error("no default listApiKeys mock");
+      return real(...args);
+    });
+    const { env, threw } = await runCli(REVOKE);
+    expect(threw).toBe(false);
+    expect(env?.ok).toBe(true);
+    expect(existsSync(ks)).toBe(false);
+  }, 20_000);
+
+  it("re-read of the slot fails → APPROVE_PARTIAL, keystore + record kept", async () => {
+    const ks = await seed();
+    mockLtListApiKeys.mockRejectedValue(new Error("GET /apikeys failed (502)"));
+    const { env } = await runCli(REVOKE);
+    expect(env?.error?.code).toBe("APPROVE_PARTIAL");
+    expect(existsSync(ks)).toBe(true);
+    expect(getAgent("lighter", "perp-cli-lt")).not.toBeNull();
+  });
+});
+
+describe("L2: keystore save failure after an accepted ChangePubKey", () => {
+  it("→ APPROVE_PARTIAL naming the slot; no agent record persisted", async () => {
+    setupOkOws();
+    setupOkLtSdk();
+    const { writeFileSync } = await import("fs");
+    // A plain file where the keystore directory should be → the keystore write fails.
+    writeFileSync(resolve(TEST_HOME, ".perp", "lighter-agents"), "not a dir");
+    const { env, threw } = await runCli(APPROVE_LT);
+    expect(threw).toBe(true);
+    expect(mockLtSetupApiKey).toHaveBeenCalledWith(5);
+    expect(env?.error?.code).toBe("APPROVE_PARTIAL");
+    expect(env?.error?.message).toMatch(/slot 5 \(account 42\)/);
+    expect(env?.error?.remediation).toMatch(/--api-key-index 5 --force/);
+    expect(getAgent("lighter", "lt-new")).toBeNull();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// approve vs an existing agent of the same name: --rotate required; --rotate = the rotate path
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("LT approve vs an existing agent of the same name", () => {
+  it("without --rotate → INVALID_PARAMS telling the user to pass --rotate; nothing is signed, the record is kept", async () => {
+    setupOkOws();
+    setupOkLtSdk();
+    setAgent("lighter", makeLtAgentMeta("perp-cli-lt", 5));
+    const out: string[] = [];
+    vi.spyOn(process.stderr, "write").mockImplementation((c) => { out.push(String(c)); return true; });
+    vi.spyOn(process.stdout, "write").mockImplementation((c) => { out.push(String(c)); return true; });
+    vi.spyOn(console, "log").mockImplementation((m) => { out.push(String(m)); });
+    vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("process.exit"); }) as never);
+    await expect(makeProgram().parseAsync([
+      "node", "perp", "wallet", "agent", "approve", "lighter", "--master", "main", "--agent-name", "perp-cli-lt", "--passphrase", "testpass", "--json",
+    ])).rejects.toThrow("process.exit");
+    const err = JSON.parse(out.find(l => l.includes('"ok":false'))!).error;
+    expect(err.code).toBe("INVALID_PARAMS");
+    expect(err.remediation).toContain("perp wallet agent approve lighter --rotate");
+    expect(mockLtSetupApiKey).not.toHaveBeenCalled();
+    expect(getAgent("lighter", "perp-cli-lt")!.apiKeyIndex).toBe(5);
+  });
+
+  it("approve --rotate → the old slot is re-keyed (revoked) first, then a fresh slot is registered (same as `rotate`)", async () => {
+    setupOkOws();
+    setupOkLtSdk();
+    setAgent("lighter", makeLtAgentMeta("perp-cli-lt", 5));
+    vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("process.exit"); }) as never);
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    await makeProgram().parseAsync([
+      "node", "perp", "wallet", "agent", "approve", "lighter", "--master", "main", "--agent-name", "perp-cli-lt", "--rotate", "--passphrase", "testpass", "--json",
+    ]);
+    expect(mockLtSetupApiKey).toHaveBeenNthCalledWith(1, 5);
+    expect(mockLtSetupApiKey).toHaveBeenNthCalledWith(2, 6);
+    expect(getAgent("lighter", "perp-cli-lt")!.apiKeyIndex).toBe(6);
   });
 });

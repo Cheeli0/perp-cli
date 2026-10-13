@@ -41,6 +41,25 @@ perp bridge send --from arbitrum --to base --amount 100 --provider cctp --fast
 perp bridge exchange --from lighter --to pacifica --amount 50
 ```
 
+### Relay 자산 스왑 (`--from-asset` / `--to-asset`)
+
+USDC 외 자산·체인(Robinhood Chain 4663 `robinhood`, BNB Chain 56 `bsc`)은 Relay 경로만 지원한다. 출발 체인은 EVM만 가능하고, OWS master 지갑이 서명하며, 수신 주소는 항상 master 지갑 자신의 주소(EVM 체인은 EVM 주소, Solana는 master의 Solana 주소)다 — 임의 `--recipient`는 거부된다.
+
+```bash
+# 견적만 (키를 열지 않음): 입력 금액, 예상 수령, 프로토콜 보장 최소 수령, 수수료, ETA, min-out 판정
+perp --dry-run funds bridge send --from robinhood --to arbitrum --from-asset USDG --to-asset USDC --amount 15
+
+# RH USDG → Solana SOL (stable → native는 --min-out 필수, 단위는 수령 자산)
+perp funds bridge send --from robinhood --to solana --from-asset USDG --to-asset SOL --amount 2 --min-out 0.015
+
+# Arbitrum ETH → RH ETH (RH에 가스가 0이면 첫 브릿지는 Arbitrum에서 출발)
+perp funds bridge send --from arbitrum --to robinhood --from-asset ETH --to-asset ETH --amount 0.00075
+```
+
+- 견적은 로컬에서 검증된다(`src/relay-swap.ts`, Relay "Input Validation" 가이드): 주문 데이터의 수신자·자산·체인·입력 금액, 주문 ID 재계산, 고정된 depository 주소(`0x4cD0…BC31`), approve는 정확한 금액 + depository spender만, 스텝 chainId. 하나라도 다르면 `POLICY_DENIED`, 아무것도 서명하지 않는다.
+- 수령 보호: stable→stable / 같은 native 자산은 예상 수령 ≥ 입력 × 97%. `--min-out`을 주면 프로토콜이 보장하는 최소 수령(`minimumAmount`)이 그 이상이어야 한다.
+- 입금 후 `GET /intents/status/v3`를 최대 5분 조회한다. `success` 외에 확인이 안 되면 `ORDER_PENDING`(request id + 입금 tx hash) — 다시 보내지 말고 `https://relay.link/transaction/<requestId>`를 확인한다.
+
 ### 지원 체인 확인
 
 ```bash
@@ -178,11 +197,15 @@ bridge-engine.ts
 LIGHTER_PRIVATE_KEY=0x...          # Arbitrum/Base EVM key
 HL_PRIVATE_KEY=0x...               # Hyperliquid EVM key (same as LIGHTER)
 PACIFICA_PRIVATE_KEY=...           # Solana key (base58)
+```
 
-# 선택 (deBridge affiliate)
-DEBRIDGE_REFERRAL_CODE=...
-DEBRIDGE_AFFILIATE_FEE_PERCENT=...
-DEBRIDGE_AFFILIATE_FEE_RECIPIENT=...
+deBridge affiliate / referral 파라미터는 env 가 아니라 settings `bridge.debridgeAffiliate` 에서만 읽는다
+(기본값 없음 = 아무것도 보내지 않음):
+
+```bash
+perp settings set bridge.debridgeAffiliate.referralCode <code>
+perp settings set bridge.debridgeAffiliate.fee <percent>,<recipient>   # 둘 다 함께 설정
+perp settings unset bridge.debridgeAffiliate
 ```
 
 ## 실행 로그

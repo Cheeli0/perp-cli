@@ -1,9 +1,11 @@
 import { Command } from "commander";
+import { listConfiguredAccountVenues } from "../config.js";
 import chalk from "chalk";
 import type { ExchangeAdapter } from "../exchanges/index.js";
 import { printJson, jsonOk, jsonError, makeTable, formatUsd, formatPnl, withJsonErrors } from "../utils.js";
 import { readExecutionLog, getExecutionStats, pruneExecutionLog } from "../execution-log.js";
 import { loadArbState } from "../arb/index.js";
+import { networkOf } from "../cli-flags.js";
 import { readPositionHistory, getPositionStats } from "../position-history.js";
 import {
   saveEquitySnapshot,
@@ -14,7 +16,6 @@ import {
   type EquitySnapshot,
 } from "../equity-tracker.js";
 
-const EXCHANGES = ["pacifica", "hyperliquid", "lighter", "aster"] as const;
 
 function parseSince(since?: string): string | undefined {
   if (!since) return undefined;
@@ -25,6 +26,18 @@ function parseSince(since?: string): string | undefined {
     return new Date(Date.now() - parseInt(num) * ms).toISOString();
   }
   return since;
+}
+
+/**
+ * Exchange filter of a history subcommand: the ROOT `-e, --exchange`, only when given on the command
+ * line. Commander hands `-e` / `--exchange` to the root wherever it appears in argv, so a subcommand
+ * copy of the option was never set (the filter was silently dropped). The root's default venue is
+ * never used as a filter.
+ */
+function cliExchangeFilter(cmd: Command): string | undefined {
+  let root = cmd;
+  while (root.parent) root = root.parent;
+  return root.getOptionValueSource("exchange") === "cli" ? String(root.opts().exchange) : undefined;
 }
 
 /** Parse period string (7d, 30d, 90d) to milliseconds. Returns undefined for "all" or missing. */
@@ -47,17 +60,17 @@ export function registerHistoryCommands(
   // ── history list ──
   history
     .command("list")
-    .description("Show recent executions")
-    .option("-n, --limit <n>", "Number of records to show", "20")
-    .option("-e, --exchange <exchange>", "Filter by exchange")
+    .description("Show recent executions — filter with the root -e <exchange>")
+    .option("--limit <n>", "Number of records to show", "20")
     .option("-s, --symbol <symbol>", "Filter by symbol")
     .option("-t, --type <type>", "Filter by type (market_order, limit_order, arb_entry, etc.)")
     .option("--since <date>", "Show records since date (ISO format or relative like '24h', '7d')")
     .option("--dry-run-only", "Show only dry-run simulations")
     .action(async (opts: {
-      limit: string; exchange?: string; symbol?: string;
+      limit: string; symbol?: string;
       type?: string; since?: string; dryRunOnly?: boolean;
     }) => {
+      const exchangeFilter = cliExchangeFilter(history);
       await withJsonErrors(isJson(), async () => {
         // Parse relative dates
         let since = opts.since;
@@ -72,7 +85,7 @@ export function registerHistoryCommands(
 
         const records = readExecutionLog({
           limit: parseInt(opts.limit),
-          exchange: opts.exchange,
+          exchange: exchangeFilter,
           symbol: opts.symbol,
           type: opts.type,
           since,
@@ -178,17 +191,17 @@ export function registerHistoryCommands(
   // ── history positions ──
   history
     .command("positions")
-    .description("Show position history (from event stream logging)")
-    .option("-n, --limit <n>", "Number of records to show", "20")
-    .option("-e, --exchange <exchange>", "Filter by exchange")
+    .description("Show position history (from event stream logging) — filter with the root -e <exchange>")
+    .option("--limit <n>", "Number of records to show", "20")
     .option("-s, --symbol <symbol>", "Filter by symbol")
     .option("--status <status>", "Filter by status (open, closed, updated)")
     .option("--since <date>", "Show records since date (ISO format or relative like '24h', '7d')")
     .option("--stats", "Show aggregate position stats instead of list")
     .action(async (opts: {
-      limit: string; exchange?: string; symbol?: string;
+      limit: string; symbol?: string;
       status?: string; since?: string; stats?: boolean;
     }) => {
+      const exchangeFilter = cliExchangeFilter(history);
       await withJsonErrors(isJson(), async () => {
         // Parse relative dates
         let since = opts.since;
@@ -203,7 +216,7 @@ export function registerHistoryCommands(
 
         // Stats mode
         if (opts.stats) {
-          const stats = getPositionStats({ exchange: opts.exchange, since });
+          const stats = getPositionStats({ exchange: exchangeFilter, since });
 
           if (isJson()) {
             return printJson(jsonOk(stats));
@@ -249,7 +262,7 @@ export function registerHistoryCommands(
         // List mode
         const records = readPositionHistory({
           limit: parseInt(opts.limit),
-          exchange: opts.exchange,
+          exchange: exchangeFilter,
           symbol: opts.symbol,
           status: opts.status,
           since,
@@ -396,16 +409,16 @@ function registerAnalyticsSubcommands(
   // ── analytics pnl ──
   parent
     .command("pnl")
-    .description("P&L analysis — trades, fees, funding income with daily breakdown")
-    .option("-e, --exchange <exchanges>", "Comma-separated exchanges")
+    .description("P&L analysis — trades, fees, funding income with daily breakdown — filter with the root -e <exchange> (comma-separated)")
     .option("--period <duration>", "Time period: 7d, 30d, 90d, all (default: all)")
     .option("--since <period>", "Alias for --period")
-    .option("-n, --limit <n>", "History limit per exchange", "200")
-    .action(async (opts: { exchange?: string; period?: string; since?: string; limit: string }) => {
+    .option("--limit <n>", "History limit per exchange", "200")
+    .action(async (opts: { period?: string; since?: string; limit: string }) => {
+      const exchangeFilter = cliExchangeFilter(parent);
       await withJsonErrors(isJson(), async () => {
-        const exchanges = opts.exchange
-          ? opts.exchange.split(",").map(e => e.trim())
-          : [...EXCHANGES];
+        const exchanges = exchangeFilter
+          ? exchangeFilter.split(",").map(e => e.trim())
+          : await listConfiguredAccountVenues();
 
         const period = opts.period ?? opts.since;
         const periodMs = parsePeriodMs(period);
@@ -535,17 +548,17 @@ function registerAnalyticsSubcommands(
   // ── analytics funding ──
   parent
     .command("funding")
-    .description("Funding income analysis — cumulative, daily, per-arb-position breakdown")
-    .option("-e, --exchange <exchanges>", "Comma-separated exchanges")
+    .description("Funding income analysis — cumulative, daily, per-arb-position breakdown — filter with the root -e <exchange> (comma-separated)")
     .option("-s, --symbol <symbol>", "Filter by symbol")
     .option("--period <duration>", "Time period: 7d, 30d, 90d, all (default: all)")
     .option("--daily", "Show daily funding breakdown")
-    .option("-n, --limit <n>", "Funding history limit per exchange", "200")
-    .action(async (opts: { exchange?: string; symbol?: string; period?: string; daily?: boolean; limit: string }) => {
+    .option("--limit <n>", "Funding history limit per exchange", "200")
+    .action(async (opts: { symbol?: string; period?: string; daily?: boolean; limit: string }) => {
+      const exchangeFilter = cliExchangeFilter(parent);
       await withJsonErrors(isJson(), async () => {
-        const exchanges = opts.exchange
-          ? opts.exchange.split(",").map(e => e.trim())
-          : [...EXCHANGES];
+        const exchanges = exchangeFilter
+          ? exchangeFilter.split(",").map(e => e.trim())
+          : await listConfiguredAccountVenues();
 
         const periodMs = parsePeriodMs(opts.period);
         const sinceMs = periodMs ? Date.now() - periodMs : 0;
@@ -603,7 +616,7 @@ function registerAnalyticsSubcommands(
             : 1;
 
         // Match funding to arb positions
-        const arbState = loadArbState();
+        const arbState = loadArbState(networkOf(parent));
         const arbPositions = arbState?.positions ?? [];
         const arbFunding = new Map<string, { longFunding: number; shortFunding: number }>();
         for (const pos of arbPositions) {
@@ -710,18 +723,18 @@ function registerAnalyticsSubcommands(
   // ── analytics report ──
   parent
     .command("report")
-    .description("Full performance report (summary + pnl + funding)")
-    .option("-e, --exchange <exchanges>", "Comma-separated exchanges")
+    .description("Full performance report (summary + pnl + funding) — filter with the root -e <exchange> (comma-separated)")
     .option("--since <period>", "Period: 24h, 7d, 30d")
-    .action(async (opts: { exchange?: string; since?: string }) => {
+    .action(async (opts: { since?: string }) => {
+      const exchangeFilter = cliExchangeFilter(parent);
       await withJsonErrors(isJson(), async () => {
         const since = parseSince(opts.since);
         const stats = getExecutionStats(since);
         const records = readExecutionLog({ since });
 
-        const exchanges = opts.exchange
-          ? opts.exchange.split(",").map(e => e.trim())
-          : [...EXCHANGES];
+        const exchanges = exchangeFilter
+          ? exchangeFilter.split(",").map(e => e.trim())
+          : await listConfiguredAccountVenues();
 
         // Volume from log
         let logVolume = 0;
@@ -809,10 +822,10 @@ function registerAnalyticsSubcommands(
     .command("compare")
     .description("Compare active arb positions — ROI, realized PnL, funding income side by side")
     .option("--period <duration>", "Funding lookup period: 7d, 30d, 90d, all (default: all)")
-    .option("-n, --limit <n>", "Funding history limit per exchange", "200")
+    .option("--limit <n>", "Funding history limit per exchange", "200")
     .action(async (opts: { period?: string; limit: string }) => {
       await withJsonErrors(isJson(), async () => {
-        const arbState = loadArbState();
+        const arbState = loadArbState(networkOf(parent));
         const positions = arbState?.positions ?? [];
 
         if (positions.length === 0) {
@@ -856,8 +869,13 @@ function registerAnalyticsSubcommands(
           }),
         );
 
+        // Entries without a verified entry price (a bot leg the venue reported no fill price for)
+        // have no price PnL: listed apart, never priced at a guess.
+        const priced = positions.filter((p): p is typeof p & { entryLongPrice: number; entryShortPrice: number } => p.entryLongPrice !== null && p.entryShortPrice !== null);
+        const unpricedPositions = positions.filter(p => p.entryLongPrice === null || p.entryShortPrice === null).map(p => p.symbol);
+
         // Build comparison data
-        const rows = positions.map(pos => {
+        const rows = priced.map(pos => {
           const daysHeld = Math.max(1, Math.round((Date.now() - new Date(pos.entryTime).getTime()) / 86400000));
           const longFunding = fundingByExSym.get(`${pos.longExchange}:${pos.symbol}`) ?? 0;
           const shortFunding = fundingByExSym.get(`${pos.shortExchange}:${pos.symbol}`) ?? 0;
@@ -908,6 +926,7 @@ function registerAnalyticsSubcommands(
           period: opts.period ?? "all",
           positionCount: rows.length,
           positions: rows,
+          unpricedPositions,
           totals: {
             ...totals,
             roi: totals.notional > 0 ? (totals.totalPnl / totals.notional) * 100 : 0,
@@ -934,6 +953,7 @@ function registerAnalyticsSubcommands(
           ["Symbol", "Long → Short", "Mode", "Held", "Funding", "Price PnL", "Total PnL", "ROI", "Ann.ROI"],
           tableRows,
         ));
+        if (unpricedPositions.length > 0) console.log(chalk.gray(`  No entry price recorded (not compared): ${unpricedPositions.join(", ")}\n`));
 
         console.log(chalk.white.bold("  Totals:"));
         console.log(`    Funding Income:   ${formatPnl(totals.funding)}`);
@@ -1002,10 +1022,10 @@ function registerPnlSubcommands(
   parent
     .command("snapshot")
     .description("Take equity snapshot across all exchanges")
-    .option("--exchanges <list>", "Comma-separated exchange list", EXCHANGES.join(","))
-    .action(async (opts: { exchanges: string }) => {
+    .option("--exchanges <list>", "Comma-separated exchange list (default: all with configured credentials)")
+    .action(async (opts: { exchanges?: string }) => {
       await withJsonErrors(isJson(), async () => {
-        const exchanges = opts.exchanges.split(",").map(e => e.trim());
+        const exchanges = opts.exchanges ? opts.exchanges.split(",").map(e => e.trim()) : await listConfiguredAccountVenues();
         const snaps = await takeSnapshot(getAdapterForExchange, exchanges);
 
         if (isJson()) {
@@ -1032,10 +1052,10 @@ function registerPnlSubcommands(
     .command("track")
     .description("Continuously track equity (foreground)")
     .option("--interval <sec>", "Snapshot interval in seconds", "300")
-    .option("--exchanges <list>", "Comma-separated exchange list", EXCHANGES.join(","))
-    .action(async (opts: { interval: string; exchanges: string }) => {
+    .option("--exchanges <list>", "Comma-separated exchange list (default: all with configured credentials)")
+    .action(async (opts: { interval: string; exchanges?: string }) => {
       const intervalMs = parseInt(opts.interval) * 1000;
-      const exchanges = opts.exchanges.split(",").map(e => e.trim());
+      const exchanges = opts.exchanges ? opts.exchanges.split(",").map(e => e.trim()) : await listConfiguredAccountVenues();
 
       console.log(chalk.cyan(`PnL tracker started — snapshot every ${opts.interval}s for [${exchanges.join(", ")}]`));
       console.log(chalk.gray("Press Ctrl+C to stop\n"));
@@ -1050,8 +1070,15 @@ function registerPnlSubcommands(
 
       while (!controller.signal.aborted) {
         await new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, intervalMs);
-          controller.signal.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
+          let timer: ReturnType<typeof setTimeout>;
+          const onAbort = () => { clearTimeout(timer); resolve(); };
+          // Remove the listener when the timer wins so it does not pile up on
+          // the controller's signal every snapshot interval (MaxListeners leak).
+          timer = setTimeout(() => {
+            controller.signal.removeEventListener("abort", onAbort);
+            resolve();
+          }, intervalMs);
+          controller.signal.addEventListener("abort", onAbort, { once: true });
         });
         if (controller.signal.aborted) break;
 
@@ -1073,20 +1100,20 @@ function registerPnlSubcommands(
   // ── perf (unified: daily/weekly/summary) ──
   parent
     .command("perf")
-    .description("Performance breakdown — daily, weekly, or summary stats")
+    .description("Performance breakdown — daily, weekly, or summary stats — filter with the root -e <exchange>")
     .option("--period <period>", "daily, weekly, or summary", "daily")
-    .option("--exchange <name>", "Single exchange filter")
     .option("--days <n>", "Number of days (daily mode)", "14")
     .option("--weeks <n>", "Number of weeks (weekly mode)", "8")
     .option("--since <period>", "Time range (e.g. 7d, 2w, 30d)")
-    .action(async (opts: { period: string; exchange?: string; days: string; weeks: string; since?: string }) => {
+    .action(async (opts: { period: string; days: string; weeks: string; since?: string }) => {
+      const exchangeFilter = cliExchangeFilter(parent);
       await withJsonErrors(isJson(), async () => {
         const mode = opts.period.toLowerCase();
         const defaultSince = mode === "weekly"
           ? new Date(Date.now() - parseInt(opts.weeks) * 7 * 86400000)
           : new Date(Date.now() - parseInt(opts.days) * 86400000);
         const since = parseSinceDate(opts.since) ?? defaultSince;
-        const snapshots = readEquityHistory({ exchange: opts.exchange, since });
+        const snapshots = readEquityHistory({ exchange: exchangeFilter, since });
 
         if (snapshots.length === 0) {
           if (isJson()) {
@@ -1098,11 +1125,11 @@ function registerPnlSubcommands(
         }
 
         if (mode === "summary") {
-          const metrics = computePnlMetrics(snapshots, opts.exchange);
+          const metrics = computePnlMetrics(snapshots, exchangeFilter);
           if (isJson()) {
             printJson(jsonOk({ ...metrics, dailyReturns: undefined, dailyCount: metrics.dailyReturns.length }));
           } else {
-            console.log(chalk.cyan.bold(`Performance Summary${opts.exchange ? ` (${opts.exchange})` : ""}\n`));
+            console.log(chalk.cyan.bold(`Performance Summary${exchangeFilter ? ` (${exchangeFilter})` : ""}\n`));
             console.log(`  Period:          ${metrics.period.from} → ${metrics.period.to} (${metrics.period.days} days)`);
             console.log(`  Total Return:    ${formatPnl(metrics.totalReturn)} (${metrics.totalReturnPct >= 0 ? "+" : ""}${metrics.totalReturnPct.toFixed(2)}%)`);
             console.log(`  Peak Equity:     $${formatUsd(metrics.peakEquity)}`);
@@ -1120,18 +1147,18 @@ function registerPnlSubcommands(
           return;
         }
 
-        const daily = computeDailyPnl(snapshots, opts.exchange);
+        const daily = computeDailyPnl(snapshots, exchangeFilter);
 
         if (mode === "weekly") {
           const weekly = aggregateWeekly(daily);
           if (isJson()) { printJson(jsonOk({ weekly })); return; }
-          console.log(chalk.cyan.bold(`Weekly PnL${opts.exchange ? ` (${opts.exchange})` : ""}\n`));
+          console.log(chalk.cyan.bold(`Weekly PnL${exchangeFilter ? ` (${exchangeFilter})` : ""}\n`));
           const rows = weekly.map(w => [w.date, `$${formatUsd(w.startEquity)}`, `$${formatUsd(w.endEquity)}`, formatPnl(w.pnl), `${w.pnlPct >= 0 ? "+" : ""}${w.pnlPct.toFixed(2)}%`]);
           console.log(makeTable(["Week", "Start", "End", "PnL", "PnL %"], rows));
         } else {
           // daily (default)
           if (isJson()) { printJson(jsonOk({ daily })); return; }
-          console.log(chalk.cyan.bold(`Daily PnL${opts.exchange ? ` (${opts.exchange})` : ""}\n`));
+          console.log(chalk.cyan.bold(`Daily PnL${exchangeFilter ? ` (${exchangeFilter})` : ""}\n`));
           const rows = daily.map(d => [d.date, `$${formatUsd(d.startEquity)}`, `$${formatUsd(d.endEquity)}`, formatPnl(d.pnl), `${d.pnlPct >= 0 ? "+" : ""}${d.pnlPct.toFixed(2)}%`]);
           console.log(makeTable(["Date", "Start", "End", "PnL", "PnL %"], rows));
         }

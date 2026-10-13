@@ -11,10 +11,15 @@ export interface ExchangeBalance {
 
 export interface BotTuiState {
   phase: string;
-  equity: number;
-  peakEquity: number;
+  /** null = unknown (see the bot log for the reason) — never shown as $0. */
+  equity: number | null;
+  /** null = no baseline yet. */
+  peakEquity: number | null;
   dailyPnl: number;
+  /** Orders the venue reported as (partly) filled. */
   fills: number;
+  /** Orders sent, filled or resting. */
+  ordersPlaced: number;
   totalPnl: number;
   runtime: number;
   strategy: string;
@@ -138,8 +143,11 @@ export function BotDashboard({ initialState, onQuit, onPause, subscribe }: Dashb
     }
   });
 
-  const drawdown = state.peakEquity - state.equity;
-  const drawdownPct = state.peakEquity > 0 ? (drawdown / state.peakEquity) * 100 : 0;
+  // Unknown equity / baseline → drawdown unknown (shown as "unknown", never $0).
+  const drawdown = state.equity !== null && state.peakEquity !== null ? state.peakEquity - state.equity : null;
+  const drawdownPct = drawdown !== null && state.peakEquity !== null && state.peakEquity > 0 ? (drawdown / state.peakEquity) * 100 : 0;
+  const usd = (v: number | null) => v === null ? "unknown" : `$${v.toFixed(2)}`;
+  const totalEquity = state.exchangeBalances !== undefined ? state.exchangeBalances.reduce((s, e) => s + parseFloat(e.equity), 0) : state.equity;
   const bidOrders = state.openOrders.filter((o) => o.side.toLowerCase() === "buy");
   const askOrders = state.openOrders.filter((o) => o.side.toLowerCase() === "sell");
   const hasMultiExchange = (state.exchangeBalances?.length ?? 0) > 1;
@@ -174,7 +182,7 @@ export function BotDashboard({ initialState, onQuit, onPause, subscribe }: Dashb
             Positions: <Text bold color={state.positions.length > 0 ? "yellow" : "white"}>{state.positions.length}</Text>
           </Text>
           <Text color="gray">
-            Total Equity: <Text bold color="white">${(state.exchangeBalances?.reduce((s, e) => s + parseFloat(e.equity), 0) ?? state.equity).toFixed(2)}</Text>
+            Total Equity: <Text bold color="white">{usd(totalEquity)}</Text>
           </Text>
           <Text color="gray">
             PnL: <Text bold color={state.totalPnl >= 0 ? "green" : "red"}>${state.totalPnl.toFixed(2)}</Text>
@@ -204,8 +212,8 @@ export function BotDashboard({ initialState, onQuit, onPause, subscribe }: Dashb
         <Box flexDirection="column">
           <Text color="cyan" bold>Account</Text>
           <Text>
-            Equity: <Text bold color="white">${state.equity.toFixed(2)}</Text>
-            <Text color="gray"> (peak: ${state.peakEquity.toFixed(2)})</Text>
+            Equity: <Text bold color="white">{usd(state.equity)}</Text>
+            <Text color="gray"> (peak: {usd(state.peakEquity)})</Text>
           </Text>
           <Text>
             Daily P&L: <Text bold color={pnlColor(state.dailyPnl)}>${state.dailyPnl.toFixed(2)}</Text>
@@ -214,12 +222,14 @@ export function BotDashboard({ initialState, onQuit, onPause, subscribe }: Dashb
         <Box flexDirection="column">
           <Text> </Text>
           <Text>
-            Drawdown: <Text bold color={drawdown > 0 ? "red" : "green"}>
-              ${drawdown.toFixed(2)} ({drawdownPct.toFixed(1)}%)
+            Drawdown: <Text bold color={drawdown === null ? "gray" : drawdown > 0 ? "red" : "green"}>
+              {drawdown === null ? "unknown" : `${usd(drawdown)} (${drawdownPct.toFixed(1)}%)`}
             </Text>
           </Text>
           <Text>
-            Fills: <Text bold color="white">{state.fills}</Text>
+            Orders: <Text bold color="white">{state.ordersPlaced}</Text>
+            <Text color="gray"> | Fills: </Text>
+            <Text bold color="white">{state.fills}</Text>
             <Text color="gray"> | Total P&L: </Text>
             <Text bold color={pnlColor(state.totalPnl)}>${state.totalPnl.toFixed(2)}</Text>
           </Text>

@@ -34,7 +34,7 @@ vi.mock("../risk.js", () => ({
 
 function mockAdapter(overrides?: Partial<Record<string, unknown>>) {
   return {
-    name: "test-exchange",
+    name: "hyperliquid", // must be a registered venue id (slippage bound resolves per venue)
     getMarkets: vi.fn().mockResolvedValue([
       {
         symbol: "BTC-PERP",
@@ -44,6 +44,10 @@ function mockAdapter(overrides?: Partial<Record<string, unknown>>) {
         volume24h: "1000000",
         openInterest: "500000",
         maxLeverage: 20,
+        sizeDecimals: null,
+        stepSize: null,
+        fundingHours: null,
+        marginTiers: null,
       },
       {
         symbol: "ETH-PERP",
@@ -53,6 +57,10 @@ function mockAdapter(overrides?: Partial<Record<string, unknown>>) {
         volume24h: "500000",
         openInterest: "250000",
         maxLeverage: 15,
+        sizeDecimals: null,
+        stepSize: null,
+        fundingHours: null,
+        marginTiers: null,
       },
     ]),
     getBalance: vi.fn().mockResolvedValue({
@@ -165,7 +173,7 @@ describe("validateTrade — symbol validity", () => {
   it("handles -PERP suffix stripping (input=BTC-PERP, market=BTC-PERP)", async () => {
     const adapter = mockAdapter({
       getMarkets: vi.fn().mockResolvedValue([
-        { symbol: "BTC-PERP", markPrice: "60000", indexPrice: "60000", fundingRate: "0.0001", volume24h: "1000000", openInterest: "500000", maxLeverage: 20 },
+        { symbol: "BTC-PERP", markPrice: "60000", indexPrice: "60000", fundingRate: "0.0001", volume24h: "1000000", openInterest: "500000", maxLeverage: 20, sizeDecimals: null, stepSize: null, fundingHours: null, marginTiers: null },
       ]),
     });
     const result = await validateTrade(adapter, {
@@ -176,22 +184,31 @@ describe("validateTrade — symbol validity", () => {
     expect(result.checks.find(c => c.check === "symbol_valid")?.passed).toBe(true);
   });
 
+  it("HIP-3 dex adapter lists 'xyz:NVDA': the bare symbol typed with --dex is valid", async () => {
+    // Live 2026-10-05: trade check NVDA buy 0.047 -e hyperliquid --dex xyz → "NVDA not found on hyperliquid".
+    const adapter = mockAdapter({
+      getMarkets: vi.fn().mockResolvedValue([
+        { symbol: "xyz:NVDA", markPrice: "180", indexPrice: "180", fundingRate: "0.0001", volume24h: "1000000", openInterest: "500000", maxLeverage: 10, sizeDecimals: 3, stepSize: "0.001", fundingHours: null, marginTiers: null },
+      ]),
+    });
+    const result = await validateTrade(adapter, { symbol: "NVDA", side: "buy", size: 0.047 });
+    expect(result.checks.find(c => c.check === "symbol_valid")).toMatchObject({ passed: true, message: "NVDA found on hyperliquid" });
+  });
+
   it("handles market without -PERP suffix matching input with -PERP suffix", async () => {
     // Market returns "BTC", user queries "BTC-PERP"
     const adapter = mockAdapter({
       getMarkets: vi.fn().mockResolvedValue([
-        { symbol: "BTC", markPrice: "60000", indexPrice: "60000", fundingRate: "0.0001", volume24h: "1000000", openInterest: "500000", maxLeverage: 20 },
+        { symbol: "BTC", markPrice: "60000", indexPrice: "60000", fundingRate: "0.0001", volume24h: "1000000", openInterest: "500000", maxLeverage: 20, sizeDecimals: null, stepSize: null, fundingHours: null, marginTiers: null },
       ]),
     });
-    // The code logic: ms === sym → "BTC" === "BTC-PERP" (no), ms === `${sym}-PERP` → "BTC" === "BTC-PERP-PERP" (no), ms.replace(/-PERP$/, "") === sym → "BTC" === "BTC-PERP" (no)
-    // So BTC-PERP input won't match "BTC" market. This tests the current behavior.
+    // symbolMatch is symmetric: the -PERP suffix is stripped from both the venue symbol and the input.
     const result = await validateTrade(adapter, {
       symbol: "BTC-PERP",
       side: "buy",
       size: 0.01,
     });
-    // "BTC" won't match "BTC-PERP" — ms=BTC, sym=BTC-PERP: ms !== sym, `${sym}-PERP`="BTC-PERP-PERP" !== "BTC", ms.replace(/-PERP$/,"")="BTC" !== "BTC-PERP"
-    expect(result.checks.find(c => c.check === "symbol_valid")?.passed).toBe(false);
+    expect(result.checks.find(c => c.check === "symbol_valid")?.passed).toBe(true);
   });
 });
 
@@ -741,6 +758,7 @@ describe("validateTrade — Rule #2 numeric guards (NaN propagation rejection)",
         {
           symbol: "BTC-PERP", markPrice: "not-a-number", indexPrice: "60000",
           fundingRate: "0.0001", volume24h: "1000000", openInterest: "500000", maxLeverage: 20,
+          sizeDecimals: null, stepSize: null, fundingHours: null, marginTiers: null,
         },
       ]),
     });
@@ -801,6 +819,7 @@ describe("validateTrade — Rule #2 numeric guards (NaN propagation rejection)",
         {
           symbol: "BTC-PERP", markPrice: "60000", indexPrice: "60000",
           fundingRate: "abc", volume24h: "1000000", openInterest: "500000", maxLeverage: 20,
+          sizeDecimals: null, stepSize: null, fundingHours: null, marginTiers: null,
         },
       ]),
     });
@@ -810,5 +829,47 @@ describe("validateTrade — Rule #2 numeric guards (NaN propagation rejection)",
     // Envelope must NOT carry NaN — agents JSON.parsing the output would break.
     expect(result.marketInfo?.fundingRate).toBe(0);
     expect(result.warnings.some((w) => w.includes("Funding rate unavailable"))).toBe(true);
+  });
+});
+
+// ──────────────────────────────────────────────
+// Leverage risk limit: only a STATED leverage is checked
+// ──────────────────────────────────────────────
+
+describe("validateTrade — leverage risk limit", () => {
+  // The real rule (risk.ts preTradeCheck): leverage above limits.maxLeverage (20 here) is a violation.
+  const leverageRule = (_a: unknown, _notional: number, leverage: number) =>
+    leverage > 20 ? { allowed: false, reason: `Leverage ${leverage}x exceeds max 20x` } : { allowed: true };
+  const eth50x = () => mockAdapter({
+    getMarkets: vi.fn().mockResolvedValue([
+      { symbol: "ETH", markPrice: "3000", indexPrice: "3000", fundingRate: "0.0001", volume24h: "1", openInterest: "1", maxLeverage: 50, sizeDecimals: null, stepSize: null, fundingHours: null, marginTiers: null },
+    ]),
+  });
+
+  it("no --leverage: the market maximum (50x) is NOT checked against the 20x limit (the account's own setting may be 5x)", async () => {
+    const { preTradeCheck } = await import("../risk.js");
+    vi.mocked(preTradeCheck).mockImplementation(leverageRule);
+    try {
+      const result = await validateTrade(eth50x(), { symbol: "ETH", side: "buy", size: 0.01, price: 3000, type: "limit" });
+      expect(vi.mocked(preTradeCheck).mock.calls.at(-1)?.[2]).toBe(0);
+      expect(result.checks.find(c => c.check === "risk_limits")).toMatchObject({ passed: true });
+      // The margin estimate still states the leverage it assumed.
+      expect(result.checks.find(c => c.check === "balance_sufficient")?.details).toMatchObject({ leverage: 50 });
+    } finally {
+      vi.mocked(preTradeCheck).mockReturnValue({ allowed: true });
+    }
+  });
+
+  it("--leverage 50: checked, and refused by the 20x limit", async () => {
+    const { preTradeCheck } = await import("../risk.js");
+    vi.mocked(preTradeCheck).mockImplementation(leverageRule);
+    try {
+      const result = await validateTrade(eth50x(), { symbol: "ETH", side: "buy", size: 0.01, price: 3000, type: "limit", leverage: 50 });
+      expect(vi.mocked(preTradeCheck).mock.calls.at(-1)?.[2]).toBe(50);
+      expect(result.checks.find(c => c.check === "risk_limits")).toMatchObject({ passed: false, message: "Risk violation: Leverage 50x exceeds max 20x" });
+      expect(result.valid).toBe(false);
+    } finally {
+      vi.mocked(preTradeCheck).mockReturnValue({ allowed: true });
+    }
   });
 });

@@ -1,0 +1,8 @@
+[mcp_servers.perp-cli]
+command = "npx"
+args = [
+    "-y",
+    "-p",
+    "perp-cli@latest",
+    "perp-mcp",
+]

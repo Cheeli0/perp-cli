@@ -11,6 +11,7 @@ import { existsSync, mkdirSync, rmSync } from "fs";
 import { resolve } from "path";
 import os from "os";
 import { Command } from "commander";
+import { addRootSafetyOptions } from "../../cli-flags.js";
 
 // ── Stable temp-dir for settings I/O ──────────────────────────────────────
 
@@ -20,6 +21,8 @@ vi.stubEnv("HOME", TEST_HOME);
 // ── Mock OWS loader BEFORE module imports ─────────────────────────────────
 
 const mockOws = {
+  listWallets: vi.fn((): Array<{ name: string }> => []),
+  deleteWallet: vi.fn(),
   createWallet: vi.fn(),
   createPolicy: vi.fn(),
   createApiKey: vi.fn(),
@@ -56,6 +59,7 @@ const { loadSettings, saveSettings } = await import("../../settings.js");
 
 function makeProgram() {
   const prog = new Command();
+  addRootSafetyOptions(prog);
   prog.exitOverride();
   // Register `agent` as a subcommand of `wallet` to match the production
   // command tree post-consolidation (`perp wallet agent ...`).
@@ -187,6 +191,27 @@ describe("perp agent verify", () => {
     expect(body.user).toBe("0xmaster0000000000000000000000000000000001"); // lowercase
   });
 
+  it("hyperliquid — no local agent record and no --master-address: the master address comes from the selected OWS wallet", async () => {
+    // Right after a revoke there is no agent record; the OWS master wallet is on this machine.
+    initSettings();
+    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => [] });
+    const out = await runVerify(["hyperliquid", "--json"]);
+    const json = JSON.parse(out.stdout.join(""));
+    expect(json.ok).toBe(true);
+    expect(json.data.registered).toBe(false);
+    expect(mockOws.getWallet).toHaveBeenCalledWith("main");
+    const body = JSON.parse((mockFetch.mock.calls[0][1] as RequestInit).body as string) as Record<string, unknown>;
+    expect(body).toEqual({ type: "extraAgents", user: "0xmaster0000000000000000000000000000000001" });
+  });
+
+  it("hyperliquid — no agent record and no OWS wallet selected → INVALID_PARAMS naming both ways out", async () => {
+    const out = await runVerify(["hyperliquid", "--json"]);
+    const json = JSON.parse(out.stdout.join(""));
+    expect(json.error.code).toBe("INVALID_PARAMS");
+    expect(json.error.remediation).toMatch(/--master-address 0xYOUR_ADDRESS.*--master <walletName>/);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
   // 4. HL unauth — no signature field in body
   it("hyperliquid — request body keys are exactly [type, user] (no signature)", async () => {
     initSettings();
@@ -203,15 +228,12 @@ describe("perp agent verify", () => {
     expect(keys).toEqual(["type", "user"]);
   });
 
-  // 5. PAC happy path — api_keys returned, body shape correct
-  it("pacifica happy path — registered:true, body contains type:list_api_keys", async () => {
+  // 5. PAC happy path — POST /agent/list, signed message nests data:{} (official SDK shape)
+  it("pacifica happy path — POST /agent/list, list_agent_wallets signed with data:{}, no type in body", async () => {
     initSettings();
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({
-        success: true,
-        data: { api_keys: [{ api_key: "key1", created_at: 1234 }] },
-      }),
+      json: async () => ({ success: true, data: [{ agent_wallet: "Agent1111", created_at: 1234 }] }),
     });
 
     const out = await runVerify(["pacifica", "--json", "--master", "main"]);
@@ -220,13 +242,22 @@ describe("perp agent verify", () => {
     expect(json.data.registered).toBe(true);
     expect(json.data.count).toBe(1);
 
+    const callUrl = mockFetch.mock.calls[0][0] as string;
+    expect(callUrl).toMatch(/\/agent\/list$/);
+    expect(callUrl).not.toContain("api_keys");
     const callOpts = mockFetch.mock.calls[0][1] as RequestInit;
     const body = JSON.parse(callOpts.body as string) as Record<string, unknown>;
-    expect(body.type).toBe("list_api_keys");
+    expect(Object.keys(body).sort()).toEqual(["account", "agent_wallet", "expiry_window", "signature", "timestamp"]);
     expect(body.agent_wallet).toBeNull();
     expect(body.expiry_window).toBe(5000);
     expect(typeof body.timestamp).toBe("number");
-    expect(typeof body.account).toBe("string");
+
+    // The signed bytes are exactly prepareMessage(header, {}) — the bind path's canonical form.
+    const { prepareMessage } = await import("../../pacifica/signing.js");
+    const signedHex = mockOws.signMessage.mock.calls.at(-1)![2] as string;
+    const signed = Buffer.from(signedHex, "hex").toString("utf8");
+    expect(signed).toBe(prepareMessage({ type: "list_agent_wallets", timestamp: body.timestamp as number, expiry_window: 5000 }, {}));
+    expect(signed).toBe(`{"data":{},"expiry_window":5000,"timestamp":${body.timestamp},"type":"list_agent_wallets"}`);
   });
 
   // 6. PAC — Ed25519 signature present (base58-shaped string)
@@ -234,7 +265,7 @@ describe("perp agent verify", () => {
     initSettings();
     mockFetch.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ success: true, data: { api_keys: [] } }),
+      json: async () => ({ success: true, data: [] }),
     });
 
     await runVerify(["pac", "--json", "--master", "main"]);
@@ -245,6 +276,43 @@ describe("perp agent verify", () => {
     expect((body.signature as string).length).toBeGreaterThan(0);
     // Base58 alphabet only
     expect(body.signature).toMatch(/^[123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz]+$/);
+  });
+
+  // 6b. PAC — the stored agent pubkey must be in the live list
+  it("pacifica — matches the stored agent pubkey; absent → registered:false + warning", async () => {
+    initSettings({
+      agents: {
+        pacifica: {
+          bot: {
+            agentName: "bot", agentWalletName: "agent-pac-main", agentEvmAddress: "0x0", userEvmAddress: "0x0",
+            agentSolanaAddress: "MyAgentPubkey", userSolanaAddress: "MasterSolanaPubkey11111111111111111111111",
+            masterWalletName: "main", owsApiKeyId: "", owsPolicyId: "", expiresAt: "2099-01-01T00:00:00.000Z",
+            approvedAt: "2026-01-01T00:00:00.000Z", permissions: { canPerpTrade: true, canSpotTrade: false, canWithdraw: false },
+            asterApprovalNonce: "1", status: "active", network: "mainnet",
+          },
+        },
+      },
+    });
+    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ success: true, data: [{ agent_wallet: "SomeoneElse" }] }) });
+    let out = await runVerify(["pacifica", "bot", "--json", "--master", "main"]);
+    let json = JSON.parse(out.stdout.join(""));
+    expect(json.data.registered).toBe(false);
+    expect(JSON.stringify(json)).toContain("MyAgentPubkey");
+
+    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ success: true, data: ["MyAgentPubkey"] }) });
+    out = await runVerify(["pacifica", "bot", "--json", "--master", "main"]);
+    json = JSON.parse(out.stdout.join(""));
+    expect(json.data.registered).toBe(true);
+  });
+
+  // 6c. PAC — envelope success:false is an error, not "0 agents"
+  it("pacifica — success:false envelope surfaces EXCHANGE_ERROR", async () => {
+    initSettings();
+    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ success: false, error: "signature does not match signer and canonical payload", data: null }) });
+    const out = await runVerify(["pacifica", "--json", "--master", "main"]);
+    const json = JSON.parse(out.stdout.join(""));
+    expect(json.ok).toBe(false);
+    expect(json.error.code).toBe("EXCHANGE_ERROR");
   });
 
   // 7. LT happy path — url has account_index, items returned
@@ -298,7 +366,7 @@ describe("perp agent verify", () => {
         return Promise.resolve({ ok: true, json: async () => [{ address: "0xB", validUntil: 9999, name: "b" }] });
       }
       if (typeof url === "string" && url.includes("pacifica.fi")) {
-        return Promise.resolve({ ok: true, json: async () => ({ success: true, data: { api_keys: [{ api_key: "k1" }] } }) });
+        return Promise.resolve({ ok: true, json: async () => ({ success: true, data: [{ agent_wallet: "k1" }] }) });
       }
       if (typeof url === "string" && url.includes("zklighter")) {
         return Promise.resolve({ ok: true, json: async () => ({ code: 200, api_keys: [{ api_key_index: 4, public_key: "pk1", nonce: 0, transaction_time: 100 }] }) });
@@ -331,7 +399,7 @@ describe("perp agent verify", () => {
         return Promise.resolve({ ok: true, json: async () => [] });
       }
       if (typeof url === "string" && url.includes("pacifica.fi")) {
-        return Promise.resolve({ ok: true, json: async () => ({ success: true, data: { api_keys: [] } }) });
+        return Promise.resolve({ ok: true, json: async () => ({ success: true, data: [] }) });
       }
       if (typeof url === "string" && url.includes("zklighter")) {
         return Promise.reject(new Error("network error on lighter"));

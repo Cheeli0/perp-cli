@@ -1,12 +1,17 @@
-import { Command } from "commander";
+import { Command, Option } from "commander";
+import { PerpError } from "../errors.js";
 import chalk from "chalk";
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from "fs";
+import bs58 from "bs58";
+import { existsSync, mkdirSync, readFileSync } from "fs";
+import { writeKeystoreAtomic } from "../agent-wallet/venue-keystore.js";
 import { resolve } from "path";
-import { formatUsd, makeTable, printJson, jsonOk } from "../utils.js";
-import { EXCHANGE_ENV_MAP, validateKey, loadEnvFile, setEnvVar, ENV_FILE } from "./init.js";
+import { formatUsd, makeTable, printJson, jsonOk, withJsonErrors } from "../utils.js";
+import { EXCHANGE_ENV_MAP, validateKey, loadEnvFile, ENV_FILE } from "./init.js";
+import { scrubSecretEnv } from "../secret-env.js";
 import { loadSettings, saveSettings } from "../settings.js";
-import { registerWalletAgentCommands } from "./agent.js";
+import { deprecatedPassphraseOption, registerWalletAgentCommands, warnDeprecatedPassphrase } from "./agent.js";
 import { registerWalletManageCommands } from "./manage.js";
+import { registerWalletBuilderCommands } from "./builder.js";
 import { loadOws } from "../signer/ows-loader.js";
 import type { ExchangeAdapter } from "../exchanges/index.js";
 
@@ -47,7 +52,8 @@ async function runOwsCli(args: string[], timeout = 30000): Promise<{ stdout: str
     throw new Error("OWS CLI not found. Install: curl -fsSL https://docs.openwallet.sh/install.sh | bash");
   }
 
-  const owsEnv = { ...process.env, PATH: `${pathResolve(process.env.HOME || "~", ".ows", "bin")}:${process.env.PATH}` };
+  // The OWS CLI child never receives key material (SSOT Rule #3): secret env vars are stripped.
+  const owsEnv = { ...scrubSecretEnv(process.env), PATH: `${pathResolve(process.env.HOME || "~", ".ows", "bin")}:${process.env.PATH}` };
   const proc = spawnSync(owsBin, args, { encoding: "utf-8", timeout, env: owsEnv });
 
   if (proc.error) throw new Error(`OWS CLI failed: ${proc.error.message}`);
@@ -88,7 +94,8 @@ function loadStore(): WalletStore {
 
 function saveStore(store: WalletStore) {
   ensurePerpDir();
-  writeFileSync(WALLETS_FILE, JSON.stringify(store, null, 2), { mode: 0o600 });
+  // Atomic, explicit 0600 (writeFileSync's mode is ignored when the file already exists).
+  writeKeystoreAtomic(WALLETS_FILE, JSON.stringify(store, null, 2));
 }
 
 /** Exported for smart landing page in index.ts */
@@ -226,101 +233,129 @@ async function deriveEvmAddress(key: string): Promise<string> {
   return new ethers.Wallet(pk).address;
 }
 
-// ── Legacy helpers ───────────────────────────────────────────
-
-async function _legacyGenerate(chain: string, name: string | undefined, isJson: () => boolean) {
-  if (chain === "solana") {
-    const { Keypair } = await import("@solana/web3.js");
-    const bs58 = (await import("bs58")).default;
-    const keypair = Keypair.generate();
-    const address = keypair.publicKey.toBase58();
-    const privkey = bs58.encode(keypair.secretKey);
-    const walletName = name || "default-sol";
-    const store = loadStore();
-    if (store.wallets[walletName]) { console.error(chalk.red(`\n  Wallet "${walletName}" already exists.\n`)); process.exit(1); }
-    store.wallets[walletName] = { name: walletName, type: "solana", address, privateKey: privkey, createdAt: new Date().toISOString() };
-    if (!store.active.pacifica) store.active.pacifica = walletName;
-    saveStore(store);
-    setEnvVar("PACIFICA_PRIVATE_KEY", privkey);
-    if (isJson()) return printJson(jsonOk({ name: walletName, type: "solana", address, legacy: true }));
-    console.log(chalk.yellow.bold("\n  [Legacy] Solana Wallet Generated\n"));
-    console.log(`  Name:    ${chalk.white.bold(walletName)}`);
-    console.log(`  Address: ${chalk.green(address)}`);
-    console.log(chalk.gray(`  Saved:   ~/.perp/.env + wallets.json (unencrypted)`));
-    console.log(chalk.yellow(`\n  Consider: ${chalk.cyan("perp wallet migrate")} to move to OWS vault\n`));
-  } else if (chain === "evm") {
-    const { ethers } = await import("ethers");
-    const w = ethers.Wallet.createRandom();
-    const walletName = name || "default-evm";
-    const store = loadStore();
-    if (store.wallets[walletName]) { console.error(chalk.red(`\n  Wallet "${walletName}" already exists.\n`)); process.exit(1); }
-    store.wallets[walletName] = { name: walletName, type: "evm", address: w.address, privateKey: w.privateKey, createdAt: new Date().toISOString() };
-    if (!store.active.hyperliquid) store.active.hyperliquid = walletName;
-    if (!store.active.lighter) store.active.lighter = walletName;
-    saveStore(store);
-    setEnvVar("HL_PRIVATE_KEY", w.privateKey);
-    setEnvVar("LIGHTER_PRIVATE_KEY", w.privateKey);
-    if (isJson()) return printJson(jsonOk({ name: walletName, type: "evm", address: w.address, legacy: true }));
-    console.log(chalk.yellow.bold("\n  [Legacy] EVM Wallet Generated\n"));
-    console.log(`  Name:    ${chalk.white.bold(walletName)}`);
-    console.log(`  Address: ${chalk.green(w.address)}`);
-    console.log(chalk.gray(`  Saved:   ~/.perp/.env + wallets.json (unencrypted)`));
-    console.log(chalk.yellow(`\n  Consider: ${chalk.cyan("perp wallet migrate")} to move to OWS vault\n`));
-  } else {
-    console.error(chalk.red(`\n  Unknown chain: ${chain}. Use: solana or evm\n`));
-    process.exit(1);
-  }
-}
-
-async function _legacyImport(chain: string, privateKey: string, name: string, isJson: () => boolean) {
-  if (chain === "solana") {
-    const { Keypair } = await import("@solana/web3.js");
-    const bs58 = (await import("bs58")).default;
-    let address: string, normalizedKey: string;
-    try {
-      try { const bytes = bs58.decode(privateKey); const kp = Keypair.fromSecretKey(bytes); address = kp.publicKey.toBase58(); normalizedKey = bs58.encode(kp.secretKey); }
-      catch { const arr = JSON.parse(privateKey); const kp = Keypair.fromSecretKey(Uint8Array.from(arr)); address = kp.publicKey.toBase58(); normalizedKey = bs58.encode(kp.secretKey); }
-    } catch { console.error(chalk.red("\n  Invalid Solana private key.\n")); process.exit(1); return; }
-    const store = loadStore();
-    if (store.wallets[name]) { console.error(chalk.red(`\n  Wallet "${name}" already exists.\n`)); process.exit(1); }
-    store.wallets[name] = { name, type: "solana", address, privateKey: normalizedKey, createdAt: new Date().toISOString() };
-    if (!store.active.pacifica) store.active.pacifica = name;
-    saveStore(store);
-    setEnvVar("PACIFICA_PRIVATE_KEY", normalizedKey);
-    if (isJson()) return printJson(jsonOk({ name, type: "solana", address, legacy: true }));
-    console.log(chalk.yellow.bold("\n  [Legacy] Solana Key Imported\n"));
-    console.log(`  Name:    ${chalk.white.bold(name)}`);
-    console.log(`  Address: ${chalk.green(address)}\n`);
-  } else if (chain === "evm") {
-    const { ethers } = await import("ethers");
-    const pk = privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`;
-    let address: string;
-    try { address = new ethers.Wallet(pk).address; } catch { console.error(chalk.red("\n  Invalid EVM private key.\n")); process.exit(1); return; }
-    const store = loadStore();
-    if (store.wallets[name]) { console.error(chalk.red(`\n  Wallet "${name}" already exists.\n`)); process.exit(1); }
-    store.wallets[name] = { name, type: "evm", address, privateKey: pk, createdAt: new Date().toISOString() };
-    if (!store.active.hyperliquid) store.active.hyperliquid = name;
-    if (!store.active.lighter) store.active.lighter = name;
-    saveStore(store);
-    setEnvVar("HL_PRIVATE_KEY", pk);
-    setEnvVar("LIGHTER_PRIVATE_KEY", pk);
-    if (isJson()) return printJson(jsonOk({ name, type: "evm", address, legacy: true }));
-    console.log(chalk.yellow.bold("\n  [Legacy] EVM Key Imported\n"));
-    console.log(`  Name:    ${chalk.white.bold(name)}`);
-    console.log(`  Address: ${chalk.green(address)}\n`);
-  } else {
-    console.error(chalk.red(`\n  Unknown chain: ${chain}. Use: solana or evm\n`));
-    process.exit(1);
-  }
+/** `--legacy` (raw keys written to ~/.perp/.env + wallets.json) was removed — SSOT Rule #3. */
+function legacyWriteRemoved(cmd: "generate" | "import"): PerpError {
+  return new PerpError("INVALID_PARAMS", `wallet ${cmd} --legacy was removed: it wrote raw private keys to ~/.perp/.env and wallets.json`, {
+    remediation: cmd === "generate"
+      ? "Run: perp wallet generate [name] (OWS encrypted vault). Existing ~/.perp/.env keys keep working; move them with perp wallet set <exchange>"
+      : "Run: perp wallet import --name <name> [--chain evm|solana|dual] (key via hidden prompt or stdin) or perp wallet set <exchange>",
+  });
 }
 
 // ── Commands ──────────────────────────────────────────────────
+
+/** Key material accepted by importOwsWallet (mirrors `wallet import` input modes). */
+export type OwsImportInput =
+  | { kind: "mnemonic"; mnemonic: string }
+  | { kind: "dual"; evm: string; solana: string }
+  | { kind: "single"; key: string; chain: string };
+
+/**
+ * Solana key normalization: OWS SDK expects 32-byte hex secret. Phantom
+ * exports base58 (88 chars, 64-byte keypair = secret + public). Auto-detect
+ * base58/JSON-array/hex and normalize to 32-byte hex secret.
+ */
+export function normalizeSolanaKey(input: string): string {
+  const s = input.trim();
+  // Already hex (with optional 0x prefix)
+  const hexNoPrefix = s.startsWith("0x") ? s.slice(2) : s;
+  if (/^[0-9a-fA-F]{64}$/.test(hexNoPrefix)) return hexNoPrefix;
+  if (/^[0-9a-fA-F]{128}$/.test(hexNoPrefix)) {
+    return hexNoPrefix.slice(0, 64);  // 64-byte keypair → first 32 bytes secret
+  }
+  // JSON byte array
+  if (s.startsWith("[")) {
+    let arr: number[];
+    try {
+      arr = JSON.parse(s) as number[];
+    } catch {
+      // Never surface the parser message: V8 echoes the input (the secret) in it.
+      throw new Error("Invalid Solana JSON byte array (not valid JSON)");
+    }
+    if (arr.length === 64) return Buffer.from(arr.slice(0, 32)).toString("hex");
+    if (arr.length === 32) return Buffer.from(arr).toString("hex");
+    throw new Error(`Invalid Solana JSON byte array length: ${arr.length} (expected 32 or 64)`);
+  }
+  // base58 (Phantom export — typically 87-88 chars for 64-byte keypair)
+  try {
+    const decoded = bs58.decode(s);
+    if (decoded.length === 64) return Buffer.from(decoded.slice(0, 32)).toString("hex");
+    if (decoded.length === 32) return Buffer.from(decoded).toString("hex");
+    throw new Error(`Invalid Solana base58 byte length: ${decoded.length} (expected 32 or 64)`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`Invalid Solana key — expected hex (64 chars), base58 (Phantom export), or JSON byte array. Inner: ${msg}`);
+  }
+}
+
+/**
+ * Import key material into the OWS vault as wallet `name` — the single import
+ * path shared by `wallet import` and `perp setup`. Never logs key material.
+ */
+/**
+ * Strip secret material from an error message before it is shown/logged: the exact secret
+ * strings plus any long hex / base58 / byte-array run (keys never reach output — Rule #3).
+ */
+export function redactSecrets(message: string, secrets: readonly string[]): string {
+  let out = message;
+  for (const sec of secrets) {
+    const t = sec.trim();
+    for (const v of [t, t.replace(/^0x/i, "")]) if (v.length >= 8) out = out.split(v).join("[redacted]");
+  }
+  return out
+    .replace(/(0x)?[0-9a-fA-F]{32,}/g, "[redacted]")
+    .replace(/[1-9A-HJ-NP-Za-km-z]{40,}/g, "[redacted]")
+    .replace(/\[\s*\d{1,3}(\s*,\s*\d{1,3}){7,}[^\]]*\]?/g, "[redacted]");
+}
+
+/** Read all of a piped (non-TTY) stdin. */
+function readAllStdin(): Promise<string> {
+  return new Promise((resolveRead, reject) => {
+    const chunks: string[] = [];
+    process.stdin.setEncoding("utf-8");
+    process.stdin.on("data", (c: string | Buffer) => chunks.push(typeof c === "string" ? c : c.toString("utf-8")));
+    process.stdin.on("end", () => resolveRead(chunks.join("")));
+    process.stdin.on("error", reject);
+  });
+}
+
+export async function importOwsWallet(name: string, passphrase: string, input: OwsImportInput) {
+  const secrets = input.kind === "mnemonic" ? [input.mnemonic] : input.kind === "dual" ? [input.evm, input.solana] : [input.key];
+  try {
+    return importOwsWalletRaw(name, passphrase, input);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new PerpError("INVALID_PARAMS", `Import failed: ${redactSecrets(msg, secrets)}`, {
+      remediation: "Check the key / mnemonic format and retry (the input is never echoed)",
+    });
+  }
+}
+
+function importOwsWalletRaw(name: string, passphrase: string, input: OwsImportInput) {
+  const ows = loadOws();
+  if (input.kind === "mnemonic") return ows.importWalletMnemonic(name, input.mnemonic, passphrase);
+  if (input.kind === "dual") {
+    // Dual-curve: both explicit keys (OWS 1.3+ API — both must be present)
+    return ows.importWalletPrivateKey(
+      name,
+      "",        // ignored when both secp256k1Key and ed25519Key are provided
+      passphrase,
+      undefined,
+      undefined,
+      input.evm,
+      normalizeSolanaKey(input.solana),
+    );
+  }
+  const key = input.chain === "solana" ? normalizeSolanaKey(input.key) : input.key;
+  return ows.importWalletPrivateKey(name, key, passphrase, undefined, input.chain);
+}
 
 export function registerWalletCommands(
   program: Command,
   isJson: () => boolean,
   getAdapter?: () => Promise<ExchangeAdapter>,
   getPacificaAdapter?: () => unknown,
+  getAdapterForExchange?: (exchange: string) => Promise<ExchangeAdapter>,
 ) {
   const wallet = program.command("wallet").description("Wallet management & on-chain balances");
 
@@ -331,12 +366,12 @@ export function registerWalletCommands(
     .description("Generate a new wallet (OWS encrypted vault, multi-chain)")
     .option("--words <count>", "Mnemonic word count (12 or 24)", "12")
     .option("--show-mnemonic", "Display the mnemonic phrase (CAUTION)")
-    .option("--passphrase <pp>", "Master OWS passphrase (fallback: OWS_PASSPHRASE env / stdin)")
-    .option("--legacy <chain>", "Legacy mode: generate solana or evm key (unencrypted)")
+    .addOption(deprecatedPassphraseOption()).hook("preAction", warnDeprecatedPassphrase)
+    .addOption(new Option("--legacy <chain>", "Removed — refused (raw keys are never written to ~/.perp/.env)").hideHelp())
     .action(async (name: string | undefined, opts: { words: string; showMnemonic?: boolean; passphrase?: string; legacy?: string }, command: Command) => {
-      // Legacy mode for backward compat
-      if (opts.legacy) {
-        return _legacyGenerate(opts.legacy, name, isJson);
+      if (opts.legacy !== undefined) {
+        await withJsonErrors(isJson(), async () => { throw legacyWriteRemoved("generate"); });
+        return;
       }
 
       const walletName = name || "default";
@@ -409,118 +444,71 @@ export function registerWalletCommands(
   // exports base58 (88 chars, 64-byte keypair = secret + public). Auto-detect
   // base58/JSON-array/hex and normalize to 32-byte hex secret.
 
+  // SSOT Rule #3: keys are never accepted on argv (shell history / process list) —
+  // hidden TTY prompt or stdin pipe only, matching `wallet set`.
   wallet
     .command("import [privateKey]")
-    .description("Import a private key into OWS encrypted vault (use --evm/--solana to import both curves at once)")
+    .description("Import a private key or mnemonic into the OWS encrypted vault (key via hidden prompt or stdin — never argv)")
     .option("--name <name>", "Wallet alias name", "imported")
-    .option("--chain <chain>", "Key type for positional <privateKey>: evm (default) or solana", "evm")
-    .option("--evm <hex>", "EVM (secp256k1) private key — use with --solana to import both curves")
-    .option("--solana <key>", "Solana (ed25519) private key — accepts hex (64), base58 (Phantom export), or JSON byte array. Use with --evm to import both curves")
-    .option("--mnemonic", "Import as mnemonic phrase instead of private key")
-    .option("--passphrase <pp>", "Master OWS passphrase (fallback: OWS_PASSPHRASE env / stdin)")
-    .option("--legacy <chain>", "Legacy mode: import to wallets.json (solana or evm)")
-    .action(async (privateKey: string | undefined, opts: { name: string; chain: string; evm?: string; solana?: string; mnemonic?: boolean; passphrase?: string; legacy?: string }, command: Command) => {
-      // Legacy mode (positional only)
-      if (opts.legacy) {
-        if (!privateKey) {
-          const msg = "--legacy mode requires a positional <privateKey>";
-          if (isJson()) { const { jsonError } = await import("../utils.js"); return printJson(jsonError("OWS_ERROR", msg)); }
-          console.error(chalk.red(`\n  Error: ${msg}\n`));
-          process.exit(1);
+    .option("--chain <chain>", "Key type: evm (default), solana, or dual (EVM + Solana keys: two prompts, or two stdin lines EVM first)", "evm")
+    .option("--mnemonic", "Import a mnemonic phrase instead of a private key")
+    .addOption(deprecatedPassphraseOption()).hook("preAction", warnDeprecatedPassphrase)
+    .addOption(new Option("--evm <hex>", "Removed — refused (key on argv); use --chain evm|dual").hideHelp())
+    .addOption(new Option("--solana <key>", "Removed — refused (key on argv); use --chain solana|dual").hideHelp())
+    .addOption(new Option("--legacy <chain>", "Removed — refused (raw keys are never written to ~/.perp/.env)").hideHelp())
+    .action(async (argvKey: string | undefined, opts: { name: string; chain: string; mnemonic?: boolean; passphrase?: string; evm?: string; solana?: string; legacy?: string }, command: Command) => {
+      await withJsonErrors(isJson(), async () => {
+        if (opts.legacy !== undefined) throw legacyWriteRemoved("import");
+        if (argvKey !== undefined || opts.evm !== undefined || opts.solana !== undefined) {
+          throw new PerpError("INVALID_PARAMS", "Refusing a private key / mnemonic on the command line: it is visible in shell history and the process list", {
+            remediation: "Enter it at the hidden prompt (perp wallet import --name <name> [--chain evm|solana|dual] [--mnemonic]) or pipe it on stdin (e.g. pbpaste | OWS_PASSPHRASE=... perp wallet import --name <name>). Clear the key from your shell history.",
+          });
         }
-        return _legacyImport(opts.legacy, privateKey, opts.name, isJson);
-      }
+        const chain = opts.chain;
+        if (chain !== "evm" && chain !== "solana" && chain !== "dual") {
+          throw new PerpError("INVALID_PARAMS", `Unknown --chain "${chain}"`, { remediation: "Use --chain evm, solana, or dual" });
+        }
+        if (opts.mnemonic && chain !== "evm") {
+          throw new PerpError("INVALID_PARAMS", "--mnemonic derives every chain itself and cannot be combined with --chain solana|dual", {
+            remediation: "Drop --chain: perp wallet import --mnemonic --name <name>",
+          });
+        }
 
-      // Validation: input mode is exactly one of (positional | --evm/--solana flags | mnemonic)
-      const hasPositional = !!privateKey;
-      const hasFlagKeys = !!(opts.evm || opts.solana);
-      if (!hasPositional && !hasFlagKeys) {
-        const msg = "Provide a <privateKey> argument OR --evm/--solana flag(s)";
-        if (isJson()) { const { jsonError } = await import("../utils.js"); return printJson(jsonError("OWS_ERROR", msg)); }
-        console.error(chalk.red(`\n  Error: ${msg}\n`));
-        process.exit(1);
-      }
-      if (hasPositional && hasFlagKeys) {
-        const msg = "Cannot mix positional <privateKey> with --evm/--solana flags. Use one input style.";
-        if (isJson()) { const { jsonError } = await import("../utils.js"); return printJson(jsonError("OWS_ERROR", msg)); }
-        console.error(chalk.red(`\n  Error: ${msg}\n`));
-        process.exit(1);
-      }
-      if (opts.mnemonic && hasFlagKeys) {
-        const msg = "--mnemonic cannot be combined with --evm/--solana";
-        if (isJson()) { const { jsonError } = await import("../utils.js"); return printJson(jsonError("OWS_ERROR", msg)); }
-        console.error(chalk.red(`\n  Error: ${msg}\n`));
-        process.exit(1);
-      }
-
-      try {
-        const ows = loadOws();
-
-        // Auto-normalize Solana keys: accept hex / base58 (Phantom) / JSON byte array
-        const bs58 = (await import("bs58")).default;
-        const normalizeSolana = (input: string): string => {
-          const s = input.trim();
-          // Already hex (with optional 0x prefix)
-          const hexNoPrefix = s.startsWith("0x") ? s.slice(2) : s;
-          if (/^[0-9a-fA-F]{64}$/.test(hexNoPrefix)) return hexNoPrefix;
-          if (/^[0-9a-fA-F]{128}$/.test(hexNoPrefix)) {
-            return hexNoPrefix.slice(0, 64);  // 64-byte keypair → first 32 bytes secret
-          }
-          // JSON byte array
-          if (s.startsWith("[")) {
-            const arr = JSON.parse(s) as number[];
-            if (arr.length === 64) return Buffer.from(arr.slice(0, 32)).toString("hex");
-            if (arr.length === 32) return Buffer.from(arr).toString("hex");
-            throw new Error(`Invalid Solana JSON byte array length: ${arr.length} (expected 32 or 64)`);
-          }
-          // base58 (Phantom export — typically 87-88 chars for 64-byte keypair)
-          try {
-            const decoded = bs58.decode(s);
-            if (decoded.length === 64) return Buffer.from(decoded.slice(0, 32)).toString("hex");
-            if (decoded.length === 32) return Buffer.from(decoded).toString("hex");
-            throw new Error(`Invalid Solana base58 byte length: ${decoded.length} (expected 32 or 64)`);
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            throw new Error(`Invalid Solana key — expected hex (64 chars), base58 (Phantom export), or JSON byte array. Inner: ${msg}`);
-          }
-        };
-
-        // Resolve vault passphrase via the standard 3-path resolver (--passphrase
-        // > OWS_PASSPHRASE env > stdin pipe). When stdin is a TTY and nothing was
-        // provided, the resolver returns null; fall back to "" to preserve the
-        // historical "no passphrase" default for interactive use.
-        //
-        // optsWithGlobals() merges parent + subcommand options — see the
-        // wallet generate action for context. Without it, the parent program's
-        // --passphrase shadows the subcommand's same-named flag.
-        const merged = command.optsWithGlobals();
-        const { resolvePassphrase } = await import("../agent-wallet/passphrase.js");
-        const pp = (await resolvePassphrase({ flag: merged.passphrase ?? opts.passphrase })) ?? "";
-
-        let w;
-        if (opts.mnemonic) {
-          w = ows.importWalletMnemonic(opts.name, privateKey!, pp);
-        } else if (opts.evm && opts.solana) {
-          // Dual-curve: both explicit keys (OWS 1.3+ API — both must be present)
-          w = ows.importWalletPrivateKey(
-            opts.name,
-            "",        // ignored when both secp256k1Key and ed25519Key are provided
-            pp,
-            undefined,
-            undefined,
-            opts.evm,
-            normalizeSolana(opts.solana),
-          );
-        } else if (opts.evm) {
-          // Single EVM via flag — same as positional + --chain evm
-          w = ows.importWalletPrivateKey(opts.name, opts.evm, pp, undefined, "evm");
-        } else if (opts.solana) {
-          // Single Solana via flag — same as positional + --chain solana
-          w = ows.importWalletPrivateKey(opts.name, normalizeSolana(opts.solana), pp, undefined, "solana");
+        const { promptHidden } = await import("./agent.js");
+        const piped = process.stdin.isTTY !== true;
+        const labels = opts.mnemonic ? ["mnemonic phrase"] : chain === "dual" ? ["EVM private key", "Solana private key"] : [`${chain === "evm" ? "EVM" : "Solana"} private key`];
+        let secrets: string[];
+        if (piped) {
+          const lines = (await readAllStdin()).split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+          secrets = opts.mnemonic ? [lines.join(" ")] : lines;
         } else {
-          const keyArg = opts.chain === "solana" ? normalizeSolana(privateKey!) : privateKey!;
-          w = ows.importWalletPrivateKey(opts.name, keyArg, pp, undefined, opts.chain);
+          secrets = [];
+          for (const label of labels) secrets.push((await promptHidden(`${label} (hidden): `)).trim());
         }
+        if (secrets.length !== labels.length || secrets.some(x => x.length === 0)) {
+          throw new PerpError("INVALID_PARAMS", `Expected ${labels.join(" + ")} on stdin / at the prompt (${labels.length === 2 ? "two lines, EVM first" : "one line"}); received ${secrets.filter(x => x.length > 0).length}`, {
+            remediation: "Enter it at the hidden prompt, or pipe it: pbpaste | OWS_PASSPHRASE=... perp wallet import --name <name>",
+          });
+        }
+
+        // Vault passphrase: --passphrase > OWS_PASSPHRASE > hidden prompt. Piped stdin
+        // carries the key, so a non-interactive run must name the passphrase explicitly.
+        // optsWithGlobals(): the root program's --passphrase shadows the subcommand's.
+        const flagPp = (command.optsWithGlobals() as { passphrase?: string }).passphrase;
+        let pp: string;
+        if (flagPp !== undefined) pp = flagPp;
+        else if ("OWS_PASSPHRASE" in process.env) pp = process.env.OWS_PASSPHRASE ?? "";
+        else if (!piped) pp = await promptHidden("OWS vault passphrase (hidden, empty = none): ");
+        else {
+          throw new PerpError("PASSPHRASE_REQUIRED", "stdin carries the key, so the vault passphrase must come from OWS_PASSPHRASE or --passphrase", {
+            remediation: `pbpaste | OWS_PASSPHRASE="$PP" perp wallet import --name ${opts.name}  (use OWS_PASSPHRASE= for an unencrypted vault wallet)`,
+          });
+        }
+
+        const w = await importOwsWallet(opts.name, pp,
+          opts.mnemonic ? { kind: "mnemonic", mnemonic: secrets[0] }
+            : chain === "dual" ? { kind: "dual", evm: secrets[0], solana: secrets[1] }
+              : { kind: "single", key: secrets[0], chain });
 
         // Set as active wallet if none set
         const { loadSettings: ls, saveSettings: ss } = await import("../settings.js");
@@ -545,15 +533,7 @@ export function registerWalletCommands(
           console.log(chalk.cyan(`  Active: yes (used by all exchanges)`));
         }
         console.log();
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        if (isJson()) {
-          const { jsonError } = await import("../utils.js");
-          return printJson(jsonError("OWS_ERROR", msg));
-        }
-        console.error(chalk.red(`\n  Error: ${msg}\n`));
-        process.exit(1);
-      }
+      });
     });
 
   // ── use (set active wallet — OWS first, legacy fallback) ──
@@ -594,7 +574,7 @@ export function registerWalletCommands(
       if (!entry) {
         console.error(chalk.red(`\n  Wallet "${name}" not found in OWS vault or legacy store.\n`));
         console.error(chalk.gray(`  Create: perp wallet generate ${name}`));
-        console.error(chalk.gray(`  Import: perp wallet import <key> -n ${name}\n`));
+        console.error(chalk.gray(`  Import: perp wallet import --name ${name}  (hidden prompt / stdin)\n`));
         process.exit(1);
       }
 
@@ -611,89 +591,94 @@ export function registerWalletCommands(
       console.log(chalk.yellow(`  Note: consider migrating to OWS: perp wallet migrate\n`));
     });
 
-  // ── set (configure exchange key → ~/.perp/.env) ──
+  // ── set (import an exchange key into the OWS vault → active wallet) ──
+  //
+  // SSOT Rule #3: the key goes into the encrypted OWS vault, never ~/.perp/.env,
+  // and never via argv (shell history / process list). Input: hidden TTY prompt,
+  // or stdin pipe. Keys already in a legacy ~/.perp/.env keep working (read path unchanged).
 
   wallet
-    .command("set <exchange> <key>")
-    .description("Set private key for an exchange")
+    .command("set <exchange> [key]")
+    .description("Import an exchange private key into the OWS vault and make it the active wallet (key via hidden prompt or stdin — never argv)")
+    .option("--name <name>", "OWS wallet name (default: the exchange id, e.g. hyperliquid)")
     .option("--default", "Also set as default exchange")
-    .action(async (exchange: string, key: string, opts: { default?: boolean }) => {
-      // Resolve alias (hl → hyperliquid, pac → pacifica, lt → lighter, ast → aster)
-      const aliases: Record<string, string> = { hl: "hyperliquid", pac: "pacifica", lt: "lighter", ast: "aster" };
-      const resolved = aliases[exchange.toLowerCase()] || exchange.toLowerCase();
-
-      const info = EXCHANGE_ENV_MAP[resolved];
-
-      if (!info) {
-        if (isJson()) {
-          const { jsonError } = await import("../utils.js");
-          return printJson(jsonError("INVALID_PARAMS", `Unknown exchange: ${exchange}. Use: pacifica, hyperliquid, lighter, aster (or hl, pac, lt, ast).`));
+    .action(async (exchange: string, argvKey: string | undefined, opts: { name?: string; default?: boolean }, command: Command) => {
+      await withJsonErrors(isJson(), async () => {
+        if (argvKey !== undefined) {
+          throw new PerpError("INVALID_PARAMS", "Refusing a private key on the command line: it is visible in shell history and the process list", {
+            remediation: `Enter it at the hidden prompt (perp wallet set ${exchange}) or pipe it on stdin (e.g. pbpaste | OWS_PASSPHRASE=... perp wallet set ${exchange}). Clear the key from your shell history.`,
+          });
         }
-        console.error(chalk.red(`\n  Unknown exchange: ${exchange}`));
-        console.error(chalk.gray(`  Use: pacifica, hyperliquid, lighter, aster (or hl, pac, lt, ast).\n`));
-        process.exit(1);
-      }
-
-      const { valid, address } = await validateKey(info.chain, key);
-      if (!valid) {
-        if (isJson()) {
-          const { jsonError } = await import("../utils.js");
-          return printJson(jsonError("INVALID_PARAMS", `Invalid ${info.chain} private key`));
+        // Resolve alias (hl → hyperliquid, pac → pacifica, lt → lighter, ast → aster)
+        const aliases: Record<string, string> = { hl: "hyperliquid", pac: "pacifica", lt: "lighter", ast: "aster" };
+        const resolved = aliases[exchange.toLowerCase()] || exchange.toLowerCase();
+        const info = EXCHANGE_ENV_MAP[resolved];
+        if (!info) {
+          throw new PerpError("INVALID_PARAMS", `Unknown exchange: ${exchange}`, {
+            remediation: "Use: pacifica, hyperliquid, lighter, aster (or hl, pac, lt, ast). Lighter RH / Ondo / Arcus use: perp wallet agent approve <lighter-rh|ondo|arcus>; QFEX: perp wallet agent import qfex.",
+          });
         }
-        console.error(chalk.red(`\n  Invalid ${info.chain} private key.\n`));
-        process.exit(1);
-      }
 
-      const normalized = info.chain === "evm"
-        ? (key.startsWith("0x") ? key : `0x${key}`)
-        : key;
+        const { promptHidden } = await import("./agent.js");
+        const piped = process.stdin.isTTY !== true;
+        const key = (piped ? await readAllStdin() : await promptHidden(`${resolved} private key (hidden): `)).trim();
+        if (!key) {
+          throw new PerpError("INVALID_PARAMS", "No private key received", {
+            remediation: `Enter it at the hidden prompt, or pipe it: pbpaste | perp wallet set ${exchange}`,
+          });
+        }
+        const { valid, address } = await validateKey(info.chain, key);
+        if (!valid) {
+          throw new PerpError("INVALID_PARAMS", `Invalid ${info.chain} private key`, {
+            remediation: info.chain === "evm" ? "Expected 32-byte hex (0x-prefixed or not)" : "Expected a Solana secret key (base58, hex, or JSON byte array)",
+          });
+        }
 
-      setEnvVar(info.envKey, normalized);
+        // Vault passphrase: --passphrase > OWS_PASSPHRASE > hidden prompt. Piped stdin
+        // carries the key, so a non-interactive run must name the passphrase explicitly.
+        const flagPp = (command.optsWithGlobals() as { passphrase?: string }).passphrase;
+        let passphrase: string;
+        if (flagPp !== undefined) passphrase = flagPp;
+        else if ("OWS_PASSPHRASE" in process.env) passphrase = process.env.OWS_PASSPHRASE ?? "";
+        else if (!piped) passphrase = await promptHidden("OWS vault passphrase (hidden, empty = none): ");
+        else {
+          throw new PerpError("PASSPHRASE_REQUIRED", "stdin carries the key, so the vault passphrase must come from OWS_PASSPHRASE or --passphrase", {
+            remediation: `pbpaste | OWS_PASSPHRASE="$PP" perp wallet set ${exchange}  (use OWS_PASSPHRASE= for an unencrypted vault wallet)`,
+          });
+        }
 
-      if (opts.default) {
+        const name = opts.name ?? resolved;
+        const w = await importOwsWallet(name, passphrase, {
+          kind: "single",
+          key: info.chain === "evm" && !key.startsWith("0x") ? `0x${key}` : key,
+          chain: info.chain,
+        });
+
         const settings = loadSettings();
-        settings.defaultExchange = resolved;
+        const previousActiveWallet = settings.owsActiveWallet || null;
+        settings.owsActiveWallet = name;
+        if (opts.default) settings.defaultExchange = resolved;
         saveSettings(settings);
-      }
 
-      // Auto-setup Lighter API key if setting lighter PK
-      let lighterApiSetup: { apiKey?: string; accountIndex?: number; error?: string } = {};
-      if (resolved === "lighter") {
-        try {
-          const { LighterAdapter } = await import("../exchanges/lighter.js");
-          const adapter = new LighterAdapter(normalized);
-          await adapter.init();
-          const apiKeyIndex = 4;
-          const { privateKey: apiKey } = await adapter.setupApiKey(apiKeyIndex);
-          // SSOT Rule #3: persist L2 key in encrypted keystore.
-          // accountIndex/apiKeyIndex live in settings.agents.lighter and don't
-          // need env duplication.
-          const { saveLighterKey } = await import("../agent-wallet/lighter-keystore.js");
-          saveLighterKey(adapter.accountIndex, apiKeyIndex, apiKey, "");
-          lighterApiSetup = { apiKey, accountIndex: adapter.accountIndex };
-        } catch (e) {
-          lighterApiSetup = { error: e instanceof Error ? e.message : String(e) };
+        // No implicit Lighter API-key registration here (it signed a mainnet ChangePubKey on slot 4
+        // and echoed the L2 key): trading needs an explicit `perp wallet agent approve lighter`.
+        const lighterNextStep = "perp wallet agent approve lighter";
+
+        if (isJson()) return printJson(jsonOk({
+          exchange: resolved, address, owsWallet: w.name, activeWallet: name, previousActiveWallet, default: !!opts.default,
+          ...(resolved === "lighter" && { lighterApiKey: { registered: false, nextStep: lighterNextStep } }),
+        }));
+
+        console.log(chalk.green(`\n  ${resolved} key imported into the OWS vault.`));
+        console.log(`  Address:  ${chalk.green(address)}`);
+        console.log(`  Wallet:   ${chalk.white.bold(w.name)} ${chalk.gray("(encrypted in ~/.ows/)")}`);
+        console.log(`  Active:   ${chalk.cyan(name)} (used by all exchanges)${previousActiveWallet && previousActiveWallet !== name ? chalk.yellow(` — was ${previousActiveWallet}; switch back: perp wallet use ${previousActiveWallet}`) : ""}`);
+        if (opts.default) console.log(`  Default:  ${chalk.cyan(resolved)}`);
+        if (resolved === "lighter") {
+          console.log(chalk.yellow(`  API Key:  not registered — to trade, run: ${lighterNextStep}`));
         }
-      }
-
-      if (isJson()) return printJson(jsonOk({
-        exchange: resolved, address, envFile: ENV_FILE, default: !!opts.default,
-        ...(resolved === "lighter" && { lighterApiKey: lighterApiSetup }),
-      }));
-
-      console.log(chalk.green(`\n  ${resolved} configured.`));
-      console.log(`  Address:  ${chalk.green(address)}`);
-      console.log(`  Saved to: ${chalk.gray("~/.perp/.env")}`);
-      if (opts.default) console.log(`  Default:  ${chalk.cyan(resolved)}`);
-      if (resolved === "lighter") {
-        if (lighterApiSetup.apiKey) {
-          console.log(chalk.green(`  API Key:  auto-registered (index: ${lighterApiSetup.accountIndex})`));
-        } else {
-          console.log(chalk.yellow(`  API Key:  setup failed — ${lighterApiSetup.error}`));
-          console.log(chalk.gray(`  You can retry: perp wallet agent approve lighter`));
-        }
-      }
-      console.log();
+        console.log();
+      });
     });
 
   // ── show (show configured exchanges with public addresses) ──
@@ -789,14 +774,18 @@ export function registerWalletCommands(
       if (isJson()) {
         return printJson(jsonOk({
           ows: { wallets: owsWallets, active: activeOwsWallet },
-          legacy: { wallets: store.wallets, active: store.active },
+          // Public fields only — wallets.json entries hold raw private keys (never printed).
+          legacy: {
+            wallets: Object.fromEntries(Object.entries(store.wallets).map(([k, w]) => [k, { name: w.name, type: w.type, address: w.address, createdAt: w.createdAt }])),
+            active: store.active,
+          },
         }));
       }
 
       if (owsWallets.length === 0 && legacyEntries.length === 0) {
         console.log(chalk.gray("\n  No wallets found."));
         console.log(chalk.gray(`  Create: ${chalk.cyan("perp wallet generate [name]")}`));
-        console.log(chalk.gray(`  Import: ${chalk.cyan("perp wallet import <key>")}\n`));
+        console.log(chalk.gray(`  Import: ${chalk.cyan("perp wallet import --name <name>")}\n`));
         return;
       }
 
@@ -963,8 +952,50 @@ export function registerWalletCommands(
           .map(([ex, wn]) => ({ exchange: ex, ...store.wallets[wn] }))
           .filter((e) => e.address);
 
-        // Fallback to .env-based wallets when no named wallets are active
+        // OWS-aware path: vault-based setups have no legacy `active` mapping
+        // (it's empty by design — owsActiveWallet replaces per-exchange
+        // active wallets). Fetch on-chain balances for both EVM and Solana
+        // accounts of the active OWS vault BEFORE falling through to the
+        // legacy .env path.
         if (activeEntries.length === 0) {
+          const settings = loadSettings();
+          if (settings.owsActiveWallet) {
+            try {
+              const { loadOws } = await import("../signer/ows-loader.js");
+              const ows = loadOws();
+              const owsWallet = ows.getWallet(settings.owsActiveWallet);
+              const owsResults: { wallet: string; chain: "evm" | "solana"; address: string; balances: unknown }[] = [];
+              for (const acct of owsWallet.accounts) {
+                const isEvm = (acct as { chainId: string }).chainId.startsWith("eip155:");
+                const isSol = (acct as { chainId: string }).chainId.startsWith("solana:");
+                if (!isEvm && !isSol) continue;
+                const address = (acct as { address: string }).address;
+                const balances = isSol
+                  ? await getSolanaBalances(address, opts.testnet)
+                  : await getEvmBalances(address, opts.testnet);
+                if (isJson()) {
+                  owsResults.push({
+                    wallet: settings.owsActiveWallet,
+                    chain: isSol ? "solana" : "evm",
+                    address,
+                    balances,
+                  });
+                } else {
+                  console.log(chalk.cyan.bold(`\n  ${settings.owsActiveWallet} (${isSol ? "solana" : "evm"} ${address.slice(0, 8)}...)`));
+                  const rows = balances.map((b) => [
+                    chalk.white.bold(b.token), b.balance, b.usdValue || chalk.gray("-"),
+                  ]);
+                  console.log(makeTable(["Token", "Balance", "USD Value"], rows));
+                }
+              }
+              if (isJson()) printJson(jsonOk(owsResults));
+              else console.log();
+              return;
+            } catch {
+              // OWS module unavailable or vault missing — fall through to env path
+            }
+          }
+
           const stored = loadEnvFile();
           const envEntries: { exchange: string; chain: "solana" | "evm"; address: string }[] = [];
           for (const [exchange, info] of Object.entries(EXCHANGE_ENV_MAP)) {
@@ -978,9 +1009,9 @@ export function registerWalletCommands(
 
           if (envEntries.length === 0) {
             if (isJson()) {
-              printJson({ ok: false, error: { code: "INVALID_PARAMS", message: "No wallets configured. Run 'perp setup' or 'perp wallet set <exchange> <key>'." }, meta: { timestamp: new Date().toISOString() } });
+              printJson({ ok: false, error: { code: "INVALID_PARAMS", message: "No wallets configured. Run 'perp setup' or 'perp wallet set <exchange>'." }, meta: { timestamp: new Date().toISOString() } });
             } else {
-              console.error(chalk.gray("\n  No wallets configured. Run 'perp setup' or 'perp wallet set <exchange> <key>'.\n"));
+              console.error(chalk.gray("\n  No wallets configured. Run 'perp setup' or 'perp wallet set <exchange>'.\n"));
             }
             process.exit(1);
           }
@@ -1101,7 +1132,7 @@ export function registerWalletCommands(
           ows.importWalletPrivateKey(entry.name, pk, "", undefined, chain);
           results.push({ name: entry.name, status: "migrated" });
         } catch (e) {
-          results.push({ name: entry.name, status: "failed", error: e instanceof Error ? e.message : String(e) });
+          results.push({ name: entry.name, status: "failed", error: redactSecrets(e instanceof Error ? e.message : String(e), [entry.privateKey]) });
         }
       }
 
@@ -1283,7 +1314,7 @@ export function registerWalletCommands(
     .requiredOption("--wallets <names>", "Comma-separated OWS wallet names")
     .option("--policy <ids>", "Comma-separated policy IDs to enforce")
     .option("--expires <iso>", "Key expiry (ISO-8601)")
-    .option("-p, --passphrase <pass>", "Vault passphrase", "")
+    .addOption(deprecatedPassphraseOption("Vault passphrase", "-p, --passphrase <pass>").default("")).hook("preAction", warnDeprecatedPassphrase)
     .action(async (opts: { name: string; wallets: string; policy?: string; expires?: string; passphrase: string }, command: Command) => {
       try {
         const o = loadOws();
@@ -1395,7 +1426,8 @@ export function registerWalletCommands(
 
         // Call OWS CLI subprocess for native MoonPay deposit
         // OWS CLI writes addresses to stderr, URL to stdout
-        const owsEnv = { ...process.env, PATH: `${pathResolve(process.env.HOME || "~", ".ows", "bin")}:${process.env.PATH}` };
+        // The OWS CLI child never receives key material (SSOT Rule #3): secret env vars are stripped.
+        const owsEnv = { ...scrubSecretEnv(process.env), PATH: `${pathResolve(process.env.HOME || "~", ".ows", "bin")}:${process.env.PATH}` };
         try {
           const { spawnSync } = await import("child_process");
           const proc = spawnSync(owsBin, ["fund", "deposit", "--wallet", walletName, "--chain", chain], {
@@ -1453,7 +1485,7 @@ export function registerWalletCommands(
   wallet
     .command("setup")
     .description("One-click setup: create wallet + guardrail policy + agent API key")
-    .option("-n, --name <name>", "Wallet name", "perp-trading")
+    .option("--name <name>", "Wallet name", "perp-trading")
     .option("--max-tx-usd <amount>", "Max per-transaction USD", "1000")
     .option("--max-daily-usd <amount>", "Max daily spending USD", "5000")
     .option("--skip-key", "Skip API key creation")
@@ -1631,6 +1663,9 @@ export function registerWalletCommands(
   // NOTE: Distinct from `wallet key` (OWS API token) and `wallet policy`
   // (OWS guardrail). See runOwsCli comment above for the three-way split.
   registerWalletAgentCommands(wallet, isJson);
+
+  // ── Builder fees (off by default; settings builder.<venue>) ──
+  registerWalletBuilderCommands(wallet, isJson, getAdapterForExchange ?? null);
 
   // ── Manage (per-DEX exchange settings — Pacifica + Lighter) ──────────
   // Absorbed from former top-level `perp manage`. Holds exchange-specific

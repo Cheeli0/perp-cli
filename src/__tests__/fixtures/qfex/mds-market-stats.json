@@ -1,0 +1,321 @@
+{
+ "sequence": 1,
+ "type": "market_stats",
+ "time": "2026-10-04T14:50:03.380307209Z",
+ "symbol": "*",
+ "bbos": [
+  {
+   "time": "2026-10-04T14:50:03.327211879Z",
+   "symbol": "AAPL-USD",
+   "bid": [
+    [
+     "333.37",
+     "304.348"
+    ]
+   ],
+   "ask": [
+    [
+     "333.47",
+     "312.5"
+    ]
+   ]
+  },
+  {
+   "time": "2026-10-04T14:50:03.329912590Z",
+   "symbol": "ANTHROPIC-USD",
+   "bid": [
+    [
+     "2028.78",
+     "0.108"
+    ]
+   ],
+   "ask": [
+    [
+     "2029.85",
+     "0.108"
+    ]
+   ]
+  },
+  {
+   "time": "2026-10-04T14:50:03.328177890Z",
+   "symbol": "CL-USD",
+   "bid": [
+    [
+     "91.2",
+     "5.7"
+    ]
+   ],
+   "ask": [
+    [
+     "91.22",
+     "4516.046"
+    ]
+   ]
+  },
+  {
+   "time": "2026-10-04T14:50:03.328125894Z",
+   "symbol": "GOLD-USD",
+   "bid": [
+    [
+     "4143.5",
+     "0.0108"
+    ]
+   ],
+   "ask": [
+    [
+     "4145.2",
+     "24.8608"
+    ]
+   ]
+  },
+  {
+   "time": "2026-10-04T14:50:03.327768287Z",
+   "symbol": "OPENAI-USD",
+   "bid": [
+    [
+     "1614.58",
+     "3.845"
+    ]
+   ],
+   "ask": [
+    [
+     "1614.99",
+     "4.016"
+    ]
+   ]
+  },
+  {
+   "time": "2026-10-04T14:50:03.329889346Z",
+   "symbol": "SKHYNIX-KRW",
+   "bid": [
+    [
+     "1841100",
+     "0.000833"
+    ]
+   ],
+   "ask": [
+    [
+     "1842000",
+     "0.000833"
+    ]
+   ]
+  },
+  {
+   "time": "2026-10-04T14:50:03.328618473Z",
+   "symbol": "US100-USD",
+   "bid": [
+    [
+     "30875",
+     "0.0021"
+    ]
+   ],
+   "ask": [
+    [
+     "30883",
+     "0.8804"
+    ]
+   ]
+  },
+  {
+   "time": "2026-10-04T14:50:03.328043695Z",
+   "symbol": "ZHIPU-USD",
+   "bid": [],
+   "ask": []
+  }
+ ],
+ "mark_prices": [
+  {
+   "time": "2026-10-04T14:50:03.200985474Z",
+   "symbol": "AAPL-USD",
+   "price": "333.41"
+  },
+  {
+   "time": "2026-10-04T14:50:03.200985474Z",
+   "symbol": "ANTHROPIC-USD",
+   "price": "2029.24"
+  },
+  {
+   "time": "2026-10-04T14:50:03.200985474Z",
+   "symbol": "CL-USD",
+   "price": "91.22"
+  },
+  {
+   "time": "2026-10-04T14:50:03.200985474Z",
+   "symbol": "GOLD-USD",
+   "price": "4144.4"
+  },
+  {
+   "time": "2026-10-04T14:50:03.200985474Z",
+   "symbol": "OPENAI-USD",
+   "price": "1614.88"
+  },
+  {
+   "time": "2026-10-04T14:50:03.200985474Z",
+   "symbol": "SKHYNIX-KRW",
+   "price": "1842000"
+  },
+  {
+   "time": "2026-10-04T14:50:03.200985474Z",
+   "symbol": "US100-USD",
+   "price": "30880"
+  },
+  {
+   "time": "2026-10-04T14:50:03.200985474Z",
+   "symbol": "ZHIPU-USD",
+   "price": "145"
+  }
+ ],
+ "open_interests": [
+  {
+   "time": "2026-10-04T14:48:54.323376011Z",
+   "symbol": "AAPL-USD",
+   "open_interest": "9936.148"
+  },
+  {
+   "time": "2026-10-04T14:48:54.323376011Z",
+   "symbol": "ANTHROPIC-USD",
+   "open_interest": "755.382"
+  },
+  {
+   "time": "2026-10-04T14:48:54.323376011Z",
+   "symbol": "CL-USD",
+   "open_interest": "22119.536"
+  },
+  {
+   "time": "2026-10-04T14:48:54.323376011Z",
+   "symbol": "GOLD-USD",
+   "open_interest": "1283.742"
+  },
+  {
+   "time": "2026-10-04T14:48:54.323376011Z",
+   "symbol": "OPENAI-USD",
+   "open_interest": "743.768"
+  },
+  {
+   "time": "2026-10-04T14:48:54.323376011Z",
+   "symbol": "SKHYNIX-KRW",
+   "open_interest": "0.987112"
+  },
+  {
+   "time": "2026-10-04T14:48:54.323376011Z",
+   "symbol": "US100-USD",
+   "open_interest": "184.167"
+  },
+  {
+   "time": "2026-10-04T14:48:54.323376011Z",
+   "symbol": "ZHIPU-USD",
+   "open_interest": "0"
+  }
+ ],
+ "funding_rates": [
+  {
+   "time": "2026-10-04T14:49:47.329541350Z",
+   "symbol": "AAPL-USD",
+   "funding_rate": "0.00000",
+   "annualised_funding_rate": "0.0000",
+   "time_remaining": 613
+  },
+  {
+   "time": "2026-10-04T14:49:25.841711138Z",
+   "symbol": "ANTHROPIC-USD",
+   "funding_rate": "-0.00000",
+   "annualised_funding_rate": "-0.0014",
+   "time_remaining": 634
+  },
+  {
+   "time": "2026-10-03T07:17:02.837085535Z",
+   "symbol": "CL-USD",
+   "funding_rate": "0.00000",
+   "annualised_funding_rate": "0.0000",
+   "time_remaining": 2493
+  },
+  {
+   "time": "2026-10-04T14:49:53.844838667Z",
+   "symbol": "GOLD-USD",
+   "funding_rate": "0.00000",
+   "annualised_funding_rate": "0.0000",
+   "time_remaining": 606
+  },
+  {
+   "time": "2026-10-04T14:49:34.333030716Z",
+   "symbol": "OPENAI-USD",
+   "funding_rate": "0.00000",
+   "annualised_funding_rate": "0.0000",
+   "time_remaining": 626
+  },
+  {
+   "time": "2026-10-04T14:48:25.839553428Z",
+   "symbol": "SKHYNIX-KRW",
+   "funding_rate": "0.00000",
+   "annualised_funding_rate": "0.0000",
+   "time_remaining": 694
+  },
+  {
+   "time": "2026-10-04T14:48:53.335515028Z",
+   "symbol": "US100-USD",
+   "funding_rate": "0.00000",
+   "annualised_funding_rate": "0.0000",
+   "time_remaining": 667
+  }
+ ],
+ "daily_volumes": [
+  {
+   "symbol": "AAPL-USD",
+   "volume": "442.818"
+  },
+  {
+   "symbol": "ANTHROPIC-USD",
+   "volume": "122.964"
+  },
+  {
+   "symbol": "CL-USD",
+   "volume": "5939.807"
+  },
+  {
+   "symbol": "GOLD-USD",
+   "volume": "50.3376"
+  },
+  {
+   "symbol": "OPENAI-USD",
+   "volume": "16.396"
+  },
+  {
+   "symbol": "SKHYNIX-KRW",
+   "volume": "0.055906"
+  },
+  {
+   "symbol": "US100-USD",
+   "volume": "16.9891"
+  }
+ ],
+ "daily_volumes_notional": [
+  {
+   "symbol": "AAPL-USD",
+   "volume": "147675.02734"
+  },
+  {
+   "symbol": "ANTHROPIC-USD",
+   "volume": "249442.08009"
+  },
+  {
+   "symbol": "CL-USD",
+   "volume": "541758.77356"
+  },
+  {
+   "symbol": "GOLD-USD",
+   "volume": "208638.18396"
+  },
+  {
+   "symbol": "OPENAI-USD",
+   "volume": "26437.75192"
+  },
+  {
+   "symbol": "SKHYNIX-KRW",
+   "volume": "103245.9642"
+  },
+  {
+   "symbol": "US100-USD",
+   "volume": "524354.0231"
+  }
+ ]
+}

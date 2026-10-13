@@ -2,62 +2,65 @@
  * Arb utilities: settlement timing strategy, basis risk monitoring, and webhook notifications.
  */
 
-import { toHourlyRate, getFundingHours } from "../funding.js";
+import { PerpError } from "../errors.js";
+import { listVenues, settlementIntervalOf } from "../exchanges/venue.js";
+import { ensureVenuesRegistered } from "../exchanges/venues/index.js";
 
 // ── Settlement Timing Strategy ──
 
-/** Settlement schedules per exchange (UTC hours when settlement occurs) */
-export const SETTLEMENT_SCHEDULES: Record<string, number[]> = {
-  hyperliquid: Array.from({ length: 24 }, (_, i) => i), // every hour
-  pacifica: Array.from({ length: 24 }, (_, i) => i),    // every hour
-  lighter: Array.from({ length: 24 }, (_, i) => i),     // every hour
-  aster: [0, 8, 16],                                     // every 8 hours (Binance convention)
-};
+ensureVenuesRegistered();
+
+/**
+ * Settlement schedules per venue (UTC hours when settlement occurs), generated
+ * from `VenueDefinition.settlementIntervalHours`, anchored at 00:00 UTC
+ * (design §10.1, §10.13 #1). Venues whose interval is per-market (Aster)
+ * have no entry — pass the market's interval to getLastSettlement().
+ */
+export const SETTLEMENT_SCHEDULES: Record<string, number[]> = Object.fromEntries(
+  listVenues()
+    .filter(v => v.settlementIntervalHours !== "perMarket")
+    .map(v => [v.id, scheduleFor(v.settlementIntervalHours as number)]),
+);
+
+function scheduleFor(intervalHours: number): number[] {
+  if (!(intervalHours > 0) || 24 % intervalHours !== 0) {
+    throw new PerpError("INVALID_PARAMS", `Settlement interval ${intervalHours}h does not divide a UTC day`);
+  }
+  return Array.from({ length: 24 / intervalHours }, (_, i) => i * intervalHours);
+}
 
 export type SettleStrategy = "block" | "aggressive" | "off";
 
 /**
- * Get the most recent settlement time for an exchange.
- * @returns Date of the most recent past settlement
+ * Settlement interval in hours for a venue ref. `marketIntervalHours` (the
+ * market's `settlementIntervalHours`) takes precedence; it is required for
+ * per-market venues. Unknown venues throw UNKNOWN_VENUE.
  */
-export function getLastSettlement(exchange: string, now: Date = new Date()): Date {
-  const schedule = SETTLEMENT_SCHEDULES[exchange.toLowerCase()];
-  if (!schedule || schedule.length === 0) {
-    return getLastSettlement("pacifica", now);
-  }
-
-  const currentHour = now.getUTCHours();
-  const currentMinutes = now.getUTCMinutes();
-  const currentSeconds = now.getUTCSeconds();
-
-  // Find the most recent settlement hour at or before now
-  for (let i = schedule.length - 1; i >= 0; i--) {
-    const hour = schedule[i];
-    if (hour < currentHour || (hour === currentHour && (currentMinutes > 0 || currentSeconds > 0))) {
-      const last = new Date(now);
-      last.setUTCHours(hour, 0, 0, 0);
-      return last;
+export function settlementIntervalHours(exchange: string, marketIntervalHours: number | null = null): number {
+  if (marketIntervalHours !== null) {
+    if (!(marketIntervalHours > 0)) {
+      throw new PerpError("INVALID_PARAMS", `Invalid settlement interval ${marketIntervalHours}h for ${exchange}`);
     }
-    // Exactly at settlement time
-    if (hour === currentHour && currentMinutes === 0 && currentSeconds === 0) {
-      const last = new Date(now);
-      last.setUTCHours(hour, 0, 0, 0);
-      return last;
-    }
+    return marketIntervalHours;
   }
+  return settlementIntervalOf(exchange);
+}
 
-  // Wrap to previous day's last settlement
-  const last = new Date(now);
-  last.setUTCDate(last.getUTCDate() - 1);
-  last.setUTCHours(schedule[schedule.length - 1], 0, 0, 0);
-  return last;
+/**
+ * Get the most recent settlement time for an exchange (anchored at 00:00 UTC).
+ * @param marketIntervalHours market settlement interval; required for per-market venues
+ * @returns Date of the most recent past settlement (== now when exactly on a settlement)
+ */
+export function getLastSettlement(exchange: string, now: Date = new Date(), marketIntervalHours: number | null = null): Date {
+  const intervalMs = settlementIntervalHours(exchange, marketIntervalHours) * 3_600_000;
+  return new Date(Math.floor(now.getTime() / intervalMs) * intervalMs);
 }
 
 /**
  * Get minutes since the most recent settlement for an exchange.
  */
-export function getMinutesSinceSettlement(exchange: string, now: Date = new Date()): number {
-  const lastSettle = getLastSettlement(exchange, now);
+export function getMinutesSinceSettlement(exchange: string, now: Date = new Date(), marketIntervalHours: number | null = null): number {
+  const lastSettle = getLastSettlement(exchange, now, marketIntervalHours);
   return (now.getTime() - lastSettle.getTime()) / (1000 * 60);
 }
 
@@ -65,15 +68,18 @@ export function getMinutesSinceSettlement(exchange: string, now: Date = new Date
  * Compute a score boost for aggressive settlement mode.
  * Returns a multiplier > 1.0 if within the post-settlement window, else 1.0.
  * The boost decays linearly from 1.5x (right after settlement) to 1.0x (at windowMinutes).
+ * `marketIntervalFor` returns the market's settlement interval per exchange;
+ * it must return a number for per-market venues (Aster).
  */
 export function aggressiveSettleBoost(
   longExchange: string,
   shortExchange: string,
   windowMinutes: number = 10,
   now: Date = new Date(),
+  marketIntervalFor: (exchange: string) => number | null = () => null,
 ): number {
-  const longMinutes = getMinutesSinceSettlement(longExchange, now);
-  const shortMinutes = getMinutesSinceSettlement(shortExchange, now);
+  const longMinutes = getMinutesSinceSettlement(longExchange, now, marketIntervalFor(longExchange));
+  const shortMinutes = getMinutesSinceSettlement(shortExchange, now, marketIntervalFor(shortExchange));
   // Use the minimum of the two — we want BOTH exchanges to have recently settled
   const minMinutes = Math.min(longMinutes, shortMinutes);
 

@@ -1,14 +1,28 @@
 import { Command } from "commander";
+import { listConfiguredAccountVenues } from "../config.js";
 import type { ExchangeAdapter, ExchangePosition, ExchangeOrder } from "../exchanges/index.js";
 import { makeTable, formatUsd, formatPnl, printJson, jsonOk, jsonError, symbolMatch, withJsonErrors } from "../utils.js";
 import chalk from "chalk";
 import { hasPacificaSdk, isDexCapable } from "../exchanges/capabilities.js";
+import { PerpError } from "../errors.js";
+import { unsupported } from "../exchanges/trading-v2.js";
 
-const EXCHANGES = ["pacifica", "hyperliquid", "lighter", "aster"] as const;
 
 function pac(adapter: ExchangeAdapter) {
   if (!hasPacificaSdk(adapter)) throw new Error("Market settings are only available on Pacifica.");
   return adapter;
+}
+
+/**
+ * Type / Trigger / Price / Size cells of an order row. A trigger order (stop / TP / SL) shows its
+ * trigger price; a market-type trigger has no limit price ("market"), and a position-level TP/SL
+ * (Pacifica: size 0 — it closes the whole position) shows "position" instead of 0.
+ */
+export function orderCells(o: ExchangeOrder): [string, string, string, string] {
+  const trigger = o.triggerPrice !== null ? `$${formatUsd(o.triggerPrice)}` : "-";
+  const price = Number(o.price) > 0 ? `$${formatUsd(o.price)}` : o.triggerPrice !== null ? "market" : `$${formatUsd(o.price)}`;
+  const size = !(Number(o.size) > 0) && o.triggerPrice !== null ? "position" : o.size;
+  return [o.type, trigger, price, size];
 }
 
 export function registerAccountCommands(
@@ -71,22 +85,26 @@ export function registerAccountCommands(
       const explicitExchange = program.getOptionValueSource?.("exchange") === "cli";
 
       if (!explicitExchange && getAdapterForExchange) {
+        const EXCHANGES = await listConfiguredAccountVenues();
         const allRows: string[][] = [];
         const errors: Record<string, string> = {};
+        // One read per venue for both outputs: a venue that fails is an `errors` entry, never dropped.
+        const grouped: Record<string, ExchangePosition[]> = {};
 
         await Promise.all(EXCHANGES.map(async (ex) => {
           try {
             const adapter = await getAdapterForExchange(ex);
             const positions = await adapter.getPositions();
+            grouped[ex] = positions;
             for (const p of positions) {
               allRows.push([
                 chalk.white.bold(p.symbol),
-                chalk.gray(ex.slice(0, 3).toUpperCase()),
+                chalk.gray(ex),
                 p.side === "long" ? chalk.green("LONG") : chalk.red("SHORT"),
                 p.size,
                 `$${formatUsd(p.entryPrice)}`,
                 `$${formatUsd(p.markPrice)}`,
-                p.liquidationPrice === "N/A" ? chalk.gray("N/A") : `$${formatUsd(p.liquidationPrice)}`,
+                p.liquidationPrice === null ? chalk.gray("-") : `$${formatUsd(p.liquidationPrice)}`,
                 formatPnl(p.unrealizedPnl),
                 `${p.leverage}x`,
               ]);
@@ -95,6 +113,7 @@ export function registerAccountCommands(
             if (opts.hip3 && ex === "hyperliquid" && isDexCapable(adapter)) {
               const hip3 = await fetchHip3Data(adapter, a => a.getPositions());
               for (const { dex, items } of hip3) {
+                grouped[`hip3:${dex}`] = items;
                 for (const p of items) {
                   allRows.push([
                     chalk.white.bold(p.symbol),
@@ -103,7 +122,7 @@ export function registerAccountCommands(
                     p.size,
                     `$${formatUsd(p.entryPrice)}`,
                     `$${formatUsd(p.markPrice)}`,
-                    p.liquidationPrice === "N/A" ? chalk.gray("N/A") : `$${formatUsd(p.liquidationPrice)}`,
+                    p.liquidationPrice === null ? chalk.gray("-") : `$${formatUsd(p.liquidationPrice)}`,
                     formatPnl(p.unrealizedPnl),
                     `${p.leverage}x`,
                   ]);
@@ -116,17 +135,6 @@ export function registerAccountCommands(
         }));
 
         if (isJson()) {
-          const grouped: Record<string, ExchangePosition[]> = {};
-          await Promise.all(EXCHANGES.map(async (ex) => {
-            try {
-              const adapter = await getAdapterForExchange(ex);
-              grouped[ex] = await adapter.getPositions();
-              if (opts.hip3 && ex === "hyperliquid" && isDexCapable(adapter)) {
-                const hip3 = await fetchHip3Data(adapter, a => a.getPositions());
-                for (const { dex, items } of hip3) grouped[`hip3:${dex}`] = items;
-              }
-            } catch { /* skip */ }
-          }));
           return printJson(jsonOk({ exchanges: grouped, errors: Object.keys(errors).length > 0 ? errors : undefined }));
         }
 
@@ -171,7 +179,7 @@ export function registerAccountCommands(
         p.size,
         `$${formatUsd(p.entryPrice)}`,
         `$${formatUsd(p.markPrice)}`,
-        p.liquidationPrice === "N/A" ? chalk.gray("N/A") : `$${formatUsd(p.liquidationPrice)}`,
+        p.liquidationPrice === null ? chalk.gray("-") : `$${formatUsd(p.liquidationPrice)}`,
         formatPnl(p.unrealizedPnl),
         `${p.leverage}x`,
       ]);
@@ -187,7 +195,7 @@ export function registerAccountCommands(
           p.size,
           `$${formatUsd(p.entryPrice)}`,
           `$${formatUsd(p.markPrice)}`,
-          p.liquidationPrice === "N/A" ? chalk.gray("N/A") : `$${formatUsd(p.liquidationPrice)}`,
+          p.liquidationPrice === null ? chalk.gray("-") : `$${formatUsd(p.liquidationPrice)}`,
           formatPnl(p.unrealizedPnl),
           `${p.leverage}x`,
         ]);
@@ -203,22 +211,24 @@ export function registerAccountCommands(
       const explicitExchange = program.getOptionValueSource?.("exchange") === "cli";
 
       if (!explicitExchange && getAdapterForExchange) {
+        const EXCHANGES = await listConfiguredAccountVenues();
         const allRows: string[][] = [];
         const errors: Record<string, string> = {};
+        // One read per venue for both outputs: a venue that fails is an `errors` entry, never dropped.
+        const grouped: Record<string, unknown[]> = {};
 
         await Promise.all(EXCHANGES.map(async (ex) => {
           try {
             const adapter = await getAdapterForExchange(ex);
             const orders = await adapter.getOpenOrders();
+            grouped[ex] = orders;
             for (const o of orders) {
               allRows.push([
                 o.orderId,
                 chalk.white.bold(o.symbol),
-                chalk.gray(ex.slice(0, 3).toUpperCase()),
+                chalk.gray(ex),
                 o.side === "buy" ? chalk.green("BUY") : chalk.red("SELL"),
-                o.type,
-                `$${formatUsd(o.price)}`,
-                o.size,
+                ...orderCells(o),
                 o.filled,
                 o.status,
               ]);
@@ -227,15 +237,14 @@ export function registerAccountCommands(
             if (opts.hip3 && ex === "hyperliquid" && isDexCapable(adapter)) {
               const hip3 = await fetchHip3Data(adapter, a => a.getOpenOrders());
               for (const { dex, items } of hip3) {
+                grouped[`hip3:${dex}`] = items;
                 for (const o of items) {
                   allRows.push([
                     o.orderId,
                     chalk.white.bold(o.symbol),
                     chalk.magenta(dex),
                     o.side === "buy" ? chalk.green("BUY") : chalk.red("SELL"),
-                    o.type,
-                    `$${formatUsd(o.price)}`,
-                    o.size,
+                    ...orderCells(o),
                     o.filled,
                     o.status,
                   ]);
@@ -248,17 +257,6 @@ export function registerAccountCommands(
         }));
 
         if (isJson()) {
-          const grouped: Record<string, unknown[]> = {};
-          await Promise.all(EXCHANGES.map(async (ex) => {
-            try {
-              const adapter = await getAdapterForExchange(ex);
-              grouped[ex] = await adapter.getOpenOrders();
-              if (opts.hip3 && ex === "hyperliquid" && isDexCapable(adapter)) {
-                const hip3 = await fetchHip3Data(adapter, a => a.getOpenOrders());
-                for (const { dex, items } of hip3) grouped[`hip3:${dex}`] = items;
-              }
-            } catch { /* skip */ }
-          }));
           return printJson(jsonOk({ exchanges: grouped, errors: Object.keys(errors).length > 0 ? errors : undefined }));
         }
 
@@ -268,7 +266,7 @@ export function registerAccountCommands(
           return;
         }
 
-        console.log(makeTable(["ID", "Symbol", "Exch", "Side", "Type", "Price", "Size", "Filled", "Status"], allRows));
+        console.log(makeTable(["ID", "Symbol", "Exch", "Side", "Type", "Trigger", "Price", "Size", "Filled", "Status"], allRows));
         for (const [ex, msg] of Object.entries(errors)) console.log(chalk.gray(`  ${ex}: ${msg}`));
         return;
       }
@@ -302,14 +300,12 @@ export function registerAccountCommands(
           o.orderId,
           chalk.white.bold(o.symbol),
           o.side === "buy" ? chalk.green("BUY") : chalk.red("SELL"),
-          o.type,
-          `$${formatUsd(o.price)}`,
-          o.size,
+          ...orderCells(o),
           o.filled,
           o.status,
         ]);
         console.log(
-          makeTable(["ID", "Symbol", "Side", "Type", "Price", "Size", "Filled", "Status"], rows)
+          makeTable(["ID", "Symbol", "Side", "Type", "Trigger", "Price", "Size", "Filled", "Status"], rows)
         );
       }
 
@@ -319,13 +315,11 @@ export function registerAccountCommands(
           o.orderId,
           chalk.white.bold(o.symbol),
           o.side === "buy" ? chalk.green("BUY") : chalk.red("SELL"),
-          o.type,
-          `$${formatUsd(o.price)}`,
-          o.size,
+          ...orderCells(o),
           o.filled,
           o.status,
         ]);
-        console.log(makeTable(["ID", "Symbol", "Side", "Type", "Price", "Size", "Filled", "Status"], dexRows));
+        console.log(makeTable(["ID", "Symbol", "Side", "Type", "Trigger", "Price", "Size", "Filled", "Status"], dexRows));
       }
     });
 
@@ -344,13 +338,11 @@ export function registerAccountCommands(
         o.orderId,
         chalk.white.bold(o.symbol),
         o.side === "buy" ? chalk.green("BUY") : chalk.red("SELL"),
-        o.type,
-        `$${formatUsd(o.price)}`,
-        o.size,
+        ...orderCells(o),
         o.filled,
         o.status,
       ]);
-      console.log(makeTable(["ID", "Symbol", "Side", "Type", "Price", "Size", "Filled", "Status"], rows));
+      console.log(makeTable(["ID", "Symbol", "Side", "Type", "Trigger", "Price", "Size", "Filled", "Status"], rows));
     });
 
   account
@@ -364,38 +356,41 @@ export function registerAccountCommands(
         const sdk = adapter.sdk as Record<string, (...args: any[]) => any>;
         const settings = await sdk.getAccountSettings(adapter.publicKey);
         if (isJson()) return printJson(jsonOk(settings));
-        if (!Array.isArray(settings) || settings.length === 0) {
-          console.log(chalk.gray("\n  No market settings configured.\n"));
+        // GET /account/settings returns an object; per-market entries are in `margin_settings`
+        // (only markets changed from the default cross / max leverage are listed).
+        const marginSettings = (settings as { margin_settings?: unknown } | null)?.margin_settings;
+        if (!Array.isArray(marginSettings)) {
+          throw new PerpError("EXCHANGE_ERROR", `Pacifica /account/settings returned no margin_settings list (got ${JSON.stringify(settings).slice(0, 160)})`, { exchange: "pacifica" });
+        }
+        if (marginSettings.length === 0) {
+          console.log(chalk.gray("\n  No market settings configured (every market is at the default: cross margin, max leverage).\n"));
           return;
         }
-        const rows = settings.map((s) => [
+        const rows = (marginSettings as Array<{ symbol: string; isolated: boolean; leverage: number }>).map((s) => [
           chalk.white.bold(s.symbol),
-          s.margin_mode,
+          s.isolated ? "isolated" : "cross",
           `${s.leverage}x`,
         ]);
         console.log(makeTable(["Symbol", "Margin Mode", "Leverage"], rows));
         return;
       }
 
-      // HL / Lighter: derive settings from open positions
-      const positions = await adapter.getPositions();
-      if (positions.length === 0) {
-        if (isJson()) return printJson(jsonOk([]));
-        console.log(chalk.gray("\n  No open positions — settings shown per active position.\n"));
-        return;
+      // Every other venue: the per-market leverage / margin mode the venue itself exposes
+      // (adapter.getMarketSettings). No read path → the uniform CAPABILITY_UNSUPPORTED; an
+      // empty answer is never printed as "no settings".
+      const read = (adapter as { getMarketSettings?: () => Promise<Array<{ symbol: string; leverage: number; marginMode: "cross" | "isolated" }>> }).getMarketSettings;
+      if (typeof read !== "function") {
+        throw unsupported(adapter.name, "accountSettings", "the adapter has no per-market leverage / margin-mode read",
+          `Set them explicitly per market: perp trade leverage <symbol> <n> [--isolated] -e ${adapter.name}`);
       }
-      const settings = positions.map(p => ({
-        symbol: p.symbol,
-        leverage: p.leverage,
-        margin_mode: "cross" as string, // HL/Lighter default to cross
-      }));
+      const rows = await read.call(adapter);
+      if (rows.length === 0) {
+        throw unsupported(adapter.name, "accountSettings", "the venue lists no per-market leverage / margin mode for this account (no market traded or configured yet)",
+          `Set one: perp trade leverage <symbol> <n> [--isolated] -e ${adapter.name}`);
+      }
+      const settings = rows.map(r => ({ symbol: r.symbol, leverage: r.leverage, margin_mode: r.marginMode }));
       if (isJson()) return printJson(jsonOk(settings));
-      const rows = settings.map((s) => [
-        chalk.white.bold(s.symbol),
-        s.margin_mode,
-        `${s.leverage}x`,
-      ]);
-      console.log(makeTable(["Symbol", "Margin Mode", "Leverage"], rows));
+      console.log(makeTable(["Symbol", "Margin Mode", "Leverage"], settings.map(s => [chalk.white.bold(s.symbol), s.margin_mode, `${s.leverage}x`])));
     });
 
   account
@@ -424,7 +419,7 @@ export function registerAccountCommands(
     .command("funding-history")
     .alias("funding")
     .description("Personal funding payment history")
-    .option("-n, --limit <n>", "Number of records", "200")
+    .option("--limit <n>", "Number of records", "200")
     .action(async (opts: { limit: string }) => {
       const adapter = await getAdapter();
       const payments = await adapter.getFundingPayments(parseInt(opts.limit));
@@ -463,6 +458,7 @@ export function registerAccountCommands(
         if (!pos) {
           if (isJson()) return printJson(jsonError("POSITION_NOT_FOUND", `No open position for ${sym}`));
           console.log(chalk.gray(`\n  No open position for ${sym}.\n`));
+          process.exitCode = 1;
           return;
         }
 
@@ -499,7 +495,7 @@ export function registerAccountCommands(
         console.log(`  Notional:         $${formatUsd(positionNotional)}`);
         console.log(`  Margin Required:  $${formatUsd(marginRequired)}`);
         console.log(`  Margin % Equity:  ${marginPct.toFixed(2)}%`);
-        console.log(`  Liquidation:      ${pos.liquidationPrice === "N/A" ? chalk.gray("N/A") : `$${formatUsd(pos.liquidationPrice)}`}`);
+        console.log(`  Liquidation:      ${pos.liquidationPrice === null ? chalk.gray("-") : `$${formatUsd(pos.liquidationPrice)}`}`);
         console.log(`  Unrealized PnL:   ${formatPnl(pos.unrealizedPnl)}`);
         console.log();
       } catch (err: unknown) {
@@ -513,6 +509,7 @@ export function registerAccountCommands(
           }));
         }
         console.error(chalk.red(`Error: ${msg}`));
+        process.exitCode = 1;
       }
     });
 

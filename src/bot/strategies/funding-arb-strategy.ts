@@ -2,21 +2,37 @@ import type { Strategy, StrategyContext, StrategyAction, EnrichedSnapshot } from
 import type { FundingArbStrategyParams } from "../config.js";
 import type { ExchangeAdapter } from "../../exchanges/index.js";
 import { registerStrategy } from "../strategy-registry.js";
+import { PerpError } from "../../errors.js";
 import { checkArbLiquidity, checkSpotPerpLiquidity } from "../../liquidity.js";
-import { computeMatchedSize, computeSpotPerpMatchedSize, reconcileArbFills } from "../../arb-sizing.js";
+import { computeMatchedSize, computeSpotPerpMatchedSize } from "../../arb-sizing.js";
 import { getFundingHours } from "../../funding.js";
 import { logExecution, pruneExecutionLog } from "../../execution-log.js";
 import { annualizeHourlyRate } from "../../funding/normalize.js";
+import { getBotSpotAdapter, nonQuoteSpotBalances, readSpotQuoteAvailableFresh, spotNetworkOf, spotTokenBase, sweepSpotQuoteToPerp } from "../../exchanges/spot-factory.js";
+import { getVenue } from "../../exchanges/venue.js";
 import {
   isPositionGone,
   transferUsdcToSpot,
   transferUsdcToPerp,
-  getSpotAdapter,
   getPerpSymbol,
   findRate,
   getPriceEstimate,
   fetchRates,
-} from "./funding-arb-utils.js";
+  botSpotPerpMatches, assertFundingArbLegs, cancelBotSymbols } from "./funding-arb-utils.js";
+import type { VenueMarket } from "../../exchanges/venue-types.js";
+import { fillSizeString, sizeDecimalsOf, spotLotStepOf, spotMarketFill } from "../../exchanges/spot-result.js";
+import { floorToStep, lotStepOf } from "../../exchanges/precision.js";
+import { isQuarantined, quarantineKey, quarantineSymbol } from "../quarantine.js";
+import { SpotPerpExecutor } from "./spot-perp-executor.js";
+import { closePerpVerified, isOutcomeUnknown, placePerpVerified, trimFirstLegToHedge } from "../perp-order.js";
+import { reportedAvgFillPrice } from "../../exchanges/ioc-outcome.js";
+import { recordSpotPerpClose, recordSpotPerpEntry } from "./spot-perp-state.js";
+
+let _posIdCounter = 0;
+function genPosId(): string { return `fa-${Date.now()}-${++_posIdCounter}`; }
+
+/** Consecutive failed closes (spot-perp and perp-perp) before the symbol is quarantined — no retry loop (same bound as funding-arb-v2 / funding-auto). */
+const MAX_CLOSE_FAILURES = 3;
 
 interface ArbOpportunity {
   symbol: string;
@@ -63,8 +79,29 @@ export class FundingArbStrategy implements Strategy {
 
   private _config: Record<string, unknown> = {};
   private _failCooldown = new Map<string, number>(); // "symbol:action" → timestamp of next retry
+  /** Consecutive failed closes per symbol, spot-perp and perp-perp (quarantined at MAX_CLOSE_FAILURES). */
+  private _closeFailures = new Map<string, number>();
+  /** Venues whose positions could not be read during recovery: no entries there until re-read. */
+  private _unrecovered = new Set<string>();
+  private executor = new SpotPerpExecutor();
+  /** Symbols this bot entered or tracked this run — the only symbols its stop cancels orders on. */
+  private _traded = new Set<string>();
+
+  private quarantined(symbol: string, ctx: StrategyContext): boolean {
+    return isQuarantined(symbol, ctx.log);
+  }
+
+  /** Unknown / unhedged outcome: stop touching this symbol until a human clears it. */
+  private quarantine(symbol: string, reason: string, venues: string, ctx: StrategyContext): void {
+    const list = venues.split("/");
+    const checks = list.map(v => `perp -e ${v} positions, perp -e ${v} trade spot-balance, perp -e ${v} trade spot-orders`).join("; ");
+    quarantineSymbol(this.name, symbol, reason,
+      `Check ${symbol.toUpperCase()} on ${list.join(" and ")} (${checks}); resolve by hand, then: perp strategy quarantine-clear ${symbol.toUpperCase()}`,
+      ctx.log);
+  }
 
   async init(ctx: StrategyContext, _snapshot: EnrichedSnapshot): Promise<void> {
+    assertFundingArbLegs(ctx);
     // Prune old execution logs (keep 30 days)
     try { pruneExecutionLog(30); } catch { /* non-critical */ }
     this._config = ctx.config;
@@ -90,92 +127,8 @@ export class FundingArbStrategy implements Strategy {
         for (const [name, a] of extraAdapters) adapters.set(name, a);
       }
 
-      // Fetch all positions across exchanges
-      const positionsByExchange = new Map<string, { symbol: string; side: string; size: string }[]>();
-      for (const [name, a] of adapters) {
-        try {
-          const positions = await a.getPositions();
-          positionsByExchange.set(name, positions.map(p => ({
-            symbol: p.symbol.toUpperCase(),
-            side: p.side,
-            size: p.size,
-          })));
-        } catch { /* skip unavailable exchange */ }
-      }
-
-      // Match long/short pairs across exchanges → reconstruct arbOpenPositions
-      const recovered: ArbOpenPosition[] = [];
-      const used = new Set<string>(); // "exchange:symbol" to avoid double-matching
-
-      for (const [exA, posA] of positionsByExchange) {
-        for (const pA of posA) {
-          const keyA = `${exA}:${pA.symbol}`;
-          if (used.has(keyA)) continue;
-
-          for (const [exB, posB] of positionsByExchange) {
-            if (exA === exB) continue;
-            for (const pB of posB) {
-              const keyB = `${exB}:${pB.symbol}`;
-              if (used.has(keyB)) continue;
-              if (pA.symbol !== pB.symbol) continue;
-              if (pA.side === pB.side) continue;
-
-              // Found a matching pair
-              const longEx = pA.side === "long" ? exA : exB;
-              const shortEx = pA.side === "short" ? exA : exB;
-              const size = pA.side === "long" ? pA.size : pB.size;
-              recovered.push({ symbol: pA.symbol, longExchange: longEx, shortExchange: shortEx, entrySpread: 0, size, mode: "perp-perp", entryTime: 0 });
-              used.add(keyA);
-              used.add(keyB);
-              break;
-            }
-            if (used.has(keyA)) break;
-          }
-        }
-      }
-
-      // ── Same-exchange spot-perp hedges (e.g. PURR spot + PURR-PERP short on HL) ──
-      for (const [name, a] of adapters) {
-        try {
-          let spotBalances: { token: string; total: string }[] = [];
-          if (name === "hyperliquid") {
-            const { HyperliquidSpotAdapter } = await import("../../exchanges/hyperliquid-spot.js");
-            const { HyperliquidAdapter } = await import("../../exchanges/hyperliquid.js");
-            if (a instanceof HyperliquidAdapter) {
-              const hlSpot = new HyperliquidSpotAdapter(a);
-              await hlSpot.init();
-              spotBalances = await hlSpot.getSpotBalances();
-            }
-          } else if (name === "lighter") {
-            const { LighterSpotAdapter } = await import("../../exchanges/lighter-spot.js");
-            const { LighterAdapter } = await import("../../exchanges/lighter.js");
-            if (a instanceof LighterAdapter) {
-              const ltSpot = new LighterSpotAdapter(a);
-              await ltSpot.init();
-              spotBalances = await ltSpot.getSpotBalances();
-            }
-          }
-
-          const nonUsdc = spotBalances.filter(b => Number(b.total) > 0 && !b.token.toUpperCase().startsWith("USDC"));
-          ctx.log(`  [ARB] ${name} spot balances: ${nonUsdc.map(b => `${b.token}=${b.total}`).join(", ") || "none"}`);
-          if (nonUsdc.length === 0) continue;
-
-          const perpPositions = positionsByExchange.get(name) ?? [];
-          for (const perp of perpPositions) {
-            const perpKey = `${name}:${perp.symbol}`;
-            if (used.has(perpKey)) { ctx.log(`  [ARB] ${perpKey} already matched cross-exchange, skip spot-perp`); continue; }
-            const base = perp.symbol.replace(/-PERP$/, "").toUpperCase();
-            const spotBal = nonUsdc.find(b => b.token.toUpperCase().replace(/-SPOT$/, "") === base);
-            ctx.log(`  [ARB] ${name} perp ${perp.symbol}(${perp.side}) → base=${base}, spotMatch=${spotBal ? spotBal.token : "none"}`);
-            if (spotBal && perp.side === "short") {
-              recovered.push({ symbol: base, longExchange: `${name}-spot`, shortExchange: name, entrySpread: 0, size: perp.size, mode: "spot-perp", entryTime: 0 });
-              used.add(perpKey);
-              ctx.log(`  [ARB] Detected spot-perp hedge: ${base} ${name}-spot↔${name}`);
-            }
-          }
-        } catch { /* adapter doesn't support spot */ }
-      }
-
+      const { recovered, unreadable } = await this.recoverPositions(adapters, ctx);
+      this._unrecovered = unreadable;
       if (recovered.length > 0) {
         ctx.state.set("arbOpenPositions", recovered);
         ctx.state.set("arbPositions", recovered.length);
@@ -208,6 +161,168 @@ export class FundingArbStrategy implements Strategy {
     }
   }
 
+  /**
+   * Rebuild tracked positions from the venues (perp-perp pairs + same-venue spot-perp
+   * hedges). A venue whose positions or spot balances cannot be read is returned in
+   * `unreadable` — never treated as holding nothing.
+   */
+  private async recoverPositions(
+    adapters: Map<string, ExchangeAdapter>,
+    ctx: StrategyContext,
+  ): Promise<{ recovered: ArbOpenPosition[]; unreadable: Set<string> }> {
+    const unreadable = new Set<string>();
+    // Fetch all positions across exchanges
+    const positionsByExchange = new Map<string, { symbol: string; side: string; size: string }[]>();
+    for (const [name, a] of adapters) {
+      try {
+        const positions = await a.getPositions();
+        positionsByExchange.set(name, positions.map(p => ({
+          symbol: p.symbol.toUpperCase(),
+          side: p.side,
+          size: p.size,
+        })));
+      } catch (e) {
+        // Never "no positions": no entries on this venue until its positions are read.
+        unreadable.add(name);
+        ctx.log(`  [ARB] ${name} positions unreadable during recovery (${e instanceof Error ? e.message : String(e)}) — no entries on ${name} until recovered`);
+      }
+    }
+
+    // Match long/short pairs across exchanges → reconstruct arbOpenPositions
+    const recovered: ArbOpenPosition[] = [];
+    const used = new Set<string>(); // "exchange:symbol" to avoid double-matching
+
+    for (const [exA, posA] of positionsByExchange) {
+      for (const pA of posA) {
+        const keyA = `${exA}:${pA.symbol}`;
+        if (used.has(keyA)) continue;
+
+        for (const [exB, posB] of positionsByExchange) {
+          if (exA === exB) continue;
+          for (const pB of posB) {
+            const keyB = `${exB}:${pB.symbol}`;
+            if (used.has(keyB)) continue;
+            if (pA.symbol !== pB.symbol) continue;
+            if (pA.side === pB.side) continue;
+            // Only an exactly size-matched long/short is a pair; anything else is quarantined below.
+            if (Math.abs(Number(pA.size)) !== Math.abs(Number(pB.size))) continue;
+
+            // Found a matching pair
+            const longEx = pA.side === "long" ? exA : exB;
+            const shortEx = pA.side === "short" ? exA : exB;
+            const size = pA.side === "long" ? pA.size : pB.size;
+            recovered.push({ symbol: pA.symbol, longExchange: longEx, shortExchange: shortEx, entrySpread: 0, size, mode: "perp-perp", entryTime: 0 });
+            used.add(keyA);
+            used.add(keyB);
+            break;
+          }
+          if (used.has(keyA)) break;
+        }
+      }
+    }
+
+    // ── Spot-perp hedges: a perp short on venue P + spot holdings of the same canonical
+    //    base on a bot spot venue S — same venue (e.g. PURR spot + PURR-PERP short on HL)
+    //    or cross-venue (spot on A, perp short on B, as `arb exec spot:A B` /
+    //    spot-perp-arb open them). Matched by quarantineKey (canonical: HIP-3 prefix /
+    //    "-PERP" stripped, denomination aliases). A same-venue holding wins; otherwise
+    //    exactly one candidate venue is required — an ambiguous match (several venues
+    //    hold the base, or the only holding is already matched to another short) is
+    //    quarantined instead of being left as untracked exposure.
+    const holdings = new Map<string, Map<string, string>>(); // venue → canonical key → spot token
+    for (const [name, a] of adapters) {
+      try {
+        const spotAdapter = await getBotSpotAdapter(name, a);
+        if (!spotAdapter) continue;
+        const nonUsdc = nonQuoteSpotBalances(getVenue(name), spotNetworkOf(spotAdapter), await spotAdapter.getSpotBalances());
+        ctx.log(`  [ARB] ${name} spot balances: ${nonUsdc.map(b => `${b.token}=${b.total}`).join(", ") || "none"}`);
+        const byKey = new Map<string, string>();
+        for (const b of nonUsdc) byKey.set(quarantineKey(spotTokenBase(b.token)), b.token);
+        holdings.set(name, byKey);
+      } catch (e) {
+        unreadable.add(name);
+        ctx.log(`  [ARB] ${name} spot recovery failed: ${e instanceof Error ? e.message : String(e)} — no entries on ${name} until recovered`);
+      }
+    }
+
+    const usedSpot = new Set<string>(); // "venue:KEY"
+    for (const [perpVenue, perpPositions] of positionsByExchange) {
+      for (const perp of perpPositions) {
+        if (perp.side !== "short") continue;
+        const perpKey = `${perpVenue}:${perp.symbol}`;
+        if (used.has(perpKey)) { ctx.log(`  [ARB] ${perpKey} already matched cross-exchange, skip spot-perp`); continue; }
+        const key = quarantineKey(perp.symbol);
+        const holders = [...holdings].filter(([, byKey]) => byKey.has(key)).map(([v]) => v);
+        if (holders.length === 0) continue;
+        const free = holders.filter(v => !usedSpot.has(`${v}:${key}`));
+        const spotVenue = free.includes(perpVenue) ? perpVenue : free.length === 1 ? free[0] : null;
+        if (spotVenue === null) {
+          this.quarantine(key,
+            `recovery: perp short ${perp.size} ${perp.symbol} on ${perpVenue} has an ambiguous spot hedge (spot ${key} held on ${holders.join(", ")}${free.length < holders.length ? "; some already matched to another short" : ""}) — not tracked`,
+            [perpVenue, ...holders.filter(v => v !== perpVenue)].join("/"), ctx);
+          continue;
+        }
+        const base = perp.symbol.replace(/-PERP$/, "").toUpperCase(); // perp venue's own symbol (orders use it)
+        recovered.push({ symbol: base, longExchange: `${spotVenue}-spot`, shortExchange: perpVenue, entrySpread: 0, size: perp.size, mode: "spot-perp", entryTime: 0 });
+        used.add(perpKey);
+        usedSpot.add(`${spotVenue}:${key}`);
+        const q = this.quarantined(base, ctx) ? " — QUARANTINED: tracked but not touched until cleared" : "";
+        ctx.log(`  [ARB] Detected spot-perp hedge: ${base} ${spotVenue}-spot (${holdings.get(spotVenue)!.get(key)})↔${perpVenue} perp short ${perp.size}${q}`);
+      }
+    }
+
+    // ── Unpaired legs: a single perp leg, or a long/short whose sizes differ, is exposure the
+    //    bot cannot manage as a hedge — quarantined (both sizes recorded), never left untracked
+    //    for a later entry to stack on.
+    const leftover = new Map<string, { venue: string; symbol: string; side: string; size: string }[]>();
+    for (const [venue, list] of positionsByExchange) {
+      for (const p of list) {
+        if (Number(p.size) === 0 || used.has(`${venue}:${p.symbol}`)) continue;
+        const key = quarantineKey(p.symbol);
+        leftover.set(key, [...(leftover.get(key) ?? []), { venue, ...p }]);
+      }
+    }
+    for (const [key, legs] of leftover) {
+      if (this.quarantined(key, ctx)) continue;
+      const desc = legs.map(l => `${l.side} ${l.size.replace(/^-/, "")} on ${l.venue}`).join(", ");
+      const mismatched = legs.some(l => l.side === "long") && legs.some(l => l.side === "short");
+      this.quarantine(key,
+        mismatched
+          ? `recovery: ${key} long/short sizes do not match (${desc}) — not tracked as a pair`
+          : `recovery: unpaired ${key} perp leg (${desc}) — no hedge found, not tracked`,
+        [...new Set(legs.map(l => l.venue))].join("/"), ctx);
+    }
+
+    return { recovered, unreadable };
+  }
+
+  /**
+   * true when `symbol` has a live perp position on any of `venues` that the bot does not track
+   * (a manual / foreign position): no entry is stacked on it. A failed read counts as held
+   * (unknown is never "flat").
+   */
+  private async heldUntracked(symbol: string, venues: string[], adapters: Map<string, ExchangeAdapter>, ctx: StrategyContext, cache: Map<string, Promise<{ symbol: string; size: string }[]>>): Promise<boolean> {
+    const key = quarantineKey(symbol);
+    const tracked = (ctx.state.get("arbOpenPositions") as ArbOpenPosition[]).some(p => quarantineKey(p.symbol) === key);
+    for (const v of venues) {
+      const a = adapters.get(v);
+      if (a === undefined) continue;
+      if (!cache.has(v)) cache.set(v, a.getPositions());
+      let list: { symbol: string; size: string }[];
+      try {
+        list = await cache.get(v)!;
+      } catch (e) {
+        ctx.log(`  [ARB] Skip ${symbol}: ${v} positions unreadable (${e instanceof Error ? e.message : String(e)}) — no entry on unknown exposure`);
+        return true;
+      }
+      if (!tracked && list.some(p => quarantineKey(p.symbol) === key && Number(p.size) !== 0)) {
+        ctx.log(`  [ARB] Skip ${symbol}: a ${symbol} position on ${v} is not one of the bot's pairs — no entry on top of it`);
+        return true;
+      }
+    }
+    return false;
+  }
+
   async onTick(ctx: StrategyContext, _snapshot: EnrichedSnapshot): Promise<StrategyAction[]> {
     const params = this.params;
     const openPositions = ctx.state.get("arbOpenPositions") as ArbOpenPosition[];
@@ -227,6 +342,20 @@ export class FundingArbStrategy implements Strategy {
       return [];
     }
 
+    // ── Retry recovery on venues whose positions could not be read at init ──
+    if (this._unrecovered.size > 0) {
+      const { recovered, unreadable } = await this.recoverPositions(adapters, ctx);
+      const tracked = new Set(openPositions.map(p => p.symbol.toUpperCase()));
+      for (const r of recovered) {
+        if (tracked.has(r.symbol.toUpperCase())) continue;
+        openPositions.push(r);
+        tracked.add(r.symbol.toUpperCase());
+        ctx.log(`  [ARB] Recovered ${r.symbol} ${r.longExchange}↔${r.shortExchange} (retry)`);
+      }
+      ctx.state.set("arbPositions", openPositions.length);
+      this._unrecovered = unreadable;
+    }
+
     // ── Pre-filter exchanges by margin availability ──
     const exchangeBalances = new Map<string, { equity: number; available: number; marginPct: number }>();
     const availableAdapters = new Map<string, ExchangeAdapter>();
@@ -241,7 +370,9 @@ export class FundingArbStrategy implements Strategy {
         exchangeBalances.set(name, { equity, available, marginPct });
         // Skip if: margin > 90%, available < $5, or exchange on liquidation cooldown
         const exchCooldown = this._failCooldown.get(`${name}:exchange`) ?? 0;
-        if (Date.now() < exchCooldown) {
+        if (this._unrecovered.has(name)) {
+          ctx.log(`  [ARB] ${name} positions not recovered — no entries this tick`);
+        } else if (Date.now() < exchCooldown) {
           ctx.log(`  [ARB] ${name} on liquidation cooldown — skipping`);
         } else if (available < 5) {
           ctx.log(`  [ARB] ${name} available $${available.toFixed(2)} too low — skipping`);
@@ -275,7 +406,14 @@ export class FundingArbStrategy implements Strategy {
     // Fetch rates — all exchanges if room for new positions, only position exchanges if full
     const ratesByExchange = new Map<string, Map<string, { rate: number; price: number; sizeDecimals?: number; maxLeverage?: number; fundingHours?: number }>>();
     for (const [name, a] of exchangesToScan) {
-      const rates = await fetchRates(a, name);
+      let rates: Awaited<ReturnType<typeof fetchRates>>;
+      try {
+        rates = await fetchRates(a, name);
+      } catch (err) {
+        // Recorded per venue; this venue is left out of this cycle's rate map.
+        ctx.log(`  [FARB] fetchRates failed for ${name}: ${err instanceof Error ? err.message : String(err)}`);
+        continue;
+      }
       const map = new Map<string, { rate: number; price: number; sizeDecimals?: number; maxLeverage?: number; fundingHours?: number }>();
       for (const r of rates) map.set(r.symbol.toUpperCase(), { rate: r.rate, price: r.price, sizeDecimals: r.sizeDecimals, maxLeverage: r.maxLeverage, fundingHours: r.fundingHours });
       ratesByExchange.set(name, map);
@@ -359,6 +497,10 @@ export class FundingArbStrategy implements Strategy {
       const deeplyNegative = signedSpread < -20; // urgent: losing significant funding
       const shouldClose = deeplyNegative || (holdTime >= minHoldMs && signedSpread < params.close_spread);
       if (shouldClose) {
+        if (this.quarantined(pos.symbol, ctx)) {
+          ctx.log(`  [ARB] ${pos.symbol} is quarantined — not closing (perp strategy quarantine)`);
+          continue;
+        }
         // Cooldown: skip if close recently failed for this symbol
         const closeKey = `${pos.symbol}:close`;
         const cooldownUntil = this._failCooldown.get(closeKey) ?? 0;
@@ -374,68 +516,8 @@ export class FundingArbStrategy implements Strategy {
           const longAdapter = adapters.get(pos.longExchange);
           const shortAdapter = adapters.get(pos.shortExchange);
           if (longAdapter && shortAdapter) {
-            let closeLongOk = false;
-            let longPositionGone = false;
-            try {
-              const closeLongResult = await longAdapter.marketOrder(pos.symbol, "sell", pos.size, { reduceOnly: true });
-              closeLongOk = true;
-              logExecution({ type: "arb_close", exchange: pos.longExchange, symbol: pos.symbol, side: "sell", size: pos.size, status: "success", dryRun: false, meta: { mode: pos.mode, leg: "long", signedSpread: signedSpread, response: closeLongResult } });
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              if (isPositionGone(msg)) {
-                // Position already liquidated/closed on this exchange
-                longPositionGone = true;
-                ctx.log(`  [ARB] Long position gone for ${pos.symbol} on ${pos.longExchange} (liquidated?) — force closing short`);
-                // Cooldown the exchange for 30 minutes to prevent liquidation-entry cycle
-                this._failCooldown.set(`${pos.longExchange}:exchange`, Date.now() + 30 * 60 * 1000);
-              } else {
-                ctx.log(`  [ARB] Close long leg failed for ${pos.symbol}: ${msg} (cooldown 5m)`);
-                logExecution({ type: "arb_close", exchange: pos.longExchange, symbol: pos.symbol, side: "sell", size: pos.size, status: "failed", error: msg, dryRun: false, meta: { mode: pos.mode, leg: "long" } });
-                this._failCooldown.set(`${pos.symbol}:close`, Date.now() + 5 * 60 * 1000);
-              }
-            }
-            if (!closeLongOk && !longPositionGone) continue;
-
-            try {
-              const closeShortResult = await shortAdapter.marketOrder(pos.symbol, "buy", pos.size, { reduceOnly: true });
-              logExecution({ type: "arb_close", exchange: pos.shortExchange, symbol: pos.symbol, side: "buy", size: pos.size, status: "success", dryRun: false, meta: { mode: pos.mode, leg: "short", signedSpread: signedSpread, response: closeShortResult } });
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              if (isPositionGone(msg)) {
-                // Short position also gone — both liquidated, just clean up tracking
-                ctx.log(`  [ARB] Short position also gone for ${pos.symbol} on ${pos.shortExchange} — removing from tracking`);
-                this._failCooldown.set(`${pos.shortExchange}:exchange`, Date.now() + 30 * 60 * 1000);
-              } else if (closeLongOk) {
-                // Long was closed but short failed (not liquidated) — rollback long
-                ctx.log(`  [ARB] Close short leg failed for ${pos.symbol}: ${msg} — re-opening long to restore hedge`);
-                logExecution({ type: "arb_close", exchange: pos.shortExchange, symbol: pos.symbol, side: "buy", size: pos.size, status: "failed", error: msg, dryRun: false, meta: { mode: pos.mode, leg: "short" } });
-                try {
-                  await longAdapter.marketOrder(pos.symbol, "buy", pos.size);
-                  ctx.log(`  [ARB] Rollback: re-opened long ${pos.size} ${pos.symbol} on ${pos.longExchange}`);
-                  logExecution({ type: "multi_leg_rollback", exchange: pos.longExchange, symbol: pos.symbol, side: "buy", size: pos.size, status: "success", dryRun: false });
-                } catch (rbErr) {
-                  const rbMsg = rbErr instanceof Error ? rbErr.message : String(rbErr);
-                  ctx.log(`  [ARB] CRITICAL: Close rollback failed for ${pos.symbol}: ${rbMsg}`);
-                  logExecution({ type: "multi_leg_rollback", exchange: pos.longExchange, symbol: pos.symbol, side: "buy", size: pos.size, status: "failed", error: rbMsg, dryRun: false });
-                }
-                this._failCooldown.set(`${pos.symbol}:close`, Date.now() + 5 * 60 * 1000);
-                continue;
-              } else {
-                // Long was gone, short failed (not liquidated) — orphaned short, force close without reduceOnly
-                ctx.log(`  [ARB] Force closing orphaned short for ${pos.symbol}: ${msg}`);
-                try {
-                  await shortAdapter.marketOrder(pos.symbol, "buy", pos.size);
-                  ctx.log(`  [ARB] Force closed short ${pos.size} ${pos.symbol} on ${pos.shortExchange}`);
-                } catch (forceErr) {
-                  const forceMsg = forceErr instanceof Error ? forceErr.message : String(forceErr);
-                  ctx.log(`  [ARB] CRITICAL: Force close short failed for ${pos.symbol}: ${forceMsg}`);
-                  this._failCooldown.set(`${pos.symbol}:close`, Date.now() + 10 * 60 * 1000);
-                  continue;
-                }
-              }
-            }
-            toClose.push(pos);
-            ctx.log(`  [ARB] Closed ${pos.symbol} position${longPositionGone ? ' (long was liquidated)' : ''}`);
+            const closed = await this.closePerpPerp(pos, longAdapter, shortAdapter, ctx, { signedSpread, stop: false });
+            if (closed) toClose.push(pos);
           }
         }
       }
@@ -491,16 +573,21 @@ export class FundingArbStrategy implements Strategy {
 
     // Spot-perp opportunities: for each exchange with positive perp rate, check if spot is available
     const spotPerpMinSpread = params.spot_perp_min_spread ?? params.min_spread;
+    const perpMarketsCache = new Map<string, Promise<VenueMarket[]>>();
     for (const [name, a] of adapters) {
+      if (this._unrecovered.has(name)) continue; // positions not recovered: no entries on this venue
       try {
-        const spotAdapter = await getSpotAdapter(name, a);
+        const spotAdapter = await getBotSpotAdapter(name, a);
         if (!spotAdapter) continue;
-
-        const spotMarkets = await spotAdapter.getSpotMarkets();
-        const spotSymbols = new Set(spotMarkets.map(m => m.baseToken.toUpperCase()));
 
         const perpRates = ratesByExchange.get(name);
         if (!perpRates) continue;
+
+        // Same-venue spot↔perp: canonical symbol + price-deviation guard (§12.4 #6).
+        const spotMarkets = await spotAdapter.getSpotMarkets();
+        const matched = await botSpotPerpMatches(name, spotMarkets, [name], perpMarketsCache, (msg) => ctx.log(`  [ARB] ${msg}`));
+        const spotSymbols = matched.get(name);
+        if (spotSymbols === undefined) throw new Error(`spot↔perp matching returned no entry for ${name}`);
 
         for (const [sym, rateEntry] of perpRates) {
           const { rate } = rateEntry;
@@ -523,7 +610,10 @@ export class FundingArbStrategy implements Strategy {
             });
           }
         }
-      } catch { /* exchange doesn't support spot */ }
+      } catch (e) {
+        // Logged, not swallowed; this venue is skipped for spot-perp this scan.
+        ctx.log(`  [ARB] ${name} spot scan failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
     }
 
     opportunities.sort((a, b) => b.spread - a.spread);
@@ -546,8 +636,15 @@ export class FundingArbStrategy implements Strategy {
         // Skip symbols already in open positions
         const openSymbols = new Set((ctx.state.get("arbOpenPositions") as ArbOpenPosition[]).map(p => p.symbol.toUpperCase()));
         let skipCooldown = 0;
-        for (const best of opportunities) {
+        const livePositions = new Map<string, Promise<{ symbol: string; size: string }[]>>();
+        // Engine: equity unknown → no new entries (closes above still run).
+        const entriesBlocked = ctx.state.get("equityUnknown") === true;
+        if (entriesBlocked) ctx.log(`  [ARB] Equity unknown — no new entries this tick`);
+        for (const best of entriesBlocked ? [] : opportunities) {
           if (openSymbols.has(best.symbol.toUpperCase())) continue;
+          if (this.quarantined(best.symbol, ctx)) continue;
+          if (await this.heldUntracked(best.symbol, best.mode === "spot-perp" ? [best.shortExchange] : [best.longExchange, best.shortExchange], adapters, ctx, livePositions)) continue;
+          this._traded.add(best.symbol.toUpperCase());
           // Cooldown: skip if entry recently failed for this symbol
           const entryKey = `${best.symbol}:entry`;
           const entryCooldown = this._failCooldown.get(entryKey) ?? 0;
@@ -625,87 +722,74 @@ export class FundingArbStrategy implements Strategy {
 
           ctx.log(`  [ARB] Opening: ${matched.size} ${best.symbol} on both legs ($${matched.notional.toFixed(0)}/leg, slippage ~${liq.longSlippage.toFixed(2)}%/${liq.shortSlippage.toFixed(2)}%)`);
 
-          // Step 1: Execute long leg first
-          let longResult: unknown;
+          // Step 1: Execute long leg first (verified by the position delta)
+          const errText = (e: unknown) => e instanceof Error ? e.message : String(e);
+          const sizeDec = sizeDecimalsOf(matched.size);
+          let longFilled: number;
           try {
-            longResult = await longAdapter.marketOrder(best.symbol, "buy", matched.size);
-            logExecution({ type: "arb_entry", exchange: best.longExchange, symbol: best.symbol, side: "buy", size: matched.size, notional: matched.notional / 2, status: "success", dryRun: false, meta: { mode: "perp-perp", leg: "long", response: longResult } });
+            const lf = await placePerpVerified(longAdapter, best.longExchange, best.symbol, "buy", matched.size);
+            longFilled = lf.filledSize;
+            logExecution({ type: "arb_entry", exchange: best.longExchange, symbol: best.symbol, side: "buy", size: matched.size, notional: matched.notional / 2, status: "success", dryRun: false, meta: { mode: "perp-perp", leg: "long", response: lf.raw, measuredFill: lf.filledSize } });
           } catch (longErr) {
-            const msg = longErr instanceof Error ? longErr.message : String(longErr);
-            ctx.log(`  [ARB] Long leg failed for ${best.symbol}: ${msg} (cooldown 5m)`);
-            logExecution({ type: "arb_entry", exchange: best.longExchange, symbol: best.symbol, side: "buy", size: matched.size, status: "failed", error: msg, dryRun: false, meta: { mode: "perp-perp", leg: "long" } });
-            this._failCooldown.set(`${best.symbol}:entry`, Date.now() + 5 * 60 * 1000);
-            continue;
-          }
-
-          // Step 2: Execute short leg
-          try {
-            const shortResult = await shortAdapter.marketOrder(best.symbol, "sell", matched.size);
-            logExecution({ type: "arb_entry", exchange: best.shortExchange, symbol: best.symbol, side: "sell", size: matched.size, notional: matched.notional / 2, status: "success", dryRun: false, meta: { mode: "perp-perp", leg: "short", response: shortResult } });
-          } catch (shortErr) {
-            const msg = shortErr instanceof Error ? shortErr.message : String(shortErr);
-            ctx.log(`  [ARB] Short leg failed for ${best.symbol}: ${msg} — ROLLING BACK long leg (cooldown 5m)`);
-            logExecution({ type: "arb_entry", exchange: best.shortExchange, symbol: best.symbol, side: "sell", size: matched.size, status: "failed", error: msg, dryRun: false, meta: { mode: "perp-perp", leg: "short" } });
-            // Rollback: close the long position
-            try {
-              await longAdapter.marketOrder(best.symbol, "sell", matched.size, { reduceOnly: true });
-              ctx.log(`  [ARB] Rollback success: closed long ${matched.size} ${best.symbol} on ${best.longExchange}`);
-              logExecution({ type: "multi_leg_rollback", exchange: best.longExchange, symbol: best.symbol, side: "sell", size: matched.size, status: "success", dryRun: false });
-            } catch (rbErr) {
-              const rbMsg = rbErr instanceof Error ? rbErr.message : String(rbErr);
-              ctx.log(`  [ARB] CRITICAL: Rollback failed for ${best.symbol}: ${rbMsg}`);
-              logExecution({ type: "multi_leg_rollback", exchange: best.longExchange, symbol: best.symbol, side: "sell", size: matched.size, status: "failed", error: rbMsg, dryRun: false });
-              ctx.log(`  [ARB] CRITICAL: Orphaned long position on ${best.longExchange} for ${best.symbol} — operator must close manually`);
-            }
-            this._failCooldown.set(`${best.symbol}:entry`, Date.now() + 5 * 60 * 1000);
-            continue;
-          }
-
-          // Verify fills match
-          try {
-            const recon = await reconcileArbFills(longAdapter, shortAdapter, best.symbol,
-              (msg) => ctx.log(`  ${msg}`),
-            );
-            if (!recon.matched) {
-              ctx.log(`  [ARB] WARNING: fills not matched after correction attempt`);
-            }
-          } catch (reconErr) {
-            const reconMsg = reconErr instanceof Error ? reconErr.message : String(reconErr);
-            ctx.log(`  [ARB] WARNING: Fill reconciliation failed: ${reconMsg}`);
-          }
-
-          // Verify both positions actually exist (catches instant liquidation)
-          // Invalidate cache so getPositions returns fresh data
-          const { invalidateCache } = await import("../../cache.js");
-          invalidateCache("acct");
-          await new Promise(resolve => setTimeout(resolve, 2000)); // brief wait for exchange settlement
-          try {
-            const [longPositions, shortPositions] = await Promise.all([
-              longAdapter.getPositions(),
-              shortAdapter.getPositions(),
-            ]);
-            const symUpper = best.symbol.toUpperCase();
-            const matchSymbol = (s: string) => { const u = s.toUpperCase(); return u === symUpper || u === symUpper + "-PERP" || u.replace(/-PERP$/, "") === symUpper; };
-            const longExists = longPositions.some(p => matchSymbol(p.symbol) && parseFloat(p.size) > 0);
-            const shortExists = shortPositions.some(p => matchSymbol(p.symbol) && parseFloat(p.size) > 0);
-            if (!longExists && !shortExists) {
-              // Both missing likely means cache issue — log warning but don't rollback
-              ctx.log(`  [ARB] Position verification: both sides not visible for ${best.symbol} (may be cache delay)`);
-            } else if (!longExists || !shortExists) {
-              // One side missing = instant liquidation — rollback the other
-              ctx.log(`  [ARB] Position verification failed for ${best.symbol}: long=${longExists}, short=${shortExists}`);
-              logExecution({ type: "arb_entry", exchange: `${best.longExchange}↔${best.shortExchange}`, symbol: best.symbol, side: "verify", size: matched.size, status: "failed", error: `Position missing after fill: long=${longExists} short=${shortExists}`, dryRun: false });
-              if (longExists && !shortExists) {
-                try { await longAdapter.marketOrder(best.symbol, "sell", matched.size, { reduceOnly: true }); ctx.log(`  [ARB] Rollback: closed phantom long ${best.symbol}`); } catch { /* best effort */ }
-              }
-              if (shortExists && !longExists) {
-                try { await shortAdapter.marketOrder(best.symbol, "buy", matched.size, { reduceOnly: true }); ctx.log(`  [ARB] Rollback: closed phantom short ${best.symbol}`); } catch { /* best effort */ }
-              }
-              this._failCooldown.set(`${best.symbol}:entry`, Date.now() + 10 * 60 * 1000);
+            const msg = errText(longErr);
+            logExecution({ type: "arb_entry", exchange: best.longExchange, symbol: best.symbol, side: "buy", size: matched.size, status: "failed", error: msg, dryRun: false, meta: { mode: "perp-perp", leg: "long", pending: isOutcomeUnknown(longErr) } });
+            if (isOutcomeUnknown(longErr)) {
+              this.quarantine(best.symbol, `long leg ${matched.size} on ${best.longExchange} outcome unknown (${msg}) — no short placed`, best.longExchange, ctx);
               continue;
             }
-          } catch (verifyErr) {
-            ctx.log(`  [ARB] Position verification error for ${best.symbol}: ${verifyErr instanceof Error ? verifyErr.message : String(verifyErr)}`);
+            ctx.log(`  [ARB] Long leg failed for ${best.symbol}: ${msg} (cooldown 5m)`);
+            this._failCooldown.set(`${best.symbol}:entry`, Date.now() + 5 * 60 * 1000);
+            continue;
+          }
+
+          // Step 2: Execute short leg sized to the VERIFIED long fill (not the requested size)
+          const longOpen = fillSizeString(longFilled, sizeDec);
+          let shortFilled: number;
+          try {
+            const sf = await placePerpVerified(shortAdapter, best.shortExchange, best.symbol, "sell", longOpen);
+            shortFilled = sf.filledSize;
+            logExecution({ type: "arb_entry", exchange: best.shortExchange, symbol: best.symbol, side: "sell", size: longOpen, notional: matched.notional / 2, status: "success", dryRun: false, meta: { mode: "perp-perp", leg: "short", response: sf.raw, measuredFill: sf.filledSize } });
+          } catch (shortErr) {
+            const msg = errText(shortErr);
+            logExecution({ type: "arb_entry", exchange: best.shortExchange, symbol: best.symbol, side: "sell", size: longOpen, status: "failed", error: msg, dryRun: false, meta: { mode: "perp-perp", leg: "short", pending: isOutcomeUnknown(shortErr) } });
+            if (isOutcomeUnknown(shortErr)) {
+              // The short may exist: closing the long now could leave a naked short.
+              this.quarantine(best.symbol, `short leg ${longOpen} on ${best.shortExchange} outcome unknown (${msg}); long ${longOpen} open on ${best.longExchange} — not rolled back`, `${best.longExchange}/${best.shortExchange}`, ctx);
+              continue;
+            }
+            ctx.log(`  [ARB] Short leg failed for ${best.symbol}: ${msg} — ROLLING BACK long leg (cooldown 5m)`);
+            // Rollback: close what the long leg actually filled (reduce-only, verified)
+            try {
+              const rb = await closePerpVerified(longAdapter, best.longExchange, best.symbol, "sell", longOpen, { decimals: sizeDec });
+              if (rb.residual > 0) {
+                const rbMsg = `rollback closed ${fillSizeString(rb.closed, sizeDec)} of ${longOpen}; ${fillSizeString(rb.residual, sizeDec)} still open${rb.note !== null ? ` (${rb.note})` : ""}`;
+                logExecution({ type: "multi_leg_rollback", exchange: best.longExchange, symbol: best.symbol, side: "sell", size: longOpen, status: "failed", error: rbMsg, dryRun: false });
+                this.quarantine(best.symbol, `short leg failed (${msg}); ${rbMsg} — orphaned long on ${best.longExchange}`, best.longExchange, ctx);
+                continue;
+              }
+              ctx.log(`  [ARB] Rollback success: closed long ${longOpen} ${best.symbol} on ${best.longExchange}`);
+              logExecution({ type: "multi_leg_rollback", exchange: best.longExchange, symbol: best.symbol, side: "sell", size: longOpen, status: "success", dryRun: false });
+            } catch (rbErr) {
+              const rbMsg = errText(rbErr);
+              logExecution({ type: "multi_leg_rollback", exchange: best.longExchange, symbol: best.symbol, side: "sell", size: longOpen, status: "failed", error: rbMsg, dryRun: false });
+              this.quarantine(best.symbol, `short leg failed (${msg}) and the long rollback failed or is unconfirmed (${rbMsg}) — orphaned long ${longOpen} on ${best.longExchange}`, best.longExchange, ctx);
+              continue;
+            }
+            this._failCooldown.set(`${best.symbol}:entry`, Date.now() + 5 * 60 * 1000);
+            continue;
+          }
+
+          // Step 3: residual — the short filled less than the long: trim the long by exactly
+          // this trade's excess (reduce-only, verified). Not trimmed → unhedged → quarantine.
+          const hedgedSize = fillSizeString(shortFilled, sizeDec);
+          try {
+            const trimmed = await trimFirstLegToHedge(longAdapter, best.longExchange, best.symbol, "buy", longFilled, shortFilled, sizeDec);
+            if (trimmed !== "0") ctx.log(`  [ARB] Short filled ${hedgedSize} of ${longOpen} — trimmed long by ${trimmed} (reduce-only)`);
+          } catch (trimErr) {
+            const trimMsg = errText(trimErr);
+            logExecution({ type: "multi_leg_rollback", exchange: best.longExchange, symbol: best.symbol, side: "sell", size: fillSizeString(longFilled - shortFilled, sizeDec), status: "failed", error: trimMsg, dryRun: false, meta: { mode: "perp-perp", reason: "residual trim" } });
+            this.quarantine(best.symbol, `short filled ${hedgedSize} of ${longOpen}; trimming the long's excess on ${best.longExchange} failed or is unconfirmed (${trimMsg}) — long ${longOpen} vs short ${hedgedSize}`, `${best.longExchange}/${best.shortExchange}`, ctx);
+            continue;
           }
 
           // Track position
@@ -715,7 +799,7 @@ export class FundingArbStrategy implements Strategy {
             longExchange: best.longExchange,
             shortExchange: best.shortExchange,
             entrySpread: best.spread,
-            size: matched.size,
+            size: hedgedSize,
             mode: "perp-perp",
             entryTime: Date.now(),
           });
@@ -740,15 +824,21 @@ export class FundingArbStrategy implements Strategy {
     const openPositions = ctx.state.get("arbOpenPositions") as ArbOpenPosition[] | undefined;
     const extraAdapters = ctx.state.get("extraAdapters") as Map<string, ExchangeAdapter> | undefined;
 
-    if (openPositions && openPositions.length > 0) {
-      const adapters = new Map<string, ExchangeAdapter>();
-      adapters.set(ctx.adapter.name.toLowerCase(), ctx.adapter);
-      if (extraAdapters) {
-        for (const [name, a] of extraAdapters) adapters.set(name, a);
-      }
+    const adapters = new Map<string, ExchangeAdapter>();
+    adapters.set(ctx.adapter.name.toLowerCase(), ctx.adapter);
+    if (extraAdapters) {
+      for (const [name, a] of extraAdapters) adapters.set(name, a);
+    }
+    for (const p of openPositions ?? []) this._traded.add(p.symbol.toUpperCase());
 
+    if (openPositions && openPositions.length > 0) {
       const remainingPositions: ArbOpenPosition[] = [];
       for (const pos of openPositions) {
+        if (this.quarantined(pos.symbol, ctx)) {
+          ctx.log(`  [ARB] CRITICAL: ${pos.symbol} is quarantined — left open on stop; resolve manually (perp strategy quarantine)`);
+          remainingPositions.push(pos);
+          continue;
+        }
         if (pos.mode === "spot-perp") {
           const closed = await this.closeSpotPerp(pos, adapters, ctx);
           if (!closed) {
@@ -760,42 +850,9 @@ export class FundingArbStrategy implements Strategy {
           const shortAdapter = adapters.get(pos.shortExchange);
           if (longAdapter && shortAdapter) {
             ctx.log(`  [ARB] Closing ${pos.symbol} on stop (${pos.size})`);
-            let closeLongOk = false;
-            try {
-              const closeLongResult = await longAdapter.marketOrder(pos.symbol, "sell", pos.size, { reduceOnly: true });
-              logExecution({ type: "arb_close", exchange: pos.longExchange, symbol: pos.symbol, side: "sell", size: pos.size, status: "success", dryRun: false, meta: { mode: pos.mode, leg: "long", stop: true, response: closeLongResult } });
-              closeLongOk = true;
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              ctx.log(`  [ARB] Close on stop failed (long) for ${pos.symbol}: ${msg}`);
-              logExecution({ type: "arb_close", exchange: pos.longExchange, symbol: pos.symbol, side: "sell", size: pos.size, status: "failed", error: msg, dryRun: false, meta: { mode: pos.mode, leg: "long", stop: true } });
-            }
-            if (!closeLongOk) {
-              ctx.log(`  [ARB] CRITICAL: ${pos.symbol} long close failed on stop — skipping short close to preserve hedge`);
-              remainingPositions.push(pos);
-              continue;
-            }
-            let closeShortOk = false;
-            try {
-              const closeShortResult = await shortAdapter.marketOrder(pos.symbol, "buy", pos.size, { reduceOnly: true });
-              logExecution({ type: "arb_close", exchange: pos.shortExchange, symbol: pos.symbol, side: "buy", size: pos.size, status: "success", dryRun: false, meta: { mode: pos.mode, leg: "short", stop: true, response: closeShortResult } });
-              closeShortOk = true;
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              ctx.log(`  [ARB] Close on stop failed (short) for ${pos.symbol}: ${msg} — re-opening long to restore hedge`);
-              logExecution({ type: "arb_close", exchange: pos.shortExchange, symbol: pos.symbol, side: "buy", size: pos.size, status: "failed", error: msg, dryRun: false, meta: { mode: pos.mode, leg: "short", stop: true } });
-              // Rollback: re-open long to restore hedge
-              try {
-                await longAdapter.marketOrder(pos.symbol, "buy", pos.size);
-                ctx.log(`  [ARB] Rollback: re-opened long ${pos.size} ${pos.symbol} on ${pos.longExchange}`);
-                logExecution({ type: "multi_leg_rollback", exchange: pos.longExchange, symbol: pos.symbol, side: "buy", size: pos.size, status: "success", dryRun: false });
-              } catch (rbErr) {
-                const rbMsg = rbErr instanceof Error ? rbErr.message : String(rbErr);
-                ctx.log(`  [ARB] CRITICAL: Stop rollback failed for ${pos.symbol}: ${rbMsg}`);
-                logExecution({ type: "multi_leg_rollback", exchange: pos.longExchange, symbol: pos.symbol, side: "buy", size: pos.size, status: "failed", error: rbMsg, dryRun: false });
-              }
-            }
-            if (!closeShortOk) {
+            const closed = await this.closePerpPerp(pos, longAdapter, shortAdapter, ctx, { signedSpread: null, stop: true });
+            if (!closed) {
+              ctx.log(`  [ARB] CRITICAL: ${pos.symbol} could not be fully closed on stop — requires manual cleanup`);
               remainingPositions.push(pos);
             }
           } else {
@@ -808,18 +865,129 @@ export class FundingArbStrategy implements Strategy {
       ctx.state.set("arbPositions", remainingPositions.length);
     }
 
-    // Cancel on extra adapters directly
-    if (extraAdapters) {
-      for (const [, a] of extraAdapters) {
-        try { await a.cancelAllOrders(); } catch { /* best effort */ }
-      }
-    }
-    return [{ type: "cancel_all" }];
+    // Cancel only the bot's own symbols on each venue it used — never an account-wide cancel
+    // (it would cancel the user's manual orders on every market).
+    await cancelBotSymbols(adapters, this._traded, "[ARB]", ctx.log);
+    return [];
   }
 
-  /** Close a spot-perp position: sell spot, transfer USDC back, close perp short.
-   * Returns true only if ALL steps succeed. If spot sell succeeds but perp close fails,
-   * attempts to re-buy spot as rollback and returns false. */
+  /**
+   * Close a perp-perp position: long then short, both reduce-only and verified by the
+   * position delta. Returns true when both legs are closed (or already gone).
+   *  - an unknown leg outcome → quarantine (never retried / rolled back blindly);
+   *  - long close definitely failed → hedge intact, cooldown; MAX_CLOSE_FAILURES in a row →
+   *    quarantine (no endless retry);
+   *  - short close definitely failed after THIS call closed the long → quarantine at once
+   *    (naked short). The long is never re-opened (a non-reduce-only order that could loop
+   *    close → fail → re-open every tick), same as closePerpPairVerified;
+   *  - short close failed with the long already gone → one more reduce-only close of the
+   *    orphaned short; if that fails → quarantine.
+   */
+  private async closePerpPerp(
+    pos: ArbOpenPosition,
+    longAdapter: ExchangeAdapter,
+    shortAdapter: ExchangeAdapter,
+    ctx: StrategyContext,
+    meta: { signedSpread: number | null; stop: boolean },
+  ): Promise<boolean> {
+    const errText = (e: unknown) => e instanceof Error ? e.message : String(e);
+    const venues = `${pos.longExchange}/${pos.shortExchange}`;
+    const cooldown = (ms: number) => { if (!meta.stop) this._failCooldown.set(`${pos.symbol}:close`, Date.now() + ms); };
+
+    let closeLongOk = false;
+    let longPositionGone = false;
+    try {
+      const lc = await closePerpVerified(longAdapter, pos.longExchange, pos.symbol, "sell", pos.size);
+      if (lc.residual > 0) {
+        // Partial close survived one residual close: legs unbalanced → quarantine (short left open).
+        logExecution({ type: "arb_close", exchange: pos.longExchange, symbol: pos.symbol, side: "sell", size: pos.size, status: "failed", error: `closed ${lc.closed}, residual ${lc.residual}`, dryRun: false, meta: { mode: pos.mode, leg: "long", stop: meta.stop } });
+        this.quarantine(pos.symbol, `close of long on ${pos.longExchange} closed ${lc.closed} of ${pos.size}, ${lc.residual} still open${lc.note !== null ? ` (${lc.note})` : ""}; short ${pos.size} on ${pos.shortExchange} left open`, venues, ctx);
+        return false;
+      }
+      closeLongOk = true;
+      logExecution({ type: "arb_close", exchange: pos.longExchange, symbol: pos.symbol, side: "sell", size: pos.size, status: "success", dryRun: false, meta: { mode: pos.mode, leg: "long", stop: meta.stop, signedSpread: meta.signedSpread, measuredClose: lc.closed } });
+    } catch (err) {
+      const msg = errText(err);
+      if (isOutcomeUnknown(err)) {
+        this.quarantine(pos.symbol, `close of long ${pos.size} on ${pos.longExchange} outcome unknown (${msg}) — short left open`, venues, ctx);
+        return false;
+      }
+      if (isPositionGone(err)) {
+        longPositionGone = true;
+        ctx.log(`  [ARB] Long position gone for ${pos.symbol} on ${pos.longExchange} (liquidated?) — closing short`);
+        // Cooldown the exchange for 30 minutes to prevent liquidation-entry cycle
+        this._failCooldown.set(`${pos.longExchange}:exchange`, Date.now() + 30 * 60 * 1000);
+      } else {
+        logExecution({ type: "arb_close", exchange: pos.longExchange, symbol: pos.symbol, side: "sell", size: pos.size, status: "failed", error: msg, dryRun: false, meta: { mode: pos.mode, leg: "long", stop: meta.stop } });
+        const n = (this._closeFailures.get(pos.symbol) ?? 0) + 1;
+        this._closeFailures.set(pos.symbol, n);
+        if (n >= MAX_CLOSE_FAILURES) {
+          this.quarantine(pos.symbol, `close of long on ${pos.longExchange} failed ${n} times in a row (last: ${msg}) — hedge intact, stopping automatic close attempts`, venues, ctx);
+          return false;
+        }
+        ctx.log(`  [ARB] Close long leg failed for ${pos.symbol}: ${msg} — hedge intact (${n}/${MAX_CLOSE_FAILURES})${meta.stop ? "" : " (cooldown 5m)"}`);
+        cooldown(5 * 60 * 1000);
+        return false;
+      }
+    }
+
+    try {
+      const sc = await closePerpVerified(shortAdapter, pos.shortExchange, pos.symbol, "buy", pos.size);
+      if (sc.residual > 0) {
+        logExecution({ type: "arb_close", exchange: pos.shortExchange, symbol: pos.symbol, side: "buy", size: pos.size, status: "failed", error: `closed ${sc.closed}, residual ${sc.residual}`, dryRun: false, meta: { mode: pos.mode, leg: "short", stop: meta.stop } });
+        this.quarantine(pos.symbol, `close of short on ${pos.shortExchange} closed ${sc.closed} of ${pos.size}, ${sc.residual} still open${sc.note !== null ? ` (${sc.note})` : ""}${closeLongOk ? "; the long is closed — residual short unhedged" : ""}`, venues, ctx);
+        return false;
+      }
+      logExecution({ type: "arb_close", exchange: pos.shortExchange, symbol: pos.symbol, side: "buy", size: pos.size, status: "success", dryRun: false, meta: { mode: pos.mode, leg: "short", stop: meta.stop, signedSpread: meta.signedSpread, measuredClose: sc.closed } });
+    } catch (err) {
+      const msg = errText(err);
+      if (isOutcomeUnknown(err)) {
+        this.quarantine(pos.symbol, `close of short ${pos.size} on ${pos.shortExchange} outcome unknown (${msg})${closeLongOk ? "; the long is closed" : ""}`, venues, ctx);
+        return false;
+      }
+      if (isPositionGone(err)) {
+        ctx.log(`  [ARB] Short position also gone for ${pos.symbol} on ${pos.shortExchange} — removing from tracking`);
+        this._failCooldown.set(`${pos.shortExchange}:exchange`, Date.now() + 30 * 60 * 1000);
+      } else if (closeLongOk) {
+        // This call closed the long but the short close definitely failed: the short is naked.
+        // Quarantine now — never re-open the long (a non-reduce-only order; close → fail →
+        // re-open could repeat every tick). Same as closePerpPairVerified.
+        logExecution({ type: "arb_close", exchange: pos.shortExchange, symbol: pos.symbol, side: "buy", size: pos.size, status: "failed", error: msg, dryRun: false, meta: { mode: pos.mode, leg: "short", stop: meta.stop } });
+        this.quarantine(pos.symbol, `long closed on ${pos.longExchange}; close of short ${pos.size} on ${pos.shortExchange} failed (${msg}) — naked short`, venues, ctx);
+        return false;
+      } else {
+        // Long already gone and the short close failed: one more reduce-only close of the
+        // orphaned short (never a plain order — it must not flip into a long).
+        ctx.log(`  [ARB] Closing orphaned short for ${pos.symbol} (reduce-only): ${msg}`);
+        try {
+          const oc = await closePerpVerified(shortAdapter, pos.shortExchange, pos.symbol, "buy", pos.size);
+          if (oc.residual > 0) {
+            this.quarantine(pos.symbol, `long gone on ${pos.longExchange}; closing the orphaned short closed ${oc.closed} of ${pos.size}, ${oc.residual} still open${oc.note !== null ? ` (${oc.note})` : ""}`, venues, ctx);
+            return false;
+          }
+          ctx.log(`  [ARB] Closed orphaned short ${pos.size} ${pos.symbol} on ${pos.shortExchange}`);
+        } catch (forceErr) {
+          const forceMsg = errText(forceErr);
+          if (!isPositionGone(forceErr)) {
+            this.quarantine(pos.symbol, `long gone on ${pos.longExchange} and closing the orphaned short failed (${forceMsg}) — naked short ${pos.size} on ${pos.shortExchange}`, venues, ctx);
+            return false;
+          }
+        }
+      }
+    }
+    this._closeFailures.delete(pos.symbol);
+    ctx.log(`  [ARB] Closed ${pos.symbol} position${longPositionGone ? " (long was liquidated)" : ""}`);
+    return true;
+  }
+
+  /**
+   * Close a spot-perp position via SpotPerpExecutor.closePosition (perp short FIRST,
+   * reduce-only and verified; spot sold only after; a perp already gone is detected by
+   * the reduce-only rejection, never by selling spot again). Returns true only when
+   * fully closed. Unknown / unhedged outcomes quarantine the symbol; a plain failure
+   * cools down, and MAX_CLOSE_FAILURES consecutive failures quarantine it — each attempt
+   * can trade (perp close → spot sell fail → re-hedge), so it never loops.
+   */
   private async closeSpotPerp(
     pos: ArbOpenPosition,
     adapters: Map<string, ExchangeAdapter>,
@@ -831,69 +999,44 @@ export class FundingArbStrategy implements Strategy {
       ctx.log(`  [ARB] Close spot-perp failed: no adapter for ${pos.shortExchange}`);
       return false;
     }
-
-    try {
-      const spotAdapter = await getSpotAdapter(exchangeName, perpAdapter);
-      if (!spotAdapter) {
-        ctx.log(`  [ARB] Close spot-perp failed: spot adapter not available for ${exchangeName}`);
-        return false;
-      }
-
-      ctx.log(`  [ARB] Closing spot-perp ${pos.symbol} (spot sell + perp buy)`);
-
-      // Step 1: Sell spot
-      let spotSold = false;
-      try {
-        await spotAdapter.spotMarketOrder(pos.symbol, "sell", pos.size);
-        ctx.log(`  [ARB] Sold spot ${pos.size} ${pos.symbol}`);
-        spotSold = true;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        ctx.log(`  [ARB] Spot sell failed for ${pos.symbol}: ${msg}`);
-        return false;
-      }
-
-      // Step 2: Transfer USDC back to perp (use 95% of notional as estimate)
-      try {
-        const perpSymbol = getPerpSymbol(pos.symbol, pos.shortExchange);
-        const priceEstimate = await getPriceEstimate(perpAdapter, perpSymbol, pos.symbol);
-        const proceeds = priceEstimate * parseFloat(pos.size) * 0.95;
-        if (proceeds > 1) {
-          await transferUsdcToPerp(spotAdapter, exchangeName, Math.floor(proceeds));
-          ctx.log(`  [ARB] Transferred ~$${Math.floor(proceeds)} USDC back to perp`);
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        ctx.log(`  [ARB] USDC transfer back failed: ${msg}`);
-        // Non-fatal: continue to close perp short
-      }
-
-      // Step 3: Close perp short
-      const perpSymbol = getPerpSymbol(pos.symbol, pos.shortExchange);
-      try {
-        await perpAdapter.marketOrder(perpSymbol, "buy", pos.size, { reduceOnly: true });
-        ctx.log(`  [ARB] Closed perp short ${pos.size} ${perpSymbol}`);
-        return true;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        ctx.log(`  [ARB] Perp close failed for ${pos.symbol}: ${msg}`);
-        // Rollback: re-buy spot to restore hedge
-        if (spotSold) {
-          try {
-            await spotAdapter.spotMarketOrder(pos.symbol, "buy", pos.size);
-            ctx.log(`  [ARB] Rollback: re-bought spot ${pos.size} ${pos.symbol} on ${exchangeName}`);
-          } catch (rbErr) {
-            const rbMsg = rbErr instanceof Error ? rbErr.message : String(rbErr);
-            ctx.log(`  [ARB] CRITICAL: Spot-perp close rollback failed for ${pos.symbol}: ${rbMsg}`);
-          }
-        }
-        return false;
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      ctx.log(`  [ARB] Close spot-perp failed for ${pos.symbol}: ${msg}`);
+    const spotAdapter = await getBotSpotAdapter(exchangeName, adapters.get(exchangeName) ?? perpAdapter);
+    if (!spotAdapter) {
+      ctx.log(`  [ARB] Close spot-perp failed: ${exchangeName} is not a bot spot venue`);
       return false;
     }
+
+    ctx.log(`  [ARB] Closing spot-perp ${pos.symbol} (perp buy reduce-only, then spot sell)`);
+    const closed = await this.executor.closePosition({
+      symbol: pos.symbol, spotExchange: exchangeName, perpExchange: pos.shortExchange,
+      spotAdapter, perpAdapter, size: pos.size, log: ctx.log,
+    });
+    // The pair in the arb state (`arb status` / `arb close`): removed on a full close, legs set to the remainder on a partial one.
+    const pair = { symbol: pos.symbol, spotExchange: exchangeName, perpExchange: pos.shortExchange };
+    if (closed.closed) {
+      recordSpotPerpClose(spotAdapter, pair, null, "[ARB]", ctx.log);
+      this._closeFailures.delete(pos.symbol);
+      return true;
+    }
+    if (closed.manual) {
+      this.quarantine(pos.symbol, closed.reason, exchangeName, ctx);
+      return false;
+    }
+    if (closed.remainingSize !== null) {
+      // Partial spot sell: the remainder stays a hedged position (state updated in place).
+      ctx.log(`  [ARB] Partial close of ${pos.symbol}: ${closed.remainingSize} remains open (spot + perp)`);
+      pos.size = closed.remainingSize;
+      recordSpotPerpClose(spotAdapter, pair, closed.remainingSize, "[ARB]", ctx.log);
+      this._closeFailures.delete(pos.symbol);
+      return false;
+    }
+    const n = (this._closeFailures.get(pos.symbol) ?? 0) + 1;
+    this._closeFailures.set(pos.symbol, n);
+    if (n >= MAX_CLOSE_FAILURES) {
+      this.quarantine(pos.symbol, `spot-perp close failed ${n} times in a row — stopping automatic close attempts`, exchangeName, ctx);
+    } else {
+      this._failCooldown.set(`${pos.symbol}:close`, Date.now() + 5 * 60 * 1000);
+    }
+    return false;
   }
 
   /** Open a spot-perp position: transfer USDC to spot, buy spot, short perp */
@@ -912,9 +1055,9 @@ export class FundingArbStrategy implements Strategy {
     }
 
     try {
-      const spotAdapter = await getSpotAdapter(exchangeName, perpAdapter);
+      const spotAdapter = await getBotSpotAdapter(exchangeName, perpAdapter);
       if (!spotAdapter) {
-        ctx.log(`  [ARB] Open spot-perp failed: spot adapter not available for ${exchangeName}`);
+        ctx.log(`  [ARB] Open spot-perp failed: ${exchangeName} is not a bot spot venue`);
         return false;
       }
 
@@ -992,48 +1135,105 @@ export class FundingArbStrategy implements Strategy {
         return false;
       }
 
+      // Lot steps from the venue market info: the hedge is floored to the perp lot and fills are
+      // judged with a half-lot tolerance. Unknown → skip before any transfer / order (Rule #2).
+      let perpStep: string;
+      let spotStep: string;
+      try {
+        perpStep = await lotStepOf(perpAdapter, perpSymbol);
+        spotStep = await spotLotStepOf(spotAdapter, opp.symbol);
+      } catch (err) {
+        ctx.log(`  [ARB] Skip spot-perp ${opp.symbol}: lot step unknown (${err instanceof Error ? err.message : String(err)})`);
+        return false;
+      }
+
       ctx.log(`  [ARB] Opening spot-perp: ${matched.size} ${opp.symbol} ($${matched.notional.toFixed(0)}, slippage ~${liq.spotSlippage.toFixed(2)}%/${liq.perpSlippage.toFixed(2)}%)`);
 
       // Step 1: Transfer USDC to spot
       const transferAmt = Math.ceil(matched.notional * 1.02); // slight buffer for price movement
-      await transferUsdcToSpot(spotAdapter, exchangeName, transferAmt);
-      ctx.log(`  [ARB] Transferred $${transferAmt} USDC to spot`);
+      if (await transferUsdcToSpot(spotAdapter, transferAmt)) ctx.log(`  [ARB] Transferred $${transferAmt} to spot`);
 
-      // Step 2: Buy spot
-      let spotResult: unknown;
+      // Step 2: Buy spot — the hedge is sized to what actually filled (§12.4 #5).
+      let hedgeSize: string;
+      let spotFill: { filledSize: number; avgPrice: number | null };
       try {
-        spotResult = await spotAdapter.spotMarketOrder(opp.symbol, "buy", matched.size);
-        ctx.log(`  [ARB] Bought spot ${matched.size} ${opp.symbol}`);
-        logExecution({ type: "arb_entry", exchange: opp.longExchange, symbol: opp.symbol, side: "buy", size: matched.size, notional: matched.notional, status: "success", dryRun: false, meta: { mode: "spot-perp", leg: "spot", response: spotResult } });
+        const fill = await spotMarketFill(spotAdapter, opp.symbol, "buy", matched.size, spotStep);
+        spotFill = fill;
+        hedgeSize = floorToStep(fill.filledSize, perpStep);
+        ctx.log(`  [ARB] Bought spot ${fill.filledSize}${fill.status === "partial" ? ` of ${matched.size} (partial)` : ""} ${opp.symbol}`);
+        logExecution({ type: "arb_entry", exchange: opp.longExchange, symbol: opp.symbol, side: "buy", size: String(fill.filledSize), notional: matched.notional, status: "success", dryRun: false, meta: { mode: "spot-perp", leg: "spot", fillStatus: fill.status, requestedSize: matched.size, response: fill.raw } });
       } catch (spotErr) {
         const msg = spotErr instanceof Error ? spotErr.message : String(spotErr);
+        const pending = spotErr instanceof PerpError && spotErr.structured.code === "ORDER_PENDING";
         ctx.log(`  [ARB] Open spot-perp failed (spot buy) for ${opp.symbol}: ${msg}`);
-        logExecution({ type: "arb_entry", exchange: opp.longExchange, symbol: opp.symbol, side: "buy", size: matched.size, status: "failed", error: msg, dryRun: false, meta: { mode: "spot-perp", leg: "spot" } });
-        try { await transferUsdcToPerp(spotAdapter, exchangeName, transferAmt); ctx.log(`  [ARB] Transferred $${transferAmt} USDC back to perp after spot buy failure`); } catch { /* best effort */ }
+        logExecution({ type: "arb_entry", exchange: opp.longExchange, symbol: opp.symbol, side: "buy", size: matched.size, status: "failed", error: msg, dryRun: false, meta: { mode: "spot-perp", leg: "spot", pending } });
+        if (pending) {
+          // Outcome unknown: the quote may already be spent — do not move funds or retry.
+          this.quarantine(opp.symbol, `spot buy ${matched.size} on ${exchangeName} is PENDING (not confirmed) — no perp hedge placed, $${transferAmt} left in spot (${msg})`, exchangeName, ctx);
+          return false;
+        }
+        try {
+          if (await transferUsdcToPerp(spotAdapter, transferAmt)) ctx.log(`  [ARB] Transferred $${transferAmt} back to perp after spot buy failure`);
+        } catch (xferErr) {
+          ctx.log(`  [ARB] WARNING: $${transferAmt} left in ${exchangeName} spot — transfer back to perp failed: ${xferErr instanceof Error ? xferErr.message : String(xferErr)}`);
+        }
+        return false;
+      }
+      if (!(Number(hedgeSize) > 0)) {
+        this.quarantine(opp.symbol, `spot buy filled only dust (below one perp lot ${perpStep}) — unhedged spot remains on ${exchangeName}; no perp short placed`, exchangeName, ctx);
         return false;
       }
 
-      // Step 3: Short perp
+      // Step 3: Short perp (filled spot size only), verified by the position delta
+      let shortHedged = hedgeSize;
+      let perpEntryPrice: number | null;
       try {
-        const perpResult = await perpAdapter.marketOrder(perpSymbol, "sell", matched.size);
-        ctx.log(`  [ARB] Shorted perp ${matched.size} ${perpSymbol}`);
-        logExecution({ type: "arb_entry", exchange: opp.shortExchange, symbol: opp.symbol, side: "sell", size: matched.size, notional: matched.notional, status: "success", dryRun: false, meta: { mode: "spot-perp", leg: "perp", response: perpResult } });
+        const pf = await placePerpVerified(perpAdapter, opp.shortExchange, perpSymbol, "sell", hedgeSize, { stepSize: perpStep });
+        shortHedged = floorToStep(pf.filledSize, perpStep);
+        // The venue-reported average fill of the short (null = not reported, never the protection price).
+        const avg = reportedAvgFillPrice(pf.raw);
+        perpEntryPrice = avg === null ? null : Number(avg);
+        if (Number(shortHedged) < Number(hedgeSize)) {
+          // Accepted partial fill (≥ 80% measured, or a venue-final partial IOC fill): spot exceeds the short — never resubmit, quarantine the residual.
+          this.quarantine(opp.symbol, `perp short filled ${shortHedged} of ${hedgeSize} on ${opp.shortExchange}; spot ${hedgeSize} held on ${exchangeName} — ${floorToStep(Number(hedgeSize) - Number(shortHedged), perpStep)} spot unhedged`, exchangeName, ctx);
+        }
+        ctx.log(`  [ARB] Shorted perp ${shortHedged} ${perpSymbol}`);
+        logExecution({ type: "arb_entry", exchange: opp.shortExchange, symbol: opp.symbol, side: "sell", size: hedgeSize, notional: matched.notional, status: "success", dryRun: false, meta: { mode: "spot-perp", leg: "perp", response: pf.raw, measuredFill: pf.filledSize } });
       } catch (perpErr) {
         const msg = perpErr instanceof Error ? perpErr.message : String(perpErr);
+        logExecution({ type: "arb_entry", exchange: opp.shortExchange, symbol: opp.symbol, side: "sell", size: hedgeSize, status: "failed", error: msg, dryRun: false, meta: { mode: "spot-perp", leg: "perp", pending: isOutcomeUnknown(perpErr) } });
+        if (isOutcomeUnknown(perpErr)) {
+          // The short may exist: selling the spot back could leave a naked short.
+          this.quarantine(opp.symbol, `perp short ${hedgeSize} on ${opp.shortExchange} outcome unknown (${msg}); ${hedgeSize} spot held on ${exchangeName} — not rolled back`, exchangeName, ctx);
+          return false;
+        }
         ctx.log(`  [ARB] Open spot-perp failed (perp short) for ${opp.symbol}: ${msg} — ROLLING BACK spot buy`);
-        logExecution({ type: "arb_entry", exchange: opp.shortExchange, symbol: opp.symbol, side: "sell", size: matched.size, status: "failed", error: msg, dryRun: false, meta: { mode: "spot-perp", leg: "perp" } });
-        // Rollback: sell spot back and transfer USDC back to perp
+        // Rollback: sell spot back, then sweep ONLY this sale's proceeds back to perp
+        // (quote above the pre-sale balance, capped at what this entry transferred in).
+        let preSaleQuote: number | null;
         try {
-          await spotAdapter.spotMarketOrder(opp.symbol, "sell", matched.size);
-          ctx.log(`  [ARB] Rollback success: sold spot ${matched.size} ${opp.symbol}`);
-          logExecution({ type: "multi_leg_rollback", exchange: opp.longExchange, symbol: opp.symbol, side: "sell", size: matched.size, status: "success", dryRun: false });
-          // Transfer USDC back to perp account
-          try {
-            await transferUsdcToPerp(spotAdapter, opp.longExchange.replace("-spot", ""), Math.ceil(matched.notional * 1.02));
-          } catch { /* best effort */ }
+          preSaleQuote = await readSpotQuoteAvailableFresh(spotAdapter);
+        } catch (qErr) {
+          preSaleQuote = null;
+          ctx.log(`  [ARB] WARNING: ${exchangeName} spot quote unreadable before the rollback sale (${qErr instanceof Error ? qErr.message : String(qErr)}) — proceeds will stay in spot`);
+        }
+        try {
+          const rb = await spotMarketFill(spotAdapter, opp.symbol, "sell", hedgeSize, spotStep);
+          ctx.log(`  [ARB] Rollback ${rb.status === "partial" ? "PARTIAL" : "success"}: sold spot ${rb.filledSize} of ${hedgeSize} ${opp.symbol}`);
+          if (rb.status === "partial") this.quarantine(opp.symbol, `entry rollback sold only ${rb.filledSize} of ${hedgeSize} — unhedged spot remains on ${exchangeName}`, exchangeName, ctx);
+          logExecution({ type: "multi_leg_rollback", exchange: opp.longExchange, symbol: opp.symbol, side: "sell", size: String(rb.filledSize), status: rb.status === "partial" ? "failed" : "success", dryRun: false });
+          if (preSaleQuote !== null) {
+            try {
+              const moved = await sweepSpotQuoteToPerp(spotAdapter, 1, { keep: preSaleQuote, max: transferAmt });
+              if (moved > 0) ctx.log(`  [ARB] Transferred rollback proceeds $${moved} back to perp (unspent transfer buffer stays in ${exchangeName} spot)`);
+            } catch (xferErr) {
+              ctx.log(`  [ARB] WARNING: rollback proceeds left in ${exchangeName} spot — transfer back to perp failed: ${xferErr instanceof Error ? xferErr.message : String(xferErr)}`);
+            }
+          }
         } catch (rbErr) {
           const rbMsg = rbErr instanceof Error ? rbErr.message : String(rbErr);
           ctx.log(`  [ARB] CRITICAL: Spot rollback failed for ${opp.symbol}: ${rbMsg}`);
+          this.quarantine(opp.symbol, `perp short failed and the spot rollback sell failed (${rbMsg}) — unhedged spot ${hedgeSize} remains on ${exchangeName}`, exchangeName, ctx);
           logExecution({ type: "multi_leg_rollback", exchange: opp.longExchange, symbol: opp.symbol, side: "sell", size: matched.size, status: "failed", error: rbMsg, dryRun: false });
         }
         return false;
@@ -1041,15 +1241,23 @@ export class FundingArbStrategy implements Strategy {
 
       // Track position
       const currentPositions = ctx.state.get("arbOpenPositions") as ArbOpenPosition[];
+      const entryTime = Date.now();
       currentPositions.push({
         symbol: opp.symbol,
         longExchange: opp.longExchange,
         shortExchange: opp.shortExchange,
         entrySpread: opp.spread,
-        size: matched.size,
+        size: shortHedged,
         mode: "spot-perp",
-        entryTime: Date.now(),
+        entryTime,
       });
+      // Recorded in the arb state with the actual legs, so `arb status` confirms it and `arb close` finds it.
+      recordSpotPerpEntry(spotAdapter, {
+        id: genPosId(), symbol: opp.symbol, spotExchange: exchangeName, perpExchange: opp.shortExchange,
+        entryTime, entrySpread: opp.spread,
+        spotSize: spotFill.filledSize, perpSize: Number(shortHedged),
+        spotAvgPrice: spotFill.avgPrice, perpEntryPrice,
+      }, "[ARB]", ctx.log);
       ctx.state.set("arbOpenPositions", currentPositions);
       ctx.state.set("arbPositions", currentPositions.length);
       ctx.log(`  [ARB] Spot-perp position opened! (${currentPositions.length}/${params.max_positions})`);

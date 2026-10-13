@@ -10,17 +10,30 @@
 
 import type { Strategy, StrategyContext, StrategyAction, EnrichedSnapshot } from "../strategy-types.js";
 import type { ExchangeAdapter } from "../../exchanges/index.js";
+import { requiredArbMargin } from "../../rebalance.js";
 import { registerStrategy } from "../strategy-registry.js";
 import { getFundingHours } from "../../funding.js";
 import { annualizeHourlyRate } from "../../funding/normalize.js";
 import { pruneExecutionLog } from "../../execution-log.js";
 import {
   type RateEntry, type RateMap, type FundingScore,
-  buildAdapterMap, getSpotAdapter,
+  buildAdapterMap,
   getPerpSymbol, findRate, matchSymbol, fetchRates,
-  scoreFunding, isPositionGone, computeFundingHoursFromHistory,
-} from "./funding-arb-utils.js";
+  scoreFunding, isPositionGone, botSpotPerpMatches, assertFundingArbLegs, cancelBotSymbols } from "./funding-arb-utils.js";
+import type { SpotMarketInfo } from "../../exchanges/spot-interface.js";
+import type { VenueMarket } from "../../exchanges/venue-types.js";
 import { SpotPerpExecutor } from "./spot-perp-executor.js";
+import { findSpotQuoteBalance, getBotSpotAdapter, nonQuoteSpotBalances, spotNetworkOf, spotSharesPerpMargin, spotTokenBase } from "../../exchanges/spot-factory.js";
+import type { SpotAdapter } from "../../exchanges/spot-interface.js";
+import { getVenue } from "../../exchanges/venue.js";
+import { updatePositionEntry } from "../../arb/state.js";
+import { recordSpotPerpClose, recordSpotPerpEntry, stateEntryOf, stateWriteFailed } from "./spot-perp-state.js";
+import { isQuarantined, quarantineSymbol } from "../quarantine.js";
+
+/** Consecutive failed closes before a position is quarantined (no sell→fail→re-hedge loop). */
+const MAX_CLOSE_FAILURES = 3;
+/** Spot leg buying power: notional plus 1% for the taker fee and the spot buy's slippage bound. */
+const SPOT_FEE_BUFFER = 1.01;
 
 // ── Types ──
 
@@ -65,6 +78,12 @@ export class SpotPerpArbStrategy implements Strategy {
 
   private _config: Record<string, unknown> = {};
   private _failCooldown = new Map<string, number>();
+  /** Consecutive failed close attempts per symbol (quarantined at MAX_CLOSE_FAILURES). */
+  private _closeFailures = new Map<string, number>();
+  /** Venues whose positions could not be read during recovery: no entries there until re-read. */
+  private _unrecovered = new Set<string>();
+  /** Perp symbols this bot entered or tracked this run — the only symbols its stop cancels orders on. */
+  private _traded = new Set<string>();
   private _fundingScoreCache = new Map<string, { score: FundingScore; ts: number }>();
 
   private get params(): SpotPerpArbParams {
@@ -87,6 +106,7 @@ export class SpotPerpArbStrategy implements Strategy {
   // ── init ──
 
   async init(ctx: StrategyContext, _snapshot: EnrichedSnapshot): Promise<void> {
+    assertFundingArbLegs(ctx);
     try { pruneExecutionLog(30); } catch { /* non-critical */ }
     this._config = ctx.config;
     const p = this.params;
@@ -100,7 +120,8 @@ export class SpotPerpArbStrategy implements Strategy {
     ctx.log(`  [SPA] Exchanges: ${p.exchanges.join(", ")}`);
     try {
       const adapters = buildAdapterMap(ctx);
-      const recovered = await this.recoverPositions(adapters, ctx);
+      const { recovered, unreadable } = await this.recoverPositions(adapters, ctx);
+      this._unrecovered = unreadable;
       if (recovered.length > 0) {
         ctx.state.set("spaPositions", recovered);
         ctx.state.set("arbPositions", recovered.length);
@@ -129,6 +150,19 @@ export class SpotPerpArbStrategy implements Strategy {
     const positions = ctx.state.get("spaPositions") as SpotPerpPosition[];
     const adapters = buildAdapterMap(ctx);
 
+    // Retry recovery on venues whose positions could not be read at init.
+    if (this._unrecovered.size > 0) {
+      const { recovered, unreadable } = await this.recoverPositions(adapters, ctx);
+      const tracked = new Set(positions.map(pos => pos.symbol.toUpperCase()));
+      for (const r of recovered) {
+        if (tracked.has(r.symbol.toUpperCase())) continue;
+        positions.push(r);
+        tracked.add(r.symbol.toUpperCase());
+      }
+      ctx.state.set("arbPositions", positions.length);
+      this._unrecovered = unreadable;
+    }
+
     const exchangeBalances = new Map<string, { equity: number; available: number; marginPct: number }>();
     const availableAdapters = new Map<string, ExchangeAdapter>();
     for (const [name, a] of adapters) {
@@ -139,7 +173,8 @@ export class SpotPerpArbStrategy implements Strategy {
         const available = parseFloat(bal.available);
         exchangeBalances.set(name, { equity, available, marginPct });
         const cd = this._failCooldown.get(`${name}:exchange`) ?? 0;
-        if (Date.now() < cd) ctx.log(`  [SPA] ${name} on cooldown`);
+        if (this._unrecovered.has(name)) ctx.log(`  [SPA] ${name} positions not recovered — no entries this tick`);
+        else if (Date.now() < cd) ctx.log(`  [SPA] ${name} on cooldown`);
         else if (available < 5) ctx.log(`  [SPA] ${name} available $${available.toFixed(2)} too low`);
         else if (marginPct >= 90) ctx.log(`  [SPA] ${name} margin ${marginPct.toFixed(0)}%`);
         else availableAdapters.set(name, a);
@@ -151,7 +186,14 @@ export class SpotPerpArbStrategy implements Strategy {
 
     const ratesByExchange: RateMap = new Map();
     for (const [name, a] of adapters) {
-      const rates = await fetchRates(a, name);
+      let rates: Awaited<ReturnType<typeof fetchRates>>;
+      try {
+        rates = await fetchRates(a, name);
+      } catch (err) {
+        // Recorded per venue; this venue is left out of this cycle's rate map.
+        ctx.log(`  [SPA] fetchRates failed for ${name}: ${err instanceof Error ? err.message : String(err)}`);
+        continue;
+      }
       const map = new Map<string, RateEntry>();
       for (const r of rates) map.set(r.symbol.toUpperCase(), { rate: r.rate, price: r.price, sizeDecimals: r.sizeDecimals, maxLeverage: r.maxLeverage, fundingHours: r.fundingHours });
       ratesByExchange.set(name, map);
@@ -203,6 +245,7 @@ export class SpotPerpArbStrategy implements Strategy {
     const toClose: SpotPerpPosition[] = [];
     for (const pos of positions) {
       if (!this.shouldClose(pos, ratesByExchange, p)) continue;
+      if (this.quarantined(pos.symbol, ctx)) { ctx.log(`  [SPA] ${pos.symbol} is quarantined — not closing (perp strategy quarantine)`); continue; }
       const cd = this._failCooldown.get(`${pos.symbol}:close`) ?? 0;
       if (Date.now() < cd) continue;
       ctx.log(`  [SPA] Closing ${pos.symbol} ${pos.spotExchange}-spot<>${pos.perpExchange}`);
@@ -215,8 +258,25 @@ export class SpotPerpArbStrategy implements Strategy {
         symbol: pos.symbol, spotExchange: pos.spotExchange, perpExchange: pos.perpExchange,
         spotAdapter, perpAdapter, size: pos.size, log: ctx.log,
       });
-      if (closed) toClose.push(pos);
-      else this._failCooldown.set(`${pos.symbol}:close`, Date.now() + 5 * 60 * 1000);
+      if (closed.closed) { toClose.push(pos); this._closeFailures.delete(pos.symbol); this.recordClose(spotAdapter, pos, null, ctx); }
+      else if (closed.manual) {
+        this.quarantine(pos.symbol, closed.reason, pos.spotExchange, pos.perpExchange, ctx);
+      } else if (closed.remainingSize !== null) {
+        pos.size = closed.remainingSize; // partial close: remainder still hedged
+        this.recordClose(spotAdapter, pos, closed.remainingSize, ctx);
+        this._closeFailures.delete(pos.symbol);
+        this._failCooldown.set(`${pos.symbol}:close`, Date.now() + 5 * 60 * 1000);
+      } else {
+        // Each failed attempt may have traded (perp close → spot sell fail → re-hedge):
+        // stop after MAX_CLOSE_FAILURES instead of looping.
+        const n = (this._closeFailures.get(pos.symbol) ?? 0) + 1;
+        this._closeFailures.set(pos.symbol, n);
+        if (n >= MAX_CLOSE_FAILURES) {
+          this.quarantine(pos.symbol, `close failed ${n} times in a row — stopping automatic close attempts`, pos.spotExchange, pos.perpExchange, ctx);
+        } else {
+          this._failCooldown.set(`${pos.symbol}:close`, Date.now() + 5 * 60 * 1000);
+        }
+      }
     }
     if (toClose.length > 0) {
       const remaining = positions.filter(pos => !toClose.some(c => c.id === pos.id));
@@ -224,12 +284,30 @@ export class SpotPerpArbStrategy implements Strategy {
       ctx.state.set("arbPositions", remaining.length);
     }
 
-    // ── Rotation check ──
+    // ── Rotation check (only to perp venues that match the spot leg, §12.4 #6) ──
+    const perpMarketsCache = new Map<string, Promise<VenueMarket[]>>();
+    const allowedBySpotVenue = new Map<string, Map<string, Set<string>>>();
     const currentPositions = ctx.state.get("spaPositions") as SpotPerpPosition[];
     for (const pos of currentPositions) {
+      if (this.quarantined(pos.symbol, ctx)) continue;
       const rcd = this._failCooldown.get(`${pos.id}:rotate`) ?? 0;
       if (Date.now() < rcd) continue;
-      const candidates = await this.findPerpCandidates(pos.symbol, adapters, ratesByExchange);
+      let allowedByBase = allowedBySpotVenue.get(pos.spotExchange);
+      if (allowedByBase === undefined) {
+        const spotExAdapter = adapters.get(pos.spotExchange);
+        const rotSpot = spotExAdapter ? await getBotSpotAdapter(pos.spotExchange, spotExAdapter) : null;
+        if (rotSpot === null) continue;
+        try {
+          allowedByBase = await this.spotPerpVenues(pos.spotExchange, await rotSpot.getSpotMarkets(), adapters, perpMarketsCache, ctx);
+        } catch (e) {
+          ctx.log(`  [SPA] ${pos.spotExchange} spot↔perp matching failed (rotation skipped): ${e instanceof Error ? e.message : String(e)}`);
+          continue;
+        }
+        allowedBySpotVenue.set(pos.spotExchange, allowedByBase);
+      }
+      const allowed = allowedByBase.get(pos.symbol.toUpperCase());
+      if (allowed === undefined) continue;
+      const candidates = await this.findPerpCandidates(pos.symbol, adapters, ratesByExchange, allowed);
       const best = candidates[0];
       if (!best || best.exchange === pos.perpExchange) continue;
       const currentInfo = findRate(ratesByExchange, pos.perpExchange, getPerpSymbol(pos.symbol, pos.perpExchange))
@@ -250,10 +328,20 @@ export class SpotPerpArbStrategy implements Strategy {
         currentAdapter: oldAdapter, newAdapter,
         size: pos.size, leverage: Math.min(p.leverage, newMaxLev), log: ctx.log,
       });
-      if (ok) {
+      if (ok.ok) {
+        // The spot leg is unchanged: the state entry follows the short to its new venue.
+        try {
+          const spotExAdapter = adapters.get(pos.spotExchange);
+          const rotSpot = spotExAdapter ? await this.executor.getSpotAdapter(pos.spotExchange, spotExAdapter) : null;
+          const entry = rotSpot !== null ? stateEntryOf(rotSpot, pos) : undefined;
+          if (rotSpot !== null && entry !== undefined) updatePositionEntry(spotNetworkOf(rotSpot), entry, { shortExchange: getVenue(best.exchange).id, entryShortPrice: ok.entryPrice });
+        } catch (e) { stateWriteFailed("[SPA]", "update (rotation)", { ...pos, perpExchange: best.exchange }, e, ctx.log); }
         pos.perpExchange = best.exchange;
         pos.fundingHistory = [];
         pos.lastFundingCheck = 0;
+      } else if (ok.manual) {
+        // A leg is unknown / unhedged: a retry could double-short — quarantine, never cool down.
+        this.quarantine(pos.symbol, ok.reason, pos.spotExchange, `${pos.perpExchange}/${best.exchange}`, ctx);
       } else {
         this._failCooldown.set(`${pos.id}:rotate`, Date.now() + 10 * 60 * 1000);
       }
@@ -272,22 +360,25 @@ export class SpotPerpArbStrategy implements Strategy {
 
     for (const [spotExName, spotExAdapter] of adapters) {
       try {
-        const spotAdapter = await getSpotAdapter(spotExName, spotExAdapter);
+        const spotAdapter = await getBotSpotAdapter(spotExName, spotExAdapter);
         if (!spotAdapter) continue;
-        const spotMarkets = await spotAdapter.getSpotMarkets();
-        for (const m of spotMarkets) {
-          const base = m.baseToken.toUpperCase();
+        // Canonical symbol + price guard (§12.4 #6): base → perp venues it may hedge on.
+        const allowedByBase = await this.spotPerpVenues(spotExName, await spotAdapter.getSpotMarkets(), adapters, perpMarketsCache, ctx);
+        for (const [base, allowed] of allowedByBase) {
           // HL spot: skip tokens not in whitelist
           if (spotExName === "hyperliquid" && !HL_SPOT_WHITELIST.has(base)) continue;
           if (openSymbols.has(base)) continue;
           if (Date.now() < (this._failCooldown.get(`${base}:entry`) ?? 0)) continue;
-          const candidates = await this.findPerpCandidates(base, adapters, ratesByExchange);
+          if (this.quarantined(base, ctx)) continue;
+          const candidates = await this.findPerpCandidates(base, adapters, ratesByExchange, allowed);
           for (const cand of candidates) {
             if (cand.score.annualized < p.min_rate || cand.score.consistency < p.min_consistency) continue;
             scoredOpps.push({ symbol: base, spotExchange: spotExName, perpExchange: cand.exchange, annualized: cand.score.annualized, score: cand.score });
           }
         }
-      } catch { /* no spot */ }
+      } catch (e) {
+        ctx.log(`  [SPA] ${spotExName} spot scan failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
     }
 
     scoredOpps.sort((a, b) => b.annualized - a.annualized);
@@ -300,6 +391,7 @@ export class SpotPerpArbStrategy implements Strategy {
 
     for (const opp of scoredOpps) {
       if ((ctx.state.get("spaPositions") as SpotPerpPosition[]).length >= p.max_positions) break;
+      if (this._unrecovered.has(opp.spotExchange) || this._unrecovered.has(opp.perpExchange)) continue;
       const opened = await this.tryOpenPosition(opp.spotExchange, opp.perpExchange, opp.symbol, opp.annualized, adapters, ctx, ratesByExchange, exchangeBalances);
       if (opened) return [{ type: "noop" }];
     }
@@ -314,9 +406,15 @@ export class SpotPerpArbStrategy implements Strategy {
   async onStop(ctx: StrategyContext): Promise<StrategyAction[]> {
     const positions = ctx.state.get("spaPositions") as SpotPerpPosition[] | undefined;
     const adapters = buildAdapterMap(ctx);
+    for (const p of positions ?? []) this._traded.add(getPerpSymbol(p.symbol, p.perpExchange).toUpperCase());
     if (positions && positions.length > 0) {
       const remaining: SpotPerpPosition[] = [];
       for (const pos of positions) {
+        if (this.quarantined(pos.symbol, ctx)) {
+          ctx.log(`  [SPA] CRITICAL: ${pos.symbol} is quarantined — left open on stop; resolve manually (perp strategy quarantine)`);
+          remaining.push(pos);
+          continue;
+        }
         const spotExAdapter = adapters.get(pos.spotExchange) ?? adapters.get(pos.perpExchange);
         const perpAdapter = adapters.get(pos.perpExchange);
         if (!perpAdapter || !spotExAdapter) { ctx.log(`  [SPA] CRITICAL: ${pos.symbol} no adapter on stop`); remaining.push(pos); continue; }
@@ -326,14 +424,39 @@ export class SpotPerpArbStrategy implements Strategy {
           symbol: pos.symbol, spotExchange: pos.spotExchange, perpExchange: pos.perpExchange,
           spotAdapter, perpAdapter, size: pos.size, log: ctx.log,
         });
-        if (!closed) { ctx.log(`  [SPA] CRITICAL: ${pos.symbol} could not be closed on stop`); remaining.push(pos); }
+        if (closed.closed) this.recordClose(spotAdapter, pos, null, ctx);
+        else {
+          if (closed.manual) this.quarantine(pos.symbol, closed.reason, pos.spotExchange, pos.perpExchange, ctx);
+          else if (closed.remainingSize !== null) {
+            pos.size = closed.remainingSize; // partial close: remainder still hedged
+            this.recordClose(spotAdapter, pos, closed.remainingSize, ctx);
+          }
+          ctx.log(`  [SPA] CRITICAL: ${pos.symbol} could not be (fully) closed on stop`);
+          remaining.push(pos);
+        }
       }
       ctx.state.set("spaPositions", remaining);
       ctx.state.set("arbPositions", remaining.length);
     }
-    const extra = ctx.state.get("extraAdapters") as Map<string, ExchangeAdapter> | undefined;
-    if (extra) { for (const [, a] of extra) { try { await a.cancelAllOrders(); } catch { /* best effort */ } } }
-    return [{ type: "cancel_all" }];
+    // Only the bot's own symbols, on each venue it used — never an account-wide cancel.
+    await cancelBotSymbols(adapters, this._traded, "[SPA]", ctx.log);
+    return [];
+  }
+
+  /** Close recorded in the arb state: entry removed (remaining null) or its legs set to the still-hedged remainder. */
+  private recordClose(spot: SpotAdapter, pos: SpotPerpPosition, remaining: string | null, ctx: StrategyContext): void {
+    recordSpotPerpClose(spot, pos, remaining, "[SPA]", ctx.log);
+  }
+
+  private quarantined(symbol: string, ctx: StrategyContext): boolean {
+    return isQuarantined(symbol, ctx.log);
+  }
+
+  /** Unknown / unhedged outcome (executor `manual`): stop touching this symbol until a human clears it. */
+  private quarantine(symbol: string, reason: string, spotExchange: string, perpExchange: string, ctx: StrategyContext): void {
+    quarantineSymbol(this.name, symbol, reason,
+      `Check ${spotExchange} spot (perp -e ${spotExchange} trade spot-balance, perp -e ${spotExchange} trade spot-orders) and the ${perpExchange} perp (perp -e ${perpExchange} positions); resolve by hand, then: perp strategy quarantine-clear ${symbol.toUpperCase()}`,
+      ctx.log);
   }
 
   // ── Scoring (decision logic) ──
@@ -342,10 +465,24 @@ export class SpotPerpArbStrategy implements Strategy {
     return scoreFunding(adapter, symbol, exchangeName, this.params.history_periods, this._fundingScoreCache);
   }
 
+  /** base (upper-case) → perp venues it may hedge on (canonical symbol + price guard, `botSpotPerpMatches`). */
+  private async spotPerpVenues(spotExName: string, spotMarkets: readonly SpotMarketInfo[], adapters: Map<string, ExchangeAdapter>, perpMarketsCache: Map<string, Promise<VenueMarket[]>>, ctx: StrategyContext): Promise<Map<string, Set<string>>> {
+    const byPerp = await botSpotPerpMatches(spotExName, spotMarkets, [...adapters.keys()], perpMarketsCache, (msg) => ctx.log(`  [SPA] ${msg}`));
+    const byBase = new Map<string, Set<string>>();
+    for (const [perpVenue, bases] of byPerp) {
+      for (const b of bases) {
+        const set = byBase.get(b);
+        if (set) set.add(perpVenue); else byBase.set(b, new Set([perpVenue]));
+      }
+    }
+    return byBase;
+  }
+
   /** Find all perp exchanges for a symbol, sorted by annualized rate (highest first). */
-  private async findPerpCandidates(symbol: string, adapters: Map<string, ExchangeAdapter>, ratesByExchange: RateMap): Promise<{ exchange: string; rate: number; score: FundingScore }[]> {
+  private async findPerpCandidates(symbol: string, adapters: Map<string, ExchangeAdapter>, ratesByExchange: RateMap, allowedPerpVenues: ReadonlySet<string>): Promise<{ exchange: string; rate: number; score: FundingScore }[]> {
     const candidates: { exchange: string; rate: number; score: FundingScore }[] = [];
     for (const [exName, adapter] of adapters) {
+      if (!allowedPerpVenues.has(exName)) continue;
       const perpSym = getPerpSymbol(symbol, exName);
       const ri = findRate(ratesByExchange, exName, perpSym) ?? findRate(ratesByExchange, exName, symbol);
       if (!ri || ri.rate <= 0) continue;
@@ -396,6 +533,8 @@ export class SpotPerpArbStrategy implements Strategy {
     ratesByExchange: RateMap, exchangeBalances: Map<string, { equity: number; available: number; marginPct: number }>,
   ): Promise<boolean> {
     const p = this.params;
+    // Engine: equity unknown → no new entries (closes / rotations' closes still run).
+    if (ctx.state.get("equityUnknown") === true) { ctx.log(`  [SPA] Skip ${symbol}: equity unknown — no new entries`); return false; }
     const spotExAdapter = adapters.get(spotExchange);
     const perpAdapter = adapters.get(perpExchange);
     if (!spotExAdapter || !perpAdapter) { this._failCooldown.set(`${symbol}:entry`, Date.now() + 5 * 60 * 1000); return false; }
@@ -449,10 +588,11 @@ export class SpotPerpArbStrategy implements Strategy {
       if (sameExchange) {
         const perpBal = await perpAdapter.getBalance();
         const perpAvail = parseFloat(perpBal.available);
-        const totalNeeded = targetSizeUsd + targetSizeUsd / leverage;
-        if (perpAvail < totalNeeded) {
-          const max = perpAvail * 0.8 / (1 + 1 / leverage);
-          if (max < 10) { ctx.log(`  [SPA] Skip ${symbol}: insufficient balance`); return false; }
+        // Spot leg: notional × SPOT_FEE_BUFFER; perp leg: requiredArbMargin (notional / leverage × ARB_MARGIN_BUFFER).
+        const need = (n: number) => n * SPOT_FEE_BUFFER + requiredArbMargin(n, leverage);
+        if (perpAvail < need(targetSizeUsd)) {
+          const max = perpAvail / need(1);
+          if (max < 10) { ctx.log(`  [SPA] Skip ${symbol}: insufficient balance — $${perpAvail.toFixed(2)} available, $${need(10).toFixed(2)} needed for the $10 minimum (spot + perp margin at ${leverage}x)`); return false; }
           targetSizeUsd = Math.floor(max);
         }
       } else {
@@ -462,19 +602,24 @@ export class SpotPerpArbStrategy implements Strategy {
         if (!sBal || !pBal) return false;
         // Check spot USDC balance (only add if separate from perp — skip for unified accounts like HL)
         let spotAvailable = sBal.available;
-        const isUnified = spotExAdapter?.isUnifiedAccount ?? false;
-        if (!isUnified) {
-          try {
-            const spotBals = await spotAdapter.getSpotBalances();
-            const spotUsdc = spotBals.find(b => b.token.toUpperCase().startsWith("USDC"));
-            if (spotUsdc) spotAvailable += parseFloat(spotUsdc.available);
-          } catch { /* non-critical */ }
+        const spotDef = getVenue(spotExchange);
+        if (!spotSharesPerpMargin(spotDef, spotExAdapter)) {
+          const spotQuote = findSpotQuoteBalance(spotDef, spotNetworkOf(spotAdapter), await spotAdapter.getSpotBalances());
+          if (spotQuote) spotAvailable += parseFloat(spotQuote.available);
         }
-        const maxNtl = Math.min(spotAvailable, pBal.available * leverage) * 0.8;
-        if (maxNtl < targetSizeUsd) { if (maxNtl < 10) { ctx.log(`  [SPA] Skip ${symbol}: insufficient balance (spot=$${spotAvailable.toFixed(2)}, perp=$${pBal.available.toFixed(2)})`); return false; } targetSizeUsd = Math.floor(maxNtl); }
+        // Spot leg: notional × SPOT_FEE_BUFFER of spot buying power; perp leg: requiredArbMargin at the leverage.
+        const maxNtl = Math.min(spotAvailable / SPOT_FEE_BUFFER, pBal.available / requiredArbMargin(1, leverage));
+        if (maxNtl < targetSizeUsd) {
+          if (maxNtl < 10) {
+            ctx.log(`  [SPA] Skip ${symbol}: insufficient balance for the $10 minimum — spot $${spotAvailable.toFixed(2)} (needs $${(10 * SPOT_FEE_BUFFER).toFixed(2)}), perp $${pBal.available.toFixed(2)} (needs $${requiredArbMargin(10, leverage).toFixed(2)} margin at ${leverage}x)`);
+            return false;
+          }
+          targetSizeUsd = Math.floor(maxNtl);
+        }
       }
 
       // Delegate to executor
+      this._traded.add(perpSymbol.toUpperCase());
       const result = await this.executor.openPosition({
         symbol, perpSymbol, spotExchange, perpExchange,
         spotAdapter, perpAdapter, sizeUsd: targetSizeUsd, leverage, log: ctx.log,
@@ -482,13 +627,22 @@ export class SpotPerpArbStrategy implements Strategy {
 
       if (result.success) {
         const cur = ctx.state.get("spaPositions") as SpotPerpPosition[];
-        cur.push({ id: genPosId(), symbol, spotExchange, perpExchange, size: result.size!, entryTime: Date.now(), entryRate, fundingHistory: [], lastFundingCheck: 0 });
+        const pos: SpotPerpPosition = { id: genPosId(), symbol, spotExchange, perpExchange, size: result.size, entryTime: Date.now(), entryRate, fundingHistory: [], lastFundingCheck: 0 };
+        cur.push(pos);
+        recordSpotPerpEntry(spotAdapter, {
+          id: pos.id, symbol, spotExchange, perpExchange, entryTime: pos.entryTime, entrySpread: entryRate,
+          spotSize: result.spotSize, perpSize: Number(result.size), spotAvgPrice: result.spotAvgPrice, perpEntryPrice: result.perpEntryPrice,
+        }, "[SPA]", ctx.log);
         ctx.state.set("spaPositions", cur);
         ctx.state.set("arbPositions", cur.length);
         ctx.log(`  [SPA] Opened! (${cur.length}/${p.max_positions})`);
         return true;
       }
 
+      if (result.manual === true) {
+        this.quarantine(symbol, result.error ?? "entry outcome unknown", spotExchange, perpExchange, ctx);
+        return false;
+      }
       this._failCooldown.set(`${symbol}:entry`, Date.now() + 5 * 60 * 1000);
       return false;
     } catch (err) {
@@ -500,20 +654,28 @@ export class SpotPerpArbStrategy implements Strategy {
 
   // ── Position recovery ──
 
-  private async recoverPositions(adapters: Map<string, ExchangeAdapter>, ctx: StrategyContext): Promise<SpotPerpPosition[]> {
+  /** Rebuild positions from the venues; `unreadable` = venues whose positions / spot balances failed to load (never "none"). */
+  private async recoverPositions(adapters: Map<string, ExchangeAdapter>, ctx: StrategyContext): Promise<{ recovered: SpotPerpPosition[]; unreadable: Set<string> }> {
     const recovered: SpotPerpPosition[] = [];
+    const unreadable = new Set<string>();
     const perpByEx = new Map<string, { symbol: string; side: string; size: string }[]>();
     for (const [name, a] of adapters) {
-      try { const pos = await a.getPositions(); perpByEx.set(name, pos.map(p => ({ symbol: p.symbol.toUpperCase(), side: p.side, size: p.size }))); } catch { /* skip */ }
+      try {
+        const pos = await a.getPositions();
+        perpByEx.set(name, pos.map(p => ({ symbol: p.symbol.toUpperCase(), side: p.side, size: p.size })));
+      } catch (e) {
+        unreadable.add(name);
+        ctx.log(`  [SPA] ${name} positions unreadable during recovery (${e instanceof Error ? e.message : String(e)}) — no entries on ${name} until recovered`);
+      }
     }
     const used = new Set<string>();
     for (const [spotExName, spotExAdapter] of adapters) {
       try {
-        const spotAdapter = await getSpotAdapter(spotExName, spotExAdapter);
+        const spotAdapter = await getBotSpotAdapter(spotExName, spotExAdapter);
         if (!spotAdapter) continue;
         const bals = await spotAdapter.getSpotBalances();
-        for (const bal of bals.filter(b => Number(b.total) > 0 && !b.token.toUpperCase().startsWith("USDC"))) {
-          const base = bal.token.toUpperCase().replace(/-SPOT$/, "");
+        for (const bal of nonQuoteSpotBalances(getVenue(spotExName), spotNetworkOf(spotAdapter), bals)) {
+          const base = spotTokenBase(bal.token);
           for (const [perpExName, perps] of perpByEx) {
             for (const perp of perps) {
               const key = `${perpExName}:${perp.symbol}`;
@@ -527,9 +689,12 @@ export class SpotPerpArbStrategy implements Strategy {
             }
           }
         }
-      } catch { /* no spot */ }
+      } catch (e) {
+        unreadable.add(spotExName);
+        ctx.log(`  [SPA] ${spotExName} spot recovery failed: ${e instanceof Error ? e.message : String(e)} — no entries on ${spotExName} until recovered`);
+      }
     }
-    return recovered;
+    return { recovered, unreadable };
   }
 }
 

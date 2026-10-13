@@ -89,7 +89,19 @@ export async function fetchAndCache<T>(key: string, ttlMs: number, fetcher: () =
 /**
  * Invalidate cache entries matching a prefix (e.g., "acct" after a trade).
  */
+let _accountEpoch = 0;
+
+/**
+ * Monotonic counter bumped on every account-cache invalidation. Adapters that keep
+ * in-process account / position / order snapshots (Aster) store the epoch with the
+ * snapshot and treat a mismatch as stale, so `invalidateCache("acct")` also reaches them.
+ */
+export function accountCacheEpoch(): number {
+  return _accountEpoch;
+}
+
 export function invalidateCache(keyPrefix?: string): void {
+  if (keyPrefix === undefined || keyPrefix === "acct" || "acct".startsWith(keyPrefix)) _accountEpoch++;
   try {
     const prefix = keyPrefix ? safeKey(keyPrefix) : "";
     const files = readdirSync(CACHE_DIR);

@@ -1,7 +1,17 @@
 import type { Strategy, StrategyContext, StrategyAction, EnrichedSnapshot } from "../strategy-types.js";
 import type { ExchangeAdapter } from "../../exchanges/index.js";
 import { registerStrategy } from "../strategy-registry.js";
-import { toHourlyRate, computeAnnualSpread, annualizeHourlyRate } from "../../funding/normalize.js";
+import { toHourlyRate, annualizeHourlyRate } from "../../funding/normalize.js";
+import { isQuarantined, quarantineSymbol } from "../quarantine.js";
+import { closePerpVerified, isOutcomeUnknown, placePerpVerified, trimFirstLegToHedge, type PerpCloseResult } from "../perp-order.js";
+import { fillSizeString, sizeDecimalsOf } from "../../exchanges/spot-result.js";
+import { PerpError } from "../../errors.js";
+import { assertFundingArbLegs } from "./funding-arb-utils.js";
+
+/** Market basis first (ExchangeMarketInfo.fundingHours), else the venue definition's basis (§10.1). */
+function hourlyOf(info: { rate: number; fundingHours: number | null }, exchange: string): number {
+  return info.fundingHours !== null ? info.rate / info.fundingHours : toHourlyRate(info.rate, exchange);
+}
 
 /**
  * Minimum notional per exchange (USD):
@@ -12,15 +22,15 @@ import { toHourlyRate, computeAnnualSpread, annualizeHourlyRate } from "../../fu
  */
 const MIN_NOTIONAL_USD = 12;
 
-/** Size precision per asset price range */
+/** Entry size precision per asset price range, FLOORED (never rounds up past the notional). */
 function formatSizeForPrice(rawSize: number, price: number): string {
-  // Higher price → fewer decimals (BTC: 4, ETH: 3, SOL: 1, small coins: 0)
-  if (price > 10000) return rawSize.toFixed(4);   // BTC
-  if (price > 1000) return rawSize.toFixed(3);     // ETH
-  if (price > 10) return rawSize.toFixed(2);       // SOL, AVAX
-  if (price > 1) return rawSize.toFixed(1);        // DOGE, etc
-  return rawSize.toFixed(0);                       // sub-$1 tokens
+  // Higher price → fewer decimals (BTC: 4, ETH: 3, SOL: 2, DOGE: 1, sub-$1: 0)
+  const decimals = price > 10000 ? 4 : price > 1000 ? 3 : price > 10 ? 2 : price > 1 ? 1 : 0;
+  return fillSizeString(rawSize, decimals);
 }
+
+/** Consecutive definite close failures before a pair is quarantined. */
+const MAX_CLOSE_FAILURES = 3;
 
 /** Normalize exchange symbol to base asset: "ETH-PERP" → "ETH", "ETHUSDT" → "ETH" */
 function normalizeSymbol(raw: string): string {
@@ -34,9 +44,10 @@ function normalizeSymbol(raw: string): string {
  *   Scan funding rates across all exchanges, find largest spread,
  *   long on low-rate exchange, short on high-rate exchange.
  *
- * Mode 2: Spot-Perp (stable mode)
- *   Find symbols where perp funding is significantly positive,
- *   buy spot + short perp = delta neutral, collect funding.
+ * Mode 2: Spot-Perp — NOT SUPPORTED (CAPABILITY_UNSUPPORTED). This strategy discovers
+ *   its pairs from live perp positions every tick and has no spot adapter or persisted
+ *   spot state, so it cannot hold a spot leg it can later find and unwind. A non-zero
+ *   `spotPerpRatio` is refused at init; use the `spot-perp-arb` strategy instead.
  *
  * Core formula:
  *   Total Cost  = 2 * [(feeA + feeB + slippageA + slippageB) * notional]
@@ -45,6 +56,12 @@ function normalizeSymbol(raw: string): string {
  *   Entry if: breakEvenHours < maxHoldHours AND hourlyIncome > 0 AND spread > minSpread
  *
  * Position tracking: discovered from live exchange data every tick (survives restarts).
+ *
+ * Order safety (design §12.3): entry legs are sequential and verified (placePerpVerified),
+ * the short sized to the long's verified fill; rollbacks, trims and closes are
+ * reduce-only and verified, closes sized from the venue's own position size. An unknown
+ * outcome, an unhedged leg, or MAX_CLOSE_FAILURES consecutive close failures
+ * quarantines the symbol — never retried automatically.
  */
 
 // ── Types ──
@@ -58,19 +75,21 @@ interface FundingOpportunity {
   annualSpread: number;
   hourlyIncome: number; // for sizeUsd notional
   breakEvenHours: number;
-  mode: "perp-perp" | "spot-perp";
+  mode: "perp-perp";
 }
 
 interface ActivePosition {
   id: string;
   symbol: string;
-  mode: "perp-perp" | "spot-perp";
+  mode: "perp-perp";
   longExchange: string;
   shortExchange: string;
   longSize: number;       // actual size from exchange
   shortSize: number;      // actual size from exchange
   longSymbol: string;     // raw exchange symbol for order execution
   shortSymbol: string;    // raw exchange symbol for order execution
+  longSizeRaw: string;    // venue-reported position size (unsigned), used verbatim for closes
+  shortSizeRaw: string;
   entrySpread: number;
   entryTime: number;
   notional: number;
@@ -105,11 +124,9 @@ class FundingAutoStrategy implements Strategy {
   private _config: Record<string, unknown> = {};
 
   // Config accessors
-  private get spotPerpRatio(): number { return Number(this._config.spotPerpRatio ?? 0.7); }
   private get perpPerpRatio(): number { return Number(this._config.perpPerpRatio ?? 0.3); }
   private get perpPerpMinSpread(): number { return Number(this._config.perpPerpMinSpread ?? 20); }
-  private get spotPerpMinSpread(): number { return Number(this._config.spotPerpMinSpread ?? 5); }
-  private get perpPerpCloseSpread(): number { return Number(this._config.perpPerpCloseSpread ?? 5); }
+  private get perpPerpCloseSpread(): number { return Number(this._config.perpPerpCloseSpread ?? 0); }
   private get maxBreakEvenHours(): number { return Number(this._config.maxBreakEvenHours ?? 48); }
   private get maxPositions(): number { return Number(this._config.maxPositions ?? 5); }
   private get maxCapitalPct(): number { return Number(this._config.maxCapitalPct ?? 20); }
@@ -118,8 +135,6 @@ class FundingAutoStrategy implements Strategy {
   private get scanIntervalTicks(): number { return Number(this._config.scanIntervalTicks ?? 1); }
   /** Position size: min of sizeUsd (if set) and maxCapitalPct% of total equity */
   private _cachedEquity = 0;
-  /** Symbols managed by this strategy instance (persists across ticks, prevents adopting unrelated positions) */
-  private _managedSymbols = new Set<string>();
   private getSizeUsd(): number {
     const fixedSize = Number(this._config.sizeUsd ?? 0);
     const capitalLimit = this._cachedEquity * (this.maxCapitalPct / 100);
@@ -130,12 +145,11 @@ class FundingAutoStrategy implements Strategy {
 
   describe() {
     return {
-      description: "Automated funding rate trading - perp-perp + spot-perp dual mode",
+      description: "Automated funding rate trading - perp-perp (spot-perp mode not supported; use spot-perp-arb)",
       params: [
-        { name: "spotPerpRatio", type: "number" as const, required: false, default: 0.7, description: "Capital ratio for spot-perp mode" },
+        { name: "spotPerpRatio", type: "number" as const, required: false, default: 0, description: "Spot-perp mode is NOT supported here (a value > 0 fails with CAPABILITY_UNSUPPORTED) — use spot-perp-arb" },
         { name: "perpPerpRatio", type: "number" as const, required: false, default: 0.3, description: "Capital ratio for perp-perp mode" },
         { name: "perpPerpMinSpread", type: "number" as const, required: false, default: 20, description: "Min annualized spread % for perp-perp entry" },
-        { name: "spotPerpMinSpread", type: "number" as const, required: false, default: 5, description: "Min annualized spread % for spot-perp entry" },
         { name: "perpPerpCloseSpread", type: "number" as const, required: false, default: 0, description: "Close perp-perp when spread reverses below this % (0 = only on reversal)" },
         { name: "maxBreakEvenHours", type: "number" as const, required: false, default: 48, description: "Max break-even hours to enter" },
         { name: "maxPositions", type: "number" as const, required: false, default: 5, description: "Max concurrent positions" },
@@ -149,10 +163,16 @@ class FundingAutoStrategy implements Strategy {
   }
 
   async init(ctx: StrategyContext, _snapshot: EnrichedSnapshot): Promise<void> {
+    assertFundingArbLegs(ctx);
     this._config = ctx.config;
+    if (ctx.config.spotPerpRatio !== undefined && Number(ctx.config.spotPerpRatio) > 0) {
+      throw new PerpError("CAPABILITY_UNSUPPORTED", "funding-auto does not support spot-perp mode (no spot leg can be held or unwound by this strategy)", {
+        remediation: "Remove spotPerpRatio (or set it to 0) to run perp-perp only, or use the spot-perp-arb strategy for spot + perp short",
+      });
+    }
     ctx.state.set("lastScan", 0);
     ctx.state.set("priceCache", new Map<string, number>());
-    ctx.log(`[funding-auto] Starting with ${this.spotPerpRatio}/${this.perpPerpRatio} spot-perp/perp-perp split`);
+    ctx.log(`[funding-auto] Starting (perp-perp only; spot-perp mode is not supported by this strategy)`);
   }
 
   async onTick(ctx: StrategyContext, _snapshot: EnrichedSnapshot): Promise<StrategyAction[]> {
@@ -177,15 +197,17 @@ class FundingAutoStrategy implements Strategy {
     }
 
     // ── Discover existing arb pairs from live exchange positions ──
-    const positions = await this.discoverArbPairs(adapters);
+    // A venue whose positions could not be read is never treated as "no positions":
+    // no entries touch it this tick (its existing pairs are simply not visible).
+    const { pairs: positions, unreadable } = await this.discoverArbPairs(adapters, ctx.log);
 
     // Fetch funding rates from all exchanges (price data cached for position sizing)
-    const ratesByExchange = new Map<string, Map<string, { rate: number; price: number; exchange: string }>>();
+    const ratesByExchange = new Map<string, Map<string, { rate: number; price: number; exchange: string; fundingHours: number | null }>>();
     const priceCache = new Map<string, number>(); // "exchange:symbol" -> price
     for (const [name, adapter] of adapters) {
       try {
         const markets = await adapter.getMarkets();
-        const map = new Map<string, { rate: number; price: number; exchange: string }>();
+        const map = new Map<string, { rate: number; price: number; exchange: string; fundingHours: number | null }>();
         for (const m of markets) {
           const raw = m.symbol.toUpperCase();
           const sym = normalizeSymbol(raw);
@@ -194,6 +216,7 @@ class FundingAutoStrategy implements Strategy {
             rate: m.fundingRate != null ? parseFloat(m.fundingRate) : NaN,
             price,
             exchange: name,
+            fundingHours: m.fundingHours,
           });
           if (price > 0) {
             priceCache.set(`${name}:${sym}`, price);
@@ -220,6 +243,11 @@ class FundingAutoStrategy implements Strategy {
     // ── Phase 1: Monitor existing positions for exit ──
     const surviving: ActivePosition[] = [];
     for (const pos of positions) {
+      if (isQuarantined(pos.symbol, ctx.log)) {
+        // Unknown / unhedged outcome recorded by some bot or arb path: hands off (design §12.3).
+        surviving.push(pos);
+        continue;
+      }
       if (pos.mode === "perp-perp") {
         // Check if spread has converged below close threshold
         const longRates = ratesByExchange.get(pos.longExchange);
@@ -230,16 +258,22 @@ class FundingAutoStrategy implements Strategy {
         const shortInfo = shortRates.get(pos.symbol);
         if (!longInfo || !shortInfo) { surviving.push(pos); continue; }
 
-        const currentSpread = computeAnnualSpread(
-          shortInfo.rate, pos.shortExchange,
-          longInfo.rate, pos.longExchange,
-        );
+        // SIGNED spread for the held direction: short-venue hourly − long-venue hourly
+        // (each normalized by its own funding basis), annualized %. Positive = still
+        // earning; ≤ 0 = the pair has reversed and now pays.
+        const currentSpread = annualizeHourlyRate(hourlyOf(shortInfo, pos.shortExchange) - hourlyOf(longInfo, pos.longExchange));
 
-        // Calculate real P&L from exchange history
+        // Calculate real P&L from exchange history. An unreadable history is never "0":
+        // no close decision for this pair this tick.
         const [longPnl, shortPnl] = await Promise.all([
-          this.calculateRealPnl(adapters.get(pos.longExchange)!, pos.symbol),
-          this.calculateRealPnl(adapters.get(pos.shortExchange)!, pos.symbol),
+          this.calculateRealPnl(adapters.get(pos.longExchange)!, pos.longExchange, pos.symbol, ctx.log),
+          this.calculateRealPnl(adapters.get(pos.shortExchange)!, pos.shortExchange, pos.symbol, ctx.log),
         ]);
+        if (longPnl === null || shortPnl === null) {
+          ctx.log(`[funding-auto] ${pos.symbol}: P&L history unreadable — skipping the exit decision this tick`);
+          surviving.push(pos);
+          continue;
+        }
         const totalFees = longPnl.fees + shortPnl.fees;
         const totalFunding = longPnl.funding + shortPnl.funding;
         pos.accumulatedFunding = totalFunding;
@@ -251,43 +285,12 @@ class FundingAutoStrategy implements Strategy {
           `net $${(totalFunding - totalFees).toFixed(4)} (${pos.longExchange}↔${pos.shortExchange})`,
         );
 
-        // Only close when spread REVERSES (≤ 0%) — never close a profitable position
-        // A spread of 5% or even 2% still earns funding. Closing costs more than keeping.
-        if (currentSpread <= 0) {
-          ctx.log(`[funding-auto] Closing perp-perp ${pos.symbol}: spread REVERSED to ${currentSpread.toFixed(1)}%`);
-          await this.closePosition(ctx, pos, adapters);
+        // Close when the signed spread falls to the configured threshold (default 0 =
+        // only on reversal). A small positive spread still earns funding; closing costs more.
+        if (currentSpread <= this.perpPerpCloseSpread) {
+          ctx.log(`[funding-auto] Closing perp-perp ${pos.symbol}: spread ${currentSpread.toFixed(1)}% <= close threshold ${this.perpPerpCloseSpread}%${currentSpread <= 0 ? " (REVERSED)" : ""}`);
+          if (!(await this.closePosition(ctx, pos, adapters))) surviving.push(pos);
         } else {
-          surviving.push(pos);
-        }
-      } else if (pos.mode === "spot-perp") {
-        // Spot-perp: exit if perp funding flips negative (we are short perp)
-        const shortRates = ratesByExchange.get(pos.shortExchange);
-        if (!shortRates) { surviving.push(pos); continue; }
-
-        const shortInfo = shortRates.get(pos.symbol);
-        if (!shortInfo) { surviving.push(pos); continue; }
-
-        const hourlyRate = toHourlyRate(shortInfo.rate, pos.shortExchange);
-        const annualized = annualizeHourlyRate(Math.abs(hourlyRate));
-
-        const pnl = await this.calculateRealPnl(adapters.get(pos.shortExchange)!, pos.symbol);
-        pos.accumulatedFunding = pnl.funding;
-        pos.totalCost = pnl.fees;
-
-        ctx.log(
-          `[funding-auto] ${pos.symbol} rate ${annualized.toFixed(1)}% | ` +
-          `fees $${pnl.fees.toFixed(4)} | funding $${pnl.funding.toFixed(4)} | ` +
-          `net $${(pnl.funding - pnl.fees).toFixed(4)} (${pos.shortExchange})`,
-        );
-
-        // Exit if funding flipped (rate went negative — shorts would pay instead of receive)
-        if (shortInfo.rate < 0) {
-          ctx.log(`[funding-auto] Closing spot-perp ${pos.symbol}: funding flipped negative (${(shortInfo.rate * 100).toFixed(4)}%)`);
-          await this.closePosition(ctx, pos, adapters);
-        } else {
-          if (annualized < this.spotPerpMinSpread) {
-            ctx.log(`[funding-auto] Spot-perp ${pos.symbol} annualized rate dropped to ${annualized.toFixed(1)}% — monitoring`);
-          }
           surviving.push(pos);
         }
       }
@@ -324,7 +327,7 @@ class FundingAutoStrategy implements Strategy {
       for (const exName of exchangeNames) {
         const info = ratesByExchange.get(exName)?.get(sym);
         if (!info) continue;
-        const hourly = toHourlyRate(info.rate, exName);
+        const hourly = hourlyOf(info, exName);
         if (hourly < minRate) { minRate = hourly; minExchange = exName; }
         if (hourly > maxRate) { maxRate = hourly; maxExchange = exName; }
       }
@@ -335,10 +338,7 @@ class FundingAutoStrategy implements Strategy {
       const longInfo = ratesByExchange.get(minExchange)!.get(sym)!;
       const shortInfo = ratesByExchange.get(maxExchange)!.get(sym)!;
 
-      const annualSpread = computeAnnualSpread(
-        shortInfo.rate, maxExchange,
-        longInfo.rate, minExchange,
-      );
+      const annualSpread = Math.abs(hourlyOf(shortInfo, maxExchange) - hourlyOf(longInfo, minExchange)) * 24 * 365 * 100;
 
       if (annualSpread < this.perpPerpMinSpread) continue;
 
@@ -369,9 +369,7 @@ class FundingAutoStrategy implements Strategy {
     }
 
     // ── Spot-Perp opportunities ──
-    // DISABLED: spot-perp requires SpotAdapter to buy spot (not yet integrated).
-    // Opening perp short without spot buy creates naked short = directional risk.
-    // TODO: Enable when SpotAdapter is wired into the strategy context.
+    // Not supported in this strategy (CAPABILITY_UNSUPPORTED at init) — see the header.
 
     // Sort by break-even hours ascending (best opportunities first)
     opportunities.sort((a, b) => a.breakEvenHours - b.breakEvenHours);
@@ -382,7 +380,7 @@ class FundingAutoStrategy implements Strategy {
         ctx.log(`[funding-auto] ${o.mode} ${o.symbol}: spread ${o.annualSpread.toFixed(1)}%, BE ${o.breakEvenHours.toFixed(0)}h, income $${(o.hourlyIncome * 24).toFixed(4)}/day (${o.longExchange}↔${o.shortExchange})`);
       }
     } else {
-      ctx.log(`[funding-auto] No opportunities found (perp-perp min ${this.perpPerpMinSpread}%, spot-perp min ${this.spotPerpMinSpread}%, BE max ${this.maxBreakEvenHours}h)`);
+      ctx.log(`[funding-auto] No opportunities found (perp-perp min ${this.perpPerpMinSpread}%, BE max ${this.maxBreakEvenHours}h)`);
     }
 
     // ── Phase 3: Enter new positions ──
@@ -390,17 +388,16 @@ class FundingAutoStrategy implements Strategy {
 
     // Allocate slots by ratio
     const perpPerpSlots = Math.max(1, Math.floor(slotsAvailable * this.perpPerpRatio));
-    const spotPerpSlots = Math.max(1, slotsAvailable - perpPerpSlots);
 
     let perpPerpOpened = 0;
-    let spotPerpOpened = 0;
     let currentCount = surviving.length;
 
     for (const opp of opportunities) {
       if (currentCount >= this.maxPositions) break;
 
-      if (opp.mode === "perp-perp" && perpPerpOpened >= perpPerpSlots) continue;
-      if (opp.mode === "spot-perp" && spotPerpOpened >= spotPerpSlots) continue;
+      if (perpPerpOpened >= perpPerpSlots) continue;
+      if (unreadable.has(opp.longExchange) || unreadable.has(opp.shortExchange)) continue;
+      if (isQuarantined(opp.symbol, ctx.log)) continue;
 
       // Track attempted symbols to prevent re-entry on same tick cycle
       attempted.add(`${opp.symbol}:${opp.mode}`);
@@ -409,10 +406,7 @@ class FundingAutoStrategy implements Strategy {
       const success = await this.openPosition(ctx, opp, adapters);
       if (success) {
         currentCount++;
-        this._managedSymbols.add(`${opp.symbol}:${opp.mode}`);
-
-        if (opp.mode === "perp-perp") perpPerpOpened++;
-        else spotPerpOpened++;
+        perpPerpOpened++;
 
         ctx.log(
           `[funding-auto] Opened ${opp.mode} ${opp.symbol}: spread ${opp.annualSpread.toFixed(1)}% | ` +
@@ -427,7 +421,10 @@ class FundingAutoStrategy implements Strategy {
 
   async onStop(ctx: StrategyContext): Promise<StrategyAction[]> {
     const adapters = this.getAdapters(ctx);
-    const positions = await this.discoverArbPairs(adapters);
+    const { pairs: positions, unreadable } = await this.discoverArbPairs(adapters, ctx.log);
+    if (unreadable.size > 0) {
+      ctx.log(`[funding-auto] CRITICAL: positions on ${[...unreadable].join(", ")} could not be read — any pair there is NOT closed on stop; check manually`);
+    }
 
     if (positions.length === 0) {
       ctx.log("[funding-auto] No positions to close.");
@@ -437,6 +434,10 @@ class FundingAutoStrategy implements Strategy {
     ctx.log(`[funding-auto] Stopping - closing ${positions.length} positions`);
 
     for (const pos of positions) {
+      if (isQuarantined(pos.symbol, ctx.log)) {
+        ctx.log(`[funding-auto] CRITICAL: ${pos.symbol} is quarantined — left open on stop; resolve manually (perp strategy quarantine)`);
+        continue;
+      }
       try {
         await this.closePosition(ctx, pos, adapters);
       } catch (err) {
@@ -473,9 +474,10 @@ class FundingAutoStrategy implements Strategy {
     return formatSizeForPrice(rawSize, price);
   }
 
-  /** Discover existing arb pairs from live exchange positions */
-  private async discoverArbPairs(adapters: Map<string, ExchangeAdapter>): Promise<ActivePosition[]> {
-    const allPositions = new Map<string, { exchange: string; side: string; size: number; symbol: string }[]>();
+  /** Discover existing arb pairs from live exchange positions; `unreadable` = venues whose positions failed to load. */
+  private async discoverArbPairs(adapters: Map<string, ExchangeAdapter>, log: (msg: string) => void): Promise<{ pairs: ActivePosition[]; unreadable: Set<string> }> {
+    const allPositions = new Map<string, { exchange: string; side: string; size: number; sizeRaw: string; symbol: string }[]>();
+    const unreadable = new Set<string>();
 
     for (const [name, adapter] of adapters) {
       try {
@@ -487,16 +489,19 @@ class FundingAutoStrategy implements Strategy {
             exchange: name,
             side: p.side,
             size: Math.abs(Number(p.size)),
+            sizeRaw: String(p.size).trim().replace(/^[-+]/, ""), // venue's own size string, for closes
             symbol: p.symbol, // raw for order execution
           });
         }
-      } catch { /* skip unavailable exchange */ }
+      } catch (e) {
+        unreadable.add(name);
+        log(`[funding-auto] ${name} positions unreadable (${e instanceof Error ? e.message : String(e)}) — no entries on ${name} this tick`);
+      }
     }
 
-    // Find arb pairs: same symbol, opposite sides, different exchanges = perp-perp
+    // Find arb pairs: same symbol, opposite sides, different exchanges = perp-perp.
+    // An unmatched short is never adopted (spot-perp mode is not supported here).
     const pairs: ActivePosition[] = [];
-    const matchedShorts = new Set<string>(); // track shorts already matched to perp-perp
-
     for (const [sym, positionList] of allPositions) {
       const longs = positionList.filter(p => p.side === "long");
       const shorts = positionList.filter(p => p.side === "short");
@@ -514,48 +519,28 @@ class FundingAutoStrategy implements Strategy {
               shortSize: short.size,
               longSymbol: long.symbol,
               shortSymbol: short.symbol,
+              longSizeRaw: long.sizeRaw,
+              shortSizeRaw: short.sizeRaw,
               entrySpread: 0,
               entryTime: 0,
               notional: 0,
               totalCost: 0,
               accumulatedFunding: 0,
             });
-            matchedShorts.add(`${sym}:${short.exchange}`);
           }
         }
       }
-
-      // Unmatched shorts = spot-perp ONLY if funding-auto previously entered them
-      // (prevents adopting unrelated positions like manual PURR short)
-      for (const short of shorts) {
-        if (!matchedShorts.has(`${sym}:${short.exchange}`) && this._managedSymbols.has(`${sym}:spot-perp`)) {
-          pairs.push({
-            id: `${sym}-spot-${short.exchange}`,
-            symbol: sym,
-            mode: "spot-perp",
-            longExchange: short.exchange,
-            shortExchange: short.exchange,
-            longSize: 0,
-            shortSize: short.size,
-            longSymbol: "",
-            shortSymbol: short.symbol,
-            entrySpread: 0,
-            entryTime: 0,
-            notional: 0,
-            totalCost: 0,
-            accumulatedFunding: 0,
-          });
-        }
-      }
     }
-    return pairs;
+    return { pairs, unreadable };
   }
 
-  /** Calculate actual P&L from exchange trade/funding history */
+  /** Actual fees / funding from exchange trade/funding history; null when the history could not be read (never 0). */
   private async calculateRealPnl(
     adapter: ExchangeAdapter,
+    exchange: string,
     symbol: string,
-  ): Promise<{ fees: number; funding: number }> {
+    log: (msg: string) => void,
+  ): Promise<{ fees: number; funding: number } | null> {
     try {
       const [trades, funding] = await Promise.all([
         adapter.getTradeHistory(50),
@@ -569,116 +554,154 @@ class FundingAutoStrategy implements Strategy {
       const totalFunding = symFunding.reduce((s, f) => s + Number(f.payment), 0);
 
       return { fees: totalFees, funding: totalFunding };
-    } catch {
-      return { fees: 0, funding: 0 };
+    } catch (e) {
+      log(`[funding-auto] ${exchange} ${symbol} trade/funding history unreadable: ${e instanceof Error ? e.message : String(e)}`);
+      return null;
     }
   }
 
+  private quarantine(ctx: StrategyContext, pos: { symbol: string; longExchange: string; shortExchange: string }, reason: string): void {
+    quarantineSymbol(this.name, pos.symbol, reason,
+      `Check ${pos.symbol} on ${pos.longExchange} and ${pos.shortExchange} (perp -e ${pos.longExchange} positions; perp -e ${pos.shortExchange} positions); close or re-hedge by hand, then: perp strategy quarantine-clear ${pos.symbol}`,
+      ctx.log);
+  }
+
+  /**
+   * Perp-perp entry, sequential and verified: long first, then the short sized to the
+   * long's VERIFIED fill; any excess the short did not cover is trimmed off the long
+   * (reduce-only, verified). A definite short failure rolls the long back reduce-only.
+   * An unknown outcome or a failed rollback / trim quarantines the symbol.
+   */
   private async openPosition(
     ctx: StrategyContext,
     opp: FundingOpportunity,
     adapters: Map<string, ExchangeAdapter>,
   ): Promise<boolean> {
-    if (opp.mode === "perp-perp") {
-      const longAdapter = adapters.get(opp.longExchange);
-      const shortAdapter = adapters.get(opp.shortExchange);
-      if (!longAdapter || !shortAdapter) return false;
+    // Engine: equity unknown → no new entries (closes still run).
+    if (ctx.state.get("equityUnknown") === true) { ctx.log(`[funding-auto] Skip ${opp.symbol}: equity unknown — no new entries`); return false; }
+    const longAdapter = adapters.get(opp.longExchange);
+    const shortAdapter = adapters.get(opp.shortExchange);
+    if (!longAdapter || !shortAdapter) return false;
 
-      const price = this.getCachedPrice(ctx, opp.longExchange, opp.symbol)
-        || this.getCachedPrice(ctx, opp.shortExchange, opp.symbol);
-      if (price <= 0) return false;
+    const price = this.getCachedPrice(ctx, opp.longExchange, opp.symbol)
+      || this.getCachedPrice(ctx, opp.shortExchange, opp.symbol);
+    if (price <= 0) return false;
 
-      const notionalUsd = this.getSizeUsd();
-      const size = this.formatSize(notionalUsd / price, opp.symbol);
+    const notionalUsd = this.getSizeUsd();
+    const size = this.formatSize(notionalUsd / price, opp.symbol);
 
-      // Minimum notional check — skip if below exchange minimums
-      if (notionalUsd < MIN_NOTIONAL_USD) {
-        ctx.log(`[funding-auto] Skip ${opp.symbol}: notional $${notionalUsd.toFixed(0)} < min $${MIN_NOTIONAL_USD}`);
-        return false;
-      }
-
-      try {
-        await Promise.all([
-          longAdapter.marketOrder(opp.symbol, "buy", size),
-          shortAdapter.marketOrder(opp.symbol, "sell", size),
-        ]);
-        return true;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        ctx.log(`[funding-auto] Perp-perp entry failed ${opp.symbol}: ${msg}`);
-        return false;
-      }
-    } else {
-      // spot-perp: short perp (spot buy would need spot adapter — use perp adapter for now)
-      const shortAdapter = adapters.get(opp.shortExchange);
-      if (!shortAdapter) return false;
-
-      const price = this.getCachedPrice(ctx, opp.shortExchange, opp.symbol);
-      if (price <= 0) return false;
-
-      const notionalUsd = this.getSizeUsd();
-      const size = this.formatSize(notionalUsd / price, opp.symbol);
-
-      if (notionalUsd < MIN_NOTIONAL_USD) {
-        ctx.log(`[funding-auto] Skip ${opp.symbol}: notional $${notionalUsd.toFixed(0)} < min $${MIN_NOTIONAL_USD}`);
-        return false;
-      }
-
-      try {
-        // Short perp leg — spot buy is out-of-scope for perp-only adapters
-        await shortAdapter.marketOrder(opp.symbol, "sell", size);
-        ctx.log(`[funding-auto] Spot-perp ${opp.symbol}: perp short opened (spot leg requires manual hedge or spot adapter)`);
-        return true;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        ctx.log(`[funding-auto] Spot-perp entry failed ${opp.symbol}: ${msg}`);
-        return false;
-      }
+    // Minimum notional check — skip if below exchange minimums
+    if (notionalUsd < MIN_NOTIONAL_USD) {
+      ctx.log(`[funding-auto] Skip ${opp.symbol}: notional $${notionalUsd.toFixed(0)} < min $${MIN_NOTIONAL_USD}`);
+      return false;
     }
+    if (!(Number(size) > 0)) {
+      ctx.log(`[funding-auto] Skip ${opp.symbol}: size rounds to 0 at $${notionalUsd.toFixed(0)} / $${price}`);
+      return false;
+    }
+
+    const errText = (e: unknown) => e instanceof Error ? e.message : String(e);
+    const dec = sizeDecimalsOf(size);
+    let longFilled: number;
+    try {
+      longFilled = (await placePerpVerified(longAdapter, opp.longExchange, opp.symbol, "buy", size)).filledSize;
+    } catch (err) {
+      if (isOutcomeUnknown(err)) this.quarantine(ctx, opp, `entry long ${size} on ${opp.longExchange} outcome unknown (${errText(err)}) — no short placed`);
+      else ctx.log(`[funding-auto] Perp-perp entry failed ${opp.symbol} (long leg): ${errText(err)}`);
+      return false;
+    }
+    const longOpen = fillSizeString(longFilled, dec);
+    let shortFilled: number;
+    try {
+      shortFilled = (await placePerpVerified(shortAdapter, opp.shortExchange, opp.symbol, "sell", longOpen)).filledSize;
+    } catch (err) {
+      const msg = errText(err);
+      if (isOutcomeUnknown(err)) {
+        // The short may exist: closing the long could leave a naked short.
+        this.quarantine(ctx, opp, `entry short ${longOpen} on ${opp.shortExchange} outcome unknown (${msg}); long ${longOpen} open on ${opp.longExchange} — not rolled back`);
+        return false;
+      }
+      ctx.log(`[funding-auto] Perp-perp entry failed ${opp.symbol} (short leg): ${msg} — rolling back the long (reduce-only)`);
+      try {
+        const rb = await closePerpVerified(longAdapter, opp.longExchange, opp.symbol, "sell", longOpen, { decimals: dec });
+        if (rb.residual > 0) {
+          this.quarantine(ctx, opp, `entry short failed (${msg}); the long rollback closed ${fillSizeString(rb.closed, dec)} of ${longOpen}, ${fillSizeString(rb.residual, dec)} still open${rb.note !== null ? ` (${rb.note})` : ""} — orphaned long on ${opp.longExchange}`);
+          return false;
+        }
+        ctx.log(`[funding-auto] Rollback OK: closed long ${longOpen} ${opp.symbol} on ${opp.longExchange}`);
+      } catch (rbErr) {
+        this.quarantine(ctx, opp, `entry short failed (${msg}) and the long rollback failed or is unconfirmed (${errText(rbErr)}) — orphaned long ${longOpen} on ${opp.longExchange}`);
+      }
+      return false;
+    }
+    try {
+      const trimmed = await trimFirstLegToHedge(longAdapter, opp.longExchange, opp.symbol, "buy", longFilled, shortFilled, dec);
+      if (trimmed !== "0") ctx.log(`[funding-auto] Short filled ${fillSizeString(shortFilled, dec)} of ${longOpen} — trimmed long by ${trimmed} (reduce-only)`);
+    } catch (trimErr) {
+      this.quarantine(ctx, opp, `entry short filled ${fillSizeString(shortFilled, dec)} of ${longOpen}; trimming the long's excess on ${opp.longExchange} failed or is unconfirmed (${errText(trimErr)})`);
+      return false;
+    }
+    return true;
   }
 
+  /**
+   * Close both legs sequentially, reduce-only and verified, each sized from the venue's
+   * own position size (never rounded up). Long first: a definite failure there changes
+   * nothing, so the pair is retried next tick and quarantined after MAX_CLOSE_FAILURES
+   * in a row. Once the long is closed, ANY short failure leaves an unhedged short this
+   * strategy can no longer discover as a pair → quarantine. An unknown outcome or a
+   * residual that survives one reduce-only residual close quarantines. Returns true when both legs closed.
+   */
   private async closePosition(
     ctx: StrategyContext,
     pos: ActivePosition,
     adapters: Map<string, ExchangeAdapter>,
-  ): Promise<void> {
-    if (pos.mode === "perp-perp") {
-      const longAdapter = adapters.get(pos.longExchange);
-      const shortAdapter = adapters.get(pos.shortExchange);
-
-      if (longAdapter && shortAdapter) {
-        // Use actual sizes from exchange positions, with raw exchange symbols
-        const longSize = formatSizeForPrice(pos.longSize, pos.longSize > 0 && pos.notional > 0 ? pos.notional / pos.longSize : 0);
-        const shortSize = formatSizeForPrice(pos.shortSize, pos.shortSize > 0 && pos.notional > 0 ? pos.notional / pos.shortSize : 0);
-
-        try {
-          await Promise.all([
-            longAdapter.marketOrder(pos.longSymbol, "sell", longSize),
-            shortAdapter.marketOrder(pos.shortSymbol, "buy", shortSize),
-          ]);
-          const netPnl = pos.accumulatedFunding - pos.totalCost;
-          ctx.log(`[funding-auto] Closed perp-perp ${pos.symbol} | funding $${pos.accumulatedFunding.toFixed(4)} - fees $${pos.totalCost.toFixed(4)} = net $${netPnl.toFixed(4)}`);
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          ctx.log(`[funding-auto] Close failed ${pos.symbol}: ${msg}`);
-        }
-      }
-    } else {
-      // spot-perp: close perp short
-      const shortAdapter = adapters.get(pos.shortExchange);
-      if (!shortAdapter) return;
-
-      const shortSize = formatSizeForPrice(pos.shortSize, pos.shortSize > 0 && pos.notional > 0 ? pos.notional / pos.shortSize : 0);
-
-      try {
-        await shortAdapter.marketOrder(pos.shortSymbol, "buy", shortSize);
-        const netPnl = pos.accumulatedFunding - pos.totalCost;
-        ctx.log(`[funding-auto] Closed spot-perp ${pos.symbol} | funding $${pos.accumulatedFunding.toFixed(4)} - fees $${pos.totalCost.toFixed(4)} = net $${netPnl.toFixed(4)}`);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        ctx.log(`[funding-auto] Close failed ${pos.symbol}: ${msg}`);
-      }
+  ): Promise<boolean> {
+    const longAdapter = adapters.get(pos.longExchange);
+    const shortAdapter = adapters.get(pos.shortExchange);
+    if (!longAdapter || !shortAdapter) {
+      ctx.log(`[funding-auto] Close ${pos.symbol}: adapter missing (${pos.longExchange}/${pos.shortExchange})`);
+      return false;
     }
+    const errText = (e: unknown) => e instanceof Error ? e.message : String(e);
+    const failures = (ctx.state.get("closeFailures") as Map<string, number> | undefined) ?? new Map<string, number>();
+    ctx.state.set("closeFailures", failures);
+
+    let lc: PerpCloseResult;
+    try {
+      lc = await closePerpVerified(longAdapter, pos.longExchange, pos.longSymbol, "sell", pos.longSizeRaw);
+    } catch (err) {
+      const msg = errText(err);
+      if (isOutcomeUnknown(err)) {
+        this.quarantine(ctx, pos, `close of long ${pos.longSizeRaw} on ${pos.longExchange} outcome unknown (${msg}) — short ${pos.shortSizeRaw} on ${pos.shortExchange} left open`);
+        return false;
+      }
+      const n = (failures.get(pos.id) ?? 0) + 1;
+      failures.set(pos.id, n);
+      ctx.log(`[funding-auto] Close failed ${pos.symbol} (long leg, nothing changed): ${msg} (${n}/${MAX_CLOSE_FAILURES})`);
+      if (n >= MAX_CLOSE_FAILURES) this.quarantine(ctx, pos, `close failed ${n} times in a row (last: ${msg})`);
+      return false;
+    }
+    failures.delete(pos.id);
+    if (lc.residual > 0) {
+      this.quarantine(ctx, pos, `close of long on ${pos.longExchange} closed ${lc.closed} of ${pos.longSizeRaw}, ${lc.residual} still open${lc.note !== null ? ` (${lc.note})` : ""} — short ${pos.shortSizeRaw} on ${pos.shortExchange} not closed (legs unbalanced)`);
+      return false;
+    }
+
+    let sc: PerpCloseResult;
+    try {
+      sc = await closePerpVerified(shortAdapter, pos.shortExchange, pos.shortSymbol, "buy", pos.shortSizeRaw);
+    } catch (err) {
+      this.quarantine(ctx, pos, `long closed on ${pos.longExchange} but the close of short ${pos.shortSizeRaw} on ${pos.shortExchange} ${isOutcomeUnknown(err) ? "has an unknown outcome" : "failed"} (${errText(err)}) — short unhedged`);
+      return false;
+    }
+    if (sc.residual > 0) {
+      this.quarantine(ctx, pos, `long closed; close of short on ${pos.shortExchange} closed ${sc.closed} of ${pos.shortSizeRaw}, ${sc.residual} still open${sc.note !== null ? ` (${sc.note})` : ""} — residual short unhedged`);
+      return false;
+    }
+    const netPnl = pos.accumulatedFunding - pos.totalCost;
+    ctx.log(`[funding-auto] Closed perp-perp ${pos.symbol} | funding $${pos.accumulatedFunding.toFixed(4)} - fees $${pos.totalCost.toFixed(4)} = net $${netPnl.toFixed(4)}`);
+    return true;
   }
 }
 

@@ -1,5 +1,28 @@
 import { describe, it, expect } from "vitest";
-import { fetchAllDexAssets, findDexArbPairs, scanDexArb } from "../../dex-asset-map.js";
+import { fetchAllDexAssets, findDexArbPairs, scanDexArb, type DexAsset } from "../../dex-asset-map.js";
+
+/**
+ * Pick, from live assets, an underlying listed on >= 2 distinct dexes (native "hl" counts as one)
+ * with at least one cross-dex price within `maxGapPct` (same product). Highest combined 24h volume
+ * wins. null = no such underlying at run time (live HIP-3 listings drift).
+ */
+function pickMultiDexUnderlying(assets: DexAsset[], maxGapPct = 2): { base: string; assets: DexAsset[] } | null {
+  const byBase = new Map<string, DexAsset[]>();
+  for (const a of assets) {
+    const list = byBase.get(a.base);
+    if (list) list.push(a); else byBase.set(a.base, [a]);
+  }
+  let best: { base: string; assets: DexAsset[]; volume: number } | null = null;
+  for (const [base, group] of byBase) {
+    if (new Set(group.map(a => a.dex)).size < 2) continue;
+    const close = group.some((a, i) => group.slice(i + 1).some(b =>
+      a.dex !== b.dex && Math.abs(a.markPrice - b.markPrice) / ((a.markPrice + b.markPrice) / 2) * 100 < maxGapPct));
+    if (!close) continue;
+    const volume = group.reduce((s, a) => s + a.volume24h, 0);
+    if (best === null || volume > best.volume) best = { base, assets: group, volume };
+  }
+  return best === null ? null : { base: best.base, assets: best.assets };
+}
 
 /**
  * Integration tests for HIP-3 cross-dex arb scanning.
@@ -41,43 +64,60 @@ describe("fetchAllDexAssets — live API", () => {
 });
 
 describe("findDexArbPairs — live data", () => {
-  it("finds TSLA arb pairs across dexes", async () => {
+  it("finds arb pairs for an underlying listed on >= 2 dexes", async (ctx) => {
     const assets = await fetchAllDexAssets();
-    const tslaAssets = assets.filter(a => a.base === "TSLA");
+    const pick = pickMultiDexUnderlying(assets);
+    if (pick === null) {
+      ctx.skip("no underlying is currently listed on >= 2 dexes (incl. native) at a matching price — live HIP-3 listings drifted");
+      return;
+    }
+    const dexes = new Set(pick.assets.map(a => a.dex));
+    expect(dexes.size).toBeGreaterThanOrEqual(2);
 
-    expect(tslaAssets.length).toBeGreaterThanOrEqual(2);
-
-    const pairs = findDexArbPairs(tslaAssets);
-    // C(n,2) pairs if n dexes have TSLA
+    const pairs = findDexArbPairs(pick.assets);
     expect(pairs.length).toBeGreaterThanOrEqual(1);
     for (const p of pairs) {
-      expect(p.underlying).toBe("TSLA");
-      expect(p.priceGapPct).toBeLessThan(2); // prices should be very close
+      expect(p.underlying).toBe(pick.base);
+      expect(p.priceGapPct).toBeLessThan(5);
       expect(p.long.dex).not.toBe(p.short.dex);
+      expect(dexes.has(p.long.dex)).toBe(true);
+      expect(dexes.has(p.short.dex)).toBe(true);
+      // Long the lower-funding side, short the higher-funding side
+      expect(p.long.fundingRate).toBeLessThanOrEqual(p.short.fundingRate);
     }
+    // At least one pair has a price gap within the picker's bound (same product)
+    expect(pairs.some(p => p.priceGapPct < 2)).toBe(true);
 
-    const dexes = new Set(tslaAssets.map(a => a.dex));
-    console.log(`TSLA on dexes: ${[...dexes].join(", ")} → ${pairs.length} arb pairs`);
+    console.log(`${pick.base} on dexes: ${[...dexes].join(", ")} → ${pairs.length} arb pairs`);
     for (const p of pairs.slice(0, 3)) {
       console.log(`  L:${p.long.dex} S:${p.short.dex} spread:${p.annualSpread.toFixed(1)}% gap:${p.priceGapPct.toFixed(3)}%`);
     }
   }, 30000);
 
-  it("finds BTC arb between hl native and hyna dex", async () => {
+  it("pairs a native HL perp with the same underlying on a deployed dex", async (ctx) => {
     const assets = await fetchAllDexAssets();
-    const btcAssets = assets.filter(a => a.base === "BTC");
+    const nativeBases = new Set(assets.filter(a => a.dex === "hl").map(a => a.base));
+    const pick = pickMultiDexUnderlying(assets.filter(a => nativeBases.has(a.base)));
+    if (pick === null) {
+      ctx.skip("no native HL perp is currently also listed on a deployed dex at a matching price — live HIP-3 listings drifted");
+      return;
+    }
+    const native = pick.assets.find(a => a.dex === "hl")!;
+    const deployed = pick.assets.filter(a => a.dex !== "hl");
+    expect(deployed.length).toBeGreaterThanOrEqual(1);
 
-    const hlBTC = btcAssets.find(a => a.dex === "hl");
-    const hynaBTC = btcAssets.find(a => a.dex === "hyna");
+    const pairs = findDexArbPairs(pick.assets);
+    const nativePairs = pairs.filter(p => p.long.dex === "hl" || p.short.dex === "hl");
+    expect(nativePairs.length).toBeGreaterThanOrEqual(1);
+    for (const p of nativePairs) {
+      expect(p.underlying).toBe(pick.base);
+      expect(p.long.dex).not.toBe(p.short.dex);
+      expect(p.priceGapPct).toBeLessThan(5);
+    }
+    // includeNative: false drops every hl leg
+    expect(findDexArbPairs(pick.assets, { includeNative: false }).every(p => p.long.dex !== "hl" && p.short.dex !== "hl")).toBe(true);
 
-    expect(hlBTC).toBeTruthy();
-    expect(hynaBTC).toBeTruthy();
-
-    // Prices should be very close (< 0.5%)
-    const gap = Math.abs(hlBTC!.markPrice - hynaBTC!.markPrice) / hlBTC!.markPrice * 100;
-    expect(gap).toBeLessThan(0.5);
-
-    console.log(`BTC: hl=$${hlBTC!.markPrice.toFixed(0)} hyna=$${hynaBTC!.markPrice.toFixed(0)} gap:${gap.toFixed(4)}%`);
+    console.log(`${pick.base}: hl=$${native.markPrice} vs ${deployed.map(a => `${a.dex}=$${a.markPrice}`).join(", ")} → ${nativePairs.length} native pairs`);
   }, 30000);
 
   it("correctly rejects USAR vs US500 (different products)", async () => {

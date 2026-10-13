@@ -1,3 +1,5 @@
+import type { ResolvedSlippage } from "./slippage.js";
+
 /**
  * Common exchange interface for multi-DEX CLI support.
  * All exchange adapters (Pacifica, Hyperliquid, Lighter) implement this.
@@ -6,14 +8,47 @@
 export interface ExchangeMarketInfo {
   symbol: string;
   markPrice: string;
-  indexPrice: string;
+  /** null = venue does not publish an index/oracle price for this market */
+  indexPrice: string | null;
   fundingRate: string | null;  // null = rate unavailable (don't assume 0)
-  volume24h: string;
-  openInterest: string;
+  /** null = venue does not publish 24h volume */
+  volume24h: string | null;
+  /** null = venue does not publish open interest (never "0" as a stand-in) */
+  openInterest: string | null;
   maxLeverage: number;
-  sizeDecimals?: number;  // quantity precision (e.g. 0 = integers only, 2 = 0.01)
-  stepSize?: string;      // lot step size (e.g. "1", "0.1", "0.001")
-  fundingHours?: number;  // funding period in hours (1 or 8). If omitted, use exchange default.
+  /** quantity precision (e.g. 0 = integers only, 2 = 0.01); null = unknown */
+  sizeDecimals: number | null;
+  /** lot step size (e.g. "1", "0.1", "0.001"); null = unknown */
+  stepSize: string | null;
+  /** hours one quoted fundingRate covers; null = use the venue definition's fundingRateBasis */
+  fundingHours: number | null;
+  /**
+   * Notional-tiered leverage caps, ascending by `lowerBound` (USD notional).
+   * `maxLeverage` above is the TOP tier — the cap falls as size grows, so a
+   * pre-trade check that uses it alone passes orders the venue will reject.
+   * Resolve with `maxLeverageForNotional()`. null when the venue does not
+   * publish tiers (then `maxLeverage` applies at every size).
+   */
+  marginTiers: Array<{ lowerBound: number; maxLeverage: number }> | null;
+}
+
+/**
+ * Effective max leverage for an order of `notional` USD.
+ *
+ * A venue that publishes no tiers (`marginTiers === null`) has one flat cap,
+ * `maxLeverage`, at every size — that is the venue's definition, not a fallback.
+ */
+export function maxLeverageForNotional(market: ExchangeMarketInfo, notional: number): number {
+  if (!Number.isFinite(notional)) {
+    throw new Error(`maxLeverageForNotional: notional must be finite (got ${notional})`);
+  }
+  const tiers = market.marginTiers;
+  if (tiers === null || tiers.length === 0) return market.maxLeverage;
+  let effective = market.maxLeverage;
+  for (const t of tiers) {
+    if (notional >= t.lowerBound) effective = t.maxLeverage;
+  }
+  return effective;
 }
 
 export interface ExchangePosition {
@@ -22,9 +57,12 @@ export interface ExchangePosition {
   size: string;
   entryPrice: string;
   markPrice: string;
-  liquidationPrice: string;
+  /** null = venue does not report a liquidation price */
+  liquidationPrice: string | null;
   unrealizedPnl: string;
   leverage: number;
+  /** Margin mode of the position, set only by adapters whose venue reports it per position. */
+  marginMode?: "cross" | "isolated";
 }
 
 export interface ExchangeOrder {
@@ -36,6 +74,8 @@ export interface ExchangeOrder {
   filled: string;
   status: string;
   type: string;
+  /** Trigger (stop) price of a stop / TP / SL order; null for plain orders or when the venue does not report it. */
+  triggerPrice: string | null;
 }
 
 export interface ExchangeBalance {
@@ -67,7 +107,8 @@ export interface ExchangeKline {
   low: string;
   close: string;
   volume: string;
-  trades: number;
+  /** null = venue does not publish a trade count for the candle */
+  trades: number | null;
 }
 
 export interface ExchangeAdapter {
@@ -94,7 +135,11 @@ export interface ExchangeAdapter {
   getFundingPayments(limit?: number): Promise<ExchangeFundingPayment[]>;
 
   // ── Trading ──
-  marketOrder(symbol: string, side: "buy" | "sell", size: string, opts?: { reduceOnly?: boolean }): Promise<unknown>;
+  /**
+   * Market order = IOC within the resolved slippage bound (design §13.2). `opts` is
+   * required so every caller states reduceOnly and passes resolveSlippage() output.
+   */
+  marketOrder(symbol: string, side: "buy" | "sell", size: string, opts: { reduceOnly: boolean; slippage: ResolvedSlippage }): Promise<unknown>;
   limitOrder(symbol: string, side: "buy" | "sell", price: string, size: string, opts?: { reduceOnly?: boolean; tif?: string }): Promise<unknown>;
   editOrder(symbol: string, orderId: string, price: string, size: string): Promise<unknown>;
   cancelOrder(symbol: string, orderId: string): Promise<unknown>;
@@ -102,5 +147,19 @@ export interface ExchangeAdapter {
 
   // ── Risk ──
   setLeverage(symbol: string, leverage: number, marginMode?: "cross" | "isolated"): Promise<unknown>;
-  stopOrder(symbol: string, side: "buy" | "sell", size: string, triggerPrice: string, opts?: { limitPrice?: string; reduceOnly?: boolean }): Promise<unknown>;
+  /**
+   * triggerType selects the trigger price source where the venue supports it
+   * (currently Pacifica: "mark" | "last" | "mid"). Adapters that don't support
+   * a configurable trigger source ignore the field and use their venue default.
+   * `slippage` (resolveSlippage() output) bounds the execution price of a market
+   * trigger on venues that send it as a protection-priced limit once triggered
+   * (Lighter, Arcus: required there for a market trigger — adapters never read
+   * settings, design §13.10 #1); venue-native market triggers ignore it.
+   * `kind` ("tp" | "sl") states the protective intent explicitly: venues with distinct
+   * take-profit / stop-loss trigger types (Aster, Lighter) send that type as given — no
+   * price-based classification — and a trigger already crossed is left for the venue to
+   * reject. Omitted (plain `trade stop`): the adapter classifies from the trigger vs its
+   * reference price. Venues with a single trigger type ignore it.
+   */
+  stopOrder(symbol: string, side: "buy" | "sell", size: string, triggerPrice: string, opts?: { limitPrice?: string; reduceOnly?: boolean; triggerType?: "mark" | "last" | "mid"; slippage?: ResolvedSlippage; kind?: "tp" | "sl" }): Promise<unknown>;
 }

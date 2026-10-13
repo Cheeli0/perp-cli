@@ -20,11 +20,25 @@ vi.mock("../jobs.js", () => ({
 
 // ── Mock adapter factory ──
 
+/**
+ * The venue reports the fill size (OrderResult `filledSize`): DCA / TWAP count only a
+ * venue-reported fill, so every mocked market order reports the requested size as filled
+ * unless the mocked result already carries its own `filledSize`.
+ */
+function reportsFill(impl: (...a: any[]) => any) {
+  return vi.fn(async (...a: any[]) => {
+    const r = await impl(...a);
+    return { ...r, status: typeof r?.status === "string" ? r.status : "FILLED", filledSize: typeof r?.filledSize === "string" ? r.filledSize : String(a[2]) };
+  });
+}
+
 function mockAdapter(overrides?: Partial<Record<string, unknown>>) {
+  const mo = overrides?.marketOrder as ((...a: any[]) => any) | undefined;
   return {
-    name: "test",
+    // Registered venue id: every market order resolves its slippage bound per venue (UNKNOWN_VENUE otherwise).
+    name: "hyperliquid",
     getMarkets: vi.fn().mockResolvedValue([
-      { symbol: "BTC", markPrice: "60000", indexPrice: "60000", fundingRate: "0.0001", volume24h: "1000000", openInterest: "500000", maxLeverage: 20 },
+      { symbol: "BTC", markPrice: "60000", indexPrice: "60000", fundingRate: "0.0001", volume24h: "1000000", openInterest: "500000", maxLeverage: 20, sizeDecimals: 5, stepSize: "0.00001", fundingHours: 1, marginTiers: null },
     ]),
     getBalance: vi.fn().mockResolvedValue({ equity: "10000", available: "8000", marginUsed: "2000", unrealizedPnl: "0" }),
     getPositions: vi.fn().mockResolvedValue([]),
@@ -36,7 +50,6 @@ function mockAdapter(overrides?: Partial<Record<string, unknown>>) {
     getFundingHistory: vi.fn().mockResolvedValue([]),
     getFundingPayments: vi.fn().mockResolvedValue([]),
     getKlines: vi.fn().mockResolvedValue([]),
-    marketOrder: vi.fn().mockResolvedValue({ orderId: "m1", price: "60000" }),
     limitOrder: vi.fn().mockResolvedValue({ orderId: "l1" }),
     editOrder: vi.fn().mockResolvedValue({}),
     cancelOrder: vi.fn().mockResolvedValue({}),
@@ -44,6 +57,7 @@ function mockAdapter(overrides?: Partial<Record<string, unknown>>) {
     setLeverage: vi.fn().mockResolvedValue({}),
     stopOrder: vi.fn().mockResolvedValue({}),
     ...overrides,
+    marketOrder: reportsFill(mo ?? (async () => ({ orderId: "m1", price: "60000" }))),
   } as any;
 }
 
@@ -125,6 +139,15 @@ describe("TWAP — runTWAP", () => {
     expect(slice2).toBeCloseTo(1 / 3, 4);
     // Last slice = remainder (handles dust)
     expect(slice1 + slice2 + slice3).toBeCloseTo(1.0, 6);
+  });
+
+  it("every slice states reduceOnly and carries the resolved slippage bound (design §13.2)", async () => {
+    const { runTWAP } = await import("../strategies/twap.js");
+    const adapter = mockAdapter();
+    await runTWAP(adapter, { symbol: "BTC", side: "sell", totalSize: 0.2, durationSec: 1, slices: 2, reduceOnly: true }, undefined, vi.fn());
+    for (const call of adapter.marketOrder.mock.calls) {
+      expect(call[3]).toEqual({ reduceOnly: true, slippage: { bps: 50, source: "default" } });
+    }
   });
 
   it("handles order errors without aborting (continues other slices)", async () => {
@@ -453,14 +476,15 @@ describe("DCA — runDCA", () => {
     expect(result.totalFilled).toBeCloseTo(0.5);
   });
 
-  it("computes average price from fill prices", async () => {
+  it("computes average price from the venue-reported fill prices (avgPrice), never the sent price", async () => {
     const { runDCA } = await import("../strategies/dca.js");
     let callNum = 0;
     const prices = [59000, 60000, 61000];
     const adapter = mockAdapter({
       marketOrder: vi.fn().mockImplementation(() => {
         const price = prices[callNum++];
-        return Promise.resolve({ orderId: `m${callNum}`, price: String(price) });
+        // `price` = the protection price sent (ignored); `avgPrice` = the venue's average fill.
+        return Promise.resolve({ orderId: `m${callNum}`, price: String(price + 500), avgPrice: String(price) });
       }),
     });
     const log = vi.fn();
@@ -475,6 +499,23 @@ describe("DCA — runDCA", () => {
 
     // avg = (1*59000 + 1*60000 + 1*61000) / 3 = 60000
     expect(result.avgPrice).toBeCloseTo(60000);
+  });
+
+  it("Aster live case: avg = venue avgPrice 108.745 (sent 109.29), no float noise; filled sum exact", async () => {
+    const { runDCA } = await import("../strategies/dca.js");
+    const adapter = mockAdapter({
+      marketOrder: vi.fn().mockResolvedValue({ orderId: "a", status: "FILLED", price: "109.29", avgPrice: "108.745", executedQty: "0.05" }),
+    });
+    const result = await runDCA(adapter, { symbol: "SOL", side: "buy", amountPerOrder: 0.05, intervalSec: 0.001, totalOrders: 3 }, undefined, vi.fn());
+    expect(result.avgPrice).toBe(108.745);
+    expect(result.totalFilled).toBe(0.15);
+  });
+
+  it("an order without a venue-reported fill price → avgPrice null (never the sent price)", async () => {
+    const { runDCA } = await import("../strategies/dca.js");
+    const adapter = mockAdapter({ marketOrder: vi.fn().mockResolvedValue({ orderId: "a", price: "100" }) });
+    const result = await runDCA(adapter, { symbol: "BTC", side: "buy", amountPerOrder: 1, intervalSec: 0.001, totalOrders: 2 }, undefined, vi.fn());
+    expect(result.avgPrice).toBeNull();
   });
 
   it("continues on individual order errors", async () => {
@@ -577,6 +618,31 @@ describe("DCA — runDCA", () => {
 // ══════════════════════════════════════════════
 // TWAP Slice Calculation (unit-level)
 // ══════════════════════════════════════════════
+
+describe("TWAP — avgPrice is the venue-reported fill price, never the protection price", () => {
+  const run = async (marketOrder: ReturnType<typeof vi.fn>) => {
+    const { runTWAP } = await import("../strategies/twap.js");
+    return runTWAP(mockAdapter({ marketOrder }), { symbol: "SOL", side: "buy", totalSize: 0.1, durationSec: 1, slices: 2 }, undefined, vi.fn());
+  };
+
+  it("Aster order objects: `price` is the IOC protection price (121.315), `avgPrice` the fill → 120.735", async () => {
+    // Live 2026-10-05: 2 slices filled at 120.735, the result said 121.315.
+    const r = await run(vi.fn().mockResolvedValue({ orderId: 1, status: "FILLED", price: "121.315", avgPrice: "120.735", executedQty: "0.05" }));
+    expect(r.avgPrice).toBe(120.735);
+  });
+
+  it("size-weighted over the slices, without float noise", async () => {
+    const r = await run(vi.fn()
+      .mockResolvedValueOnce({ avgPrice: "2723.81", price: "9999" })
+      .mockResolvedValueOnce({ response: { data: { statuses: [{ filled: { totalSz: "0.05", avgPx: "2723.83", oid: 1 } }] } } }));
+    expect(r.avgPrice).toBe(2723.82);
+  });
+
+  it("a slice whose result reports no fill price → null (not the sent price, not 0)", async () => {
+    expect((await run(vi.fn().mockResolvedValue({ orderId: "m1", price: "60000" }))).avgPrice).toBeNull();
+    expect((await run(vi.fn().mockResolvedValueOnce({ avgPrice: "120.7" }).mockResolvedValueOnce({ price: "121.3" }))).avgPrice).toBeNull();
+  });
+});
 
 describe("TWAP — slice calculation edge cases", () => {
   it("minimum 2 slices even for very short duration", async () => {

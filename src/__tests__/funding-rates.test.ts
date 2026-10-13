@@ -16,30 +16,58 @@ const { fetchAllFundingRates, fetchSymbolFundingRates, TOP_SYMBOLS } = await imp
 const { invalidateCache } = await import("../cache.js");
 
 // ── Helpers to build mock API responses ──
+//
+// Funding rates now fan out over every "marketData" venue's publicData (design §10.6):
+//  - Pacifica: GET /info (markets, instrument_type required) + GET /info/prices (mark,
+//    next_funding = the quoted funding rate);
+//  - Hyperliquid: POST /info metaAndAssetCtxs;
+//  - Lighter: /api/v1/orderBookDetails (perp details incl. mark_price) + /api/v1/funding-rates
+//    (own rows need market_id + symbol + rate; mark comes from the details by market_id).
+// Venues the test does not configure (aster, lighter-rh, ondo, arcus) fail their fetch and are
+// reported as exchangeStatus "error" — never silently empty.
 
-function makePacificaResponse(rates: { symbol: string; funding: number; mark: number }[]) {
-  return { data: rates };
+function json(body: unknown) {
+  return { ok: true, status: 200, headers: new Headers(), json: async () => body, text: async () => JSON.stringify(body) };
+}
+
+function pacificaInfo(rates: { symbol: string }[]) {
+  return { success: true, data: rates.map(r => ({ symbol: r.symbol, instrument_type: "perp", max_leverage: 20, tick_size: "0.01", lot_size: "0.001", min_order_size: "10" })) };
+}
+
+function pacificaPrices(rates: { symbol: string; funding: number; mark: number; next_funding?: number }[]) {
+  return { success: true, data: rates.map(r => ({ symbol: r.symbol, mark: String(r.mark), oracle: String(r.mark), funding: String(r.funding), next_funding: String(r.next_funding ?? r.funding), open_interest: "1000", volume_24h: "100000" })) };
 }
 
 function makeHyperliquidResponse(
   assets: { name: string }[],
   ctxs: { funding: number; markPx: number }[]
 ) {
-  return [{ universe: assets }, ctxs];
+  return [
+    { universe: assets.map(a => ({ szDecimals: 3, maxLeverage: 20, ...a })) },
+    ctxs.map(c => ({ funding: String(c.funding), markPx: String(c.markPx), oraclePx: String(c.markPx), openInterest: "1000", dayNtlVlm: "100000" })),
+  ];
 }
 
-function makeLighterResponse(
-  details: { market_id: number; symbol: string; last_trade_price: number }[],
-  fundingRates: { market_id: number; symbol?: string; rate: number; exchange?: string }[]
-) {
+function lighterDetails(details: { market_id: number; symbol: string; last_trade_price: number }[]) {
   return {
-    details: { order_book_details: details },
-    funding: { funding_rates: fundingRates.map(fr => ({ exchange: "lighter", ...fr })) },
+    order_book_details: details.map(d => ({
+      symbol: d.symbol, market_id: d.market_id, market_type: "perp", status: "active",
+      price_decimals: 2, size_decimals: 4, min_base_amount: "0.001", min_quote_amount: "10",
+      min_initial_margin_fraction: 500, mark_price: String(d.last_trade_price),
+    })),
   };
 }
 
+function lighterFunding(
+  details: { market_id: number; symbol: string }[],
+  fundingRates: { market_id: number; symbol?: string; rate: number; exchange?: string }[],
+) {
+  const symbolOf = (id: number) => details.find(d => d.market_id === id)?.symbol;
+  return { funding_rates: fundingRates.map(fr => ({ exchange: "lighter", symbol: fr.symbol ?? symbolOf(fr.market_id), ...fr })) };
+}
+
 function setupMockFetch(opts: {
-  pac?: { symbol: string; funding: number; mark: number }[];
+  pac?: { symbol: string; funding: number; mark: number; next_funding?: number }[];
   hl?: { assets: { name: string }[]; ctxs: { funding: number; markPx: number }[] };
   lt?: {
     details: { market_id: number; symbol: string; last_trade_price: number }[];
@@ -49,54 +77,34 @@ function setupMockFetch(opts: {
   hlError?: boolean;
   ltError?: boolean;
 }) {
-  mockFetch.mockImplementation(async (url: string | URL, init?: RequestInit) => {
+  mockFetch.mockImplementation(async (url: string | URL) => {
     const urlStr = typeof url === "string" ? url : url.toString();
 
-    // Pacifica
+    // Pacifica: /info (markets) and /info/prices (mark + funding)
     if (urlStr.includes("pacifica.fi")) {
       if (opts.pacError) throw new Error("Pacifica API error");
-      return {
-        ok: true,
-        status: 200,
-        json: async () => makePacificaResponse(opts.pac ?? []),
-        text: async () => JSON.stringify(makePacificaResponse(opts.pac ?? [])),
-      };
+      return json(urlStr.includes("/info/prices") ? pacificaPrices(opts.pac ?? []) : pacificaInfo(opts.pac ?? []));
     }
 
     // Hyperliquid
     if (urlStr.includes("hyperliquid.xyz")) {
       if (opts.hlError) throw new Error("HL API error");
       const hl = opts.hl ?? { assets: [], ctxs: [] };
-      return {
-        ok: true,
-        status: 200,
-        json: async () => makeHyperliquidResponse(hl.assets, hl.ctxs),
-        text: async () => JSON.stringify(makeHyperliquidResponse(hl.assets, hl.ctxs)),
-      };
+      return json(makeHyperliquidResponse(hl.assets, hl.ctxs));
     }
 
     // Lighter - two endpoints
     if (urlStr.includes("zklighter") && urlStr.includes("orderBookDetails")) {
       if (opts.ltError) throw new Error("Lighter API error");
-      const lt = opts.lt ?? { details: [], funding: [] };
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({ order_book_details: lt.details }),
-        text: async () => JSON.stringify({ order_book_details: lt.details }),
-      };
+      return json(lighterDetails((opts.lt ?? { details: [] }).details));
     }
     if (urlStr.includes("zklighter") && urlStr.includes("funding-rates")) {
       if (opts.ltError) throw new Error("Lighter API error");
       const lt = opts.lt ?? { details: [], funding: [] };
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({ funding_rates: lt.funding.map(fr => ({ exchange: "lighter", ...fr })) }),
-        text: async () => JSON.stringify({ funding_rates: lt.funding.map(fr => ({ exchange: "lighter", ...fr })) }),
-      };
+      return json(lighterFunding(lt.details, lt.funding));
     }
 
+    // aster / lighter-rh / ondo / arcus are not part of these scenarios.
     throw new Error(`Unexpected fetch: ${urlStr}`);
   });
 }
@@ -371,6 +379,100 @@ describe("fetchSymbolFundingRates", () => {
 // ──────────────────────────────────────────────
 // 3-DEX direction logic
 // ──────────────────────────────────────────────
+
+// ──────────────────────────────────────────────
+// Pacifica nextFundingTime semantic guard
+// (regression: pacifica's next_funding API field is the next-period funding
+//  RATE — not a unix-ms timestamp. Mapping it into the schema's
+//  nextFundingTime field polluted cross-DEX comparisons.)
+// ──────────────────────────────────────────────
+
+describe("Pacifica nextFundingTime guard", () => {
+  it("does not populate nextFundingTime even when API returns next_funding", async () => {
+    // Pacifica's API exposes next_funding as a small decimal (rate). Mock it
+    // here as a value that would clearly be invalid as a unix-ms timestamp
+    // (negative + sub-millisecond).
+    setupMockFetch({
+      pac: [{ symbol: "BTC", funding: 0.0001, mark: 60000, next_funding: -0.00014299 }],
+      hl: { assets: [{ name: "BTC" }], ctxs: [{ funding: 0.00005, markPx: 60100 }] },
+    });
+
+    const snapshot = await fetchAllFundingRates();
+    const btc = snapshot.symbols.find(s => s.symbol === "BTC");
+    expect(btc).toBeTruthy();
+    const pacEntry = btc!.rates.find(r => r.exchange === "pacifica");
+    expect(pacEntry).toBeTruthy();
+    // The API's next_funding (a rate) MUST NOT leak into nextFundingTime. Contract (venue-types,
+    // SSOT Rule #2): an unpublished value is null, never undefined / a guessed timestamp.
+    expect(pacEntry!.nextFundingTime).toBeNull();
+    // next_funding is the quoted funding rate itself (legacy-public.ts pacificaRows).
+    expect(pacEntry!.fundingRate).toBeCloseTo(-0.00014299);
+  });
+});
+
+describe("Pacifica row-skip on non-finite venue payload (Phase 4, qa/2026-05-16)", () => {
+  // src/api/public/pacifica.ts:25-35 already guards against NaN/Infinity
+  // funding/mark and silently skips the row (no throw — partial-result UX
+  // for funding aggregation, by design). Pin the contract so a future
+  // "fix" that promotes the silent skip to an error doesn't accidentally
+  // crash multi-DEX scans.
+
+  it("drops a Pacifica row where funding is NaN, keeps clean rows", async () => {
+    invalidateCache();
+    setupMockFetch({
+      pac: [
+        { symbol: "BTC", funding: 0.0001, mark: 60000 },
+        // Corrupted: non-numeric funding → must be filtered out by
+        // src/api/public/pacifica.ts:30 (Number.isFinite guard).
+        { symbol: "ETH", funding: "garbage" as unknown as number, mark: 3000 },
+      ],
+      hl: {
+        assets: [{ name: "BTC" }, { name: "ETH" }],
+        ctxs: [
+          { funding: 0.00005, markPx: 60100 },
+          { funding: 0.00003, markPx: 3001 },
+        ],
+      },
+      lt: { details: [], funding: [] },
+    });
+
+    const snapshot = await fetchAllFundingRates();
+    const btc = snapshot.symbols.find(s => s.symbol === "BTC");
+    const eth = snapshot.symbols.find(s => s.symbol === "ETH");
+    expect(btc?.rates.find(r => r.exchange === "pacifica")).toBeTruthy();
+    // ETH had a corrupt funding → pacifica row dropped. ETH presence in the
+    // snapshot depends on whether at least one exchange returned a valid row;
+    // primary assertion is that pacifica is NOT in the ETH rate list.
+    expect(eth?.rates.find(r => r.exchange === "pacifica")).toBeUndefined();
+  });
+
+  it("drops a Pacifica row where mark is non-finite or <= 0", async () => {
+    invalidateCache();
+    setupMockFetch({
+      pac: [
+        { symbol: "BTC", funding: 0.0001, mark: 60000 },
+        // mark <= 0 → must be skipped (a $0 mark would corrupt arb sizing).
+        { symbol: "ETH", funding: 0.0001, mark: 0 },
+        // mark = NaN string → also skipped (Number(NaN-string)=NaN, not finite).
+        { symbol: "SOL", funding: 0.0001, mark: "NaN" as unknown as number },
+      ],
+      hl: {
+        assets: [{ name: "BTC" }, { name: "ETH" }, { name: "SOL" }],
+        ctxs: [
+          { funding: 0.00005, markPx: 60100 },
+          { funding: 0.00005, markPx: 3001 },
+          { funding: 0.00005, markPx: 150 },
+        ],
+      },
+      lt: { details: [], funding: [] },
+    });
+    const snapshot = await fetchAllFundingRates();
+    const eth = snapshot.symbols.find(s => s.symbol === "ETH");
+    const sol = snapshot.symbols.find(s => s.symbol === "SOL");
+    expect(eth?.rates.find(r => r.exchange === "pacifica")).toBeUndefined();
+    expect(sol?.rates.find(r => r.exchange === "pacifica")).toBeUndefined();
+  });
+});
 
 describe("3-DEX direction logic", () => {
   it("picks correct long/short when lighter has best rate", async () => {

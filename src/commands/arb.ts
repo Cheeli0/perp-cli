@@ -1,7 +1,7 @@
 import { Command } from "commander";
 import { makeTable, formatUsd, formatPercent, formatPnl, printJson, jsonOk, jsonError, withJsonErrors, logSettledRejections } from "../utils.js";
 import chalk from "chalk";
-import { annualizeRate, computeAnnualSpread, toHourlyRate, estimateHourlyFunding, annualizeHourlyRate } from "../funding.js";
+import { annualizeRate, computeAnnualSpread, toHourlyRate, estimateHourlyFunding, annualizeHourlyRate, estimateHourlyFundingFromHourly } from "../funding.js";
 import {
   fetchAllFundingRates,
   fetchSymbolFundingRates,
@@ -16,6 +16,8 @@ import {
   getExchangeCompoundingHours,
 } from "../funding-history.js";
 import type { ExchangeAdapter } from "../exchanges/index.js";
+import { getVenue, listVenuesWithRole, tryResolveVenueId } from "../exchanges/venue.js";
+import "../exchanges/venues/index.js";
 import {
   fetchPacificaPrices, fetchHyperliquidMeta,
   fetchLighterOrderBookDetails, fetchLighterFundingRates,
@@ -30,7 +32,6 @@ interface FundingRate {
   symbol: string;
   fundingRate: number;
   markPrice: number;
-  nextFunding?: number;
 }
 
 async function fetchPacificaRates(): Promise<FundingRate[]> {
@@ -40,7 +41,6 @@ async function fetchPacificaRates(): Promise<FundingRate[]> {
     symbol: p.symbol,
     fundingRate: p.funding,
     markPrice: p.mark,
-    nextFunding: p.nextFunding ?? 0,
   }));
 }
 
@@ -69,7 +69,6 @@ async function fetchAsterRates(): Promise<FundingRate[]> {
       if (!rawSym.endsWith("USDT")) continue;
       const fundingRate = Number(p.lastFundingRate);
       const markPrice = Number(p.markPrice);
-      const nextFunding = Number(p.nextFundingTime);
       if (!Number.isFinite(fundingRate) || !Number.isFinite(markPrice) || markPrice <= 0) {
         continue;
       }
@@ -78,7 +77,6 @@ async function fetchAsterRates(): Promise<FundingRate[]> {
         symbol: rawSym.replace(/USDT$/, ""),
         fundingRate,
         markPrice,
-        nextFunding: Number.isFinite(nextFunding) ? nextFunding : 0,
       });
     }
     return out;
@@ -317,8 +315,17 @@ function formatAvgRate(rate: number | null | undefined): string {
   return color(`${annualPct.toFixed(1)}%`);
 }
 
+/** Short venue label: first alias (or id), upper-cased — e.g. PAC, HL, LT, AST, LRH, ONDO-PERPS. */
+function venueAbbr(e: string): string {
+  const id = tryResolveVenueId(e);
+  if (id === null) return e.toUpperCase();
+  const def = getVenue(id);
+  return (def.aliases[0] ?? def.id).toUpperCase();
+}
+
 function printSnapshotTable(snapshot: FundingRateSnapshot): void {
-  const exAbbr = (e: string) => e === "pacifica" ? "PAC" : e === "hyperliquid" ? "HL" : "LT";
+  const exAbbr = venueAbbr;
+  const columns = listVenuesWithRole("marketData");
   if (snapshot.symbols.length === 0) { console.log(chalk.gray("  No funding rate data available.\n")); return; }
 
   // Build 24h trend: arrow + change in annualized spread
@@ -349,23 +356,23 @@ function printSnapshotTable(snapshot: FundingRateSnapshot): void {
   }
 
   const rows = snapshot.symbols.map(s => {
-    const pacRate = s.rates.find(r => r.exchange === "pacifica");
-    const hlRate = s.rates.find(r => r.exchange === "hyperliquid");
-    const ltRate = s.rates.find(r => r.exchange === "lighter");
-    const astRate = s.rates.find(r => r.exchange === "aster");
+    const rateOf = (id: string) => s.rates.find(r => r.exchange === id);
     const spreadColor = s.maxSpreadAnnual >= 30 ? chalk.green : s.maxSpreadAnnual >= 10 ? chalk.yellow : chalk.white;
-    const bestRate = hlRate ?? pacRate ?? ltRate ?? astRate;
+    // Historical-average source preference: HL, PAC, LT, AST, then whichever venue quoted.
+    const bestRate = rateOf("hyperliquid") ?? rateOf("pacifica") ?? rateOf("lighter") ?? rateOf("aster") ?? s.rates[0];
     const trend = trendMap.get(s.symbol) ?? chalk.gray("-");
     return [
-      chalk.white.bold(s.symbol), pacRate ? formatPercent(pacRate.fundingRate) : chalk.gray("-"),
-      hlRate ? formatPercent(hlRate.fundingRate) : chalk.gray("-"), ltRate ? formatPercent(ltRate.fundingRate) : chalk.gray("-"),
-      astRate ? formatPercent(astRate.fundingRate) : chalk.gray("-"),
+      chalk.white.bold(s.symbol),
+      ...columns.map(v => {
+        const r = rateOf(v.id);
+        return r ? formatPercent(r.fundingRate) : chalk.gray("-");
+      }),
       spreadColor(`${s.maxSpreadAnnual.toFixed(1)}%`), trend,
       s.maxSpreadAnnual >= 5 ? `${exAbbr(s.shortExchange)}>${exAbbr(s.longExchange)}` : chalk.gray("-"),
       formatAvgRate(bestRate?.historicalAvg?.avg8h), formatAvgRate(bestRate?.historicalAvg?.avg24h), formatAvgRate(bestRate?.historicalAvg?.avg7d),
     ];
   });
-  console.log(makeTable(["Symbol", "Pacifica", "Hyperliquid", "Lighter", "Aster", "Spread", "24h", "Direction", "Avg 8h", "Avg 24h", "Avg 7d"], rows));
+  console.log(makeTable(["Symbol", ...columns.map(v => v.displayName), "Spread", "24h", "Direction", "Avg 8h", "Avg 24h", "Avg 7d"], rows));
   console.log(chalk.gray(`\n  ${snapshot.symbols.length} symbols compared across exchanges.\n`));
 }
 
@@ -378,7 +385,7 @@ function printFundingExchangeStatus(snapshot: FundingRateSnapshot): void {
 }
 
 function printDetailedComparison(comparison: SymbolFundingComparison): void {
-  const exAbbr = (e: string) => e === "pacifica" ? "PAC" : e === "hyperliquid" ? "HL" : e === "lighter" ? "LT" : e === "aster" ? "AST" : e.toUpperCase();
+  const exAbbr = venueAbbr;
   console.log(chalk.cyan.bold(`  ${comparison.symbol} Funding Rate Comparison\n`));
   console.log(`  Mark Price: $${formatUsd(comparison.bestMarkPrice)}\n`);
   for (const r of comparison.rates) {
@@ -398,15 +405,27 @@ function printDetailedComparison(comparison: SymbolFundingComparison): void {
 
 // ── Exported handler functions for use by arb-auto.ts scan routing ──
 
-export async function handleRates(isJson: () => boolean, opts: { symbol?: string; symbols?: string; all?: boolean; minSpread: string; top?: string }): Promise<void> {
+/** One-line stderr notice when rows of unverified-funding venues are shown (--include-unverified). */
+function warnUnverifiedFunding(rates: ReadonlyArray<{ exchange: string; fundingVerified: boolean }>): void {
+  const venues = [...new Set(rates.filter(r => !r.fundingVerified).map(r => r.exchange))];
+  if (venues.length === 0) return;
+  process.stderr.write(`[warn] ${venues.join(", ")}: funding rates are UNVERIFIED (unit not confirmed against funding payments; annualized values overstate venues whose funding accrues only during market hours). Shown on request — not for trading decisions.\n`);
+}
+
+export async function handleRates(isJson: () => boolean, opts: { symbol?: string; symbols?: string; all?: boolean; minSpread: string; top?: string; includeUnverified?: boolean }): Promise<void> {
   const minSpread = parseFloat(opts.minSpread);
   let filterSymbols: string[] | undefined;
   if (opts.symbol) filterSymbols = [opts.symbol.toUpperCase()];
   else if (opts.symbols) filterSymbols = opts.symbols.split(",").map(s => s.trim().toUpperCase());
   else if (!opts.all) filterSymbols = TOP_SYMBOLS;
   if (!isJson()) console.log(chalk.cyan("  Fetching funding rates from all exchanges...\n"));
-  const snapshot = await fetchAllFundingRates({ symbols: filterSymbols, minSpread });
-  try { const allRates = snapshot.symbols.flatMap(s => s.rates); if (allRates.length > 0) saveFundingSnapshot(allRates); } catch { /* non-critical */ }
+  // With --include-unverified and no symbol filter, show every matched symbol: the default
+  // TOP_SYMBOLS list is crypto-only and would hide every market of an equity venue.
+  if (opts.includeUnverified === true && !opts.symbol && !opts.symbols) filterSymbols = undefined;
+  const snapshot = await fetchAllFundingRates({ symbols: filterSymbols, minSpread, includeUnverified: opts.includeUnverified === true });
+  warnUnverifiedFunding(snapshot.symbols.flatMap(s => s.rates));
+  // Unverified rates are never written to the funding history (it feeds averages and bots).
+  try { const allRates = snapshot.symbols.flatMap(s => s.rates).filter(r => r.fundingVerified); if (allRates.length > 0) saveFundingSnapshot(allRates); } catch { /* non-critical */ }
   if (opts.top) snapshot.symbols = snapshot.symbols.slice(0, parseInt(opts.top));
   if (isJson()) {
     // Enrich with 24h rate history for each symbol
@@ -507,9 +526,10 @@ export async function handleDexScan(isJson: () => boolean, opts: { minSpread: st
   console.log(chalk.gray(`  Note: HIP-3 dexes charge 2x fees. Factor into net profitability.\n`));
 }
 
-export async function handleCompare(isJson: () => boolean, symbol: string): Promise<void> {
+export async function handleCompare(isJson: () => boolean, symbol: string, includeUnverified = false): Promise<void> {
   if (!isJson()) console.log(chalk.cyan(`  Fetching funding rates for ${symbol.toUpperCase()}...\n`));
-  const comparison = await fetchSymbolFundingRates(symbol);
+  const comparison = await fetchSymbolFundingRates(symbol, includeUnverified);
+  if (comparison) warnUnverifiedFunding(comparison.rates);
   if (!comparison) { if (isJson()) return printJson(jsonOk({ symbol: symbol.toUpperCase(), available: false })); console.log(chalk.gray(`  ${symbol.toUpperCase()} not found on at least 2 exchanges.\n`)); return; }
   if (isJson()) return printJson(jsonOk(comparison));
   printDetailedComparison(comparison);
@@ -525,7 +545,7 @@ export async function handleFundingHistory(isJson: () => boolean, opts: { symbol
     return printJson(jsonOk({ symbol, hours, startTime: startTime.toISOString(), endTime: endTime.toISOString(), rates: data }));
   }
   console.log(chalk.cyan.bold(`  ${symbol} Funding Rate History (last ${hours}h)\n`));
-  const exAbbr = (e: string) => e === "pacifica" ? "PAC" : e === "hyperliquid" ? "HL" : "LT";
+  const exAbbr = venueAbbr;
   let hasData = false;
   for (const ex of exchanges) {
     const rates = getHistoricalRates(symbol, ex, startTime, endTime); if (rates.length === 0) continue; hasData = true;
@@ -545,25 +565,26 @@ export async function handleFundingPositions(
     const targetExchanges = opts.exchanges ? opts.exchanges.split(",").map(s => s.trim().toLowerCase()) : [...ALL_EXCHANGES];
     if (!isJson()) console.log(chalk.cyan("  Fetching positions and funding rates...\n"));
     interface PF { exchange: string; symbol: string; side: "long"|"short"; size: string; entryPrice: string; markPrice: string; unrealizedPnl: string; leverage: number; notionalUsd: number; fundingRate: number; hourlyRate: number; annualPct: number; hourlyPayment: number; dailyPayment: number; actualReceived24h: number; actualPaid24h: number; actualNet24h: number; }
-    const results: PF[] = []; const exchangeErrors: Record<string, string> = {};
+    const results: PF[] = []; const exchangeErrors: Record<string, string> = {}; const fundingUnknown: string[] = [];
     await Promise.all(targetExchanges.map(async (exchange) => {
       try {
         const adapter = await getAdapterForExchange(exchange);
         const [positions, markets, fp] = await Promise.all([adapter.getPositions(), adapter.getMarkets(), adapter.getFundingPayments(100).catch(() => [] as { time: number; symbol: string; payment: string }[])]);
         if (positions.length === 0) return;
-        const fm = new Map<string, { rate: number; markPrice: number }>(); for (const m of markets) { const sym = m.symbol.toUpperCase().replace(/-PERP$/, ""); fm.set(sym, { rate: Number(m.fundingRate) || 0, markPrice: Number(m.markPrice) || 0 }); }
+        /* rate null = the venue reports no funding rate for the market (never read as 0) */ const fm = new Map<string, { rate: number | null; markPrice: number; fundingHours: number | null }>(); for (const m of markets) { const sym = m.symbol.toUpperCase().replace(/-PERP$/, ""); const rate = m.fundingRate === null || !Number.isFinite(Number(m.fundingRate)) ? null : Number(m.fundingRate); fm.set(sym, { rate, markPrice: Number(m.markPrice) || 0, fundingHours: m.fundingHours }); }
         const dayAgo = Date.now() - 86400000; const af = new Map<string, { received: number; paid: number }>(); for (const f of fp) { if (f.time < dayAgo) continue; const sym = f.symbol.toUpperCase().replace(/-PERP$/, ""); const amt = Number(f.payment) || 0; if (!af.has(sym)) af.set(sym, { received: 0, paid: 0 }); const e = af.get(sym)!; if (amt > 0) e.received += amt; else e.paid += Math.abs(amt); }
-        for (const pos of positions) { const sym = pos.symbol.toUpperCase().replace(/-PERP$/, ""); const fd = fm.get(sym); const fr = fd?.rate ?? 0; const mk = Number(pos.markPrice) || fd?.markPrice || 0; const sz = Math.abs(Number(pos.size)); const nu = sz * mk; const hr = toHourlyRate(fr, exchange); const ap = annualizeRate(fr, exchange); const hp = estimateHourlyFunding(fr, exchange, nu, pos.side); const a = af.get(sym); results.push({ exchange, symbol: sym, side: pos.side, size: pos.size, entryPrice: pos.entryPrice, markPrice: pos.markPrice, unrealizedPnl: pos.unrealizedPnl, leverage: pos.leverage, notionalUsd: nu, fundingRate: fr, hourlyRate: hr, annualPct: ap, hourlyPayment: hp, dailyPayment: hp * 24, actualReceived24h: a?.received ?? 0, actualPaid24h: a?.paid ?? 0, actualNet24h: (a?.received ?? 0) - (a?.paid ?? 0) }); }
+        for (const pos of positions) { const sym = pos.symbol.toUpperCase().replace(/-PERP$/, ""); const fd = fm.get(sym); if (fd === undefined || fd.rate === null) { fundingUnknown.push(`${exchange}:${sym}`); continue; } const fr = fd.rate; const mk = Number(pos.markPrice) || fd?.markPrice || 0; const sz = Math.abs(Number(pos.size)); const nu = sz * mk; const fh = fd ? fd.fundingHours : null; /* market basis first (§10.1) */ const hr = fh !== null ? fr / fh : toHourlyRate(fr, exchange); const ap = annualizeHourlyRate(hr); const hp = estimateHourlyFundingFromHourly(hr, nu, pos.side); const a = af.get(sym); results.push({ exchange, symbol: sym, side: pos.side, size: pos.size, entryPrice: pos.entryPrice, markPrice: pos.markPrice, unrealizedPnl: pos.unrealizedPnl, leverage: pos.leverage, notionalUsd: nu, fundingRate: fr, hourlyRate: hr, annualPct: ap, hourlyPayment: hp, dailyPayment: hp * 24, actualReceived24h: a?.received ?? 0, actualPaid24h: a?.paid ?? 0, actualNet24h: (a?.received ?? 0) - (a?.paid ?? 0) }); }
       } catch (err) { exchangeErrors[exchange] = err instanceof Error ? err.message : String(err); }
     }));
-    if (results.length === 0) { if (isJson()) return printJson(jsonOk({ positions: [], totals: { predicted: { hourly: 0, daily: 0 }, actual24h: { net: 0 }, notionalUsd: 0 }, errors: exchangeErrors })); console.log(chalk.gray("  No open positions.\n")); return; }
+    if (results.length === 0) { if (isJson()) return printJson(jsonOk({ positions: [], totals: { predicted: { hourly: 0, daily: 0 }, actual24h: { net: 0 }, notionalUsd: 0 }, fundingUnknown, errors: exchangeErrors })); console.log(chalk.gray(fundingUnknown.length > 0 ? `  No positions with a published funding rate (funding unknown: ${fundingUnknown.join(", ")}).\n` : "  No open positions.\n")); return; }
     results.sort((a, b) => Math.abs(b.dailyPayment) - Math.abs(a.dailyPayment));
     const tH = results.reduce((s, r) => s + r.hourlyPayment, 0); const tD = results.reduce((s, r) => s + r.dailyPayment, 0); const tN = results.reduce((s, r) => s + r.notionalUsd, 0); const tA = results.reduce((s, r) => s + r.actualNet24h, 0);
-    if (isJson()) return printJson(jsonOk({ positions: results.map(r => ({ exchange: r.exchange, symbol: r.symbol, side: r.side, size: r.size, notionalUsd: +r.notionalUsd.toFixed(2), fundingRate: r.fundingRate, annualPct: +r.annualPct.toFixed(2), predicted: { hourly: +r.hourlyPayment.toFixed(6), daily: +r.dailyPayment.toFixed(4) }, actual24h: { received: +r.actualReceived24h.toFixed(6), paid: +r.actualPaid24h.toFixed(6), net: +r.actualNet24h.toFixed(6) }, unrealizedPnl: r.unrealizedPnl })), totals: { predicted: { hourly: +tH.toFixed(6), daily: +tD.toFixed(4) }, actual24h: { net: +tA.toFixed(6) }, notionalUsd: +tN.toFixed(2) }, errors: Object.keys(exchangeErrors).length > 0 ? exchangeErrors : undefined }));
-    const exAbbr = (e: string) => e === "pacifica" ? "PAC" : e === "hyperliquid" ? "HL" : e === "lighter" ? "LT" : e === "aster" ? "AST" : e.toUpperCase();
+    if (isJson()) return printJson(jsonOk({ positions: results.map(r => ({ exchange: r.exchange, symbol: r.symbol, side: r.side, size: r.size, notionalUsd: +r.notionalUsd.toFixed(2), fundingRate: r.fundingRate, annualPct: +r.annualPct.toFixed(2), predicted: { hourly: +r.hourlyPayment.toFixed(6), daily: +r.dailyPayment.toFixed(4) }, actual24h: { received: +r.actualReceived24h.toFixed(6), paid: +r.actualPaid24h.toFixed(6), net: +r.actualNet24h.toFixed(6) }, unrealizedPnl: r.unrealizedPnl })), totals: { predicted: { hourly: +tH.toFixed(6), daily: +tD.toFixed(4) }, actual24h: { net: +tA.toFixed(6) }, notionalUsd: +tN.toFixed(2) }, fundingUnknown, errors: Object.keys(exchangeErrors).length > 0 ? exchangeErrors : undefined }));
+    const exAbbr = venueAbbr;
     console.log(chalk.cyan.bold("  Position Funding Impact\n"));
     const rows = results.map(r => { const sc = r.side === "long" ? chalk.green : chalk.red; const rc = r.fundingRate > 0 ? chalk.red : r.fundingRate < 0 ? chalk.green : chalk.white; const as = r.actualNet24h !== 0 ? (r.actualNet24h > 0 ? chalk.green : chalk.red)(`${r.actualNet24h > 0 ? "+" : ""}$${r.actualNet24h.toFixed(4)}`) : chalk.gray("-"); return [chalk.white.bold(exAbbr(r.exchange)), chalk.white.bold(r.symbol), sc(r.side.toUpperCase()), `$${formatUsd(r.notionalUsd)}`, rc(formatPercent(r.fundingRate)), rc(`${r.annualPct.toFixed(1)}%`), as, formatPnl(r.unrealizedPnl)]; });
     console.log(makeTable(["Ex", "Symbol", "Side", "Notional", "Rate(now)", "Annual(now)", "Actual 24h", "uPnL"], rows));
     console.log(`\n  Total: $${formatUsd(tN)} | Actual 24h: ${tA >= 0 ? "+" : ""}$${tA.toFixed(4)} | Predicted: ${tD >= 0 ? "-" : "+"}$${Math.abs(tD).toFixed(4)}/d\n`);
+    if (fundingUnknown.length > 0) console.log(chalk.yellow(`  Funding rate not published (excluded, not counted as 0): ${fundingUnknown.join(", ")}\n`));
   });
 }

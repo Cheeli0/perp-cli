@@ -90,19 +90,24 @@ describe("HyperliquidOutcomeAdapter — pure helpers", () => {
       })).not.toThrow();
     });
 
-    it("throws PerpError when venue embeds an error in statuses[0] despite top-level status:ok", () => {
+    it("a per-entry insufficient-balance error inside status:ok → definite INSUFFICIENT_BALANCE (live 2026-10-12)", () => {
       const result = {
         status: "ok",
-        response: { type: "order", data: { statuses: [{ error: "Insufficient USDH balance" }] } },
+        response: { type: "order", data: { statuses: [{ error: "Insufficient spot balance asset=100014881" }] } },
       };
-      expect(() => HyperliquidOutcomeAdapter._assertOrderStatusOk(result)).toThrow(PerpError);
+      let err: PerpError | null = null;
+      try { HyperliquidOutcomeAdapter._assertOrderStatusOk(result); } catch (e) { err = e as PerpError; }
+      expect(err).toBeInstanceOf(PerpError);
+      expect(err!.structured).toMatchObject({ code: "INSUFFICIENT_BALANCE", retryable: false });
+      expect(err!.message).toContain("Insufficient spot balance asset=100014881");
+    });
+
+    it("any other per-entry error → ORDER_REJECTED (never retryable EXCHANGE_ERROR)", () => {
+      let err: PerpError | null = null;
       try {
-        HyperliquidOutcomeAdapter._assertOrderStatusOk(result);
-      } catch (e) {
-        const err = e as PerpError;
-        expect(err.structured.code).toBe("EXCHANGE_ERROR");
-        expect(err.message).toContain("Insufficient USDH balance");
-      }
+        HyperliquidOutcomeAdapter._assertOrderStatusOk({ status: "ok", response: { type: "order", data: { statuses: [{ error: "Order must have minimum value of 10 USDC." }] } } });
+      } catch (e) { err = e as PerpError; }
+      expect(err!.structured).toMatchObject({ code: "ORDER_REJECTED", retryable: false });
     });
 
     it("throws PerpError on missing/empty statuses array", () => {
@@ -411,5 +416,43 @@ describe("HyperliquidOutcomeAdapter — pure helpers", () => {
         response: { type: "cancel", data: { statuses: [{ error: "Order already filled" }] } },
       })).toThrow(PerpError);
     });
+  });
+});
+
+describe("HyperliquidOutcomeAdapter — per-outcome quote token", () => {
+  type Meta = { outcomes: Array<Record<string, unknown>>; questions: unknown[] };
+  function adapter(meta: Meta, balances: Array<Record<string, unknown>>) {
+    const exchangeAction = async () => ({ status: "ok", response: { type: "order", data: { statuses: [{ resting: { oid: 1 } }] } } });
+    const hl = { address: "0xabc", isTestnet: false, exchangeAction } as never;
+    const a = new HyperliquidOutcomeAdapter(hl);
+    const h = a as unknown as Record<string, unknown>;
+    h._outcomeMeta = meta;
+    h._initialized = true;
+    h._invalidateAccountCache = async () => {};
+    h._infoPost = async (body: { type: string }) => body.type === "spotClearinghouseState" ? { balances } : {};
+    return a;
+  }
+  const meta = (quoteToken: unknown): Meta => ({
+    outcomes: [{ outcome: 1488, name: "x", description: "", sideSpecs: [{ name: "Yes" }, { name: "No" }], quoteToken, venue: "out" }],
+    questions: [],
+  });
+
+  it("quoteTokenOf reads outcomeMeta quoteToken; missing → EXCHANGE_ERROR; unknown outcome → SYMBOL_NOT_FOUND", () => {
+    expect(adapter(meta("USDC"), []).quoteTokenOf(1488)).toBe("USDC");
+    expect(() => adapter(meta(undefined), []).quoteTokenOf(1488)).toThrow(expect.objectContaining({ structured: expect.objectContaining({ code: "EXCHANGE_ERROR" }) }));
+    expect(() => adapter(meta("USDC"), []).quoteTokenOf(7)).toThrow(expect.objectContaining({ structured: expect.objectContaining({ code: "SYMBOL_NOT_FOUND" }) }));
+  });
+
+  it("buy pre-check uses the outcome's quote token balance (USDC), not USDH", async () => {
+    const usdhOnly = adapter(meta("USDC"), [{ coin: "USDH", total: "11.39", hold: "0" }, { coin: "USDC", total: "2.1", hold: "0" }]);
+    await expect(usdhOnly.placeOrder({ outcome: 1488, side: 0, isBuy: true, price: "0.5", size: "22" }))
+      .rejects.toMatchObject({ structured: { code: "INSUFFICIENT_BALANCE" }, message: expect.stringContaining("Insufficient USDC") });
+    const usdc = adapter(meta("USDC"), [{ coin: "USDC", total: "12", hold: "0" }]);
+    await expect(usdc.placeOrder({ outcome: 1488, side: 0, isBuy: true, price: "0.5", size: "22" })).resolves.toBeDefined();
+  });
+
+  it("minimum order value is 10 of the quote token", async () => {
+    await expect(adapter(meta("USDC"), []).placeOrder({ outcome: 1488, side: 0, isBuy: false, price: "0.5", size: "10" }))
+      .rejects.toMatchObject({ structured: { code: "INVALID_PARAMS" }, message: expect.stringContaining("10 USDC") });
   });
 });

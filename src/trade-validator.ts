@@ -1,7 +1,9 @@
 import type { ExchangeAdapter, ExchangeMarketInfo } from "./exchanges/index.js";
+import { maxLeverageForNotional } from "./exchanges/interface.js";
 import { symbolMatch } from "./utils.js";
 import { DEFAULT_TAKER_FEE } from "./constants.js";
 import { PerpError } from "./errors.js";
+import { resolveAdapterSlippage } from "./exchanges/slippage.js";
 
 export interface CheckResult {
   check: "symbol_valid" | "balance_sufficient" | "price_fresh" | "liquidity_ok" | "risk_limits" | "position_exists";
@@ -40,7 +42,6 @@ export interface TradeCheckParams {
 }
 
 // Use centralized DEFAULT_TAKER_FEE from constants.ts (0.035%)
-const DEFAULT_MAX_SLIPPAGE = 0.005; // 0.5%
 
 /**
  * Validate a trade before execution.
@@ -53,6 +54,8 @@ export async function validateTrade(
   const checks: CheckResult[] = [];
   const warnings: string[] = [];
   const sym = params.symbol.toUpperCase();
+  // Liquidity threshold = the bound a market order on this venue would carry (design §13.10 #14).
+  const maxSlippage = resolveAdapterSlippage(adapter, null).bps / 10_000;
 
   // Fetch market list, balance, and positions in parallel.
   // Defer the orderbook call until symbol membership is confirmed so invalid
@@ -75,11 +78,8 @@ export async function validateTrade(
     return { valid: false, checks, warnings, timestamp: new Date().toISOString() };
   }
 
-  // 1. Symbol validity (handle BTC vs BTC-PERP suffix variants)
-  const market = markets.find(m => {
-    const ms = m.symbol.toUpperCase();
-    return ms === sym || ms === `${sym}-PERP` || ms.replace(/-PERP$/, "") === sym;
-  });
+  // 1. Symbol validity (BTC vs BTC-PERP; a HIP-3 dex adapter lists "xyz:NVDA" for "NVDA")
+  const market = markets.find(m => symbolMatch(m.symbol, sym));
   if (market) {
     checks.push({ check: "symbol_valid", passed: true, message: `${sym} found on ${adapter.name}`, details: { maxLeverage: market.maxLeverage } });
   } else {
@@ -114,7 +114,12 @@ export async function validateTrade(
   if (params.leverage !== undefined && (!Number.isFinite(params.leverage) || params.leverage <= 0)) {
     throw new Error(`Leverage must be a positive number (received ${params.leverage}).`);
   }
-  const leverage = params.leverage ?? market.maxLeverage;
+  // `market.maxLeverage` is the TOP tier. Venues that publish notional-tiered
+  // caps (Hyperliquid: 36 of 233 symbols, e.g. BTC 40x but 20x above $150M)
+  // reject an order sized past a threshold even though the flat value allows it,
+  // so resolve the cap AT THIS ORDER'S NOTIONAL.
+  const effectiveMax = maxLeverageForNotional(market as ExchangeMarketInfo, notional);
+  const leverage = params.leverage ?? effectiveMax;
   if (!Number.isFinite(leverage) || leverage <= 0) {
     throw new Error(`No usable leverage for ${sym} (resolved=${leverage}); supply params.leverage explicitly.`);
   }
@@ -184,8 +189,8 @@ export async function validateTrade(
 
     if (availableLiquidity >= notional) {
       const slippage = markPrice > 0 ? Math.abs(worstPrice - markPrice) / markPrice : 0;
-      if (slippage > DEFAULT_MAX_SLIPPAGE) {
-        checks.push({ check: "liquidity_ok", passed: false, message: `Slippage ${(slippage * 100).toFixed(2)}% exceeds ${(DEFAULT_MAX_SLIPPAGE * 100).toFixed(1)}% threshold`, details: { slippagePct: slippage * 100, worstPrice, liquidityUsd: availableLiquidity } });
+      if (slippage > maxSlippage) {
+        checks.push({ check: "liquidity_ok", passed: false, message: `Slippage ${(slippage * 100).toFixed(2)}% exceeds the ${(maxSlippage * 100).toFixed(2)}% market-order slippage bound`, details: { slippagePct: slippage * 100, worstPrice, liquidityUsd: availableLiquidity } });
       } else {
         checks.push({ check: "liquidity_ok", passed: true, message: `Sufficient liquidity ($${availableLiquidity.toFixed(0)}), slippage ~${(slippage * 100).toFixed(3)}%`, details: { slippagePct: slippage * 100, liquidityUsd: availableLiquidity } });
       }
@@ -203,7 +208,11 @@ export async function validateTrade(
       [{ exchange: adapter.name, balance }],
       positions.map(p => ({ exchange: adapter.name, position: p })),
     );
-    const riskResult = preTradeCheck(assessment, notional, leverage);
+    // The leverage limit is checked only for a leverage the caller STATED (--leverage), exactly
+    // like enforceOrderRisk. Without one, `leverage` above is the market MAXIMUM (used for the
+    // margin estimate only) — not what the account trades at: checking it failed every order on
+    // a 50x market against a 20x limit while the account was set to 5x.
+    const riskResult = preTradeCheck(assessment, notional, params.leverage ?? 0);
     if (riskResult.allowed) {
       checks.push({ check: "risk_limits", passed: true, message: "Within risk limits" });
     } else {
@@ -249,8 +258,15 @@ export async function validateTrade(
 
   const valid = checks.every(c => c.passed);
 
-  if (leverage > market.maxLeverage) {
-    warnings.push(`Requested leverage ${leverage}x exceeds max ${market.maxLeverage}x`);
+  if (leverage > effectiveMax) {
+    // Compare against the tier that applies at this notional, not the headline
+    // cap — otherwise the check is tautological whenever leverage defaulted FROM
+    // maxLeverage, and it never fires for the tiered case it exists to catch.
+    warnings.push(
+      effectiveMax < market.maxLeverage
+        ? `Requested leverage ${leverage}x exceeds ${effectiveMax}x, the cap for this $${notional.toFixed(0)} notional (headline max ${market.maxLeverage}x applies below the tier threshold)`
+        : `Requested leverage ${leverage}x exceeds max ${market.maxLeverage}x`,
+    );
   }
 
   return {
@@ -281,4 +297,65 @@ export async function validateTrade(
     },
     timestamp: new Date().toISOString(),
   };
+}
+
+/**
+ * Hard pre-trade risk gate for manual order commands.
+ *
+ * Unlike validateTrade (which is advisory — used by `trade check` and the MCP
+ * preview), this is meant to run immediately before submitting a real order.
+ * It throws RISK_VIOLATION when the order would breach the locally configured
+ * limits (maxPositionUsd / maxTotalExposureUsd / maxPositions, plus any active
+ * critical violation that suspends trading). reduce-only and --force orders are
+ * exempt, so position-reducing and intentional-override flows are never blocked.
+ *
+ * Leverage is only checked when the caller passes an explicit value; the bare
+ * buy/sell/market/limit commands carry no leverage argument, so the gate there
+ * enforces notional/exposure rather than per-order leverage.
+ */
+export async function enforceOrderRisk(
+  adapter: ExchangeAdapter,
+  p: { symbol: string; size: number; price?: number; leverage?: number; reduceOnly?: boolean; force?: boolean },
+): Promise<void> {
+  if (p.reduceOnly || p.force) return;
+
+  const { loadRiskLimits, assessRisk, preTradeCheck } = await import("./risk.js");
+  const limits = loadRiskLimits();
+
+  // Resolve notional: limit orders carry a price; market orders need markPrice.
+  let price = p.price;
+  if (price == null || !Number.isFinite(price)) {
+    const markets = await adapter.getMarkets();
+    const m = markets.find((mk) => symbolMatch(mk.symbol, p.symbol));
+    if (!m) {
+      throw new PerpError("SYMBOL_NOT_FOUND", `${p.symbol} not found on ${adapter.name}`, { exchange: adapter.name });
+    }
+    price = Number(m.markPrice);
+  }
+  // SSOT rule #2: if the notional cannot be computed we cannot enforce the
+  // limit — fail closed (the caller may pass --force) rather than wave it
+  // through with a silent zero notional that bypasses the position cap.
+  if (!Number.isFinite(price) || (price as number) <= 0) {
+    throw new PerpError("PRICE_STALE", `Cannot resolve a mark price for ${p.symbol} on ${adapter.name} to check risk limits`, {
+      exchange: adapter.name,
+      remediation: "Retry, or pass --force to skip the local risk check.",
+    });
+  }
+
+  const notional = Math.abs(p.size * (price as number));
+  const [balance, positions] = await Promise.all([adapter.getBalance(), adapter.getPositions()]);
+  const assessment = assessRisk(
+    [{ exchange: adapter.name, balance }],
+    positions.map((pos) => ({ exchange: adapter.name, position: pos })),
+    limits,
+  );
+
+  const check = preTradeCheck(assessment, notional, p.leverage ?? 0);
+  if (!check.allowed) {
+    throw new PerpError("RISK_VIOLATION", check.reason ?? "Order blocked by local risk limits", {
+      exchange: adapter.name,
+      remediation: "Adjust limits with `perp risk set ...`, reduce the order size, or pass --force to override.",
+      details: { symbol: p.symbol, notional },
+    });
+  }
 }

@@ -40,10 +40,15 @@ function makeRate(overrides: Partial<ExchangeFundingRate> = {}): ExchangeFunding
   return {
     exchange: "hyperliquid",
     symbol: "BTC",
+    canonical: "BTC",
     fundingRate: 0.0001,
+    basis: { kind: "perHours", hours: 1 },
     hourlyRate: 0.0001,
     annualizedPct: 87.6,
     markPrice: 50000,
+    nextFundingTime: null,
+    historicalAvg: null,
+    fundingVerified: true,
     ...overrides,
   };
 }

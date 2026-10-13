@@ -10,6 +10,7 @@ import { existsSync, mkdirSync, rmSync } from "fs";
 import { resolve } from "path";
 import os from "os";
 import { Command } from "commander";
+import { addRootSafetyOptions } from "../../cli-flags.js";
 
 // ── Stable temp-dir for settings I/O ──────────────────────────────────────
 
@@ -41,6 +42,8 @@ const MOCK_MASTER_WALLET = {
 const FAKE_SIG = "0x1aee1548148536475582711c39958806646195b294c0bbc0d52ed8aae77988175240c82244cf8e1e0d4387d107ef558090bae5d6a603235750e93ee0be1b1bbf1b";
 
 const mockOws = {
+  listWallets: vi.fn((): Array<{ name: string }> => []),
+  deleteWallet: vi.fn(),
   createWallet: vi.fn(),
   createPolicy: vi.fn(),
   createApiKey: vi.fn(),
@@ -69,11 +72,13 @@ const { registerWalletAgentCommands } = await import("../../commands/agent.js");
 const { getAgent, setAgent, deleteAgent } = await import("../../agent-wallet/store.js");
 const { loadSettings, saveSettings } = await import("../../settings.js");
 import { HyperliquidAdapter } from "../../exchanges/hyperliquid.js";
+import type { PerpError } from "../../errors.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 function makeProgram() {
   const prog = new Command();
+  addRootSafetyOptions(prog);
   prog.exitOverride();
   // Register `agent` as a subcommand of `wallet` to match the production
   // command tree post-consolidation (`perp wallet agent ...`).
@@ -277,6 +282,7 @@ describe("Test 2: HL approve --rotate replaces existing entry", () => {
       "--master", "main",
       "--agent-name", "perp-cli-hl",
       "--expires-in", "90d",
+      "--rotate",
       "--passphrase", "testpass",
       "--json",
     ]);
@@ -594,5 +600,286 @@ describe("Test 13: HL verify cross-check happy (AC-28)", () => {
     expect(parsed.ok).toBe(true);
     // No warnings when address matches
     expect(!parsed.meta?.warnings || parsed.meta?.warnings?.length === 0).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Review fixes: M3 (approve acceptance rule) + (a) revoked OWS agent wallet removal
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("M3: HL approve requires HTTP 2xx AND status \"ok\"", () => {
+  it.each([
+    ["HTTP 502 with ok body", { ok: false, status: 502, body: { status: "ok" } }],
+    ["200 without a status field", { ok: true, status: 200, body: { response: "?" } }],
+    ["200 with an unexpected status", { ok: true, status: 200, body: { status: "pending" } }],
+  ])("%s → APPROVE_PARTIAL, no agent persisted, local agent wallet kept (outcome unknown)", async (_l, r) => {
+    setupOkOws();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: r.ok, status: r.status, text: async () => JSON.stringify(r.body) }));
+    const out: string[] = [];
+    vi.spyOn(process.stdout, "write").mockImplementation((c: string | Uint8Array) => { out.push(String(c)); return true; });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("process.exit"); }) as never);
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    await expect(makeProgram().parseAsync([
+      "node", "perp", "wallet", "agent", "approve", "hyperliquid", "--master", "main", "--passphrase", "testpass", "--json",
+    ])).rejects.toThrow("process.exit");
+    const env = JSON.parse(out.find(l => l.includes('"ok":false'))!);
+    expect(env.error.code).toBe("APPROVE_PARTIAL");
+    expect(getAgent("hyperliquid", "perp-cli-hl")).toBeNull();
+    expect(mockOws.deleteWallet).not.toHaveBeenCalled();
+  });
+});
+
+describe("(a) a confirmed revoke deletes the OWS agent wallet so rotate can recreate the name", () => {
+  it("revoke: venue confirms → deleteWallet(agent-hl-main)", async () => {
+    setupOkOws();
+    mockOws.listWallets.mockReturnValue([{ name: "agent-hl-main" }]);
+    setAgent("hyperliquid", makeHlAgentMeta("perp-cli-hl"));
+    stubHlFetchOk();
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("process.exit"); }) as never);
+    await makeProgram().parseAsync(["node", "perp", "wallet", "agent", "revoke", "hyperliquid", "perp-cli-hl", "--passphrase", "testpass", "--json"]);
+    expect(mockOws.deleteWallet).toHaveBeenCalledWith("agent-hl-main");
+    expect(getAgent("hyperliquid", "perp-cli-hl")).toBeNull();
+  });
+
+  it("revoke --force (nothing sent) keeps the OWS agent wallet", async () => {
+    mockOws.listWallets.mockReturnValue([{ name: "agent-hl-main" }]);
+    setAgent("hyperliquid", makeHlAgentMeta("perp-cli-hl"));
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    await makeProgram().parseAsync(["node", "perp", "wallet", "agent", "revoke", "hyperliquid", "perp-cli-hl", "--force", "--json"]);
+    expect(mockOws.deleteWallet).not.toHaveBeenCalled();
+  });
+
+  it("rotate: old wallet deleted after the confirmed revoke and BEFORE createWallet of the same name", async () => {
+    setupOkOws();
+    const order: string[] = [];
+    // Stateful: the old agent wallet exists until the confirmed revoke deletes it.
+    let wallets = [{ name: "agent-hl-main" }];
+    mockOws.listWallets.mockImplementation(() => wallets);
+    mockOws.deleteWallet.mockImplementation((n: string) => { order.push(`delete:${n}`); wallets = wallets.filter(w => w.name !== n); });
+    mockOws.createWallet.mockImplementation((n: string) => { order.push(`create:${n}`); return MOCK_AGENT_WALLET; });
+    setAgent("hyperliquid", makeHlAgentMeta("perp-cli-hl"));
+    stubHlFetchOk();
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("process.exit"); }) as never);
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    await makeProgram().parseAsync(["node", "perp", "wallet", "agent", "rotate", "hyperliquid", "perp-cli-hl", "--master", "main", "--passphrase", "testpass", "--json"]);
+    expect(order).toEqual(["delete:agent-hl-main", "create:agent-hl-main"]);
+    expect(getAgent("hyperliquid", "perp-cli-hl")).not.toBeNull();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Docs/review fixes: venue expiry suffix, expired agent, approve --rotate, wallet-name collision
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Runs a `wallet agent …` command that must fail; returns the JSON error envelope's `error`. */
+async function failingRun(args: string[]): Promise<{ code: string; message: string; remediation?: string }> {
+  const out: string[] = [];
+  vi.spyOn(process.stdout, "write").mockImplementation((c: string | Uint8Array) => { out.push(String(c)); return true; });
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("process.exit"); }) as never);
+  vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+  await expect(makeProgram().parseAsync(["node", "perp", "wallet", "agent", ...args, "--json"])).rejects.toThrow("process.exit");
+  return JSON.parse(out.find(l => l.includes('"ok":false'))!).error;
+}
+
+describe("HL approveAgent carries the venue expiry (`<name> valid_until <ms>`, max 180 days)", () => {
+  it("signed and posted agentName end with the stored expiresAt in ms; the stored name stays bare", async () => {
+    setupOkOws();
+    stubHlFetchOk();
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await makeProgram().parseAsync(["node", "perp", "wallet", "agent", "approve", "hyperliquid", "--master", "main", "--expires-in", "30d", "--passphrase", "testpass", "--json"]);
+    const meta = getAgent("hyperliquid", "perp-cli-hl")!;
+    expect(meta.agentName).toBe("perp-cli-hl");
+    const expiryMs = new Date(meta.expiresAt).getTime();
+    expect(Math.abs(expiryMs - (Date.now() + 30 * 86_400_000))).toBeLessThan(60_000);
+    const body = JSON.parse((fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0][1].body as string);
+    expect(body.action.agentName).toBe(`perp-cli-hl valid_until ${expiryMs}`);
+    // The EIP-712 message the master signed names the same string.
+    const typedData = JSON.parse(mockOws.signTypedData.mock.calls[0][2] as string) as { message: { agentName: string } };
+    expect(typedData.message.agentName).toBe(body.action.agentName);
+  });
+
+  it.each(["181d", "1y"])("--expires-in %s (> 180 days) → INVALID_PARAMS before any wallet is created or anything is sent", async (expiresIn) => {
+    setupOkOws();
+    stubHlFetchOk();
+    const err = await failingRun(["approve", "hyperliquid", "--master", "main", "--expires-in", expiresIn, "--passphrase", "testpass"]);
+    expect(err.code).toBe("INVALID_PARAMS");
+    expect(err.message).toMatch(/at most 180 days/);
+    expect(mockOws.createWallet).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(getAgent("hyperliquid", "perp-cli-hl")).toBeNull();
+  });
+
+  it("an agent name containing valid_until is refused", async () => {
+    setupOkOws();
+    stubHlFetchOk();
+    const err = await failingRun(["approve", "hyperliquid", "--master", "main", "--agent-name", "a valid_until 1", "--passphrase", "testpass"]);
+    expect(err.code).toBe("INVALID_PARAMS");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("HyperliquidAdapter: an expired agent never falls through to the master signer", () => {
+  const expiredAdapter = () => {
+    const adapter = new HyperliquidAdapter();
+    const meta = makeHlAgentMeta();
+    meta.expiresAt = new Date(Date.now() - 1000).toISOString();
+    const signer = (addr: string) => ({ getAddress: () => addr, signTypedData: vi.fn().mockResolvedValue(FAKE_SIG), signMessage: vi.fn() });
+    adapter.setAgentSigner(meta, signer("0xAgentHLAddr00000000000000000000000000001") as never);
+    adapter.setSigner(signer("0xMasterHLAddr0000000000000000000000000001") as never);
+    return adapter;
+  };
+
+  it("expired agent + master available → AGENT_EXPIRED with the re-approve remediation, nothing signed", async () => {
+    const adapter = expiredAdapter();
+    expect(adapter.activeSignerTier).toBeNull();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const err = await adapter.exchangeAction({ type: "cancel", cancels: [{ a: 0, o: 1 }] }).catch((e: unknown) => e) as PerpError;
+    expect(err.structured.code).toBe("AGENT_EXPIRED");
+    expect(err.structured.remediation).toContain("perp wallet agent approve hyperliquid");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("--no-agent → the master signer is used", () => {
+    const adapter = expiredAdapter();
+    adapter.setNoAgent(true);
+    expect(adapter.activeSignerTier).toBe("master");
+  });
+});
+
+describe("approve vs an existing agent OWS wallet (name collision) and approve --rotate", () => {
+  afterEach(() => {
+    // mockImplementation survives vi.clearAllMocks(): restore the file-level defaults.
+    mockOws.listWallets.mockReset().mockImplementation(() => []);
+    mockOws.deleteWallet.mockReset();
+    mockOws.createWallet.mockReset();
+  });
+
+  /** OWS wallet list that follows deleteWallet / createWallet; records their order. */
+  const statefulWallets = (initial: string[]) => {
+    let wallets = initial.map(name => ({ name }));
+    const order: string[] = [];
+    mockOws.listWallets.mockImplementation(() => wallets);
+    mockOws.deleteWallet.mockImplementation((n: string) => { order.push(`delete:${n}`); wallets = wallets.filter(w => w.name !== n); });
+    mockOws.createWallet.mockImplementation((n: string) => {
+      if (wallets.some(w => w.name === n)) throw new Error(`wallet name already exists: '${n}'`);
+      order.push(`create:${n}`); wallets = [...wallets, { name: n }];
+      return MOCK_AGENT_WALLET;
+    });
+    return order;
+  };
+
+  it("approve without --rotate while the agent exists → INVALID_PARAMS telling the user to pass --rotate, never DUPLICATE_ORDER", async () => {
+    setupOkOws();
+    statefulWallets(["agent-hl-main"]);
+    const expired = makeHlAgentMeta("perp-cli-hl");
+    expired.expiresAt = new Date(Date.now() - 1000).toISOString();
+    setAgent("hyperliquid", expired);
+    stubHlFetchOk();
+    const err = await failingRun(["approve", "hyperliquid", "--master", "main", "--passphrase", "testpass"]);
+    expect(err.code).toBe("INVALID_PARAMS");
+    expect(err.message).toContain('agent "perp-cli-hl" already exists');
+    expect(err.remediation).toContain("perp wallet agent approve hyperliquid --rotate");
+    expect(fetch).not.toHaveBeenCalled();
+    expect(mockOws.signTypedData).not.toHaveBeenCalled();
+  });
+
+  it("a NEW --agent-name still collides with the master's agent wallet: without --rotate → INVALID_PARAMS naming the owner", async () => {
+    setupOkOws();
+    statefulWallets(["agent-hl-main"]);
+    setAgent("hyperliquid", makeHlAgentMeta("perp-cli-hl"));
+    stubHlFetchOk();
+    const err = await failingRun(["approve", "hyperliquid", "--master", "main", "--agent-name", "fresh", "--passphrase", "testpass"]);
+    expect(err.code).toBe("INVALID_PARAMS");
+    expect(err.message).toContain('agent "perp-cli-hl" already exists');
+    expect(err.remediation).toContain("perp wallet agent approve hyperliquid --rotate");
+    expect(err.remediation).toContain("perp wallet agent rotate hyperliquid perp-cli-hl");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("approve --rotate under a NEW --agent-name replaces the agent that owns the wallet (revoked by ITS name), then registers the new one", async () => {
+    setupOkOws();
+    const order = statefulWallets(["agent-hl-main"]);
+    setAgent("hyperliquid", makeHlAgentMeta("perp-cli-hl"));
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => JSON.stringify({ status: "ok" }) });
+    vi.stubGlobal("fetch", fetchMock);
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await makeProgram().parseAsync(["node", "perp", "wallet", "agent", "approve", "hyperliquid", "--master", "main", "--agent-name", "fresh", "--rotate", "--passphrase", "testpass", "--json"]);
+    expect(order).toEqual(["delete:agent-hl-main", "create:agent-hl-main"]);
+    const actions = fetchMock.mock.calls.map(c => JSON.parse(c[1].body as string).action as { agentAddress: string; agentName: string });
+    expect(actions[0]).toMatchObject({ agentAddress: "0x0000000000000000000000000000000000000000", agentName: "perp-cli-hl" });
+    expect(actions[1].agentName).toMatch(/^fresh valid_until \d{13}$/);
+    expect(getAgent("hyperliquid", "perp-cli-hl")).toBeNull();
+    expect(getAgent("hyperliquid", "fresh")).not.toBeNull();
+  });
+
+  it.each([["rotate", ["rotate", "hyperliquid", "perp-cli-hl"]], ["approve --rotate", ["approve", "hyperliquid", "--master", "main", "--rotate"]]])(
+    "%s: the venue already pruned the expired agent (\"Extra agent does not exist.\") → treated as gone: local wallet replaced, fresh key approved", async (_l, args) => {
+      setupOkOws();
+      const order = statefulWallets(["agent-hl-main"]);
+      const expired = makeHlAgentMeta("perp-cli-hl");
+      expired.expiresAt = new Date(Date.now() - 1000).toISOString();
+      setAgent("hyperliquid", expired);
+      const fetchMock = vi.fn().mockImplementation(async (_u: string, init: { body: string }) => {
+        const zero = JSON.parse(init.body).action.agentAddress === "0x0000000000000000000000000000000000000000";
+        const body = zero ? { status: "err", response: "Extra agent does not exist." } : { status: "ok" };
+        return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      vi.spyOn(console, "log").mockImplementation(() => {});
+      vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+      vi.spyOn(process, "exit").mockImplementation((() => { throw new Error("process.exit"); }) as never);
+      vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+      await makeProgram().parseAsync(["node", "perp", "wallet", "agent", ...args, "--passphrase", "testpass", "--json"]);
+      expect(order).toEqual(["delete:agent-hl-main", "create:agent-hl-main"]);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(new Date(getAgent("hyperliquid", "perp-cli-hl")!.expiresAt).getTime()).toBeGreaterThan(Date.now());
+    });
+
+  it("any OTHER revoke refusal aborts the rotate: the still-possibly-active agent's wallet and record are kept", async () => {
+    setupOkOws();
+    const order = statefulWallets(["agent-hl-main"]);
+    setAgent("hyperliquid", makeHlAgentMeta("perp-cli-hl"));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => JSON.stringify({ status: "err", response: "Must deposit before performing actions." }) }));
+    const err = await failingRun(["approve", "hyperliquid", "--master", "main", "--rotate", "--passphrase", "testpass"]);
+    expect(err.code).toBe("APPROVE_FAILED");
+    expect(order).toEqual([]);
+    expect(getAgent("hyperliquid", "perp-cli-hl")).not.toBeNull();
+  });
+
+  it("a leftover wallet no agent record uses → INVALID_PARAMS with the cleanup step", async () => {
+    setupOkOws();
+    statefulWallets(["agent-hl-main"]);
+    stubHlFetchOk();
+    const err = await failingRun(["approve", "hyperliquid", "--master", "main", "--passphrase", "testpass"]);
+    expect(err.code).toBe("INVALID_PARAMS");
+    expect(err.remediation).toContain("ows wallet delete agent-hl-main");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("approve --rotate with an EXPIRED previous agent takes the rotate path: revoke → delete wallet → create → approve", async () => {
+    setupOkOws();
+    const order = statefulWallets(["agent-hl-main"]);
+    const expired = makeHlAgentMeta("perp-cli-hl");
+    expired.expiresAt = new Date(Date.now() - 1000).toISOString();
+    setAgent("hyperliquid", expired);
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => JSON.stringify({ status: "ok" }) });
+    vi.stubGlobal("fetch", fetchMock);
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await makeProgram().parseAsync(["node", "perp", "wallet", "agent", "approve", "hyperliquid", "--master", "main", "--rotate", "--passphrase", "testpass", "--json"]);
+    expect(order).toEqual(["delete:agent-hl-main", "create:agent-hl-main"]);
+    const actions = fetchMock.mock.calls.map(c => JSON.parse(c[1].body as string).action as { agentAddress: string; agentName: string });
+    expect(actions).toHaveLength(2);
+    expect(actions[0]).toMatchObject({ agentAddress: "0x0000000000000000000000000000000000000000", agentName: "perp-cli-hl" });
+    expect(actions[1].agentAddress).toBe("0xAgentHLAddr00000000000000000000000000001");
+    const meta = getAgent("hyperliquid", "perp-cli-hl")!;
+    expect(new Date(meta.expiresAt).getTime()).toBeGreaterThan(Date.now());
   });
 });

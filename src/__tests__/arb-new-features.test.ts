@@ -382,8 +382,8 @@ describe("ArbDaemonState with lastSuccessfulScanTime", () => {
     const testTimestamp = "2025-06-15T14:30:00.000Z";
     state.lastSuccessfulScanTime = testTimestamp;
 
-    saveArbState(state);
-    const loaded = loadArbState();
+    saveArbState("mainnet", state);
+    const loaded = loadArbState("mainnet");
 
     expect(loaded).not.toBeNull();
     expect(loaded!.lastSuccessfulScanTime).toBe(testTimestamp);
@@ -396,16 +396,16 @@ describe("ArbDaemonState with lastSuccessfulScanTime", () => {
     });
     const ts1 = "2025-06-15T10:00:00.000Z";
     state.lastSuccessfulScanTime = ts1;
-    saveArbState(state);
+    saveArbState("mainnet", state);
 
     // Simulate daemon updating lastSuccessfulScanTime
-    const loaded = loadArbState()!;
+    const loaded = loadArbState("mainnet")!;
     const ts2 = "2025-06-15T11:00:00.000Z";
     loaded.lastSuccessfulScanTime = ts2;
     loaded.lastScanTime = ts2;
-    saveArbState(loaded);
+    saveArbState("mainnet", loaded);
 
-    const reloaded = loadArbState()!;
+    const reloaded = loadArbState("mainnet")!;
     expect(reloaded.lastSuccessfulScanTime).toBe(ts2);
     expect(reloaded.lastScanTime).toBe(ts2);
   });
@@ -565,14 +565,14 @@ describe("getNextSettlement", () => {
 describe("isSpreadReversed", () => {
   it("detects reversal when long exchange has higher rate", () => {
     // Long HL, Short PAC. If HL rate > PAC rate hourly -> reversed
-    const snapshot = { symbol: "ETH", pacRate: 0.0001, hlRate: 0.0005, ltRate: 0, spread: 0, longExch: "hyperliquid", shortExch: "pacifica", markPrice: 3000, pacMarkPrice: 0, hlMarkPrice: 0, ltMarkPrice: 0 };
+    const snapshot = { symbol: "ETH", pacRate: 0.0001, hlRate: 0.0005, ltRate: 0, spread: 0, longExch: "hyperliquid", shortExch: "pacifica", markPrice: 3000, pacMarkPrice: 0, hlMarkPrice: 0, ltMarkPrice: 0, astRate: 0, astMarkPrice: 0, astHours: null };
     const reversed = isSpreadReversed("hyperliquid", "pacifica", snapshot);
     expect(reversed).toBe(true);
   });
 
   it("no reversal when short exchange has higher rate", () => {
     // Long HL, Short PAC. PAC rate > HL rate -> NOT reversed
-    const snapshot = { symbol: "ETH", pacRate: 0.0005, hlRate: 0.0001, ltRate: 0, spread: 0, longExch: "hyperliquid", shortExch: "pacifica", markPrice: 3000, pacMarkPrice: 0, hlMarkPrice: 0, ltMarkPrice: 0 };
+    const snapshot = { symbol: "ETH", pacRate: 0.0005, hlRate: 0.0001, ltRate: 0, spread: 0, longExch: "hyperliquid", shortExch: "pacifica", markPrice: 3000, pacMarkPrice: 0, hlMarkPrice: 0, ltMarkPrice: 0, astRate: 0, astMarkPrice: 0, astHours: null };
     const reversed = isSpreadReversed("hyperliquid", "pacifica", snapshot);
     expect(reversed).toBe(false);
   });
