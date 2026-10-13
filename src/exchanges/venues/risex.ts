@@ -70,7 +70,9 @@ export const risexVenue: VenueDefinition = {
   settlementIntervalHours: 1,
   // Verified 2026-10-14: current_funding_rate equals the last settled print in
   // /funding-rate-history, and public /v1/account/funding-payments satisfy
-  // payment = position size × index price × rate for that hour (13 records, 13 markets).
+  // payment = position size × index price × rate for that hour, positive = paid. Evidence: raw
+  // records of 6 mainnet accounts / 23 markets / 31 hours in
+  // src/__tests__/fixtures/risex/funding-payments-evidence.json, checked by risex-evidence.test.ts.
   fundingVerified: true,
   roles: ["marketData", "account", "trading"],
   capabilities: {

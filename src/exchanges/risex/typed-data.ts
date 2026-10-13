@@ -18,7 +18,10 @@
  * permission with a `DisablePermission` signed by the SIGNER itself (typehash below, matched against
  * the contract's DISABLE_PERMISSION_TYPEHASH(); a master-signed one reverts InvalidSignerSignature),
  * sent on-chain by the master. EnablePermission must be signed by the account, so a signer cannot
- * restore what it gave up (both checked by eth_call on testnet 2026-10-14).
+ * restore what it gave up (both checked by eth_call on testnet 2026-10-14). The calldata outcomes,
+ * revert selectors, the permission-id map and the router traces are recorded in
+ * src/__tests__/fixtures/risex/permissions-evidence.json (asserted by risex-evidence.test.ts). The
+ * implementation source is not verified on the explorer, so permission NAMES are unknown.
  */
 
 import { AbiCoder, Interface, Signature, getAddress, keccak256, toUtf8Bytes, verifyTypedData } from "ethers";
