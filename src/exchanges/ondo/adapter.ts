@@ -37,7 +37,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { PerpError, orderOutcomeUnknown } from "../../errors.js";
+import { PerpError, orderNotSent, orderOutcomeUnknown } from "../../errors.js";
 import type { OndoAgentMeta } from "../../settings.js";
 import type {
   ExchangeAdapter, ExchangeBalance, ExchangeFundingPayment, ExchangeKline, ExchangeMarketInfo, ExchangeOrder,
@@ -472,24 +472,41 @@ export class OndoAdapter implements ExchangeAdapter, TradingV2 {
     });
     const stopBody: Record<string, unknown> = { market: pair.market, positionDirection, type, triggerPrice: trigger, quantity };
     await this.attachBuilderCode(stopBody, exec);
-    const stopRaw = await this.client.post<OndoStopOrders>("/v1/perps/stop_order", stopBody);
-
-    // The stop endpoint returns no order id — locate the resulting untriggered order. A stop set
-    // with `quantity` is a PARTIAL stop (set-stop-order: "Sets a partial stop order for this quantity
-    // of the position instead of the full position"), so it carries `size`, not closePosition
-    // (live mainnet 2026-10-05: {type:"stopMarket", status:"untriggered", size:"0.005"}).
-    const recent = await this.client.getPage<OndoOrder[] | null>("/v1/perps/orders", { market: pair.market, limit: ORDERS_PAGE_LIMIT });
     // Order type per kind, live mainnet 2026-10-05: stopLoss → "stopMarket", takeProfit → "takeProfitMarket".
     const orderType = type === "stopLoss" ? "stopMarket" : "takeProfitMarket";
-    const order = listOf(recent.result).find(o =>
-      o.status === "untriggered" && o.type === orderType && o.stopOrderType === type
-      && o.triggerPrice !== undefined && Number(o.triggerPrice) === t && subDecimal(o.size, quantity) === "0");
-    if (order === undefined) {
-      throw new PerpError("EXCHANGE_ERROR", `Ondo Perps accepted the ${type} at ${trigger} but the order is not visible in the order list`, {
-        stopOrders: stopRaw,
-        remediation: "Check with: perp account orders -e ondo (the stop may be set; do not resubmit blindly)",
+    const sameStop = (o: OndoOrder) => o.status === "untriggered" && o.type === orderType && o.stopOrderType === type
+      && o.triggerPrice !== undefined && Number(o.triggerPrice) === t && subDecimal(o.size, quantity) === "0";
+    // The stop endpoint returns no order id ({market, positionDirection, stopLoss?, takeProfit?}),
+    // so the order ids already listed BEFORE the POST are excluded afterwards — an older identical
+    // stop is never reported as the new one. Pre-send: a failed read sends nothing.
+    let before: Set<string>;
+    try {
+      const prior = await this.client.getPage<OndoOrder[] | null>("/v1/perps/orders", { market: pair.market, limit: ORDERS_PAGE_LIMIT });
+      before = new Set(listOf(prior.result).map(o => o.orderId));
+    } catch (e) {
+      throw orderNotSent("ondo", `${type} ${req.side} ${quantity} ${pair.market} @ ${trigger}`, e);
+    }
+    const stopRaw = await this.client.post<OndoStopOrders>("/v1/perps/stop_order", stopBody);
+
+    // Locate the resulting untriggered order. A stop set with `quantity` is a PARTIAL stop
+    // (set-stop-order: "Sets a partial stop order for this quantity of the position instead of the
+    // full position"), so it carries `size`, not closePosition (live mainnet 2026-10-05:
+    // {type:"stopMarket", status:"untriggered", size:"0.005"}). The POST succeeded: a failed read
+    // or no / several new candidates leave the stop's state unknown — ORDER_PENDING, never resubmit.
+    const pendingRemediation = "Do NOT resubmit — the stop may be set. Check with: perp account orders -e ondo";
+    let recent: Awaited<ReturnType<OndoClient["getPage"]>>;
+    try {
+      recent = await this.client.getPage<OndoOrder[] | null>("/v1/perps/orders", { market: pair.market, limit: ORDERS_PAGE_LIMIT });
+    } catch (e) {
+      throw orderOutcomeUnknown("ondo", `${type} at ${trigger}: accepted, but the order list could not be read`, e, pendingRemediation);
+    }
+    const fresh = listOf(recent.result as OndoOrder[] | null).filter(o => !before.has(o.orderId) && sameStop(o));
+    if (fresh.length !== 1) {
+      throw new PerpError("ORDER_PENDING", `Ondo Perps accepted the ${type} at ${trigger} but ${fresh.length === 0 ? "the new order is not visible in the order list" : `${fresh.length} new matching orders are listed (${fresh.map(o => o.orderId).join(", ")})`}`, {
+        exchange: "ondo", stopOrders: stopRaw, remediation: pendingRemediation,
       });
     }
+    const order = fresh[0];
     return this.toOrderResult(order, subDecimal(req.size, quantity) === "0"
       ? { stopOrder: stopRaw, order }
       : { stopOrder: stopRaw, order, requestedSize: req.size, placedSize: quantity }, exec);
@@ -622,6 +639,14 @@ export class OndoAdapter implements ExchangeAdapter, TradingV2 {
       tif = postOnly ? "ALO" : original.timeInForce;
     }
     const w = wireTif(tif);
+    // The replacement keeps reduceOnly: a reduce-only limit must be one of caps.reduceOnlyTif (IOC
+    // — see header), so a reduce-only replacement at another TIF would be refused only AFTER the
+    // original is cancelled. Refuse up front; nothing is cancelled.
+    if (original.reduceOnly === true && this.caps.reduceOnlyTif !== null && !this.caps.reduceOnlyTif.includes(tif)) {
+      throw unsupported(this.venue.displayName, "amend",
+        `order ${original.orderId} is reduce-only and a reduce-only limit can only be ${this.caps.reduceOnlyTif.join(" / ")} (replacement TIF ${tif}); nothing was cancelled`,
+        `Cancel it (perp trade cancel ${req.symbol} ${original.orderId} -e ondo) and place a new order`);
+    }
 
     // Validate the replacement BEFORE cancelling so a bad price/size never loses the original.
     const price = requireOnTick(req.price, pair.quoteIncrement);

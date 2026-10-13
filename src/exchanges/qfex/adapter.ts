@@ -91,6 +91,8 @@ const HISTORY_SETTLE_DELAY_MS = 1_000;
  * /user/historic-orders and /user/trade rows carry no order id, so a vanished stop cannot be
  * proven cancelled — "not indexed" becomes a reason that says so (the cancel stays pending).
  */
+/** settledByHistory verdict prefix for a row that partially filled and then was cancelled (never reported as "filled"). */
+const QFEX_PARTIAL_PREFIX = "partially filled";
 function stopHistoryVerdict(settled: string): string {
   return settled === "not indexed"
     ? "no longer listed open, but QFEX keeps no record of stop orders (not in /user/historic-orders), so the cancel cannot be proven — if perp account orders/positions -e qfex both show nothing for the symbol, it is gone"
@@ -482,8 +484,12 @@ export class QfexAdapter implements ExchangeAdapter, TradingV2 {
         orderType = (closeSide === "sell") === below ? "STOP_LOSS" : "TAKE_PROFIT";
         exec.notes.push(`sent as ${orderType}: trigger ${trigger} is ${below ? "below" : "above"} the mark ${mark}`);
       }
+      // Same gate as every other order (ACTIVE, USD-quoted, tradable). The refdata `order_types`
+      // list only LIMIT / MARKET / ALO (no stop types — fixtures/qfex/refdata.json), and a stop
+      // executes as a MARKET order when triggered, so MARKET + GTC (the TIF sent) is checked.
+      this.requireOrderable(i, "MARKET", "GTC");
       const held = floorSize(plainNumber(Math.abs(position), "position"), i.lotSize);
-      const sameType = (await session.getUserOrders(i.venueSymbol)).filter(o => o.symbol === i.venueSymbol && o.type === orderType);
+      const sameType =(await session.getUserOrders(i.venueSymbol)).filter(o => o.symbol === i.venueSymbol && o.type === orderType);
       const reserved = sumDecimals(sameType.map(o => fromWireNumber(o.quantity, i.lotSize, "quantity")));
       const total = sumDecimals([reserved, size]);
       if (lessThan(held, total)) {
@@ -1005,6 +1011,7 @@ export class QfexAdapter implements ExchangeAdapter, TradingV2 {
       const settled = STOP_TYPES.has(row.type) ? await this.settleUnknownStopCancel(i.venueSymbol, row.order_id) : null;
       if (settled === "cancelled") result.cancelled.push(ref);
       else if (settled === "filled") result.failed.push({ ref, error: `order ${row.order_id} triggered / filled before the cancel` });
+      else if (settled !== null && settled.startsWith(QFEX_PARTIAL_PREFIX)) result.failed.push({ ref, error: `order ${row.order_id} ${settled}` });
       else (result.pending as NonNullable<CancelResult["pending"]>).push({ ref, reason: settled === null ? outcome.reason : `${outcome.reason}; re-check: ${settled}`, remediation: "Do NOT assume it was cancelled. Check: perp account orders -e qfex" });
     }
     return result;
@@ -1037,6 +1044,7 @@ export class QfexAdapter implements ExchangeAdapter, TradingV2 {
         const settled = STOP_TYPES.has(o.type) ? stopHistoryVerdict(await this.settledByHistory(o.symbol, o.order_id)) : await this.settledByHistory(o.symbol, o.order_id);
         if (settled === "cancelled") result.cancelled.push(refOf(o.order_id));
         else if (settled === "filled") result.failed.push({ ref: refOf(o.order_id), error: `order ${o.order_id} ${STOP_TYPES.has(o.type) ? "triggered / " : ""}filled before the cancel` });
+        else if (settled.startsWith(QFEX_PARTIAL_PREFIX)) result.failed.push({ ref: refOf(o.order_id), error: `order ${o.order_id} ${settled} — check the position: perp account positions -e qfex` });
         else pending.push({ ref: refOf(o.order_id), reason: `no longer listed after cancel_all_orders, and its historic-orders row does not settle it yet (${settled})`, remediation: "Check: perp account orders -e qfex / perp account positions -e qfex" });
         continue;
       }
@@ -1051,6 +1059,7 @@ export class QfexAdapter implements ExchangeAdapter, TradingV2 {
           const settled = await this.settleUnknownStopCancel(o.symbol, o.order_id);
           if (settled === "cancelled") result.cancelled.push(refOf(o.order_id));
           else if (settled === "filled") result.failed.push({ ref: refOf(o.order_id), error: `order ${o.order_id} triggered / filled before the cancel` });
+          else if (settled.startsWith(QFEX_PARTIAL_PREFIX)) result.failed.push({ ref: refOf(o.order_id), error: `order ${o.order_id} ${settled}` });
           else pending.push({ ref: refOf(o.order_id), reason: `${one.reason}; re-check: ${settled}`, remediation: "Check: perp account orders -e qfex" });
         }
         continue;
@@ -1100,9 +1109,11 @@ export class QfexAdapter implements ExchangeAdapter, TradingV2 {
       }
       if (rows.length !== 1) { last = rows.length === 0 ? "not indexed" : `${rows.length} rows`; continue; }
       const h = rows[0];
-      if (Number(h.filled_qty) > 0) return "filled";
+      const cancelledStatus = h.terminal_status === "CANCELLED" || h.terminal_status === "CANCELLED_STP" || h.terminal_status === "EXPIRED";
+      // Filled qty on a CANCELLED row = partially filled, remainder cancelled — not "filled".
+      if (Number(h.filled_qty) > 0) return cancelledStatus ? `${QFEX_PARTIAL_PREFIX} (${String(h.filled_qty)}) before the cancel; the remainder was cancelled` : "filled";
       const cls = qfexStatusClass(h.terminal_status);
-      if (h.terminal_status === "CANCELLED" || h.terminal_status === "CANCELLED_STP" || h.terminal_status === "EXPIRED") return "cancelled";
+      if (cancelledStatus) return "cancelled";
       last = `terminal_status ${JSON.stringify(h.terminal_status)} (${cls})`;
     }
     return last;

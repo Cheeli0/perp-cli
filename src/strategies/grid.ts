@@ -3,6 +3,7 @@ import type { ExchangeAdapter } from "../exchanges/index.js";
 import { updateJobState } from "../jobs.js";
 import { closePerpVerified } from "../bot/perp-order.js";
 import { formatComputedPrice } from "../exchanges/precision.js";
+import { alignComputedLimitPrice } from "../bot/quote-rules.js";
 import { symbolMatch } from "../utils.js";
 import { venueRateString } from "../utils/numeric.js";
 
@@ -131,7 +132,7 @@ export async function runGrid(
   try {
     // Get current price to determine buy/sell sides
     const markets = await adapter.getMarkets();
-    const market = markets.find(m => m.symbol.toUpperCase() === symbol.toUpperCase());
+    const market = markets.find(m => symbolMatch(m.symbol, symbol));
     const currentPrice = market ? parseFloat(market.markPrice) : (upperPrice + lowerPrice) / 2;
 
     // Assign sides: buy below current, sell above current
@@ -184,7 +185,7 @@ export async function runGrid(
 
             if (newPrice >= lowerPrice && newPrice <= upperPrice) {
               try {
-                const result = await adapter.limitOrder(symbol, newSide, String(newPrice.toFixed(2)), String(line.size)) as Record<string, unknown>;
+                const result = await adapter.limitOrder(symbol, newSide, await alignComputedLimitPrice(adapter, symbol, newSide, formatComputedPrice(newPrice)), String(line.size)) as Record<string, unknown>;
                 const newOrderId = String(result?.orderId ?? result?.oid ?? result?.id ?? "");
                 state.activeOrders.set(String(i), newOrderId);
                 line.side = newSide;
@@ -328,7 +329,7 @@ async function placeGridOrders(
       const result = await adapter.limitOrder(
         symbol,
         line.side,
-        String(line.price.toFixed(2)),
+        await alignComputedLimitPrice(adapter, symbol, line.side, formatComputedPrice(line.price)),
         String(line.size),
       ) as Record<string, unknown>;
 

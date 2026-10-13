@@ -52,7 +52,7 @@ describe("funds bridge send --dry-run with explicit addresses loads no key (L3)"
     expect(env.data).toMatchObject({ dryRun: true, sent: false, selected: "cctp" });
     expect(loadPrivateKey).not.toHaveBeenCalled();
     expect(executeBestBridge).not.toHaveBeenCalled();
-    expect(getAllQuotes).toHaveBeenCalledWith("arbitrum", "base", 10, "0x0000000000000000000000000000000000000001", "0x0000000000000000000000000000000000000002");
+    expect(getAllQuotes).toHaveBeenCalledWith("arbitrum", "base", "10", "0x0000000000000000000000000000000000000001", "0x0000000000000000000000000000000000000002");
   });
 });
 

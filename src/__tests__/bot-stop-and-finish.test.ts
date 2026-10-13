@@ -46,7 +46,7 @@ const { stopJob } = await import("../jobs.js");
 import "../exchanges/venues/index.js";
 import { DCAStrategy } from "../bot/strategies/dca-strategy.js";
 import { registerAdapterNetwork } from "../exchanges/adapter-network.js";
-import { openPositionsAtStop, runBot } from "../bot/engine.js";
+import { openPositionsAtStop, runBot, UNKNOWN_EQUITY_STOP_TICKS } from "../bot/engine.js";
 import { evaluateCondition } from "../bot/conditions.js";
 import type { BotConfig } from "../bot/config.js";
 import type { ExchangeAdapter } from "../exchanges/interface.js";
@@ -211,12 +211,17 @@ describe("JSON mode stop summary (25) and unknown equity (26)", () => {
     const stdout = vi.spyOn(console, "log").mockImplementation(() => {});
     const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     try {
-      const cfg = { ...dcaConfig("t-eq-null"), exit_conditions: [{ type: "time_after" as const, value: 0.3 }], strategy: { type: "dca", amount: 0.05, interval_sec: 3600, total_orders: 0, side: "buy" } as never };
-      await runBot(a, cfg, undefined, () => {}, new Map([["hyperliquid", hl]]), "json", false);
+      // Deterministic (no wall-clock exit): the run ends by itself after exactly
+      // UNKNOWN_EQUITY_STOP_TICKS ticks of unknown equity — one status line per tick.
+      const cfg = { ...dcaConfig("t-eq-null"), exit_conditions: [{ type: "time_after" as const, value: 3600 }], strategy: { type: "dca", amount: 0.05, interval_sec: 3600, total_orders: 0, side: "buy" } as never };
+      await expect(runBot(a, cfg, undefined, () => {}, new Map([["hyperliquid", hl]]), "json", false))
+        .rejects.toThrow(new RegExp(`equity unknown for ${UNKNOWN_EQUITY_STOP_TICKS} consecutive ticks`));
       const json = stdout.mock.calls.map(c => String(c[0])).filter(l => l.startsWith("{")).map(l => JSON.parse(l));
       const status = json.filter(j => j.event === undefined);
-      expect(status.length).toBeGreaterThan(1);
+      expect(status).toHaveLength(UNKNOWN_EQUITY_STOP_TICKS);
       for (const j of status) expect(j).toMatchObject({ equity: null, peakEquity: null });
+      // Entries are blocked while equity is unknown: the DCA never sends an order.
+      expect(a.marketOrder).not.toHaveBeenCalled();
       expect(json.find(j => j.event === "done")).toMatchObject({ equity: null, peakEquity: null });
       const warnings = stderr.mock.calls.map(c => String(c[0])).filter(l => /equity reported as unknown/.test(l));
       expect(warnings).toHaveLength(1);
@@ -237,7 +242,10 @@ describe("JSON mode stop summary (25) and unknown equity (26)", () => {
       const stdout = vi.spyOn(console, "log").mockImplementation(() => {});
       const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
       try {
-        await runBot(a, cfg, undefined, () => {}, new Map([["hyperliquid", hl]]), "json", false);
+        // Unknown equity all run ends the run with an error after UNKNOWN_EQUITY_STOP_TICKS; the done line is printed first.
+        await runBot(a, cfg, undefined, () => {}, new Map([["hyperliquid", hl]]), "json", false).catch((e: unknown) => {
+          if (!/equity unknown for/.test(String(e))) throw e;
+        });
         return stdout.mock.calls.map(c => String(c[0])).filter(l => l.startsWith("{")).map(l => JSON.parse(l)).find(j => j.event === "done");
       } finally { stdout.mockRestore(); stderr.mockRestore(); }
     };

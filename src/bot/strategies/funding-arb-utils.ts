@@ -277,3 +277,24 @@ export async function fetchRates(
   }
   return result;
 }
+
+/**
+ * Cancel the open orders of `symbols` (the bot's own) on every venue in `adapters` — never an
+ * account-wide cancel. Each failure is logged (never "cancelled"); nothing is logged as
+ * cancelled when the bot traded no symbol.
+ */
+export async function cancelBotSymbols(
+  adapters: Map<string, ExchangeAdapter>, symbols: ReadonlySet<string>, tag: string, log: (msg: string) => void,
+): Promise<void> {
+  if (symbols.size === 0) { log(`  ${tag} No bot symbols traded — no orders to cancel`); return; }
+  for (const [name, a] of adapters) {
+    for (const sym of symbols) {
+      try {
+        await a.cancelAllOrders(sym);
+      } catch (e) {
+        log(`  ${tag} WARNING: cancelling ${sym} orders on ${name} FAILED (${e instanceof Error ? e.message : String(e)}) — check: perp -e ${name} account orders`);
+      }
+    }
+  }
+  log(`  ${tag} Cancel requested for ${[...symbols].join(", ")} on ${[...adapters.keys()].join(", ")}`);
+}

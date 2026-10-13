@@ -113,7 +113,7 @@ describe("OWS master: public addresses only, nothing decrypted", () => {
 
   it("funds bridge send --dry-run arbitrum → solana quotes for the master's own addresses (the live bug)", async () => {
     expect(await run(["--dry-run", "funds", "bridge", "send", "--from", "arbitrum", "--to", "solana", "--amount", "5"])).toBeNull();
-    expect(getAllQuotes).toHaveBeenCalledWith("arbitrum", "solana", 5, OWS_EVM, OWS_SOL);
+    expect(getAllQuotes).toHaveBeenCalledWith("arbitrum", "solana", "5", OWS_EVM, OWS_SOL);
     expect(lastJson()).toMatchObject({ ok: true, data: { dryRun: true, sent: false, selected: "cctp" } });
     expect(owsSign).not.toHaveBeenCalled();
     expect(loadPrivateKey).not.toHaveBeenCalled();
@@ -121,10 +121,17 @@ describe("OWS master: public addresses only, nothing decrypted", () => {
     expect(checkBridgeGasBalance).not.toHaveBeenCalled();
   });
 
-  it("funds bridge exchange --dry-run hyperliquid → pacifica resolves both sides from the vault", async () => {
-    expect(await run(["--dry-run", "funds", "bridge", "exchange", "--from", "hyperliquid", "--to", "pacifica", "--amount", "10"])).toBeNull();
-    expect(getAllQuotes).toHaveBeenCalledWith("hyperliquid", "solana", 10, OWS_EVM, OWS_SOL);
+  it("funds bridge exchange --dry-run lighter → pacifica resolves both sides from the vault", async () => {
+    expect(await run(["--dry-run", "funds", "bridge", "exchange", "--from", "lighter", "--to", "pacifica", "--amount", "10"])).toBeNull();
+    expect(getAllQuotes).toHaveBeenCalledWith("arbitrum", "solana", "10", OWS_EVM, OWS_SOL);
     expect(lastJson()).toMatchObject({ ok: true, data: { dryRun: true, sent: false } });
+    expect(owsSign).not.toHaveBeenCalled();
+    expect(loadPrivateKey).not.toHaveBeenCalled();
+  });
+
+  it("funds bridge exchange hyperliquid → pacifica (HyperCore → Solana CCTP) is refused before any quote or key", async () => {
+    expect(codeOf(await run(["--dry-run", "funds", "bridge", "exchange", "--from", "hyperliquid", "--to", "pacifica", "--amount", "10"]))).toBe("NO_BRIDGE_ROUTE");
+    expect(getAllQuotes).not.toHaveBeenCalled();
     expect(owsSign).not.toHaveBeenCalled();
     expect(loadPrivateKey).not.toHaveBeenCalled();
   });
@@ -139,7 +146,7 @@ describe("OWS master: public addresses only, nothing decrypted", () => {
 
   it("funds bridge quote defaults sender / recipient to the master's own addresses", async () => {
     expect(await run(["funds", "bridge", "quote", "--from", "solana", "--to", "base", "--amount", "5"])).toBeNull();
-    expect(getAllQuotes).toHaveBeenCalledWith("solana", "base", 5, OWS_SOL, OWS_EVM);
+    expect(getAllQuotes).toHaveBeenCalledWith("solana", "base", "5", OWS_SOL, OWS_EVM);
     expect(owsSign).not.toHaveBeenCalled();
   });
 
@@ -207,7 +214,8 @@ describe("signer selection", () => {
     const evmQ = { ...QUOTE("arbitrum", "base", "debridge"), raw: { senderAddress: OWS_EVM, recipientAddress: OWS_EVM, amountRaw: "5000000" } };
     const solQ = { ...QUOTE("solana", "base", "debridge"), raw: { senderAddress: OWS_SOL, recipientAddress: OWS_EVM, amountRaw: "5000000" } };
     expect(codeOf(await engine.executeDebridgeBridge("mainnet", evmQ, "ows:main").catch(e => e))).toBe("NO_SIGNER_AVAILABLE");
-    expect(codeOf(await engine.executeDebridgeBridge("mainnet", solQ, "ows:main").catch(e => e))).toBe("NO_SIGNER_AVAILABLE");
+    // Solana-origin deBridge is refused outright (its transaction cannot be verified locally).
+    expect(codeOf(await engine.executeDebridgeBridge("mainnet", solQ, "ows:main").catch(e => e))).toBe("NO_BRIDGE_ROUTE");
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 

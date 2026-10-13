@@ -4,7 +4,7 @@
  * pair and `arb close <SYM>` finds it. The network is the spot adapter's own (the bot's -n).
  * An entry is matched on symbol + spot venue + perp venue.
  */
-import { addPosition, getPositions, removePosition, updatePosition, type ArbPositionState } from "../../arb/state.js";
+import { addPosition, getPositions, removePositionEntry, updatePositionEntry, type ArbPositionState } from "../../arb/state.js";
 import { spotNetworkOf, spotPairSymbol } from "../../exchanges/spot-factory.js";
 import { SPOT_PERP_TOKEN_MAP, type SpotAdapter } from "../../exchanges/spot-interface.js";
 import { getVenue } from "../../exchanges/venue.js";
@@ -44,7 +44,11 @@ export interface SpotPerpEntry extends SpotPerpPair {
   perpEntryPrice: number | null;
 }
 
-/** Record an opened pair as a spot-perp arb-state entry (a failed write is logged, never thrown). */
+/**
+ * Record an opened pair as a spot-perp arb-state entry (a failed write is logged, never thrown —
+ * including the RISK_VIOLATION of an existing entry of the symbol on other venues / another
+ * mode, which is never overwritten).
+ */
 export function recordSpotPerpEntry(spot: SpotAdapter, e: SpotPerpEntry, tag: string, log: (msg: string) => void): void {
   try {
     const net = spotNetworkOf(spot);
@@ -70,8 +74,9 @@ export function recordSpotPerpClose(spot: SpotAdapter, pos: SpotPerpPair, remain
   try {
     const entry = stateEntryOf(spot, pos);
     if (entry === undefined) return;
-    if (remaining === null) removePosition(spotNetworkOf(spot), entry.symbol);
-    else updatePosition(spotNetworkOf(spot), entry.symbol, { longSize: Number(remaining), shortSize: Number(remaining) });
+    // Keyed by symbol + venues + mode: never another pair of the same symbol.
+    if (remaining === null) removePositionEntry(spotNetworkOf(spot), entry);
+    else updatePositionEntry(spotNetworkOf(spot), entry, { longSize: Number(remaining), shortSize: Number(remaining) });
   } catch (err) {
     stateWriteFailed(tag, remaining === null ? "removal" : "update", pos, err, log);
   }

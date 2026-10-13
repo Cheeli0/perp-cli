@@ -23,6 +23,7 @@ import type { ExchangeAdapter } from "../exchanges/index.js";
 import { computeExecutableSize } from "../liquidity.js";
 import { logExecution } from "../execution-log.js";
 import { PerpError, extractErrorMessage, isDefiniteOrderFailure } from "../errors.js";
+import { alignComputedLimitPrice } from "../bot/quote-rules.js";
 import { alignProtectionPrice, floorToStep, formatComputedPrice, toUnitsExact, unitsToString } from "../exchanges/precision.js";
 import { placePerpVerified } from "../bot/perp-order.js";
 import { reportedAvgFillPrice } from "../exchanges/ioc-outcome.js";
@@ -199,7 +200,9 @@ export async function runSplitOrder(
     }
 
     // 3. IOC limit at the worst acceptable price, fill verified
-    const price = sliceLimitPrice(best, side, maxSlippagePct, tickSize);
+    const raw = sliceLimitPrice(best, side, maxSlippagePct, tickSize);
+    // No published tick (HL): the venue grid, aligned toward the best price (never past the tolerance).
+    const price = tickSize === null ? await alignComputedLimitPrice(adapter, symbol, side === "buy" ? "buy" : "sell", raw) : raw;
     const depth = computeExecutableSize(levels, Number(size) * Number(best), maxSlippagePct);
     log(`[SPLIT] Slice ${i + 1}/${sliceCount}: ${size} @ limit $${price} | depth within ${maxSlippagePct}%: $${depth.depthUsd.toFixed(0)}`);
 

@@ -129,12 +129,18 @@ describe("C1 — root --dry-run honored wherever it appears (real root program)"
   });
 
   it.each([
-    [["--json", "--dry-run", "funds", "bridge", "exchange", "--from", "hyperliquid", "--to", "pacifica", "--amount", "5"]],
-    [["--json", "funds", "bridge", "exchange", "--from", "hyperliquid", "--to", "pacifica", "--amount", "5", "--dry-run"]],
+    [["--json", "--dry-run", "funds", "bridge", "exchange", "--from", "lighter", "--to", "pacifica", "--amount", "5"]],
+    [["--json", "funds", "bridge", "exchange", "--from", "lighter", "--to", "pacifica", "--amount", "5", "--dry-run"]],
   ])("funds bridge exchange %j → nothing sent", async (argv) => {
     await run(argv);
     expect(executeBestBridge).not.toHaveBeenCalled();
     expect(lastJson()).toMatchObject({ ok: true, data: { dryRun: true, sent: false } });
+  });
+
+  it("funds bridge exchange hyperliquid → pacifica (HyperCore → Solana CCTP) is refused: NO_BRIDGE_ROUTE, nothing sent", async () => {
+    await expect(run(["--json", "--dry-run", "funds", "bridge", "exchange", "--from", "hyperliquid", "--to", "pacifica", "--amount", "5"]))
+      .rejects.toMatchObject({ structured: { code: "NO_BRIDGE_ROUTE" } });
+    expect(executeBestBridge).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -261,13 +267,30 @@ describe("H1 — central dry-run guard (default-deny)", () => {
     [["funds", "withdraw", "pacifica", "20"], "pacifica"],
     [["-e", "lighter", "funds", "withdraw", "lighter", "20"], "lighter"],
     [["-e", "lighter-rh", "funds", "withdraw", "lighter", "20"], "lighter-rh"],
-    [["funds", "transfer", "20", "0x2222222222222222222222222222222222222222"], "hyperliquid"],
   ])("%j --dry-run → plan with sent:false; no key, relayer, adapter write or network", async (args, venue) => {
     await run(["--json", "--dry-run", ...args]);
     expect(lastJson()).toMatchObject({ ok: true, data: { dryRun: true, sent: false, venue } });
     expect(loadPrivateKey).not.toHaveBeenCalled();
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(stubAdapter.withdraw).not.toHaveBeenCalled();
+    expect(stubAdapter.usdTransfer).not.toHaveBeenCalled();
+  });
+
+  it("funds transfer --dry-run evaluates the settings withdraw.hyperliquid gate: unset → POLICY_DENIED; allowlisted → plan; nothing sent", async () => {
+    const dest = "0x2222222222222222222222222222222222222222";
+    await expect(run(["--json", "--dry-run", "funds", "transfer", "20", dest])).rejects.toMatchObject({ structured: { code: "POLICY_DENIED" } });
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    const { resolve } = await import("node:path");
+    mkdirSync(resolve(process.env.HOME as string, ".perp"), { recursive: true });
+    writeFileSync(resolve(process.env.HOME as string, ".perp", "settings.json"), JSON.stringify({ withdraw: { hyperliquid: { allowlist: [dest], maxPerTx: 100, maxPerDay: 100 } } }));
+    try {
+      await run(["--json", "--dry-run", "funds", "transfer", "20", dest]);
+      expect(lastJson()).toMatchObject({ ok: true, data: { dryRun: true, sent: false, venue: "hyperliquid" } });
+    } finally {
+      writeFileSync(resolve(process.env.HOME as string, ".perp", "settings.json"), JSON.stringify({}));
+    }
+    expect(loadPrivateKey).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
     expect(stubAdapter.usdTransfer).not.toHaveBeenCalled();
   });
 });

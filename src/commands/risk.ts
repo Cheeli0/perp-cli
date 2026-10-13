@@ -76,6 +76,15 @@ export async function runHealthCheck(isJson: () => boolean): Promise<void> {
 }
 
 
+/**
+ * Exchange filter (comma-separated) of a risk subcommand: the ROOT `-e, --exchange`, only when given
+ * on the command line. Commander hands `--exchange` to the root wherever it appears, so a subcommand
+ * copy was never set (the filter was silently dropped); the root's default venue is never a filter.
+ */
+function cliExchangeFilter(root: Command): string | undefined {
+  return root.getOptionValueSource("exchange") === "cli" ? String(root.opts().exchange) : undefined;
+}
+
 export function registerRiskCommands(
   program: Command,
   getAdapterForExchange: (exchange: string) => Promise<ExchangeAdapter>,
@@ -86,12 +95,12 @@ export function registerRiskCommands(
   // ── risk status ──
   risk
     .command("status")
-    .description("Assess current risk across all exchanges")
-    .option("--exchange <exchanges>", "Comma-separated exchanges (default: all with configured credentials)")
-    .action(async (opts: { exchange?: string }) => {
+    .description("Assess current risk across all exchanges — -e <ex1,ex2> limits the exchanges (default: all with configured credentials)")
+    .action(async () => {
+      const exchangeFilter = cliExchangeFilter(program);
       await withJsonErrors(isJson(), async () => {
-        const exchanges = opts.exchange
-          ? opts.exchange.split(",").map(e => e.trim())
+        const exchanges = exchangeFilter
+          ? exchangeFilter.split(",").map(e => e.trim())
           : await listConfiguredAccountVenues();
 
         const balances: { exchange: string; balance: Awaited<ReturnType<ExchangeAdapter['getBalance']>> }[] = [];
@@ -257,14 +266,14 @@ export function registerRiskCommands(
   // ── risk check ── (pre-trade check, for agent use)
   risk
     .command("check")
-    .description("Pre-trade risk check (for agents)")
+    .description("Pre-trade risk check (for agents) — -e <ex1,ex2> limits the exchanges (default: all with configured credentials)")
     .requiredOption("--notional <usd>", "Order notional value in USD")
     .requiredOption("--leverage <n>", "Order leverage")
-    .option("--exchange <exchanges>", "Comma-separated exchanges (default: all with configured credentials)")
-    .action(async (opts: { notional: string; leverage: string; exchange?: string }) => {
+    .action(async (opts: { notional: string; leverage: string }) => {
+      const exchangeFilter = cliExchangeFilter(program);
       await withJsonErrors(isJson(), async () => {
-        const exchanges = opts.exchange
-          ? opts.exchange.split(",").map(e => e.trim())
+        const exchanges = exchangeFilter
+          ? exchangeFilter.split(",").map(e => e.trim())
           : await listConfiguredAccountVenues();
 
         const balances: { exchange: string; balance: Awaited<ReturnType<ExchangeAdapter['getBalance']>> }[] = [];
@@ -301,13 +310,13 @@ export function registerRiskCommands(
   // ── risk liquidation-distance ──
   risk
     .command("liquidation-distance")
-    .description("Show % distance from liquidation price for all positions")
+    .description("Show % distance from liquidation price for all positions — -e <ex1,ex2> limits the exchanges (default: all with configured credentials)")
     .alias("liq-dist")
-    .option("--exchange <exchanges>", "Comma-separated exchanges (default: all with configured credentials)")
-    .action(async (opts: { exchange?: string }) => {
+    .action(async () => {
+      const exchangeFilter = cliExchangeFilter(program);
       await withJsonErrors(isJson(), async () => {
-        const exchanges = opts.exchange
-          ? opts.exchange.split(",").map(e => e.trim())
+        const exchanges = exchangeFilter
+          ? exchangeFilter.split(",").map(e => e.trim())
           : await listConfiguredAccountVenues();
 
         const positions: { exchange: string; position: Awaited<ReturnType<ExchangeAdapter['getPositions']>>[number] }[] = [];

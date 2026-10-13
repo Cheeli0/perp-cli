@@ -8,6 +8,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { Command } from "commander";
 import { Readable } from "stream";
+import { addRootSafetyOptions } from "../../cli-flags.js";
 
 // ── Mock shared-api (ping functions) BEFORE module imports ────────────────
 
@@ -107,7 +108,8 @@ function makeMockAdapter(opts: {
 function makeProgram(adapterFactory?: (exchange: string) => Promise<unknown>) {
   const prog = new Command();
   prog.exitOverride();
-  prog
+  // Root -n / --dry-run like the real program (portfolio --health reads the validated network).
+  addRootSafetyOptions(prog)
     .option("-e, --exchange <exchange>", "Exchange", "pacifica")
     .option("--json", "JSON output");
 

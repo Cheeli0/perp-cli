@@ -328,7 +328,10 @@ export function isTransportFailure(e: unknown): boolean {
   if (e instanceof TypeError || e instanceof SyntaxError) return true;
   const name = e instanceof Error ? e.name : "";
   if (name === "AbortError" || name === "TimeoutError") return true;
-  return /fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket hang up|network|timed? ?out/i.test(extractErrorMessage(e));
+  // "network" alone is NOT a transport signal: definite refusals such as "wrong network" /
+  // "unsupported network" mention it too. Only transport phrasings ("network error",
+  // "NetworkError when attempting to fetch", "network request failed", …) count.
+  return /fetch failed|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket hang up|\bnetwork ?(error|request failed|failure|unreachable|is unreachable|connection lost)\b|timed? ?out/i.test(extractErrorMessage(e));
 }
 
 const CONNECT_FAILURE_CODES: ReadonlySet<string> = new Set(["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "UND_ERR_CONNECT_TIMEOUT", "ENETUNREACH", "EHOSTUNREACH"]);

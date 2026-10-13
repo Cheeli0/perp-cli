@@ -304,7 +304,6 @@ describe("Hyperliquid trigger orders", () => {
     let n = 0;
     const a = hlAdapter(() => (n++ === 0 ? [] : [HL_STOP_ROW]));
     a.getSzDecimals = vi.fn().mockReturnValue(2);
-    a._hlRoundPrice = (x: number) => String(x);
     a.builderDecision = vi.fn().mockResolvedValue({ applied: null, note: null });
     a.markPrice = vi.fn().mockResolvedValue(120); // sell stop 116.43 below the mark → "sl"
     const ack = { status: "ok", response: { type: "order", data: { statuses: ["waitingForTrigger"] } } };
@@ -325,7 +324,6 @@ describe("Hyperliquid trigger orders", () => {
     const err = vi.spyOn(console, "error").mockImplementation(() => {});
     const a = hlAdapter(() => [HL_STOP_ROW]);
     a.getSzDecimals = vi.fn().mockReturnValue(2);
-    a._hlRoundPrice = (x: number) => String(x);
     a.builderDecision = vi.fn().mockResolvedValue({ applied: null, note: null });
     a.markPrice = vi.fn().mockResolvedValue(120); // sell stop 116.43 below the mark → "sl"
     (a._signAndSendAction as ReturnType<typeof vi.fn>).mockResolvedValue({ status: "ok", response: { type: "order", data: { statuses: ["waitingForTrigger"] } } });

@@ -50,7 +50,8 @@ vi.mock("../../bot/quarantine.js", async (importOriginal) => {
 // Import mocked modules so we can control their behavior per-test
 import { generateClientId, logClientId, isOrderDuplicate } from "../../client-id-tracker.js";
 import { logExecution } from "../../execution-log.js";
-import { quarantineSymbol } from "../../bot/quarantine.js";
+import { QUARANTINE_FILE, quarantineSymbol } from "../../bot/quarantine.js";
+import { rmSync } from "node:fs";
 
 // ── Mock adapter factory ──
 //
@@ -193,6 +194,9 @@ beforeEach(() => {
   vi.mocked(isOrderDuplicate).mockReturnValue(false);
   venueMinimums.minSize = null;
   venueMinimums.minNotional = null;
+  // An earlier test's unknown-outcome close quarantines BTC; opening orders now refuse a
+  // quarantined symbol, so every test starts with an empty quarantine (isolated HOME).
+  rmSync(QUARANTINE_FILE, { force: true });
 });
 
 // ══════════════════════════════════════════════════════════════

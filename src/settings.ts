@@ -88,7 +88,12 @@ export interface AgentMeta {
   owsPolicyId: string;
   expiresAt: string;
   approvedAt: string;
-  permissions: { canPerpTrade: boolean; canSpotTrade: boolean; canWithdraw: boolean };
+  /**
+   * canWithdraw null = unknown: a key imported from the exchange website (its withdraw
+   * permission is set there and cannot be read back). Never treated as true (rotate does not
+   * inherit it; Aster withdraw requires === true).
+   */
+  permissions: { canPerpTrade: boolean; canSpotTrade: boolean; canWithdraw: boolean | null };
   asterApprovalNonce: string;
   status?: "active" | "partial";
   /**
@@ -231,8 +236,8 @@ export interface Settings {
   /** Bridge integrations. */
   bridge: BridgeSettings;
   /**
-   * Withdraw gate for venues whose withdrawals are authorized by an API key alone (no owner
-   * signature): qfex. Absent venue = withdrawals refused. Ships empty. See WithdrawGate.
+   * Withdraw gate: qfex (API-key withdrawals; absent = refused) and hyperliquid (withdrawals /
+   * transfers to a non-owner address; absent = only the owner's own address). Ships empty. See WithdrawGate.
    */
   withdraw: WithdrawSettings;
 }
@@ -251,8 +256,13 @@ export interface WithdrawGate {
   maxPerDay: number;
 }
 
-/** Venues with a withdraw gate (API-key-authority withdrawals). Follow-up: ondo. */
-export const WITHDRAW_GATE_VENUES = ["qfex"] as const;
+/**
+ * Venues with a withdraw gate. qfex: API-key-authority withdrawals (every destination is gated).
+ * hyperliquid: master-signed withdraw3 / usdSend to any address other than the account owner
+ * (`funds withdraw hyperliquid --to`, `funds transfer`); the owner's own address needs no gate.
+ * Follow-up: ondo.
+ */
+export const WITHDRAW_GATE_VENUES = ["qfex", "hyperliquid"] as const;
 export type WithdrawGateVenue = typeof WITHDRAW_GATE_VENUES[number];
 
 export type WithdrawSettings = { [K in WithdrawGateVenue]?: WithdrawGate };

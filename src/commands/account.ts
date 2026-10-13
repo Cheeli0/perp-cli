@@ -88,11 +88,14 @@ export function registerAccountCommands(
         const EXCHANGES = await listConfiguredAccountVenues();
         const allRows: string[][] = [];
         const errors: Record<string, string> = {};
+        // One read per venue for both outputs: a venue that fails is an `errors` entry, never dropped.
+        const grouped: Record<string, ExchangePosition[]> = {};
 
         await Promise.all(EXCHANGES.map(async (ex) => {
           try {
             const adapter = await getAdapterForExchange(ex);
             const positions = await adapter.getPositions();
+            grouped[ex] = positions;
             for (const p of positions) {
               allRows.push([
                 chalk.white.bold(p.symbol),
@@ -110,6 +113,7 @@ export function registerAccountCommands(
             if (opts.hip3 && ex === "hyperliquid" && isDexCapable(adapter)) {
               const hip3 = await fetchHip3Data(adapter, a => a.getPositions());
               for (const { dex, items } of hip3) {
+                grouped[`hip3:${dex}`] = items;
                 for (const p of items) {
                   allRows.push([
                     chalk.white.bold(p.symbol),
@@ -131,17 +135,6 @@ export function registerAccountCommands(
         }));
 
         if (isJson()) {
-          const grouped: Record<string, ExchangePosition[]> = {};
-          await Promise.all(EXCHANGES.map(async (ex) => {
-            try {
-              const adapter = await getAdapterForExchange(ex);
-              grouped[ex] = await adapter.getPositions();
-              if (opts.hip3 && ex === "hyperliquid" && isDexCapable(adapter)) {
-                const hip3 = await fetchHip3Data(adapter, a => a.getPositions());
-                for (const { dex, items } of hip3) grouped[`hip3:${dex}`] = items;
-              }
-            } catch { /* skip */ }
-          }));
           return printJson(jsonOk({ exchanges: grouped, errors: Object.keys(errors).length > 0 ? errors : undefined }));
         }
 
@@ -221,11 +214,14 @@ export function registerAccountCommands(
         const EXCHANGES = await listConfiguredAccountVenues();
         const allRows: string[][] = [];
         const errors: Record<string, string> = {};
+        // One read per venue for both outputs: a venue that fails is an `errors` entry, never dropped.
+        const grouped: Record<string, unknown[]> = {};
 
         await Promise.all(EXCHANGES.map(async (ex) => {
           try {
             const adapter = await getAdapterForExchange(ex);
             const orders = await adapter.getOpenOrders();
+            grouped[ex] = orders;
             for (const o of orders) {
               allRows.push([
                 o.orderId,
@@ -241,6 +237,7 @@ export function registerAccountCommands(
             if (opts.hip3 && ex === "hyperliquid" && isDexCapable(adapter)) {
               const hip3 = await fetchHip3Data(adapter, a => a.getOpenOrders());
               for (const { dex, items } of hip3) {
+                grouped[`hip3:${dex}`] = items;
                 for (const o of items) {
                   allRows.push([
                     o.orderId,
@@ -260,17 +257,6 @@ export function registerAccountCommands(
         }));
 
         if (isJson()) {
-          const grouped: Record<string, unknown[]> = {};
-          await Promise.all(EXCHANGES.map(async (ex) => {
-            try {
-              const adapter = await getAdapterForExchange(ex);
-              grouped[ex] = await adapter.getOpenOrders();
-              if (opts.hip3 && ex === "hyperliquid" && isDexCapable(adapter)) {
-                const hip3 = await fetchHip3Data(adapter, a => a.getOpenOrders());
-                for (const { dex, items } of hip3) grouped[`hip3:${dex}`] = items;
-              }
-            } catch { /* skip */ }
-          }));
           return printJson(jsonOk({ exchanges: grouped, errors: Object.keys(errors).length > 0 ? errors : undefined }));
         }
 

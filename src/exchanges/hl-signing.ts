@@ -109,6 +109,24 @@ export const HL_USER_SIGNED_TYPES = {
       { name: "nonce", type: "uint64" },
     ],
   },
+  // CCTP withdrawal (native USDC): HyperCore → HyperEVM burn → CCTP mint on the destination chain.
+  // Field order per the Circle guide "Withdraw USDC from HyperCore to EVM chains"
+  // (developers.circle.com/cctp/howtos/withdraw-usdc-from-hypercore-to-evm) and the HL exchange endpoint docs.
+  sendToEvmWithData: {
+    primaryType: "HyperliquidTransaction:SendToEvmWithData",
+    fields: [
+      { name: "hyperliquidChain", type: "string" },
+      { name: "token", type: "string" },
+      { name: "amount", type: "string" },
+      { name: "sourceDex", type: "string" },
+      { name: "destinationRecipient", type: "string" },
+      { name: "addressEncoding", type: "string" },
+      { name: "destinationChainId", type: "uint32" },
+      { name: "gasLimit", type: "uint64" },
+      { name: "data", type: "bytes" },
+      { name: "nonce", type: "uint64" },
+    ],
+  },
   usdClassTransfer: {
     primaryType: "HyperliquidTransaction:UsdClassTransfer",
     fields: [

@@ -1,8 +1,7 @@
 import { assertCanClosePositions } from "../exchanges/trading-v2.js";
 import type { ExchangeAdapter } from "../exchanges/index.js";
 import { resolveAdapterSlippage } from "../exchanges/slippage.js";
-import { isIocOutcomeCapable } from "../exchanges/ioc-outcome.js";
-import type { OrderResult } from "../exchanges/venue-types.js";
+import { filledOf } from "./fill-size.js";
 import type { BotConfig } from "./config.js";
 import { PerpError } from "../errors.js";
 import { getMarketSnapshot, evaluateAllConditions, evaluateCondition, type MarketSnapshot } from "./conditions.js";
@@ -14,7 +13,7 @@ import chalk from "chalk";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { prepareLimitQuote, prepareMarketSize, quoteRulesOf, type QuoteRules } from "./quote-rules.js";
+import { prepareLimitQuote, prepareMarketSize, quoteRulesOf, type QuoteRules, alignComputedLimitPrice } from "./quote-rules.js";
 
 // Auto-register built-in strategies
 import "./strategies/grid-strategy.js";
@@ -295,6 +294,59 @@ export async function runBot(
     if (mode === "json") process.stderr.write(`${msg}\n`);
   };
 
+  // Consecutive ticks whose end-of-tick equity read failed; at UNKNOWN_EQUITY_STOP_TICKS the bot stops.
+  let unknownEquityTicks = 0;
+  /** A condition that ends the run as a failure regardless of earlier successful ticks. */
+  let fatalError: PerpError | null = null;
+  // Entries are blocked while equity is unknown (logged once per blocked stretch).
+  let entryBlockLogged = false;
+  const blockEntryLog = (what: string) => {
+    if (entryBlockLogged) return;
+    entryBlockLogged = true;
+    effectiveLog(chalk.yellow(`  Entries blocked: equity unknown (${equityError ?? "not read yet"}) — ${what}; reduce-only orders and cancels still go out`));
+  };
+  // Market data (orderbook / klines) a strategy needs but could not be read: the tick is skipped (logged once per cause).
+  let marketDataError: string | null = null;
+  const needsMarketData = MARKET_DATA_STRATEGIES.has(config.strategy.type.toLowerCase());
+  /** Last snapshot price (reference price for the stop actions' market orders). */
+  let lastPrice = 0;
+  // onStop runs once per started strategy, on every stop path (exit / risk / time_after / SIGINT / error).
+  let onStopPending = false;
+  /** `retry`: a failure is rethrown and onStop stays pending (the exit phase retries next tick); else logged. */
+  const runOnStop = async (why: string, retry: boolean): Promise<void> => {
+    if (!onStopPending) return;
+    onStopPending = false;
+    try {
+      const stopActions = await strategy.onStop(strategyCtx);
+      await executeActions(adapter, config.symbol, stopActions, effectiveLog, isDryRun, rulesOf, lastPrice);
+    } catch (e) {
+      if (retry) { onStopPending = true; throw e; }
+      effectiveLog(chalk.red(`  WARNING: strategy stop (${why}) FAILED: ${e instanceof Error ? e.message : String(e)} — check positions / orders by hand: perp -e ${adapter.name} account positions; perp -e ${adapter.name} account orders`));
+    }
+  };
+  /**
+   * Cancel the orders this bot placed. Single-symbol bot: that symbol's orders on its venue.
+   * Multi-symbol ("ALL") bot: the engine never sends a symbol-less cancel (it would cancel the
+   * user's manual orders on every market) — the strategy's onStop cancels its own symbols.
+   * Returns true when nothing of the bot's is left to cancel.
+   */
+  const cancelBotOrders = async (): Promise<boolean> => {
+    if (isDryRun) return true;
+    if (config.symbol.toUpperCase() === "ALL") {
+      effectiveLog(`  Multi-symbol bot: no account-wide cancel sent — the strategy cancels the orders of the symbols it traded`);
+      return true;
+    }
+    effectiveLog(`  Cleaning up orders...`);
+    try {
+      await adapter.cancelAllOrders(config.symbol);
+      effectiveLog(`  Remaining ${config.symbol} orders cancelled.`);
+      return true;
+    } catch (e) {
+      effectiveLog(`  WARNING: cancelling the remaining ${config.symbol} orders FAILED (${e instanceof Error ? e.message : String(e)}) — check: perp -e ${adapter.name} account orders`);
+      return false;
+    }
+  };
+
   // Get initial equity (every venue + spot holdings for a multi-venue bot — botEquity)
   try {
     const eq = await botEquity(adapter, extraAdapters);
@@ -323,7 +375,18 @@ export async function runBot(
 
       try {
         // Get market data (enriched for strategy use)
-        const snapshot = await getEnrichedSnapshot(adapter, config.symbol);
+        const { snapshot, unknown: dataUnknown } = await getEnrichedSnapshot(adapter, config.symbol);
+        if (snapshot.price > 0) lastPrice = snapshot.price;
+        // A strategy that reads the orderbook / klines never runs on fake (empty) data.
+        const skipForData = needsMarketData && dataUnknown !== null;
+        if (skipForData && dataUnknown !== marketDataError) {
+          marketDataError = dataUnknown;
+          effectiveLog(chalk.yellow(`  WARNING: market data unknown (${dataUnknown}) — ${config.strategy.type} ticks are skipped until it is read`));
+        } else if (!skipForData && needsMarketData && marketDataError !== null) {
+          effectiveLog(`  Market data known again — ${config.strategy.type} resumes`);
+          marketDataError = null;
+        }
+        strategyCtx.state.set("equityUnknown", state.equity === null);
 
         const context = {
           equity: state.equity,
@@ -343,7 +406,13 @@ export async function runBot(
         if (state.phase === "monitoring") {
           const shouldEnter = evaluateAllConditions(config.entry_conditions, snapshot, context, "all");
 
-          if (shouldEnter) {
+          if (shouldEnter && state.equity === null) {
+            // Unknown equity: no new entry (the start places opening orders); retried next tick.
+            blockEntryLog("the strategy is not started");
+            logStatus(effectiveLog, state, snapshot, "waiting");
+          } else if (shouldEnter && skipForData) {
+            logStatus(effectiveLog, state, snapshot, "waiting");
+          } else if (shouldEnter) {
             effectiveLog(`  Entry conditions met @ $${snapshot.price.toFixed(2)}`);
             state.phase = "entering";
           } else {
@@ -353,11 +422,21 @@ export async function runBot(
 
         // ── Phase: Entering (start strategy) ──
         if (state.phase === "entering") {
+          // Leftover orders of a failed start: cancel them before a retry (never stack a second batch).
+          if (state.strategyActive && !(await cancelBotOrders())) {
+            effectiveLog(`  Strategy start postponed: the previous failed start's orders could not be cancelled`);
+            state.phase = "monitoring";
+          }
+        }
+        if (state.phase === "entering") {
+          // Active BEFORE the first order: a failed start's leftover orders are cancelled at stop.
+          state.strategyActive = true;
           try {
             await strategy.init(strategyCtx, snapshot);
             // Execute any initial actions (e.g., grid placement on first tick)
             strategyCtx.tick = 0;
             const initActions = await strategy.onTick(strategyCtx, snapshot);
+            onStopPending = true;
             // Orders sent (an undersized side skipped for the tick is not counted) / venue-reported fills.
             const sent = await executeActions(adapter, config.symbol, initActions, effectiveLog, isDryRun, rulesOf, snapshot.price);
             state.ordersPlaced += sent.placed;
@@ -367,13 +446,14 @@ export async function runBot(
             failureStreak = 0;
 
             state.phase = "running";
-            state.strategyActive = true;
             effectiveLog(`  Strategy started`);
           } catch (err) {
             lastError = err;
             failureStreak++;
+            onStopPending = false; // a failed start is not stopped (its leftovers are cancelled), it is retried
             const msg = err instanceof Error ? err.message : String(err);
             effectiveLog(`  Strategy start failed: ${msg}`);
+            if (await cancelBotOrders()) state.strategyActive = false;
             state.phase = "monitoring"; // retry
           }
         }
@@ -405,9 +485,19 @@ export async function runBot(
             state.riskBreached = riskBreached;
             state.runtimeEnded = runtimeEnded || finished;
             state.phase = "exiting";
+          } else if (skipForData) {
+            logStatus(effectiveLog, state, snapshot, "running");
           } else {
             // Manage running strategy
-            const actions = await strategy.onTick(strategyCtx, snapshot);
+            let actions = await strategy.onTick(strategyCtx, snapshot);
+            if (state.equity === null) {
+              // Unknown equity: opening orders are dropped; reduce-only orders / cancels still go out.
+              const kept = actions.filter(a => a.type !== "place_order" || a.reduceOnly === true);
+              if (kept.length < actions.length) blockEntryLog(`${actions.length - kept.length} opening order(s) dropped this tick`);
+              actions = kept;
+            } else {
+              entryBlockLogged = false;
+            }
             // Orders sent (an undersized side skipped for the tick is not counted) / venue-reported fills.
             const sent = await executeActions(adapter, config.symbol, actions, effectiveLog, isDryRun, rulesOf, snapshot.price);
             state.ordersPlaced += sent.placed;
@@ -421,8 +511,7 @@ export async function runBot(
 
         // ── Phase: Exiting (close everything) ──
         if (state.phase === "exiting") {
-          const stopActions = await strategy.onStop(strategyCtx);
-          await executeActions(adapter, config.symbol, stopActions, effectiveLog, isDryRun, rulesOf, snapshot.price);
+          await runOnStop("exit", true);
           state.strategyActive = false;
 
           if (state.runtimeEnded) {
@@ -482,8 +571,19 @@ export async function runBot(
           }
           state.dailyPnl = eq - state.dailyStartEquity;
           state.totalPnl = eq - state.initialEquity;
+          unknownEquityTicks = 0;
         } catch (e) {
           equityUnknown(e, "equity read failed");
+          unknownEquityTicks++;
+          if (unknownEquityTicks >= UNKNOWN_EQUITY_STOP_TICKS) {
+            fatalError = new PerpError(e instanceof PerpError ? e.structured.code : "EXCHANGE_ERROR",
+              `Bot "${config.name}": equity unknown for ${unknownEquityTicks} consecutive ticks (last: ${equityError}) — stopped (risk limits cannot be evaluated)`, {
+                exchange: adapter.name,
+                remediation: `Check the balances / spot holdings the bot reads (perp -e ${adapter.name} account balance${extraAdapters ? "; every venue of the bot" : ""}), fix the read or the unpriced holding, then restart the bot`,
+              });
+            effectiveLog(chalk.red(`  ${fatalError.message}`));
+            running = false;
+          }
         }
 
         if (mode === "tui" || mode === "json") {
@@ -536,16 +636,10 @@ export async function runBot(
       process.stdin.pause();
     }
 
-    // Cleanup: cancel any remaining orders
-    if (state.strategyActive && !isDryRun) {
-      effectiveLog(`  Cleaning up orders...`);
-      try {
-        await adapter.cancelAllOrders(config.symbol);
-        effectiveLog(`  Remaining ${config.symbol} orders cancelled.`);
-      } catch (e) {
-        effectiveLog(`  WARNING: cancelling the remaining ${config.symbol} orders FAILED (${e instanceof Error ? e.message : String(e)}) — check: perp -e ${adapter.name} account orders`);
-      }
-    }
+    // Every stop path (SIGINT / time_after / error / unknown equity): the strategy's onStop runs
+    // once (guarded), then the bot's remaining orders are cancelled.
+    await runOnStop("shutdown", false);
+    if (state.strategyActive) await cancelBotOrders();
 
     // Unmount TUI if active
     if (tuiUnmount) {
@@ -573,6 +667,11 @@ export async function runBot(
     log(`  Equity: ${usdOrUnknown(state.equity)} (peak: ${usdOrUnknown(state.peakEquity)})\n`);
   }
 
+  if (fatalError !== null) {
+    if (jobId) updateJobState(jobId, { status: "error", result: { error: fatalError.message, fills: state.fills, ordersPlaced: state.ordersPlaced, runtime } });
+    throw fatalError;
+  }
+
   // A run whose strategy never completed a start / tick — or whose last FAILED_RUN_STREAK attempts
   // all failed — is a failed run (non-zero exit / ok:false), never a clean "done".
   if (lastError !== null && (strategyTicksOk === 0 || failureStreak >= FAILED_RUN_STREAK)) {
@@ -595,6 +694,14 @@ export async function runBot(
 
 /** Consecutive failed strategy starts / ticks at the end of a run that make the run a failure. */
 const FAILED_RUN_STREAK = 3;
+
+/** Consecutive ticks with unknown equity after which the bot stops (an error, never a silent run). */
+export const UNKNOWN_EQUITY_STOP_TICKS = 10;
+
+/** Strategies that read the snapshot's orderbook / klines: a tick whose read failed is skipped. */
+export const MARKET_DATA_STRATEGIES: ReadonlySet<string> = new Set([
+  "engine-mm", "avellaneda-mm", "regime-mm", "claude-agent", "momentum-breakout", "aggressive-taker", "mean-reversion",
+]);
 
 /** Strategies that hold spot legs (spot-perp): their stop summary lists the spot holdings too. */
 export const SPOT_LEG_STRATEGIES: ReadonlySet<string> = new Set(["spot-perp-arb", "funding-arb"]);
@@ -769,7 +876,7 @@ export async function executeActions(
         }
         const raw = prepared.price === null
           ? await adapter.marketOrder(symbol, action.side, prepared.size, { reduceOnly: action.reduceOnly === true, slippage: resolveAdapterSlippage(adapter, null) })
-          : await adapter.limitOrder(symbol, action.side, prepared.price, prepared.size, {
+          : await adapter.limitOrder(symbol, action.side, rules.tickSize === null ? await alignComputedLimitPrice(adapter, symbol, action.side, prepared.price) : prepared.price, prepared.size, {
             reduceOnly: action.reduceOnly,
             tif: action.tif,
           });
@@ -781,7 +888,10 @@ export async function executeActions(
         await adapter.cancelOrder(symbol, action.orderId);
         break;
       case "cancel_all":
-        await adapter.cancelAllOrders(symbol);
+        // A multi-symbol bot never sends an account-wide cancel (it would cancel the user's
+        // manual orders on every market): its strategy cancels the symbols it traded.
+        if (symbol.toUpperCase() === "ALL") log(`  cancel_all not sent for a multi-symbol bot (account-wide) — the strategy cancels its own symbols`);
+        else await adapter.cancelAllOrders(symbol);
         break;
       case "edit_order":
         await adapter.editOrder(symbol, action.orderId, action.price, action.size);
@@ -797,41 +907,42 @@ export async function executeActions(
   return { placed: orders - skipped, filled };
 }
 
-/**
- * Filled base size the venue reported for a placed order: the adapter's venue-final IOC / market
- * outcome (iocOutcomeOf), else a TradingV2 OrderResult's `filledSize`. null = not reported (a
- * resting order, or an unrecognized result) — the caller does not count it as a fill.
- */
-export function filledOf(adapter: ExchangeAdapter, raw: unknown): number | null {
-  const outcome = isIocOutcomeCapable(adapter) ? adapter.iocOutcomeOf(raw) : null;
-  if (outcome !== null) return Number(outcome.filledSize);
-  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
-  const r = raw as Partial<OrderResult>;
-  if (typeof r.status !== "string" || typeof r.filledSize !== "string") return null;
-  const n = Number(r.filledSize);
-  return Number.isFinite(n) ? n : null;
-}
+
+export { filledOf };
 
 // ── Enriched snapshot ──
 
+/**
+ * The tick's market snapshot. `unknown` names a failed orderbook / klines read (null = both
+ * read): the empty arrays in `snapshot` then are NOT data — the engine skips the tick of a
+ * strategy that reads them (MARKET_DATA_STRATEGIES).
+ */
 async function getEnrichedSnapshot(
   adapter: ExchangeAdapter,
   symbol: string,
-): Promise<EnrichedSnapshot> {
+): Promise<{ snapshot: EnrichedSnapshot; unknown: string | null }> {
   // Multi-symbol strategies use "ALL" — skip market-specific data
   if (symbol.toUpperCase() === "ALL") {
     return {
-      price: 0, high24h: 0, low24h: 0, volume24h: 0,
-      fundingRate: 0, volatility24h: 0, rsi: NaN, spreadPct: 0,
-      klines: [], orderbook: { bids: [], asks: [] }, openInterest: "0",
+      snapshot: {
+        price: 0, high24h: 0, low24h: 0, volume24h: 0,
+        fundingRate: 0, volatility24h: 0, rsi: NaN, spreadPct: 0,
+        klines: [], orderbook: { bids: [], asks: [] }, openInterest: "0",
+      },
+      unknown: null,
     };
   }
   const base = await getMarketSnapshot(adapter, symbol);
+  const failed: string[] = [];
+  const why = (what: string) => (e: unknown) => { failed.push(`${what} read failed: ${e instanceof Error ? e.message : String(e)}`); return null; };
   const [orderbook, klines] = await Promise.all([
-    adapter.getOrderbook(symbol).catch(() => ({ bids: [] as [string, string][], asks: [] as [string, string][] })),
-    adapter.getKlines(symbol, "1h", Date.now() - 24 * 60 * 60 * 1000, Date.now()).catch(() => []),
+    adapter.getOrderbook(symbol).catch(why("orderbook")),
+    adapter.getKlines(symbol, "1h", Date.now() - 24 * 60 * 60 * 1000, Date.now()).catch(why("klines")),
   ]);
-  return { ...base, klines, orderbook, openInterest: "0" };
+  return {
+    snapshot: { ...base, klines: klines ?? [], orderbook: orderbook ?? { bids: [], asks: [] }, openInterest: "0" },
+    unknown: failed.length > 0 ? failed.join("; ") : null,
+  };
 }
 
 // ── Utils ──

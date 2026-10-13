@@ -20,6 +20,9 @@ export {
   addPosition,
   removePosition,
   updatePosition,
+  removePositionEntry,
+  updatePositionEntry,
+  positionKey,
   getPositions,
   createInitialState,
 } from "./state.js";

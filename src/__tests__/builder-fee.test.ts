@@ -370,6 +370,25 @@ describe("L1: approval cache TTL + builder-related rejection", () => {
     await a.builderDecision(0);
     expect(read).toHaveBeenCalledTimes(1);
   });
+
+  it("an unknown outcome that mentions the builder keeps its own code and 'do NOT resubmit' remediation", async () => {
+    const { PerpError: PE, orderOutcomeUnknown } = await import("../errors.js");
+    const read = vi.fn(approved);
+    const { a } = hl();
+    a.builderFee = gate("hyperliquid", { address: HL_BUILDER, feeBps: 1 }, read);
+    await a.builderDecision(0);
+    const pending = orderOutcomeUnknown("hyperliquid", "order with builder fee", new Error("socket hang up"));
+    expect(bf.builderRejectionOf(a, pending)).toBe(pending);
+    const partial = new PE("ORDER_PARTIAL", "builder leg accepted, other leg failed", { remediation: "keep me" });
+    expect(bf.builderRejectionOf(a, partial)).toBe(partial);
+    const transport = new Error("fetch failed while sending builder order");
+    expect(bf.builderRejectionOf(a, transport)).toBe(transport);
+    const retryable = new PE("EXCHANGE_ERROR", "builder fee read timed out");
+    expect(bf.builderRejectionOf(a, retryable)).toBe(retryable);
+    // A definite rejection is still re-described.
+    const definite = new PE("ORDER_REJECTED", "Builder fee has not been approved.");
+    expect((bf.builderRejectionOf(a, definite) as InstanceType<typeof PE>).structured.remediation).toMatch(/NOT retried/);
+  });
 });
 
 describe("Hyperliquid order action", () => {
@@ -577,7 +596,8 @@ function ondo() {
       return path.endsWith("stop_order") ? { market: PAIR.market, positionDirection: "long", stopLoss: "90" }
         : { orderId: "o1", market: PAIR.market, side: "buy", type: "limit", status: "open", price: "100", size: "1", filledSize: "0", filledCost: "0", reduceOnly: false, timeInForce: "GTC" };
     }),
-    getPage: vi.fn(async () => ({ result: [{ orderId: "s1", market: PAIR.market, side: "sell", type: "stopMarket", status: "untriggered", size: "1", filledSize: "0", filledCost: "0", reduceOnly: true, closePosition: true, stopOrderType: "stopLoss", triggerPrice: "90" }] })),
+    // The stop is listed only once POST /v1/perps/stop_order was sent (the pre-POST read excludes older ids).
+    getPage: vi.fn(async () => ({ result: !posts.some(([p]) => p.endsWith("stop_order")) ? [] : [{ orderId: "s1", market: PAIR.market, side: "sell", type: "stopMarket", status: "untriggered", size: "1", filledSize: "0", filledCost: "0", reduceOnly: true, closePosition: true, stopOrderType: "stopLoss", triggerPrice: "90" }] })),
   };
   const def = getVenue("ondo");
   const a = Object.create(OndoAdapter.prototype) as InstanceType<typeof OndoAdapter>;

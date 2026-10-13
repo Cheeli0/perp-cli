@@ -26,7 +26,7 @@ import type {
 import type { ResolvedSlippage } from "./slippage.js";
 import { pacificaCreateRejection, pacificaLatestHistoryRow, pacificaTif, type PacificaAdapter } from "./pacifica.js";
 import type { IocOutcome } from "./ioc-outcome.js";
-import { PerpError } from "../errors.js";
+import { PerpError, orderNotSent } from "../errors.js";
 import { floorSize, requireOnTick, requirePositive, subDecimal } from "./precision.js";
 import type { MarketInfo } from "../pacifica/types/market.js";
 
@@ -251,14 +251,22 @@ export class PacificaSpotAdapter implements SpotAdapter, SpotOpenOrdersCapable, 
   }
 
   async spotMarketOrder(symbol: string, side: "buy" | "sell", size: string, opts: { slippage: ResolvedSlippage }): Promise<SpotOrderResult> {
-    await this.init();
-    const m = this._resolve(symbol);
+    // Pre-send (market resolution, mark read, notional check, signing setup): any failure here
+    // is a definite "not sent" — never a retryable error that hides whether an order went out.
+    let m: MarketInfo;
+    let amount: string;
     const bps = opts.slippage.bps;
-    requirePositive(size, "size");
-    const amount = floorSize(size, m.lot_size);
-    this._checkNotional(m, await this._mark(m.symbol), amount);
+    try {
+      await this.init();
+      m = this._resolve(symbol);
+      requirePositive(size, "size");
+      amount = floorSize(size, m.lot_size);
+      this._checkNotional(m, await this._mark(m.symbol), amount);
+      this._perp.prepareSigning();
+    } catch (e) {
+      throw orderNotSent("pacifica", `spot market ${side} ${size} ${symbol}`, e);
+    }
     if (side === "buy") warnSharedMarginOnce();
-    this._perp.prepareSigning();
     const res = await this._perp.sdk.createMarketOrder(
       { symbol: m.symbol, amount, side: side === "buy" ? "bid" : "ask", reduce_only: false, slippage_percent: String(bps / 100) },
       this._perp.publicKey,
@@ -274,15 +282,23 @@ export class PacificaSpotAdapter implements SpotAdapter, SpotOpenOrdersCapable, 
   }
 
   async spotLimitOrder(symbol: string, side: "buy" | "sell", price: string, size: string, opts?: { tif?: string }): Promise<SpotOrderResult> {
-    await this.init();
-    const m = this._resolve(symbol);
-    const tif = pacificaTif(opts?.tif); // §13.3 common mapping; FOK → CAPABILITY_UNSUPPORTED
-    const px = requireOnTick(price, m.tick_size);
-    requirePositive(size, "size");
-    const amount = floorSize(size, m.lot_size);
-    this._checkNotional(m, px, amount);
+    let m: MarketInfo;
+    let tif: ReturnType<typeof pacificaTif>;
+    let px: string;
+    let amount: string;
+    try { // pre-send (see spotMarketOrder)
+      await this.init();
+      m = this._resolve(symbol);
+      tif = pacificaTif(opts?.tif); // §13.3 common mapping; FOK → CAPABILITY_UNSUPPORTED
+      px = requireOnTick(price, m.tick_size);
+      requirePositive(size, "size");
+      amount = floorSize(size, m.lot_size);
+      this._checkNotional(m, px, amount);
+      this._perp.prepareSigning();
+    } catch (e) {
+      throw orderNotSent("pacifica", `spot limit ${side} ${size} ${symbol} @ ${price}`, e);
+    }
     if (side === "buy") warnSharedMarginOnce();
-    this._perp.prepareSigning();
     const res = await this._perp.sdk.createLimitOrder(
       { symbol: m.symbol, price: px, amount, side: side === "buy" ? "bid" : "ask", tif, reduce_only: false },
       this._perp.publicKey,
@@ -323,7 +339,11 @@ export class PacificaSpotAdapter implements SpotAdapter, SpotOpenOrdersCapable, 
         return {
           orderId: String(o.order_id),
           symbol: `${w.split("-")[0]}/${QUOTE}`,
-          side: o.side === "bid" ? ("buy" as const) : ("sell" as const),
+          side: o.side === "bid" ? ("buy" as const) : o.side === "ask" ? ("sell" as const) : (() => {
+            throw new PerpError("EXCHANGE_ERROR", `Pacifica spot order ${String(o.order_id)} has an unrecognized side ${JSON.stringify(o.side ?? null)} (expected "bid" / "ask")`, {
+              exchange: "pacifica", remediation: "Retry: perp spot orders -e pacifica",
+            });
+          })(),
           price: String(o.price),
           size: reqField(o, "initial_amount"),
           filled: reqField(o, "filled_amount"),

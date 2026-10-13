@@ -28,6 +28,18 @@ function parseSince(since?: string): string | undefined {
   return since;
 }
 
+/**
+ * Exchange filter of a history subcommand: the ROOT `-e, --exchange`, only when given on the command
+ * line. Commander hands `-e` / `--exchange` to the root wherever it appears in argv, so a subcommand
+ * copy of the option was never set (the filter was silently dropped). The root's default venue is
+ * never used as a filter.
+ */
+function cliExchangeFilter(cmd: Command): string | undefined {
+  let root = cmd;
+  while (root.parent) root = root.parent;
+  return root.getOptionValueSource("exchange") === "cli" ? String(root.opts().exchange) : undefined;
+}
+
 /** Parse period string (7d, 30d, 90d) to milliseconds. Returns undefined for "all" or missing. */
 function parsePeriodMs(period?: string): number | undefined {
   if (!period || period === "all") return undefined;
@@ -48,17 +60,17 @@ export function registerHistoryCommands(
   // ── history list ──
   history
     .command("list")
-    .description("Show recent executions")
+    .description("Show recent executions — filter with the root -e <exchange>")
     .option("--limit <n>", "Number of records to show", "20")
-    .option("-e, --exchange <exchange>", "Filter by exchange")
     .option("-s, --symbol <symbol>", "Filter by symbol")
     .option("-t, --type <type>", "Filter by type (market_order, limit_order, arb_entry, etc.)")
     .option("--since <date>", "Show records since date (ISO format or relative like '24h', '7d')")
     .option("--dry-run-only", "Show only dry-run simulations")
     .action(async (opts: {
-      limit: string; exchange?: string; symbol?: string;
+      limit: string; symbol?: string;
       type?: string; since?: string; dryRunOnly?: boolean;
     }) => {
+      const exchangeFilter = cliExchangeFilter(history);
       await withJsonErrors(isJson(), async () => {
         // Parse relative dates
         let since = opts.since;
@@ -73,7 +85,7 @@ export function registerHistoryCommands(
 
         const records = readExecutionLog({
           limit: parseInt(opts.limit),
-          exchange: opts.exchange,
+          exchange: exchangeFilter,
           symbol: opts.symbol,
           type: opts.type,
           since,
@@ -179,17 +191,17 @@ export function registerHistoryCommands(
   // ── history positions ──
   history
     .command("positions")
-    .description("Show position history (from event stream logging)")
+    .description("Show position history (from event stream logging) — filter with the root -e <exchange>")
     .option("--limit <n>", "Number of records to show", "20")
-    .option("-e, --exchange <exchange>", "Filter by exchange")
     .option("-s, --symbol <symbol>", "Filter by symbol")
     .option("--status <status>", "Filter by status (open, closed, updated)")
     .option("--since <date>", "Show records since date (ISO format or relative like '24h', '7d')")
     .option("--stats", "Show aggregate position stats instead of list")
     .action(async (opts: {
-      limit: string; exchange?: string; symbol?: string;
+      limit: string; symbol?: string;
       status?: string; since?: string; stats?: boolean;
     }) => {
+      const exchangeFilter = cliExchangeFilter(history);
       await withJsonErrors(isJson(), async () => {
         // Parse relative dates
         let since = opts.since;
@@ -204,7 +216,7 @@ export function registerHistoryCommands(
 
         // Stats mode
         if (opts.stats) {
-          const stats = getPositionStats({ exchange: opts.exchange, since });
+          const stats = getPositionStats({ exchange: exchangeFilter, since });
 
           if (isJson()) {
             return printJson(jsonOk(stats));
@@ -250,7 +262,7 @@ export function registerHistoryCommands(
         // List mode
         const records = readPositionHistory({
           limit: parseInt(opts.limit),
-          exchange: opts.exchange,
+          exchange: exchangeFilter,
           symbol: opts.symbol,
           status: opts.status,
           since,
@@ -397,15 +409,15 @@ function registerAnalyticsSubcommands(
   // ── analytics pnl ──
   parent
     .command("pnl")
-    .description("P&L analysis — trades, fees, funding income with daily breakdown")
-    .option("-e, --exchange <exchanges>", "Comma-separated exchanges")
+    .description("P&L analysis — trades, fees, funding income with daily breakdown — filter with the root -e <exchange> (comma-separated)")
     .option("--period <duration>", "Time period: 7d, 30d, 90d, all (default: all)")
     .option("--since <period>", "Alias for --period")
     .option("--limit <n>", "History limit per exchange", "200")
-    .action(async (opts: { exchange?: string; period?: string; since?: string; limit: string }) => {
+    .action(async (opts: { period?: string; since?: string; limit: string }) => {
+      const exchangeFilter = cliExchangeFilter(parent);
       await withJsonErrors(isJson(), async () => {
-        const exchanges = opts.exchange
-          ? opts.exchange.split(",").map(e => e.trim())
+        const exchanges = exchangeFilter
+          ? exchangeFilter.split(",").map(e => e.trim())
           : await listConfiguredAccountVenues();
 
         const period = opts.period ?? opts.since;
@@ -536,16 +548,16 @@ function registerAnalyticsSubcommands(
   // ── analytics funding ──
   parent
     .command("funding")
-    .description("Funding income analysis — cumulative, daily, per-arb-position breakdown")
-    .option("-e, --exchange <exchanges>", "Comma-separated exchanges")
+    .description("Funding income analysis — cumulative, daily, per-arb-position breakdown — filter with the root -e <exchange> (comma-separated)")
     .option("-s, --symbol <symbol>", "Filter by symbol")
     .option("--period <duration>", "Time period: 7d, 30d, 90d, all (default: all)")
     .option("--daily", "Show daily funding breakdown")
     .option("--limit <n>", "Funding history limit per exchange", "200")
-    .action(async (opts: { exchange?: string; symbol?: string; period?: string; daily?: boolean; limit: string }) => {
+    .action(async (opts: { symbol?: string; period?: string; daily?: boolean; limit: string }) => {
+      const exchangeFilter = cliExchangeFilter(parent);
       await withJsonErrors(isJson(), async () => {
-        const exchanges = opts.exchange
-          ? opts.exchange.split(",").map(e => e.trim())
+        const exchanges = exchangeFilter
+          ? exchangeFilter.split(",").map(e => e.trim())
           : await listConfiguredAccountVenues();
 
         const periodMs = parsePeriodMs(opts.period);
@@ -711,17 +723,17 @@ function registerAnalyticsSubcommands(
   // ── analytics report ──
   parent
     .command("report")
-    .description("Full performance report (summary + pnl + funding)")
-    .option("-e, --exchange <exchanges>", "Comma-separated exchanges")
+    .description("Full performance report (summary + pnl + funding) — filter with the root -e <exchange> (comma-separated)")
     .option("--since <period>", "Period: 24h, 7d, 30d")
-    .action(async (opts: { exchange?: string; since?: string }) => {
+    .action(async (opts: { since?: string }) => {
+      const exchangeFilter = cliExchangeFilter(parent);
       await withJsonErrors(isJson(), async () => {
         const since = parseSince(opts.since);
         const stats = getExecutionStats(since);
         const records = readExecutionLog({ since });
 
-        const exchanges = opts.exchange
-          ? opts.exchange.split(",").map(e => e.trim())
+        const exchanges = exchangeFilter
+          ? exchangeFilter.split(",").map(e => e.trim())
           : await listConfiguredAccountVenues();
 
         // Volume from log
@@ -1088,20 +1100,20 @@ function registerPnlSubcommands(
   // ── perf (unified: daily/weekly/summary) ──
   parent
     .command("perf")
-    .description("Performance breakdown — daily, weekly, or summary stats")
+    .description("Performance breakdown — daily, weekly, or summary stats — filter with the root -e <exchange>")
     .option("--period <period>", "daily, weekly, or summary", "daily")
-    .option("--exchange <name>", "Single exchange filter")
     .option("--days <n>", "Number of days (daily mode)", "14")
     .option("--weeks <n>", "Number of weeks (weekly mode)", "8")
     .option("--since <period>", "Time range (e.g. 7d, 2w, 30d)")
-    .action(async (opts: { period: string; exchange?: string; days: string; weeks: string; since?: string }) => {
+    .action(async (opts: { period: string; days: string; weeks: string; since?: string }) => {
+      const exchangeFilter = cliExchangeFilter(parent);
       await withJsonErrors(isJson(), async () => {
         const mode = opts.period.toLowerCase();
         const defaultSince = mode === "weekly"
           ? new Date(Date.now() - parseInt(opts.weeks) * 7 * 86400000)
           : new Date(Date.now() - parseInt(opts.days) * 86400000);
         const since = parseSinceDate(opts.since) ?? defaultSince;
-        const snapshots = readEquityHistory({ exchange: opts.exchange, since });
+        const snapshots = readEquityHistory({ exchange: exchangeFilter, since });
 
         if (snapshots.length === 0) {
           if (isJson()) {
@@ -1113,11 +1125,11 @@ function registerPnlSubcommands(
         }
 
         if (mode === "summary") {
-          const metrics = computePnlMetrics(snapshots, opts.exchange);
+          const metrics = computePnlMetrics(snapshots, exchangeFilter);
           if (isJson()) {
             printJson(jsonOk({ ...metrics, dailyReturns: undefined, dailyCount: metrics.dailyReturns.length }));
           } else {
-            console.log(chalk.cyan.bold(`Performance Summary${opts.exchange ? ` (${opts.exchange})` : ""}\n`));
+            console.log(chalk.cyan.bold(`Performance Summary${exchangeFilter ? ` (${exchangeFilter})` : ""}\n`));
             console.log(`  Period:          ${metrics.period.from} → ${metrics.period.to} (${metrics.period.days} days)`);
             console.log(`  Total Return:    ${formatPnl(metrics.totalReturn)} (${metrics.totalReturnPct >= 0 ? "+" : ""}${metrics.totalReturnPct.toFixed(2)}%)`);
             console.log(`  Peak Equity:     $${formatUsd(metrics.peakEquity)}`);
@@ -1135,18 +1147,18 @@ function registerPnlSubcommands(
           return;
         }
 
-        const daily = computeDailyPnl(snapshots, opts.exchange);
+        const daily = computeDailyPnl(snapshots, exchangeFilter);
 
         if (mode === "weekly") {
           const weekly = aggregateWeekly(daily);
           if (isJson()) { printJson(jsonOk({ weekly })); return; }
-          console.log(chalk.cyan.bold(`Weekly PnL${opts.exchange ? ` (${opts.exchange})` : ""}\n`));
+          console.log(chalk.cyan.bold(`Weekly PnL${exchangeFilter ? ` (${exchangeFilter})` : ""}\n`));
           const rows = weekly.map(w => [w.date, `$${formatUsd(w.startEquity)}`, `$${formatUsd(w.endEquity)}`, formatPnl(w.pnl), `${w.pnlPct >= 0 ? "+" : ""}${w.pnlPct.toFixed(2)}%`]);
           console.log(makeTable(["Week", "Start", "End", "PnL", "PnL %"], rows));
         } else {
           // daily (default)
           if (isJson()) { printJson(jsonOk({ daily })); return; }
-          console.log(chalk.cyan.bold(`Daily PnL${opts.exchange ? ` (${opts.exchange})` : ""}\n`));
+          console.log(chalk.cyan.bold(`Daily PnL${exchangeFilter ? ` (${exchangeFilter})` : ""}\n`));
           const rows = daily.map(d => [d.date, `$${formatUsd(d.startEquity)}`, `$${formatUsd(d.endEquity)}`, formatPnl(d.pnl), `${d.pnlPct >= 0 ? "+" : ""}${d.pnlPct.toFixed(2)}%`]);
           console.log(makeTable(["Date", "Start", "End", "PnL", "PnL %"], rows));
         }

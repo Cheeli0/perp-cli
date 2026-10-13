@@ -41,6 +41,7 @@ import { registerAlertCommands } from "./commands/alerts.js";
 import { setSharedApiNetwork } from "./shared-api.js";
 
 import { registerBackgroundCommands } from "./commands/jobs.js";
+import { setQuarantineNetwork } from "./bot/quarantine.js";
 import { addRootSafetyOptions, networkOf, isDryRun, installDryRunGuard } from "./cli-flags.js";
 
 export interface CliProgram {
@@ -67,6 +68,44 @@ export function assertNoArgvSecrets(root: Command): void {
     _passphraseWarned = true;
     process.stderr.write("[warn] --passphrase on the command line is DEPRECATED and visible in ps / shell history. Use the OWS_PASSPHRASE env var or pipe it on stdin.\n");
   }
+}
+
+/**
+ * `-n` used to be the record count of `history` / `account` subcommands (now `--limit`); it is the
+ * root network flag. A numeric `-n` / `--network` value on those commands is a migration error
+ * (INVALID_PARAMS "use --limit <n>") instead of the bare "invalid network" usage error. null = no such use.
+ */
+export function numericNetworkFlagError(argv: readonly string[]): PerpError | null {
+  if (!argv.includes("history") && !argv.includes("account")) return null;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    const value = a === "-n" || a === "--network" ? argv[i + 1]
+      : a.startsWith("--network=") ? a.slice("--network=".length)
+      : /^-n\d+$/.test(a) ? a.slice(2)
+      : undefined;
+    if (value !== undefined && /^\d+$/.test(value)) {
+      return new PerpError("INVALID_PARAMS", `-n is the network flag (mainnet | testnet), not a record count (got "${value}")`, {
+        remediation: `The record count is --limit now: use --limit ${value}`,
+      });
+    }
+  }
+  return null;
+}
+
+/** `perp --json` with no subcommand: the landing / usage document (static — no wallet or venue reads). */
+export function landingData(program: Command, version: string): {
+  name: string; version: string; usage: string; help: string;
+  commands: { name: string; description: string }[];
+} {
+  return {
+    name: program.name(),
+    version,
+    usage: `${program.name()} [options] <command> [args] (add --json for one JSON document on stdout)`,
+    help: `${program.name()} <command> --help`,
+    commands: program.commands
+      .filter(c => (c as unknown as { _hidden?: boolean })._hidden !== true)
+      .map(c => ({ name: c.name(), description: c.description() })),
+  };
 }
 
 export function buildProgram(opts: { defaultExchange: string; version: string }): CliProgram {
@@ -277,6 +316,9 @@ export function buildProgram(opts: { defaultExchange: string; version: string })
   program.hook("preAction", () => {
     if (networkOf(program) === "testnet") setSharedApiNetwork("testnet");
   });
+  // Quarantine entries are network-scoped: every command reads / writes them for its -n network.
+  // (`perp mcp` re-declares its own network from PERP_NETWORK when the server starts.)
+  program.hook("preAction", () => setQuarantineNetwork(networkOf(program)));
 
   return { program, getAdapterForExchange, isJson };
 }

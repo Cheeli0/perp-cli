@@ -14,6 +14,8 @@ import {
   checkBridgeGasBalance,
   assertBridgeNetwork,
   assertDistinctBridgeChains,
+  assertCctpRouteSupported,
+  parseUsdcAmount,
   CHAIN_IDS,
   USDC_ADDRESSES,
   EXCHANGE_TO_CHAIN,
@@ -86,17 +88,17 @@ function assertBridgeGas(gasCheck: { ok: boolean; errors: string[] }, needsDstGa
 
 /** Execute through the engine; ORDER_PENDING (sent, outcome unknown) is logged as unverified, never as failed. */
 async function executeLogged(
-  side: string, amount: number, fast: boolean, run: () => ReturnType<typeof executeBestBridge>,
+  side: string, amount: string, fast: boolean, run: () => ReturnType<typeof executeBestBridge>,
 ): ReturnType<typeof executeBestBridge> {
   try {
     const result = await run();
-    logExecution({ type: "bridge", exchange: "bridge", symbol: "USDC", side, size: String(amount), status: "success", dryRun: false, meta: { provider: result.provider, txHash: result.txHash, fast } });
+    logExecution({ type: "bridge", exchange: "bridge", symbol: "USDC", side, size: amount, status: "success", dryRun: false, meta: { provider: result.provider, txHash: result.txHash, fast } });
     return result;
   } catch (err) {
     const pending = err instanceof PerpError && err.structured.code === "ORDER_PENDING";
     const txHash = err instanceof PerpError ? err.structured.details?.txHash : undefined;
     logExecution({
-      type: "bridge", exchange: "bridge", symbol: "USDC", side, size: String(amount), status: pending ? "unverified" : "failed", dryRun: false,
+      type: "bridge", exchange: "bridge", symbol: "USDC", side, size: amount, status: pending ? "unverified" : "failed", dryRun: false,
       error: err instanceof Error ? err.message : String(err),
       meta: { fast, ...(typeof txHash === "string" ? { txHash } : {}) },
     });
@@ -275,7 +277,8 @@ export function registerFundsBridgeCommands(
       const srcChain = opts.from.toLowerCase();
       const dstChain = opts.to.toLowerCase();
       assertDistinctBridgeChains(srcChain, dstChain);
-      const amount = Number(parsePositiveDecimal(opts.amount, "--amount"));
+      assertCctpRouteSupported(srcChain, dstChain);
+      const amount = parseUsdcAmount(opts.amount, "--amount"); // exact decimal string (≤ 6 decimals)
 
       // Omitted addresses are the master wallet's own public addresses (OWS: vault account list).
       const credOpts = rootCredOpts(cmd);
@@ -317,7 +320,7 @@ export function registerFundsBridgeCommands(
         ];
       });
 
-      console.log(chalk.cyan.bold(`  Bridge Quotes: $${formatUsd(amount)} USDC ${srcChain} → ${dstChain}\n`));
+      console.log(chalk.cyan.bold(`  Bridge Quotes: $${formatUsd(Number(amount))} USDC ${srcChain} → ${dstChain}\n`));
       console.log(makeTable(["Provider", "Receive", "Fee", "ETA", "Dst Gas"], rows));
 
       // Show gas notes per provider
@@ -358,6 +361,7 @@ export function registerFundsBridgeCommands(
       const dstChain = opts.to.toLowerCase();
       // Before any key is loaded or quote fetched.
       assertDistinctBridgeChains(srcChain, dstChain);
+      assertCctpRouteSupported(srcChain, dstChain);
 
       // Relay path: asked for by name, by an asset / min-out flag, or implied by a Relay-only chain.
       const relayRoute = opts.provider?.toLowerCase() === "relay" || opts.fromAsset !== undefined || opts.toAsset !== undefined
@@ -370,7 +374,7 @@ export function registerFundsBridgeCommands(
         }
         return relaySend(opts, cmd, isJson, getNetwork);
       }
-      const amount = Number(parsePositiveDecimal(opts.amount, "--amount"));
+      const amount = parseUsdcAmount(opts.amount, "--amount"); // exact decimal string (≤ 6 decimals)
       const chosenProvider = parseProvider(opts.provider);
 
       // Addresses are public (review L3): an address passed with --sender / --recipient needs no
@@ -511,9 +515,10 @@ export function registerFundsBridgeCommands(
         });
       }
 
+      assertCctpRouteSupported(srcChain, dstChain);
       const chosenProvider = parseProvider(opts.provider);
 
-      const amount = Number(parsePositiveDecimal(opts.amount, "--amount"));
+      const amount = parseUsdcAmount(opts.amount, "--amount"); // exact decimal string (≤ 6 decimals)
       if (!isJson()) console.log(chalk.cyan(`\n  Bridge: $${amount} USDC ${srcExchange} (${srcChain}) → ${dstExchange} (${dstChain})\n`));
 
       // The master wallet's own public addresses (OWS: vault account list; nothing is decrypted).

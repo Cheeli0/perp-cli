@@ -2,7 +2,8 @@ import { Command } from "commander";
 import { networkOf, parseNetwork } from "../cli-flags.js";
 import chalk from "chalk";
 import { createInterface } from "node:readline/promises";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync } from "fs";
+import { writeKeystoreAtomic } from "../agent-wallet/venue-keystore.js";
 import { resolve } from "path";
 import { loadSettings, saveSettings, SHIPPED_DEFAULT_SLIPPAGE_BPS, type Settings } from "../settings.js";
 import { PerpError, classifyError, type StructuredError } from "../errors.js";
@@ -15,7 +16,7 @@ import type { Network, VenueId } from "../exchanges/venue-types.js";
 import { maxDefaultSlippageBps, parseSlippageSettingBps } from "../exchanges/slippage.js";
 import {
   agentApproveUnsupportedReason, approveVenueAgent, assertLighterSlot, isLighterFamilyVenue,
-  printApproveOutcome, promptHidden, verifyVenueAgent, type ApproveAgentParams,
+  deprecatedPassphraseOption, printApproveOutcome, promptHidden, verifyVenueAgent, warnDeprecatedPassphrase, type ApproveAgentParams,
 } from "./agent.js";
 import { importOwsWallet, type OwsImportInput } from "./wallet.js";
 import { agentNetworkOf, getAgent, listAgents } from "../agent-wallet/store.js";
@@ -66,7 +67,8 @@ function writeEnvFile(env: Record<string, string>) {
     lines.push(`${key}=${value}`);
   }
   lines.push("");
-  writeFileSync(ENV_FILE, lines.join("\n"), { mode: 0o600 });
+  // Atomic, explicit 0600 (writeFileSync's mode is ignored when the file already exists).
+  writeKeystoreAtomic(ENV_FILE, lines.join("\n"));
 }
 
 function setEnvVar(key: string, value: string) {
@@ -866,7 +868,7 @@ export function registerInitCommand(program: Command) {
     .option("--non-interactive", "Run without prompts (scripts / CI)")
     .option("--wallet <name>", "Existing OWS wallet to use as master")
     .option("--wallet-name <name>", "Create a new OWS wallet with this name as master")
-    .option("--passphrase <pp>", "OWS vault passphrase (fallback: OWS_PASSPHRASE env / stdin)")
+    .addOption(deprecatedPassphraseOption("OWS vault passphrase")).hook("preAction", warnDeprecatedPassphrase)
     .option("--venues <list>", "Comma-separated trading venues to configure")
     .option("--default-venue <venue>", "Default venue (settings.defaultExchange)")
     .option("--default-exchange <venue>", "Alias of --default-venue")

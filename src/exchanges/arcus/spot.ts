@@ -366,6 +366,9 @@ export class ArcusSpotAdapter implements SpotAdapter, SpotPricesCapable {
       return await this.swap(symbol, side, size, opts.slippage.bps, progress);
     } catch (e) {
       if (progress.submitted) throw e;
+      // The swap was not submitted, but an approve(Permit2) tx sent on the way may still be
+      // pending: keep its ORDER_PENDING ("Do NOT send another approve"), never re-typed as not sent.
+      if (e instanceof PerpError && e.structured.code === "ORDER_PENDING") throw e;
       throw orderNotSent("arcus", `spot ${side} ${size} ${symbol}`, e);
     }
   }

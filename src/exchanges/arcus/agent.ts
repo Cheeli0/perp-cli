@@ -148,8 +148,20 @@ export async function approveArcusAgent(opts: ApproveArcusAgentOpts): Promise<Ar
       signature,
     });
   } catch (err) {
-    const cleanupOk = created ? tryDeleteWallet(agentWalletName) : true;
     const msg = err instanceof Error ? err.message : String(err);
+    if (err instanceof PerpError && err.structured.code === "ORDER_PENDING") {
+      // The request may have registered the key: deleting the wallet would orphan an active
+      // venue API key whose private key no longer exists anywhere. Keep it and say so.
+      throw new PerpError("ORDER_PENDING", `Arcus createApiKey outcome unknown: ${msg}`, {
+        exchange: "arcus",
+        cause: err.structured,
+        agentWalletName,
+        apiKeyHex,
+        remediation: `Do NOT re-run approve yet — the key ${apiKeyHex} may already be registered. The agent wallet "${agentWalletName}" was KEPT (it holds that key). ` +
+          `Check the account's API keys on Arcus (perp wallet agent list arcus, or the Arcus UI), then re-run: perp wallet agent approve arcus --master ${masterOwsWallet}`,
+      });
+    }
+    const cleanupOk = created ? tryDeleteWallet(agentWalletName) : true;
     throw new PerpError("APPROVE_FAILED", `Arcus createApiKey failed: ${msg}`, {
       cause: err instanceof PerpError ? err.structured : undefined,
       remediation: cleanupOk

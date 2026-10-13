@@ -26,6 +26,8 @@ import { listConfiguredAccountVenues } from "../config.js";
 import { HYPERLIQUID_API_URL } from "../api/public/urls.js";
 import { fetchValuedSpotBalances, getSpotAdapter, spotSharesPerpMargin, withSpotTimeout } from "../exchanges/spot-factory.js";
 import { scrubSecretEnv } from "../secret-env.js";
+import { networkOf } from "../cli-flags.js";
+import type { Network } from "../exchanges/venue-types.js";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -149,6 +151,8 @@ interface ResolvedOptions {
   pollIntervalMs: number;
   dexList: string[];
   autoDex: boolean;
+  /** Validated root -n network (health probes hit this network's endpoints). */
+  network: Network;
 }
 
 // ── CLI flags type ─────────────────────────────────────────────────────────
@@ -160,7 +164,7 @@ interface CliFlags {
   watch?: string | boolean;
   serve?: string | boolean;
   interval?: string;
-  dex?: string;
+  dexes?: string;           // --dexes <list> (plural: the root --dex is swallowed by the root program)
   autoDex?: boolean;
   stdin?: boolean;
 }
@@ -297,7 +301,10 @@ function resolveOptions(
     }
   }
 
-  const dexList = stdinOpts.dex ?? parseList(flags.dex);
+  // --dexes, or the root --dex when typed on the command line (backward compatible: `portfolio --serve --dex xyz`
+  // reaches the root option, which used to swallow a subcommand --dex silently).
+  const rootDex = program.getOptionValueSource("dex") === "cli" ? String(program.opts().dex) : undefined;
+  const dexList = stdinOpts.dex ?? parseList(flags.dexes ?? rootDex);
   const autoDex = stdinOpts.autoDex ?? (flags.autoDex !== false);
 
   return {
@@ -312,6 +319,7 @@ function resolveOptions(
     pollIntervalMs,
     dexList,
     autoDex,
+    network: networkOf(program),
   };
 }
 
@@ -437,7 +445,7 @@ function buildTotals(entries: ExchangeEntry[]): { totals: Totals; risk: RiskBloc
 
 // ── Health check (no balance fetches) ──────────────────────────────────────
 
-async function runHealth(exchangeList: string[]): Promise<HealthBlock> {
+async function runHealth(exchangeList: string[], network: Network): Promise<HealthBlock> {
   const { pingPacifica, pingHyperliquid, pingLighter } = await import("../shared-api.js");
 
   const pingAster = async (): Promise<{ ok: boolean; latencyMs: number; status: number }> => {
@@ -463,7 +471,7 @@ async function runHealth(exchangeList: string[]): Promise<HealthBlock> {
     try {
       if (!fn) {
         // No dedicated ping helper: probe the venue's public market-data path.
-        await getVenue(ex).publicData.fetchMarkets("mainnet");
+        await getVenue(ex).publicData.fetchMarkets(network);
         exchanges[ex] = "ok";
         return;
       }
@@ -718,7 +726,7 @@ async function runWatch(
       // Clear screen + redraw.
       process.stdout.write("[2J[H");
       renderSnapshotText(data);
-      if (resolved.health) renderHealthText(await runHealth(resolved.exchangeList));
+      if (resolved.health) renderHealthText(await runHealth(resolved.exchangeList, resolved.network));
     }
     await new Promise<void>(r => setTimeout(r, resolved.watchIntervalMs));
   }
@@ -919,7 +927,7 @@ export function registerPortfolioCommand(
     .option("--watch [interval]", "Poll mode: clear screen + redraw each tick (ms; default 5000)")
     .option("--serve [port]", "Serve web dashboard (replaces 'perp dashboard')")
     .option("--interval <ms>", "Poll interval for --watch / --serve (default 5000)")
-    .option("--dex <list>", "Comma-separated HIP-3 dex names (only with --serve)")
+    .option("--dexes <list>", "Comma-separated HIP-3 dex names (only with --serve; the root --dex <name> is also accepted)")
     .option("--no-auto-dex", "Disable HIP-3 dex auto-detection")
     .option("--stdin", "Read JSON args from stdin (overrides flag args)")
     .action(async (flags: CliFlags) => {
@@ -962,7 +970,7 @@ export function registerPortfolioCommand(
 
       await withJsonErrors(json, async () => {
         if (resolved.health) {
-          const health = await runHealth(resolved.exchangeList);
+          const health = await runHealth(resolved.exchangeList, resolved.network);
           const data: PortfolioEnvelopeData = {
             version,
             scope: resolved.scope,

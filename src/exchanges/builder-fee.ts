@@ -48,7 +48,7 @@
  * - arcus: unsupported — see UNSUPPORTED below.
  */
 
-import { PerpError, classifyError } from "../errors.js";
+import { PerpError, classifyError, isDefiniteOrderFailure, isTransportFailure, isUnknownOutcomeServerError } from "../errors.js";
 import type { Network, VenueId } from "./venue-types.js";
 import { isVenueId } from "./venue-types.js";
 
@@ -466,12 +466,33 @@ export function builderRejectionOf(adapter: unknown, err: unknown): unknown {
   if (g === null) return err;
   const msg = err instanceof Error ? err.message : String(err);
   if (!/builder/i.test(msg)) return err;
+  // Only a DEFINITE venue rejection is re-described: an unknown outcome (ORDER_PENDING /
+  // ORDER_PARTIAL, a transport failure, a 5xx, any non-definite PerpError) keeps its own
+  // "do NOT resubmit" remediation — "re-send it without the fee" could double the order.
+  if (!isDefiniteBuilderRejection(err)) return err;
   const venue = g.target.venue;
   invalidateBuilderApproval(venue, g.network);
   const n = g.network === "testnet" ? " -n testnet" : "";
   const remediation = `The venue rejected the order over the builder fee; it was NOT retried. Re-send it without the fee (--no-builder), or re-approve: perp${n} wallet builder approve ${venue} (check: perp${n} wallet builder status ${venue})`;
   const e = classifyError(err, venue);
   return new PerpError(e.code, e.message, { ...(e.details ?? {}), exchange: venue, remediation });
+}
+
+/**
+ * true when `err` proves the order was refused (nothing placed): a PerpError with a definite code
+ * (isDefiniteOrderFailure), or a venue 4xx answer (details.httpStatus 4xx, not 429) whose code is
+ * not an unknown-outcome code; a plain Error that is neither a transport failure nor a 5xx
+ * unknown-outcome message (adapter-level venue refusal text).
+ */
+function isDefiniteBuilderRejection(err: unknown): boolean {
+  if (err instanceof PerpError) {
+    const code = err.structured.code;
+    if (code === "ORDER_PENDING" || code === "ORDER_PARTIAL") return false;
+    if (isDefiniteOrderFailure(err)) return true;
+    const http = err.structured.details?.httpStatus;
+    return typeof http === "number" && http >= 400 && http < 500 && http !== 429;
+  }
+  return !isTransportFailure(err) && !isUnknownOutcomeServerError(err);
 }
 
 /**

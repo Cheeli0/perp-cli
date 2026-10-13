@@ -268,11 +268,14 @@ export class QfexTradeSession {
 
   /** Close the connection (normal closure). Safe to call at any time; queued after the running command. */
   async close(): Promise<void> {
-    await this.queue.catch(() => undefined);
-    const conn = this.conn;
-    this.conn = null;
-    if (this.idleTimer !== null) { clearTimeout(this.idleTimer); this.idleTimer = null; }
-    if (conn !== null && conn.closed === null) conn.ws.close(1000);
+    // Through the FIFO queue: a command queued while an earlier one runs must never have its
+    // socket closed under it — the close runs strictly between commands.
+    await this.enqueue(async () => {
+      const conn = this.conn;
+      this.conn = null;
+      if (this.idleTimer !== null) { clearTimeout(this.idleTimer); this.idleTimer = null; }
+      if (conn !== null && conn.closed === null) conn.ws.close(1000);
+    });
   }
 
   private setRef(conn: Connection, ref: boolean): void {

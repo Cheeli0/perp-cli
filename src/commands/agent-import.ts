@@ -32,7 +32,7 @@ import { getVenue, networkConfig } from "../exchanges/venue.js";
 import type { Network, VenueId } from "../exchanges/venue-types.js";
 import { LIGHTER_RH_RESERVED_KEY_INDEXES, type LighterVenueId } from "../exchanges/venues/lighter-family.js";
 import { loadOws } from "../signer/ows-loader.js";
-import { defaultAgentName, isLighterFamilyVenue, parseExpiresIn, promptHidden } from "./agent.js";
+import { defaultAgentName, isLighterFamilyVenue, parseExpiresIn, promptHidden, qfexWithdrawKeyWarning } from "./agent.js";
 import { importOwsWallet, normalizeSolanaKey } from "./wallet.js";
 
 /** Shown wherever an import is offered: what the imported key can and cannot do. */
@@ -422,7 +422,8 @@ function baseMeta(agentName: string, network: Network, expiresAt: string | null)
     expiresAt: expiresAt ?? "",
     approvedAt: new Date().toISOString(),
     // Set on the website; not readable for every venue — perp trading is what the CLI uses it for.
-    permissions: { canPerpTrade: true, canSpotTrade: false, canWithdraw: false },
+    // canWithdraw null = unknown (never assumed false or true).
+    permissions: { canPerpTrade: true, canSpotTrade: false, canWithdraw: null },
     asterApprovalNonce: "",
     status: "active",
     network,
@@ -779,6 +780,7 @@ async function importQfex(p: ImportAgentParams, agentName: string, s: { publicKe
     warnings: [
       IMPORT_KEY_WARNING,
       "QFEX withdrawals are authorized by the API key alone: keep a trading key WITHOUT the \"Deposit and withdraw\" permission, and import a separate key for funding if you need it.",
+      ...((w => (w === null ? [] : [w]))(qfexWithdrawKeyWarning(meta))),
     ],
   };
 }
@@ -837,6 +839,10 @@ export function printImportOutcome(o: ImportAgentOutcome): void {
   console.log(`  Stored in:     ${chalk.gray(o.storage)}`);
   if (o.verification.status === "verified") console.log(`  Verified:      ${chalk.green("yes")} ${chalk.gray(`— ${o.verification.method}`)}`);
   else console.log(`  Verified:      ${chalk.yellow("NO")} ${chalk.yellow(`— ${o.verification.method}`)}`);
-  for (const w of o.warnings) console.log(chalk.yellow(`\n  [warn] ${w}`));
+  for (const w of o.warnings) {
+    // The withdraw-capable QFEX key warning is printed loudly (red); the rest as plain warnings.
+    if (o.venue === "qfex" && w.includes("\"Deposit and withdraw\" permission and is stored with an EMPTY passphrase")) console.log(chalk.red.bold(`\n  [WARNING] ${w}`));
+    else console.log(chalk.yellow(`\n  [warn] ${w}`));
+  }
   console.log(chalk.gray(`\n  ${IMPORT_SCOPE_NOTE}\n`));
 }

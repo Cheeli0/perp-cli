@@ -1,6 +1,7 @@
 import { copyFileSync, constants as fsConstants, existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from "fs";
 import { resolve } from "path";
 import { PerpError } from "../errors.js";
+import { withFileLock } from "./file-lock.js";
 import type { Network } from "../exchanges/venue-types.js";
 
 /**
@@ -196,35 +197,89 @@ function writeStateAtomic(path: string, state: ArbDaemonState): void {
   renameSync(tmpPath, path);
 }
 
-/** Add a position to the persisted state for `network`. Auto-initializes state if missing. */
-export function addPosition(network: Network, pos: ArbPositionState): void {
-  let state = loadArbState(network);
-  if (!state) {
-    // State was lost — create minimal valid state to avoid losing position tracking
-    state = createInitialState({ minSpread: 0, closeSpread: 0, size: 0, holdDays: 0, bridgeCost: 0, maxPositions: 10, settleStrategy: "off" });
-  }
-  // Avoid duplicates by symbol
-  state.positions = state.positions.filter(p => p.symbol !== pos.symbol);
-  state.positions.push(pos);
-  saveArbState(network, state);
+/** Identity of a state entry: symbol + long venue + short venue + mode (absent mode = perp-perp). */
+export function positionKey(p: Pick<ArbPositionState, "symbol" | "longExchange" | "shortExchange" | "mode">): string {
+  return `${p.symbol.toUpperCase()}|${p.longExchange}|${p.shortExchange}|${p.mode ?? "perp-perp"}`;
 }
 
-/** Remove a position by symbol from the persisted state for `network`. */
+/**
+ * Put `pos` into `positions`: an entry with the same key is replaced (a re-record of the same
+ * pair); an entry of the same symbol on OTHER venues / another mode is never overwritten —
+ * RISK_VIOLATION (the state tracks one pair per symbol; overwriting would drop a live pair).
+ */
+export function upsertPosition(positions: ArbPositionState[], pos: ArbPositionState): ArbPositionState[] {
+  const key = positionKey(pos);
+  const other = positions.find(p => p.symbol.toUpperCase() === pos.symbol.toUpperCase() && positionKey(p) !== key);
+  if (other !== undefined) {
+    throw new PerpError("RISK_VIOLATION", `Arb state already tracks ${other.symbol} as ${other.mode ?? "perp-perp"} long ${other.longExchange} / short ${other.shortExchange} — refusing to overwrite it with ${pos.mode ?? "perp-perp"} long ${pos.longExchange} / short ${pos.shortExchange}`, {
+      remediation: `Both pairs may be open: check ${pos.symbol} on ${[...new Set([other.longExchange, other.shortExchange, pos.longExchange, pos.shortExchange])].join(", ")} (perp arb status), close one by hand, then record / drop it (perp arb close ${pos.symbol} --state-only)`,
+    });
+  }
+  return [...positions.filter(p => positionKey(p) !== key), pos];
+}
+
+/** Load → modify → save of the state for `network` under the cross-process lock. */
+function withStateLock<T>(network: Network, fn: () => T): T {
+  return withFileLock(arbStateFilePath(network), `Arb state (${network})`, fn);
+}
+
+/** Add a position to the persisted state for `network`. Auto-initializes state if missing. Throws RISK_VIOLATION for a conflicting entry (upsertPosition). */
+export function addPosition(network: Network, pos: ArbPositionState): void {
+  withStateLock(network, () => {
+    let state = loadArbState(network);
+    if (!state) {
+      // State was lost — create minimal valid state to avoid losing position tracking
+      state = createInitialState({ minSpread: 0, closeSpread: 0, size: 0, holdDays: 0, bridgeCost: 0, maxPositions: 10, settleStrategy: "off" });
+    }
+    state.positions = upsertPosition(state.positions, pos);
+    saveArbState(network, state);
+  });
+}
+
+/** Remove a position by symbol from the persisted state for `network` (one entry per symbol: upsertPosition). */
 export function removePosition(network: Network, symbol: string): void {
-  const state = loadArbState(network);
-  if (!state) return;
-  state.positions = state.positions.filter(p => p.symbol !== symbol);
-  saveArbState(network, state);
+  withStateLock(network, () => {
+    const state = loadArbState(network);
+    if (!state) return;
+    state.positions = state.positions.filter(p => p.symbol !== symbol);
+    saveArbState(network, state);
+  });
+}
+
+/** Remove exactly the entry with `entry`'s key (symbol + venues + mode); another pair of the symbol is left alone. */
+export function removePositionEntry(network: Network, entry: Pick<ArbPositionState, "symbol" | "longExchange" | "shortExchange" | "mode">): void {
+  withStateLock(network, () => {
+    const state = loadArbState(network);
+    if (!state) return;
+    const key = positionKey(entry);
+    state.positions = state.positions.filter(p => positionKey(p) !== key);
+    saveArbState(network, state);
+  });
 }
 
 /** Update a position by symbol with partial updates. */
 export function updatePosition(network: Network, symbol: string, updates: Partial<ArbPositionState>): void {
-  const state = loadArbState(network);
-  if (!state) return;
-  const idx = state.positions.findIndex(p => p.symbol === symbol);
-  if (idx === -1) return;
-  state.positions[idx] = { ...state.positions[idx], ...updates };
-  saveArbState(network, state);
+  withStateLock(network, () => {
+    const state = loadArbState(network);
+    if (!state) return;
+    const idx = state.positions.findIndex(p => p.symbol === symbol);
+    if (idx === -1) return;
+    state.positions[idx] = { ...state.positions[idx], ...updates };
+    saveArbState(network, state);
+  });
+}
+
+/** Update exactly the entry with `entry`'s key (symbol + venues + mode). */
+export function updatePositionEntry(network: Network, entry: Pick<ArbPositionState, "symbol" | "longExchange" | "shortExchange" | "mode">, updates: Partial<ArbPositionState>): void {
+  withStateLock(network, () => {
+    const state = loadArbState(network);
+    if (!state) return;
+    const key = positionKey(entry);
+    const idx = state.positions.findIndex(p => positionKey(p) === key);
+    if (idx === -1) return;
+    state.positions[idx] = { ...state.positions[idx], ...updates };
+    saveArbState(network, state);
+  });
 }
 
 /** Get all persisted positions for `network`. */
@@ -274,8 +329,7 @@ export function createDaemonStateStore(network: Network, dryRun: boolean, config
     save: (next) => { sim = structuredClone(next); },
     add: (pos) => {
       const next = sim ?? createInitialState(config);
-      next.positions = next.positions.filter(p => p.symbol !== pos.symbol);
-      next.positions.push(structuredClone(pos));
+      next.positions = upsertPosition(next.positions, structuredClone(pos));
       sim = next;
     },
     remove: (symbol) => {

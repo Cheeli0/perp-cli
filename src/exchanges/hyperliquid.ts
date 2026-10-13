@@ -12,7 +12,7 @@ import type { ResolvedSlippage } from "./slippage.js";
 import type { EvmSigner } from "../signer/index.js";
 import { LocalEvmSigner } from "../signer/index.js";
 import type { AgentMeta } from "../settings.js";
-import { PerpError, classifyError, orderNotSent, orderOutcomeUnknown, sendFailure } from "../errors.js";
+import { DEFINITE_ORDER_FAILURE_CODES, PerpError, classifyError, extractErrorMessage, orderNotSent, orderOutcomeUnknown, sendFailure, type ErrorCode } from "../errors.js";
 import { parseFiniteVenueNumber, venueRateField } from "../utils/numeric.js";
 import { alignProtectionPrice, floorSize, formatComputedPrice, slippagePrice } from "./precision.js";
 import { unsupported } from "./trading-v2.js";
@@ -71,6 +71,77 @@ export function hlProtectionPrice(
   const protectionPrice = alignProtectionPrice(raw, tick, side);
   const appliedBps = Math.abs(Number(protectionPrice) - reference) / reference * 10_000;
   return { protectionPrice, appliedBps };
+}
+
+/**
+ * A USER-SUPPLIED limit / trigger / modify price checked against HL's price grid (design §10.10:
+ * an off-grid limit price is refused, never rounded — rounding to nearest can move a buy price UP).
+ * HL docs (trading/tick-and-lot-size): "Prices can have up to 5 significant figures, but no more
+ * than MAX_DECIMALS - szDecimals decimal places where MAX_DECIMALS is 6 for perps and 8 for spot.
+ * Integer prices are always allowed, regardless of the number of significant figures."
+ * Non-numeric / non-positive → INVALID_PARAMS; off-grid → INVALID_TICK (with the nearest on-grid
+ * prices below / above). Returns the price normalized (no leading / trailing zeros). Computed
+ * prices (protection, market-trigger `p`) are aligned with hlProtectionPrice instead.
+ */
+export function hlRequirePriceOnGrid(price: string, szDecimals: number, maxDecimals: 6 | 8, what: string): string {
+  const s = String(price).trim();
+  if (!/^\d+(\.\d+)?$/.test(s) || !(Number(s) > 0)) {
+    throw new PerpError("INVALID_PARAMS", `Hyperliquid ${what} must be a positive plain decimal (got "${price}")`, {
+      exchange: "hyperliquid", remediation: "Pass a plain decimal price such as 3012.5 (no exponent, sign or spaces)",
+    });
+  }
+  const [ipRaw, fpRaw = ""] = s.split(".");
+  const ip = ipRaw.replace(/^0+(?=\d)/, "");
+  const fp = fpRaw.replace(/0+$/, "");
+  const normalized = fp === "" ? ip : `${ip}.${fp}`;
+  if (fp === "") return normalized; // integer prices are always valid
+  const maxDec = Math.max(0, maxDecimals - szDecimals);
+  const sigFigs = (ip + fp).replace(/^0+/, "").length;
+  if (fp.length <= maxDec && sigFigs <= 5) return normalized;
+  // Nearest on-grid prices: the grid tick at this magnitude (≤ 5 sig figs, ≤ maxDec decimals).
+  const px = Number(normalized);
+  const e = Math.floor(Math.log10(px));
+  const decimals = Math.max(0, Math.min(maxDec, 4 - e));
+  const tick = decimals === 0 ? "1" : `0.${"0".repeat(decimals - 1)}1`;
+  const above = alignProtectionPrice(normalized, tick, "buy");
+  const below = px >= Number(tick) ? alignProtectionPrice(normalized, tick, "sell") : null;
+  throw new PerpError("INVALID_TICK", `Hyperliquid ${what} ${price} is off the price grid (max 5 significant figures and ${maxDec} decimals for szDecimals ${szDecimals}); nothing was sent`, {
+    exchange: "hyperliquid",
+    remediation: `Use an on-grid price, e.g. ${below !== null ? `${below} or ` : ""}${above}`,
+  });
+}
+
+/** CCTP destinations for Hyperliquid withdrawals (Circle CCTP domain ids: Ethereum 0, Arbitrum 3, Base 6). */
+export type HlCctpChain = "arbitrum" | "ethereum" | "base";
+export const HL_CCTP_ROUTES: Record<HlCctpChain, { cctpDomain: number; forwardingFeeUsdc: string | null }> = {
+  // Forwarding fee: Circle documents 0.2 USDC for Arbitrum; other chains' fee is not published (null = unknown).
+  arbitrum: { cctpDomain: 3, forwardingFeeUsdc: "0.2" },
+  ethereum: { cctpDomain: 0, forwardingFeeUsdc: null },
+  base: { cctpDomain: 6, forwardingFeeUsdc: null },
+};
+
+/**
+ * A COMPUTED price (strategy quote, grid level, slice limit) moved onto the HL price grid in the
+ * passive direction: "down" for a buy, "up" for a sell — never more aggressive than computed.
+ * User-supplied prices are never aligned (hlRequirePriceOnGrid refuses them instead).
+ */
+export function hlAlignPriceToGrid(price: string, szDecimals: number, maxDecimals: 6 | 8, direction: "down" | "up"): string {
+  const s = String(price).trim();
+  if (!/^\d+(\.\d+)?$/.test(s) || !(Number(s) > 0)) {
+    throw new PerpError("INVALID_PARAMS", `Hyperliquid computed price must be a positive plain decimal (got "${price}")`, { exchange: "hyperliquid" });
+  }
+  const px = Number(s);
+  const maxDec = Math.max(0, maxDecimals - szDecimals);
+  const e = Math.floor(Math.log10(px));
+  // ≤ 5 significant figures at this magnitude, ≤ maxDec decimals; integers are always valid.
+  const decimals = Math.max(0, Math.min(maxDec, 4 - e));
+  const tick = decimals === 0 ? "1" : `0.${"0".repeat(decimals - 1)}1`;
+  const aligned = alignProtectionPrice(s, tick, direction === "up" ? "buy" : "sell");
+  if (!(Number(aligned) > 0)) {
+    throw new PerpError("INVALID_TICK", `Hyperliquid computed price ${price} aligns to 0 on the grid`, { exchange: "hyperliquid" });
+  }
+  // Aligning up across a power of ten (e.g. 9.99995 → 10.0000) stays valid: hlRequirePriceOnGrid re-checks.
+  return hlRequirePriceOnGrid(aligned, szDecimals, maxDecimals, "computed price");
 }
 
 /**
@@ -674,14 +745,6 @@ export class HyperliquidAdapter implements ExchangeAdapter {
     return hlSizeStep(this.getSzDecimals(symbol));
   }
 
-  /** HL official price rounding: 5 significant figures */
-  private _hlRoundPrice(px: number, szDecimals: number, maxDecimals = 6): string {
-    if (px > 100_000) return String(Math.round(px));
-    const sig5 = Number(px.toPrecision(5));
-    const priceDec = Math.max(0, maxDecimals - szDecimals);
-    return Number(sig5.toFixed(priceDec)).toString();
-  }
-
   async getAssetIndex(symbol: string): Promise<number> {
     // Retry once if asset map is empty (e.g. init failed silently)
     if (this._assetMap.size === 0) {
@@ -1138,12 +1201,23 @@ export class HyperliquidAdapter implements ExchangeAdapter {
     // Perp orders only. Without a dex, frontendOpenOrders also lists the account's SPOT orders
     // (coin "@<index>" or "<BASE>/<QUOTE>"): they belong to the spot commands — a perp
     // cancel-all / flatten must neither cancel nor be failed by a resting spot limit.
-    return (orders ?? []).filter((o) => !hlIsSpotCoin(String(o.coin ?? ""))).map((o) => ({
-      orderId: String(o.oid ?? ""),
+    if (!Array.isArray(orders)) {
+      throw new PerpError("EXCHANGE_ERROR", "Hyperliquid frontendOpenOrders returned no array", { exchange: "hyperliquid", remediation: "Retry: perp -e hyperliquid account orders" });
+    }
+    // Rule #2: a row without its oid / limitPx / sz is unreadable — never listed as id "" or price/size "0".
+    const field = (o: Record<string, unknown>, k: "oid" | "limitPx" | "sz"): string => {
+      const v = o[k];
+      if ((typeof v === "number" && Number.isFinite(v)) || (typeof v === "string" && v.trim() !== "")) return String(v);
+      throw new PerpError("EXCHANGE_ERROR", `Hyperliquid frontendOpenOrders row without ${k}: ${JSON.stringify(o).slice(0, 200)}`, {
+        exchange: "hyperliquid", remediation: "Retry: perp -e hyperliquid account orders",
+      });
+    };
+    return orders.filter((o) => !hlIsSpotCoin(String(o.coin ?? ""))).map((o) => ({
+      orderId: field(o, "oid"),
       symbol: this._dex ? String(o.coin ?? "") : this._displaySymbol(String(o.coin ?? "")),
       side: String(o.side) === "B" ? ("buy" as const) : String(o.side) === "A" ? ("sell" as const) : (String(o.side).toLowerCase() as "buy" | "sell"),
-      price: String(o.limitPx ?? "0"),
-      size: String(o.sz ?? "0"),
+      price: field(o, "limitPx"),
+      size: field(o, "sz"),
       filled: "0",
       status: "open",
       type: o.isTrigger === true && typeof o.orderType === "string" ? o.orderType : "limit",
@@ -1516,6 +1590,15 @@ export class HyperliquidAdapter implements ExchangeAdapter {
     return result;
   }
 
+  /**
+   * A computed limit price for `symbol` on the HL grid, aligned passively for `side` (buy ↓,
+   * sell ↑). For strategy / grid / slice prices — limitOrder itself refuses off-grid input.
+   */
+  async alignComputedPrice(symbol: string, side: "buy" | "sell", price: string): Promise<string> {
+    await this.getAssetIndex(symbol.toUpperCase()); // loads meta (szDecimals) when empty
+    return hlAlignPriceToGrid(price, this.getSzDecimals(symbol), 6, side === "buy" ? "down" : "up");
+  }
+
   async limitOrder(symbol: string, side: "buy" | "sell", price: string, size: string, opts?: { reduceOnly?: boolean; tif?: string; clientOrderId?: string }) {
     // TIF aliases (§13.3): GTC/IOC/ALO or native spellings; FOK → CAPABILITY_UNSUPPORTED.
     let action: Record<string, unknown>;
@@ -1524,9 +1607,9 @@ export class HyperliquidAdapter implements ExchangeAdapter {
       const tif = hlTif(opts?.tif ?? "GTC");
       const reduceOnly = opts?.reduceOnly ?? false;
       const assetIndex = await this.getAssetIndex(symbol.toUpperCase()); // loads meta (szDecimals) when empty
-      // Round price/size to HL-supported decimals
+      // Off-grid price → INVALID_TICK (refused, never rounded); size floored to the lot.
       const szDec = this.getSzDecimals(symbol);
-      const roundedPrice = this._hlRoundPrice(Number(price), szDec);
+      const roundedPrice = hlRequirePriceOnGrid(price, szDec, 6, "limit price");
       const roundedSize = floorSize(size, hlSizeStep(szDec)); // floored to the lot; 0 → SIZE_TOO_SMALL
       action = await this._orderAction([this._orderWire({
         assetIndex,
@@ -1613,18 +1696,54 @@ export class HyperliquidAdapter implements ExchangeAdapter {
     // Use _signAndSendAction uniformly for both standard perps and HIP-3 dexes.
     // SDK exchange.cancelOrder has the same runtime unavailability as single
     // cancelOrder (see comment there); raw cancel action works for both paths.
-    const results = [];
+    // Every target is attempted (like lighter.ts cancelAllOrders): one refused / unknown cancel
+    // must not leave the orders after it untouched and unreported. A per-entry "Order was never
+    // placed, already canceled, or filled." means the order is no longer open — reported as gone
+    // (not cancelled by this call), not a failure. All cancelled / gone → the raw results; any
+    // failure → one error carrying the per-order outcome.
+    const results: unknown[] = [];
+    const perOrder: Array<{ orderId: string; symbol: string; outcome: "cancelled" | "gone" | "failed"; code: string | null; error: string | null }> = [];
     for (const o of toCancel) {
-      const oid = this._oidOf(o.orderId);
-      const assetIndex = await this.getAssetIndex(o.symbol);
-      const res = await this._signAndSendAction({
-        type: "cancel",
-        cancels: [{ a: assetIndex, o: oid }],
-      });
-      this._validateVenueAck(res, `cancel ${o.orderId}`);
-      results.push(res);
+      try {
+        const oid = this._oidOf(o.orderId);
+        let assetIndex: number;
+        try { // pre-send: the `meta` read behind the asset id
+          assetIndex = await this.getAssetIndex(o.symbol);
+        } catch (e) {
+          throw orderNotSent("hyperliquid", `cancel ${o.orderId} ${o.symbol}`, e);
+        }
+        const res = await this._signAndSendAction({
+          type: "cancel",
+          cancels: [{ a: assetIndex, o: oid }],
+        });
+        this._validateVenueAck(res, `cancel ${o.orderId}`);
+        results.push(res);
+        perOrder.push({ orderId: o.orderId, symbol: o.symbol, outcome: "cancelled", code: null, error: null });
+      } catch (e) {
+        const venueErrors = e instanceof PerpError ? e.structured.details?.venueErrors : undefined;
+        const gone = Array.isArray(venueErrors) && venueErrors.length > 0
+          && venueErrors.every(v => typeof v === "string" && /already canceled, or filled/i.test(v));
+        perOrder.push({ orderId: o.orderId, symbol: o.symbol, outcome: gone ? "gone" : "failed", code: classifyError(e, "hyperliquid").code, error: extractErrorMessage(e) });
+      }
     }
-    return results;
+    const failed = perOrder.filter(r => r.outcome === "failed");
+    const gone = perOrder.filter(r => r.outcome === "gone");
+    if (failed.length === 0) {
+      if (gone.length > 0) {
+        console.error(`[hyperliquid] cancel-all: ${gone.length} order(s) were no longer open (already cancelled or filled, not cancelled by this call): ${gone.map(r => r.orderId).join(", ")}`);
+      }
+      return results;
+    }
+    const cancelled = perOrder.filter(r => r.outcome === "cancelled").length;
+    // Some cancelled → ORDER_PARTIAL; none cancelled → ORDER_REJECTED only when every failure is a
+    // definite refusal, otherwise the outcome of at least one cancel is unknown (ORDER_PENDING).
+    const code = cancelled > 0 ? "ORDER_PARTIAL"
+      : failed.every(r => r.code !== null && DEFINITE_ORDER_FAILURE_CODES.has(r.code as ErrorCode)) ? "ORDER_REJECTED" : "ORDER_PENDING";
+    throw new PerpError(code, `hyperliquid cancel-all: ${cancelled} of ${perOrder.length} order(s) cancelled${gone.length > 0 ? `, ${gone.length} already gone (cancelled or filled)` : ""}; failed: ${failed.map(r => `${r.orderId} ${r.symbol} (${r.error})`).join("; ")}`, {
+      exchange: "hyperliquid",
+      results: perOrder,
+      remediation: "Check which orders are still open (perp account orders -e hyperliquid) and cancel the remaining ones individually",
+    });
   }
 
   // ── Interface methods ──
@@ -1853,17 +1972,13 @@ export class HyperliquidAdapter implements ExchangeAdapter {
     }
     const szDec = this.getSzDecimals(symbol);
     const roundedSize = floorSize(size, hlSizeStep(szDec)); // floored to the lot; 0 → SIZE_TOO_SMALL
-    const roundedTrigger = this._hlRoundPrice(Number(triggerPrice), szDec);
+    // User-supplied trigger / limit prices: off-grid → INVALID_TICK (never rounded).
+    const roundedTrigger = hlRequirePriceOnGrid(triggerPrice, szDec, 6, "trigger price");
     // Stop-limit / TP-limit: the order's limit price is the caller's limitPrice, not the trigger.
-    if (opts?.limitPrice !== undefined && !(Number(opts.limitPrice) > 0)) {
-      throw new PerpError("INVALID_PARAMS", `Invalid limit price "${opts.limitPrice}" for ${symbol.toUpperCase()} trigger order`, {
-        remediation: "Pass a positive numeric --limit-price / --tp-limit.",
-      });
-    }
     const isMarket = opts?.isMarket ?? true;
     let roundedLimit: string;
     if (opts?.limitPrice !== undefined) {
-      roundedLimit = this._hlRoundPrice(Number(opts.limitPrice), szDec);
+      roundedLimit = hlRequirePriceOnGrid(opts.limitPrice, szDec, 6, "trigger limit price");
     } else if (isMarket) {
       // Market trigger: `p` = trigger ± the venue's documented market TP/SL tolerance (never the
       // trigger itself — see HL_MARKET_TPSL_SLIPPAGE_BPS), aligned toward crossing.
@@ -2056,11 +2171,34 @@ export class HyperliquidAdapter implements ExchangeAdapter {
   }
 
   /**
-   * Withdraw USDC via the Hyperliquid bridge — user-signed `withdraw3` (master only),
-   * python SDK withdraw_from_bridge.
+   * Withdraw USDC over CCTP (native USDC) — user-signed `sendToEvmWithData` (master only):
+   * HyperCore is debited, the USDC is burned on HyperEVM and CCTP mints it on `chain`
+   * (default Arbitrum). The Arbitrum Bridge2 `withdraw3` path is no longer used.
+   * Docs: developers.circle.com/cctp/howtos/withdraw-usdc-from-hypercore-to-evm —
+   * sourceDex "spot" (unified accounts hold USDC in spot) or "" (standard accounts' perp
+   * balance); data "0x" = automatic forwarding, which CCTP charges a fixed fee for
+   * (Arbitrum 0.2 USDC; an amount below the fee reverts).
    */
-  async withdraw(amount: string, destination: string, _opts?: { assetId?: number; routeType?: number }) {
-    return this._signAndSendUserAction("withdraw3", { destination: hlDestination(destination), amount: hlAmountString(amount) });
+  async withdraw(amount: string, destination: string, opts?: { assetId?: number; routeType?: number; chain?: HlCctpChain }) {
+    if (opts?.assetId !== undefined || opts?.routeType !== undefined) {
+      throw new PerpError("INVALID_PARAMS", "Hyperliquid withdraw takes no assetId / routeType (USDC over CCTP; pick the destination with --chain)", { exchange: "hyperliquid" });
+    }
+    const chain: HlCctpChain = opts?.chain ?? "arbitrum";
+    const route = HL_CCTP_ROUTES[chain];
+    const amountStr = hlAmountString(amount);
+    if (route.forwardingFeeUsdc !== null && !(Number(amountStr) > Number(route.forwardingFeeUsdc))) {
+      throw new PerpError("SIZE_TOO_SMALL", `Hyperliquid CCTP withdraw ${amountStr} USDC does not exceed the ${chain} forwarding fee ${route.forwardingFeeUsdc} USDC (the transfer would revert); nothing was sent`, { exchange: "hyperliquid" });
+    }
+    return this._signAndSendUserAction("sendToEvmWithData", {
+      token: "USDC",
+      amount: amountStr,
+      sourceDex: this.isUnifiedAccount ? "spot" : "",
+      destinationRecipient: hlDestination(destination),
+      addressEncoding: "hex",
+      destinationChainId: route.cctpDomain,
+      gasLimit: 200000,
+      data: "0x",
+    });
   }
 
   /**
@@ -2171,7 +2309,7 @@ export class HyperliquidAdapter implements ExchangeAdapter {
         order: {
           a: assetIndex,
           b: newSide === "buy",
-          p: trimZeros(this._hlRoundPrice(Number(newPrice), szDec)),
+          p: trimZeros(hlRequirePriceOnGrid(newPrice, szDec, 6, "modify price")),
           s: trimZeros(floorSize(newSize, hlSizeStep(szDec))), // floored to the lot; 0 → SIZE_TOO_SMALL
           r: opts.reduceOnly,
           t: { limit: { tif: opts.tif } },
@@ -2202,11 +2340,13 @@ export class HyperliquidAdapter implements ExchangeAdapter {
     const r = result as { response?: { data?: { statuses?: unknown[] } } };
     const statuses = r?.response?.data?.statuses;
     if (!Array.isArray(statuses) || statuses.length === 0) {
-      throw new PerpError(
-        "EXCHANGE_ERROR",
-        `Hyperliquid ${what}: no order status in response`,
-        { exchange: "hyperliquid" },
-      );
+      // The signed action was already accepted by the envelope: without a per-entry verdict the
+      // order / modify / cancel may or may not have taken effect (like marketOrder's
+      // _validateOrderFill) — ORDER_PENDING, never the retryable EXCHANGE_ERROR.
+      throw orderOutcomeUnknown("hyperliquid", what, new Error("no order status in response"),
+        /^cancel/i.test(what)
+          ? `Do NOT assume the order was cancelled (nor resubmit the cancel blindly) — check open orders first: perp -e hyperliquid account orders`
+          : `Do NOT resubmit — the ${what} may have taken effect. Check open orders and positions first: perp -e hyperliquid account orders / portfolio`);
     }
     const errors = statuses
       .map((s) => (s && typeof s === "object" ? (s as Record<string, unknown>).error : undefined))

@@ -296,6 +296,18 @@ export function lighterTakerFilledBase(eventInfo: unknown, sentBaseAmount: numbe
   return filled !== null && filled === sentBaseAmount ? filled : null;
 }
 
+/**
+ * A required open-order row field as a string (Rule #2): missing / empty / non-finite numeric →
+ * EXCHANGE_ERROR, never listed as price / size "0" or status "open".
+ */
+export function lighterRowField(o: Record<string, unknown>, key: string, venue: string): string {
+  const v = o[key];
+  if ((typeof v === "string" && v.trim() !== "") || (typeof v === "number" && Number.isFinite(v))) return String(v);
+  throw new PerpError("EXCHANGE_ERROR", `${venue} open order ${lighterOrderIdOf(o) || "(no id)"}: row has no ${key} (got ${JSON.stringify(v ?? null)})`, {
+    exchange: venue, remediation: `Retry: perp -e ${venue} account orders`,
+  });
+}
+
 /** What identifies OUR accountOrders row besides the client order index: the market sent to and the send time. */
 export interface LighterRowMatch { marketIndex: number; sentAtMs: number }
 
@@ -1048,7 +1060,20 @@ export class LighterAdapter implements ExchangeAdapter {
       let tx: unknown;
       try {
         tx = await this.restGet("/tx", { by: "hash", value: txHash });
-      } catch {
+      } catch (e) {
+        if (e instanceof PerpError && e.structured.code === "RATE_LIMITED") {
+          // HTTP 429: polling on every 500 ms would only extend the breach. Honour Retry-After
+          // when it fits in the remaining window, else stop — the caller reports the tx pending.
+          const retryAfterMs = e.structured.details?.retryAfterMs;
+          const remainingMs = (attempts - attempt - 1) * 500;
+          if (typeof retryAfterMs === "number" && retryAfterMs > 0 && retryAfterMs <= remainingMs) {
+            await new Promise(r => setTimeout(r, retryAfterMs));
+            attempt += Math.ceil(retryAfterMs / 500);
+            continue;
+          }
+          console.error(`[${this.name}] Warning: /tx poll of ${txHash} rate limited (HTTP 429${typeof retryAfterMs === "number" ? `, Retry-After ${retryAfterMs} ms` : ""}) — polling stopped, outcome not confirmed`);
+          return last;
+        }
         continue;
       }
       last = lighterTxState(tx);
@@ -1399,7 +1424,13 @@ export class LighterAdapter implements ExchangeAdapter {
   async getBalance(): Promise<ExchangeBalance> {
     if (!this._address) throw new Error("No private key configured — account data unavailable. Run: perp setup");
     const acct = await this.fetchAccount();
-    if (!acct) return { equity: "0", available: "0", marginUsed: "0", unrealizedPnl: "0" };
+    // Rule #2: no account is not a zero balance — say so (like getMarketSettings).
+    if (!acct) {
+      throw new PerpError("EXCHANGE_ERROR", `${this.name}: no account found for ${this._address}${this._accountIndex >= 0 ? ` (account index ${this._accountIndex})` : ""} — balance unknown`, {
+        exchange: this.name,
+        remediation: `A ${this.name} account is created by the first deposit; check the address / account index (perp -e ${this.name} wallet show) or deposit first`,
+      });
+    }
 
     const totalAsset = parseFiniteVenueNumber(acct.total_asset_value, "total_asset_value", "lighter");
     const available = parseFiniteVenueNumber(acct.available_balance, "available_balance", "lighter");
@@ -1411,13 +1442,14 @@ export class LighterAdapter implements ExchangeAdapter {
     ) ?? 0;
 
     // Include spot collateral balance (USDC on Lighter, USDG on Lighter RH; separate from perp collateral)
+    // An account without that asset holds none of it (0); an unreadable assets list / balance throws.
     let spotUsdc = 0;
     const collateralSymbol = this.collateralSymbol;
-    try {
-      const assets = (acct.assets ?? []) as Array<{ symbol: string; balance: string; locked_balance: string }>;
-      const usdcAsset = assets.find(a => a.symbol === collateralSymbol);
-      if (usdcAsset) spotUsdc = parseFloat(usdcAsset.balance || "0");
-    } catch { /* non-critical */ }
+    if (!Array.isArray(acct.assets)) {
+      throw new PerpError("EXCHANGE_ERROR", `${this.name} account has no assets list — spot ${collateralSymbol} balance unknown`, { exchange: this.name });
+    }
+    const usdcAsset = (acct.assets as Array<Record<string, unknown>>).find(a => a?.symbol === collateralSymbol);
+    if (usdcAsset !== undefined) spotUsdc = parseFiniteVenueNumber(usdcAsset.balance, `assets.${collateralSymbol}.balance`, "lighter");
 
     return {
       equity: String(totalAsset + spotUsdc),
@@ -1524,10 +1556,10 @@ export class LighterAdapter implements ExchangeAdapter {
         orderId: lighterOrderIdOf(o),
         symbol: sym,
         side: this.sideOfIsAsk(o.is_ask, "open order", o),
-        price: String(o.price ?? "0"),
-        size: String(o.initial_base_amount ?? o.remaining_base_amount ?? "0"),
-        filled: String(o.filled_base_amount ?? "0"),
-        status: String(o.status ?? "open"),
+        price: lighterRowField(o, "price", this.name),
+        size: lighterRowField(o, "initial_base_amount", this.name),
+        filled: lighterRowField(o, "filled_base_amount", this.name),
+        status: lighterRowField(o, "status", this.name),
         type: String(o.type ?? "limit"),
         triggerPrice: Number(o.trigger_price) > 0 ? String(o.trigger_price) : null,
       };
@@ -1888,11 +1920,22 @@ export class LighterAdapter implements ExchangeAdapter {
   async orderStatusRow(symbol: string, ref: { kind: "orderId" | "clientOrderId"; value: string }): Promise<Record<string, unknown>> {
     if (ref.kind === "clientOrderId") {
       const coi = lighterClientOrderIndex(ref.value);
-      const row = (await this.getOrdersByClientIndex([coi])).find(r => Number(r.client_order_index ?? r.client_order_id) === coi);
-      if (row === undefined) {
-        throw new PerpError("ORDER_NOT_FOUND", `${this.name} order c:${ref.value} is not listed by accountOrders`, { exchange: this.name });
+      // A client order index is not unique (it repeats across markets and over time — see
+      // orderRowOutcome's LighterRowMatch): only rows on `symbol`'s market count, and several
+      // such rows are ambiguous (never guessed).
+      await this.ensureMarketMap();
+      const marketIndex = this.getMarketIndex(symbol);
+      const rows = (await this.getOrdersByClientIndex([coi])).filter(r =>
+        Number(r.client_order_index ?? r.client_order_id) === coi && Number(r.market_index) === marketIndex);
+      if (rows.length === 0) {
+        throw new PerpError("ORDER_NOT_FOUND", `${this.name} order c:${ref.value} is not listed by accountOrders on ${symbol.toUpperCase()}`, { exchange: this.name });
       }
-      return row;
+      if (rows.length > 1) {
+        throw new PerpError("INVALID_PARAMS", `${this.name} client order id c:${ref.value} matches ${rows.length} ${symbol.toUpperCase()} orders (${rows.map(r => lighterOrderIdOf(r) || "?").join(", ")}); refusing to pick one`, {
+          exchange: this.name, remediation: `Query by the venue order id instead: perp -e ${this.name} trade status ${symbol.toUpperCase()} <orderId>`,
+        });
+      }
+      return rows[0];
     }
     await this.ensureMarketMap();
     const marketId = String(this.getMarketIndex(symbol));

@@ -19,14 +19,14 @@ import {
   type RateEntry, type RateMap, type FundingScore,
   buildAdapterMap,
   getPerpSymbol, findRate, matchSymbol, fetchRates,
-  scoreFunding, isPositionGone, botSpotPerpMatches, assertFundingArbLegs } from "./funding-arb-utils.js";
+  scoreFunding, isPositionGone, botSpotPerpMatches, assertFundingArbLegs, cancelBotSymbols } from "./funding-arb-utils.js";
 import type { SpotMarketInfo } from "../../exchanges/spot-interface.js";
 import type { VenueMarket } from "../../exchanges/venue-types.js";
 import { SpotPerpExecutor } from "./spot-perp-executor.js";
 import { findSpotQuoteBalance, getBotSpotAdapter, nonQuoteSpotBalances, spotNetworkOf, spotSharesPerpMargin, spotTokenBase } from "../../exchanges/spot-factory.js";
 import type { SpotAdapter } from "../../exchanges/spot-interface.js";
 import { getVenue } from "../../exchanges/venue.js";
-import { updatePosition } from "../../arb/state.js";
+import { updatePositionEntry } from "../../arb/state.js";
 import { recordSpotPerpClose, recordSpotPerpEntry, stateEntryOf, stateWriteFailed } from "./spot-perp-state.js";
 import { isQuarantined, quarantineSymbol } from "../quarantine.js";
 
@@ -82,6 +82,8 @@ export class SpotPerpArbStrategy implements Strategy {
   private _closeFailures = new Map<string, number>();
   /** Venues whose positions could not be read during recovery: no entries there until re-read. */
   private _unrecovered = new Set<string>();
+  /** Perp symbols this bot entered or tracked this run — the only symbols its stop cancels orders on. */
+  private _traded = new Set<string>();
   private _fundingScoreCache = new Map<string, { score: FundingScore; ts: number }>();
 
   private get params(): SpotPerpArbParams {
@@ -332,7 +334,7 @@ export class SpotPerpArbStrategy implements Strategy {
           const spotExAdapter = adapters.get(pos.spotExchange);
           const rotSpot = spotExAdapter ? await this.executor.getSpotAdapter(pos.spotExchange, spotExAdapter) : null;
           const entry = rotSpot !== null ? stateEntryOf(rotSpot, pos) : undefined;
-          if (rotSpot !== null && entry !== undefined) updatePosition(spotNetworkOf(rotSpot), entry.symbol, { shortExchange: getVenue(best.exchange).id, entryShortPrice: ok.entryPrice });
+          if (rotSpot !== null && entry !== undefined) updatePositionEntry(spotNetworkOf(rotSpot), entry, { shortExchange: getVenue(best.exchange).id, entryShortPrice: ok.entryPrice });
         } catch (e) { stateWriteFailed("[SPA]", "update (rotation)", { ...pos, perpExchange: best.exchange }, e, ctx.log); }
         pos.perpExchange = best.exchange;
         pos.fundingHistory = [];
@@ -404,6 +406,7 @@ export class SpotPerpArbStrategy implements Strategy {
   async onStop(ctx: StrategyContext): Promise<StrategyAction[]> {
     const positions = ctx.state.get("spaPositions") as SpotPerpPosition[] | undefined;
     const adapters = buildAdapterMap(ctx);
+    for (const p of positions ?? []) this._traded.add(getPerpSymbol(p.symbol, p.perpExchange).toUpperCase());
     if (positions && positions.length > 0) {
       const remaining: SpotPerpPosition[] = [];
       for (const pos of positions) {
@@ -435,9 +438,9 @@ export class SpotPerpArbStrategy implements Strategy {
       ctx.state.set("spaPositions", remaining);
       ctx.state.set("arbPositions", remaining.length);
     }
-    const extra = ctx.state.get("extraAdapters") as Map<string, ExchangeAdapter> | undefined;
-    if (extra) { for (const [, a] of extra) { try { await a.cancelAllOrders(); } catch { /* best effort */ } } }
-    return [{ type: "cancel_all" }];
+    // Only the bot's own symbols, on each venue it used — never an account-wide cancel.
+    await cancelBotSymbols(adapters, this._traded, "[SPA]", ctx.log);
+    return [];
   }
 
   /** Close recorded in the arb state: entry removed (remaining null) or its legs set to the still-hedged remainder. */
@@ -530,6 +533,8 @@ export class SpotPerpArbStrategy implements Strategy {
     ratesByExchange: RateMap, exchangeBalances: Map<string, { equity: number; available: number; marginPct: number }>,
   ): Promise<boolean> {
     const p = this.params;
+    // Engine: equity unknown → no new entries (closes / rotations' closes still run).
+    if (ctx.state.get("equityUnknown") === true) { ctx.log(`  [SPA] Skip ${symbol}: equity unknown — no new entries`); return false; }
     const spotExAdapter = adapters.get(spotExchange);
     const perpAdapter = adapters.get(perpExchange);
     if (!spotExAdapter || !perpAdapter) { this._failCooldown.set(`${symbol}:entry`, Date.now() + 5 * 60 * 1000); return false; }
@@ -614,6 +619,7 @@ export class SpotPerpArbStrategy implements Strategy {
       }
 
       // Delegate to executor
+      this._traded.add(perpSymbol.toUpperCase());
       const result = await this.executor.openPosition({
         symbol, perpSymbol, spotExchange, perpExchange,
         spotAdapter, perpAdapter, sizeUsd: targetSizeUsd, leverage, log: ctx.log,

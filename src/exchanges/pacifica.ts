@@ -16,7 +16,7 @@ import { LocalSolanaSigner } from "../signer/index.js";
 import type { AgentMeta } from "../settings.js";
 import { isExpired } from "../agent-wallet/expiry.js";
 import { randomUUID } from "crypto";
-import { PerpError, extractErrorMessage, orderOutcomeUnknown } from "../errors.js";
+import { PerpError, extractErrorMessage, isDefiniteOrderFailure, orderNotSent, orderOutcomeUnknown } from "../errors.js";
 import { parseFiniteVenueNumber, venueRateField } from "../utils/numeric.js";
 import type { MarketInfo } from "../pacifica/types/market.js";
 import type { TimeInForce as PacificaTif } from "../pacifica/types/order.js";
@@ -853,6 +853,7 @@ export class PacificaAdapter implements ExchangeAdapter {
     if (orderId && !(opts?.reduceOnly ?? false)) {
       // Poll order status via history_by_id
       let lastPollError: unknown = null;
+      let verdict: PerpError | null = null;
       for (let attempt = 0; attempt < 10; attempt++) {
         await new Promise(r => setTimeout(r, 500));
         try {
@@ -882,7 +883,11 @@ export class PacificaAdapter implements ExchangeAdapter {
               if (latest.filled_amount !== undefined && latest.filled_amount !== null && String(latest.filled_amount).trim() !== "" && Number(latest.filled_amount) === 0) {
                 throw new PerpError("ORDER_REJECTED", `Market ${side} ${symbol}: order ${orderId} ${status}`, { exchange: "pacifica", orderId });
               }
-              throw new Error(`Market ${side} ${symbol}: order ${orderId} ${status} (fill amount not reported — outcome unconfirmed)`);
+              // Sent and terminal, but the fill amount is not reported: a partially filled IOC
+              // whose remainder was cancelled looks the same — outcome unknown, never resubmit.
+              verdict = orderOutcomeUnknown("pacifica", `market ${side} ${size} ${symbol}`,
+                new Error(`order ${orderId} ${status} without a reported filled_amount`),
+                `Do NOT resubmit — order ${orderId} may have partially filled. Check positions and fills first: perp -e pacifica account positions / trades`);
             }
             // Still processing, retry
           }
@@ -890,10 +895,12 @@ export class PacificaAdapter implements ExchangeAdapter {
           if (e instanceof Error && e.message.startsWith("Market ")) throw e;
           lastPollError = e;
         }
+        if (verdict !== null) throw verdict;
       }
-      // Order was accepted but verification timed out — warn, don't throw
+      // Accepted but not confirmed within the poll window: returned without a fill report, so the
+      // caller (iocOutcomeOf → null) reports it unconfirmed — never assumed executed.
       const errDetail = lastPollError instanceof Error ? ` (poll error: ${lastPollError.message})` : "";
-      console.error(`[pacifica] Warning: market ${side} ${symbol} order ${orderId} not confirmed after 5s${errDetail} — assuming executed`);
+      console.error(`[pacifica] Warning: market ${side} ${symbol} order ${orderId} not confirmed after 5s${errDetail} — outcome unconfirmed; check positions before retrying: perp -e pacifica account positions`);
     }
 
     if (!orderId && !(opts?.reduceOnly ?? false)) {
@@ -1054,23 +1061,43 @@ export class PacificaAdapter implements ExchangeAdapter {
 
   async cancelAllOrders(symbol?: string) {
     this.ensureSigner();
-    if (symbol) {
-      // Cancel only orders for this symbol: fetch open orders, filter, cancel individually
-      const orders = await this.getOpenOrders();
-      const filtered = orders.filter(o => o.symbol.toUpperCase() === symbol.toUpperCase());
-      const results = [];
-      for (const o of filtered) {
-        results.push(await this._cancelListed(o));
-      }
-      return results;
-    }
     // Never `cancel_all` with all_symbols:true — it would also cancel spot orders.
     // getOpenOrders() already excludes spot symbols; cancel the perp orders one by one.
-    const results = [];
-    for (const o of await this.getOpenOrders()) {
-      results.push(await this._cancelListed(o));
+    let orders: ExchangeOrder[];
+    try { // pre-send: the open-orders listing — nothing is cancelled when it fails
+      orders = await this.getOpenOrders();
+    } catch (e) {
+      throw orderNotSent("pacifica", `cancel-all${symbol ? ` ${symbol.toUpperCase()}` : ""}`, e);
     }
-    return results;
+    const targets = symbol ? orders.filter(o => o.symbol.toUpperCase() === symbol.toUpperCase()) : orders;
+    // Every target is attempted (like lighter.ts cancelAllOrders): one refused / unknown cancel
+    // must not leave the orders after it untouched and unreported. All cancelled → the raw
+    // results; any failure → one error carrying the per-order outcome.
+    const results: unknown[] = [];
+    const perOrder: Array<{ orderId: string; symbol: string; cancelled: boolean; definite: boolean; error: string | null }> = [];
+    for (const o of targets) {
+      try {
+        const r = await this._cancelListed(o);
+        const bodyErr = pacificaBodyError(r);
+        if (bodyErr !== null) throw new PerpError("ORDER_REJECTED", `Pacifica cancel of ${o.orderId} refused: ${bodyErr}`, { exchange: "pacifica" });
+        results.push(r);
+        perOrder.push({ orderId: o.orderId, symbol: o.symbol, cancelled: true, definite: true, error: null });
+      } catch (e) {
+        // A 4xx refusal / explicit body refusal / pre-send refusal is definite (that order was not
+        // cancelled by this request); a transport failure, 5xx or anything else leaves it unknown.
+        const definite = pacificaRefused(e) || isDefiniteOrderFailure(e);
+        perOrder.push({ orderId: o.orderId, symbol: o.symbol, cancelled: false, definite, error: extractErrorMessage(e) });
+      }
+    }
+    const failed = perOrder.filter(r => !r.cancelled);
+    if (failed.length === 0) return results;
+    const cancelled = perOrder.length - failed.length;
+    const code = cancelled > 0 ? "ORDER_PARTIAL" : failed.every(r => r.definite) ? "ORDER_REJECTED" : "ORDER_PENDING";
+    throw new PerpError(code, `pacifica cancel-all: ${cancelled} of ${perOrder.length} order(s) cancelled; failed: ${failed.map(r => `${r.orderId} ${r.symbol} (${r.error})`).join("; ")}`, {
+      exchange: "pacifica",
+      results: perOrder,
+      remediation: "Check which orders are still open (perp account orders -e pacifica) and cancel the remaining ones individually",
+    });
   }
 
   /** Stop / TP / SL rows (incl. position-level TP/SL) go to /orders/stop/cancel; /orders/cancel refuses them (422). */
@@ -1169,7 +1196,17 @@ export class PacificaAdapter implements ExchangeAdapter {
       throw new PerpError("SYMBOL_NOT_FOUND", `Pacifica ${sym}: no tick size published; cannot validate the replacement price`, { exchange: "pacifica" });
     }
     requireOnTick(price, info.tick_size);
-    const filledAtRead = String(original.filled_amount);
+    // The replacement size is derived from filled_amount (size − fills raced in during the cancel):
+    // an unreadable one is refused HERE, before the cancel — after it, the original would be gone
+    // with no computable replacement.
+    const filledAtReadRaw = original.filled_amount;
+    if ((typeof filledAtReadRaw !== "string" && typeof filledAtReadRaw !== "number") || !/^\d+(\.\d+)?$/.test(String(filledAtReadRaw).trim())) {
+      throw new PerpError("EXCHANGE_ERROR", `Pacifica order ${orderId} has no readable filled_amount (got ${JSON.stringify(filledAtReadRaw ?? null)}); nothing was cancelled`, {
+        exchange: "pacifica", sent: false,
+        remediation: `Retry the amend, or cancel (perp trade cancel ${sym} ${orderId} -e pacifica) and place a new order`,
+      });
+    }
+    const filledAtRead = String(filledAtReadRaw).trim();
     const cancelWhat = `amend: cancel of ${orderId}`;
     let cancelRaw: unknown;
     try {

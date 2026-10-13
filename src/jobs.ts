@@ -263,8 +263,12 @@ export interface StopJobResult {
   waitedMs: number;
 }
 
-/** Default wait for a job to finish its own cleanup after SIGINT. */
-export const JOB_STOP_TIMEOUT_MS = 30_000;
+/**
+ * Default wait for a job to finish its own cleanup after SIGINT. A daemon that receives SIGINT
+ * mid-entry finishes the verified leg sequence (or its rollback) first — that alone can take
+ * longer than 30s on a slow venue — so the default leaves room for one full verified pair.
+ */
+export const JOB_STOP_TIMEOUT_MS = 90_000;
 
 /**
  * The pid of the job's node process inside the tmux pane: the pane runs
@@ -307,6 +311,10 @@ export async function stopJob(id: string, timeoutMs: number = JOB_STOP_TIMEOUT_M
   if (!tmuxSessionExists(job.tmuxSession)) {
     result = { outcome: "notRunning", note: null, waitedMs: 0 };
   } else {
+    // Mark the stop BEFORE the SIGINT: the job's own final updateJobState (status "done") must
+    // not overwrite it (updateJobState keeps "stopped").
+    job.status = "stopped";
+    saveJob(job);
     const pid = jobNodePid(job.tmuxSession);
     let note: string | null = null;
     if (pid === null) note = "the job's process could not be identified in its tmux pane — no SIGINT was sent";
@@ -331,9 +339,11 @@ export async function stopJob(id: string, timeoutMs: number = JOB_STOP_TIMEOUT_M
       result = { outcome: "forced", note: note ?? `the job did not exit within ${Math.round(timeoutMs / 1000)}s of SIGINT`, waitedMs: Date.now() - started };
     }
   }
-  job.status = "stopped";
-  job.result = { ...(job.result ?? {}), stop: result };
-  saveJob(job);
+  // Re-read: the job wrote its final result while it shut down — keep it, add the stop outcome.
+  const latest = loadJob(id) ?? job;
+  latest.status = "stopped";
+  latest.result = { ...(latest.result ?? {}), stop: result };
+  saveJob(latest);
   return result;
 }
 
@@ -343,7 +353,10 @@ export async function stopJob(id: string, timeoutMs: number = JOB_STOP_TIMEOUT_M
 export function updateJobState(id: string, data: Partial<JobEntry>): void {
   const job = loadJob(id);
   if (!job) return;
-  Object.assign(job, data);
+  // A job stopped by `perp background stop` stays "stopped": its final write (done / error)
+  // only merges the result.
+  const status = job.status === "stopped" ? "stopped" : (data.status ?? job.status);
+  Object.assign(job, data, { status });
   saveJob(job);
 }
 

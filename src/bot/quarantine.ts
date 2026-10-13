@@ -21,12 +21,22 @@
  * from the CLI takes effect in running bots on their next tick (no restart). Only an
  * entry whose persist failed is held in process memory (logged CRITICAL); it holds
  * until that process stops.
+ *
+ * Network scope: an entry records the network it was set on (`network`); a process that called
+ * setQuarantineNetwork(n) sees only entries of n plus entries of unknown network (null — set by
+ * a process that never declared its network: they apply to EVERY network, fail closed). Entries
+ * written before network scoping have no tag and are MAINNET (like the arb state's legacy file).
+ * A process that never declared its network sees every entry (fail closed). Mainnet / unknown
+ * entries keep the legacy key "<source>:<KEY>"; testnet ones are keyed "testnet:<source>:<KEY>".
+ * Every load → modify → save of the file holds the cross-process lock (withFileLock).
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
 import { resolve } from "path";
 import { PerpError } from "../errors.js";
 import { DENOMINATION_ALIASES } from "../exchanges/canonical-symbols.js";
+import type { Network } from "../exchanges/venue-types.js";
+import { withFileLock } from "../arb/file-lock.js";
 
 const PERP_DIR = resolve(process.env.HOME || "~", ".perp");
 export const QUARANTINE_FILE = resolve(PERP_DIR, "bot-quarantine.json");
@@ -41,6 +51,8 @@ export interface QuarantineEntry {
   /** What the human must check before clearing. */
   remediation: string;
   time: string; // ISO
+  /** Network the entry was set on; null = unknown (applies to every network). Legacy untagged entries load as "mainnet". */
+  network: Network | null;
 }
 
 interface QuarantineFile {
@@ -64,8 +76,26 @@ export function quarantineKey(symbol: string): string {
   return DENOMINATION_ALIASES[up] ?? up;
 }
 
-function keyOf(source: string, symbol: string): string {
-  return `${source}:${quarantineKey(symbol)}`;
+/** The network this process trades on (setQuarantineNetwork); null = not declared → every entry applies. */
+let activeNetwork: Network | null = null;
+
+/** Declare the network this process trades on: entries are set on it and checked against it. */
+export function setQuarantineNetwork(network: Network): void {
+  activeNetwork = network;
+}
+
+/** Test hook: back to "network not declared". */
+export function resetQuarantineNetwork(): void {
+  activeNetwork = null;
+}
+
+function keyOf(source: string, symbol: string, network: Network | null): string {
+  return `${network === "testnet" ? "testnet:" : ""}${source}:${quarantineKey(symbol)}`;
+}
+
+/** Does `e` block on this process's network? (unknown on either side → yes, fail closed) */
+function applies(e: QuarantineEntry): boolean {
+  return activeNetwork === null || e.network === null || e.network === activeNetwork;
 }
 
 /** Read the file. A missing file = nothing quarantined; an unreadable / malformed file throws (never "empty"). */
@@ -85,7 +115,15 @@ function load(): QuarantineFile {
       remediation: `Fix or remove ${QUARANTINE_FILE} after verifying every quarantined position on the venues`,
     });
   }
+  // Legacy entries (written before network scoping) have no tag: they are mainnet.
+  for (const e of Object.values(f.entries as Record<string, Partial<QuarantineEntry>>)) {
+    if (e.network === undefined) e.network = "mainnet";
+  }
   return f as QuarantineFile;
+}
+
+function withQuarantineLock<T>(fn: () => T): T {
+  return withFileLock(QUARANTINE_FILE, "Bot quarantine file", fn);
 }
 
 function save(f: QuarantineFile): void {
@@ -109,16 +147,21 @@ export function quarantineSymbol(
 ): void {
   const sym = symbol.toUpperCase();
   const key = quarantineKey(sym);
-  const entry: QuarantineEntry = { strategy: source, symbol: sym, reason, remediation, time: new Date().toISOString() };
+  const entry: QuarantineEntry = { strategy: source, symbol: sym, reason, remediation, time: new Date().toISOString(), network: activeNetwork };
+  const k = keyOf(source, sym, activeNetwork);
   log(`  [QUARANTINE] CRITICAL: ${sym}${key !== sym ? ` (key ${key})` : ""} quarantined by ${source} — ${reason}`);
   log(`  [QUARANTINE] Remediation: ${remediation}`);
   log(`  [QUARANTINE] No bot / arb path will touch ${key} until cleared: perp strategy quarantine-clear ${key}`);
   try {
-    const f = load();
-    f.entries[keyOf(source, sym)] = entry;
-    save(f);
+    withQuarantineLock(() => {
+      const f = load();
+      // Never narrow: an existing unknown-network entry under this key keeps applying everywhere.
+      if (f.entries[k]?.network === null) entry.network = null;
+      f.entries[k] = entry;
+      save(f);
+    });
   } catch (e) {
-    unpersisted.set(keyOf(source, sym), entry);
+    unpersisted.set(k, entry);
     log(`  [QUARANTINE] CRITICAL: could not persist quarantine to ${QUARANTINE_FILE} (${e instanceof Error ? e.message : String(e)}) — it holds only until this process stops`);
   }
 }
@@ -131,14 +174,14 @@ export function quarantineSymbol(
 export function quarantineEntryFor(symbol: string, log: (msg: string) => void): QuarantineEntry | null {
   const sym = symbol.toUpperCase();
   const key = quarantineKey(sym);
-  for (const e of unpersisted.values()) if (quarantineKey(e.symbol) === key) return e;
+  for (const e of unpersisted.values()) if (quarantineKey(e.symbol) === key && applies(e)) return e;
   try {
-    for (const e of Object.values(load().entries)) if (quarantineKey(e.symbol) === key) return e;
+    for (const e of Object.values(load().entries)) if (quarantineKey(e.symbol) === key && applies(e)) return e;
     return null;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     log(`  [QUARANTINE] CRITICAL: ${msg} — treating ${sym} as quarantined`);
-    return { strategy: "quarantine-file", symbol: sym, reason: msg, remediation: `Fix or remove ${QUARANTINE_FILE}`, time: new Date().toISOString() };
+    return { strategy: "quarantine-file", symbol: sym, reason: msg, remediation: `Fix or remove ${QUARANTINE_FILE}`, time: new Date().toISOString(), network: activeNetwork };
   }
 }
 
@@ -147,27 +190,31 @@ export function isQuarantined(symbol: string, log: (msg: string) => void): boole
   return quarantineEntryFor(symbol, log) !== null;
 }
 
+/** Entries that apply on this process's network (every entry when it never declared one). */
 export function listQuarantine(): QuarantineEntry[] {
-  return [...Object.values(load().entries), ...unpersisted.values()];
+  return [...Object.values(load().entries), ...unpersisted.values()].filter(applies);
 }
 
-/** Remove entries whose quarantineKey matches symbol's (one source, or every source when null). Returns the removed entries. */
+/** Remove entries (that apply on this process's network) whose quarantineKey matches symbol's (one source, or every source when null). Returns the removed entries. */
 export function clearQuarantine(symbol: string, strategy: string | null): QuarantineEntry[] {
-  const f = load();
-  const key = quarantineKey(symbol);
-  const removed: QuarantineEntry[] = [];
-  for (const [k, e] of Object.entries(f.entries)) {
-    if (quarantineKey(e.symbol) === key && (strategy === null || e.strategy === strategy)) {
-      removed.push(e);
-      delete f.entries[k];
+  return withQuarantineLock(() => {
+    const f = load();
+    const key = quarantineKey(symbol);
+    const removed: QuarantineEntry[] = [];
+    const match = (e: QuarantineEntry) => quarantineKey(e.symbol) === key && (strategy === null || e.strategy === strategy) && applies(e);
+    for (const [k, e] of Object.entries(f.entries)) {
+      if (match(e)) {
+        removed.push(e);
+        delete f.entries[k];
+      }
     }
-  }
-  for (const [k, e] of unpersisted) {
-    if (quarantineKey(e.symbol) === key && (strategy === null || e.strategy === strategy)) {
-      removed.push(e);
-      unpersisted.delete(k);
+    for (const [k, e] of unpersisted) {
+      if (match(e)) {
+        removed.push(e);
+        unpersisted.delete(k);
+      }
     }
-  }
-  if (removed.length > 0) save(f);
-  return removed;
+    if (removed.length > 0) save(f);
+    return removed;
+  });
 }

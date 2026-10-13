@@ -1,3 +1,4 @@
+import { symbolMatch } from "../utils.js";
 import type { ExchangeAdapter } from "../exchanges/index.js";
 import type { Condition } from "./config.js";
 
@@ -63,7 +64,7 @@ export async function getMarketSnapshot(
   symbol: string,
 ): Promise<MarketSnapshot> {
   const markets = await adapter.getMarkets();
-  const m = markets.find(mk => mk.symbol.toUpperCase() === symbol.toUpperCase());
+  const m = markets.find(mk => symbolMatch(mk.symbol, symbol));
 
   if (!m) {
     throw new Error(`Market "${symbol}" not found on ${adapter.name}`);

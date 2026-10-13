@@ -18,7 +18,7 @@ import {
   fetchHyperliquidMetaRaw, parseHyperliquidMetaRaw,
   fetchLighterOrderBookDetailsRaw, fetchLighterFundingRatesRaw, parseLighterRaw,
 } from "../shared-api.js";
-import { scanDexArb, type DexArbPair } from "../dex-asset-map.js";
+import { fetchAllDexAssets, findDexArbPairs, scanDexArb, type DexArbPair } from "../dex-asset-map.js";
 import { logExecution, readExecutionLog } from "../execution-log.js";
 import { smartOrder } from "../smart-order.js";
 import {
@@ -95,7 +95,8 @@ import { findSpotQuoteBalance, readSpotQuoteAvailableFresh, requireBotSpotVenue,
 import { fillSizeString, readSpotBalancesFresh, sizeDecimalsOf, spotLotStepOf, spotMarketFill, type SpotFill } from "../exchanges/spot-result.js";
 import { floorSize, floorToStep, lotStepOf } from "../exchanges/precision.js";
 import { MAX_PRICE_DEVIATION_PCT } from "../exchanges/spot-interface.js";
-import { isQuarantined, quarantineEntryFor, quarantineSymbol } from "../bot/quarantine.js";
+import { isQuarantined, quarantineEntryFor, quarantineKey, quarantineSymbol, setQuarantineNetwork } from "../bot/quarantine.js";
+import { clearPendingEntry, orphanedPendingEntries, writePendingEntry } from "../arb/pending-entry.js";
 import { closePerpVerified, isOutcomeUnknown, placePerpVerified, rejectedLotSize, trimFirstLegToHedge, type PerpCloseResult, type PerpFill } from "../bot/perp-order.js";
 
 // ── Venue order minimums ──
@@ -287,6 +288,59 @@ export async function closePerpPairVerified(p: {
     return q(`long closed; close of short on ${shortExch} closed ${sc.closed} of ${shortSize}, ${sc.residual} still open${sc.note !== null ? ` (${sc.note})` : ""} — residual short unhedged`);
   }
   return { status: "closed" };
+}
+
+/**
+ * Graceful stop of a daemon loop: SIGINT / SIGTERM (`perp background stop`, Ctrl+C) only REQUEST
+ * the stop — the leg sequence (or rollback) in flight finishes, nothing new starts, then the loop
+ * ends. A repeated signal never exits between two legs (it is logged).
+ */
+export function gracefulStop(name: string): { requested: () => boolean; dispose: () => void } {
+  let stopping = false;
+  const onSignal = (sig: string) => {
+    if (stopping) {
+      console.error(chalk.yellow(`\n  ${name}: already stopping (${sig}) — finishing the current leg sequence first`));
+      return;
+    }
+    stopping = true;
+    console.error(chalk.yellow(`\n  ${name}: stop requested (${sig}) — finishing the current cycle, no new entries`));
+  };
+  const onInt = () => onSignal("SIGINT");
+  const onTerm = () => onSignal("SIGTERM");
+  process.on("SIGINT", onInt);
+  process.on("SIGTERM", onTerm);
+  return {
+    requested: () => stopping,
+    dispose: () => { process.removeListener("SIGINT", onInt); process.removeListener("SIGTERM", onTerm); },
+  };
+}
+
+/** Sleep `ms`, waking within 250 ms once `stop()` is true. */
+export async function interruptibleSleep(ms: number, stop: () => boolean): Promise<void> {
+  const until = Date.now() + ms;
+  while (!stop() && Date.now() < until) await new Promise(r => setTimeout(r, Math.min(250, until - Date.now())));
+}
+
+/**
+ * Startup: pending-entry records `source` left behind by a process that died mid-entry → the
+ * symbol is quarantined (legs may be open), then the record is cleared. An unreadable pending
+ * file throws (the daemon does not start on unknown exposure).
+ */
+export function quarantineOrphanedEntries(network: Network, source: string, log: (m: string) => void): void {
+  for (const e of orphanedPendingEntries(network, source)) {
+    quarantinePair(source, e.symbol, e.longExchange, e.shortExchange,
+      `an entry (${e.size} per leg, started ${e.startedAt} by pid ${e.pid}) was in flight when that daemon stopped — legs may be open`, log);
+    clearPendingEntry(network, source, e.symbol);
+  }
+}
+
+/** The entry's outcome is recorded: drop its pending record (a failed drop is logged — the next start quarantines it). */
+export function finishPendingEntry(network: Network, source: string, symbol: string, log: (m: string) => void): void {
+  try {
+    clearPendingEntry(network, source, symbol);
+  } catch (e) {
+    log(`  CRITICAL: could not clear the pending-entry record of ${symbol} (${e instanceof Error ? e.message : String(e)}) — the next daemon start will quarantine ${symbol}`);
+  }
 }
 
 /** Consecutive definite close failures before the daemons quarantine a pair. */
@@ -593,6 +647,8 @@ export function registerArbAutoCommands(
 ) {
   const arb = program.commands.find(c => c.name() === "arb");
   if (!arb) return;
+  // Quarantine checks / entries of every arb command are scoped to its -n network.
+  arb.hook("preAction", (_cmd, action) => setQuarantineNetwork(networkOf(action)));
 
   // ── arb auto ── (daemon mode)
 
@@ -794,19 +850,14 @@ export function registerArbAutoCommands(
         st.save(daemonState);
       }
 
-      // SIGINT handler: clean up interval and save final state before exit
-      let cycleInterval: ReturnType<typeof setInterval> | null = null;
-      const handleSigint = () => {
-        if (cycleInterval) clearInterval(cycleInterval);
-        const finalState = st.load();
-        if (finalState) {
-          finalState.lastScanTime = new Date().toISOString();
-          st.save(finalState);
-        }
-        if (!isJson()) console.log(chalk.yellow("\n  Daemon stopped. State saved.\n"));
-        process.exit(0);
-      };
-      process.on("SIGINT", handleSigint);
+      // A previous daemon that died between two legs (crash / kill) left its pending-entry
+      // record: what is open is unknown → quarantine the symbol (never re-entered blind).
+      if (!dryRun) quarantineOrphanedEntries(networkOf(program), "arb-auto", (m) => console.log(chalk.red(m)));
+
+      // Graceful stop (SIGINT / SIGTERM — `perp background stop`): the current cycle finishes the
+      // leg sequence (or rollback) it is in, starts nothing new, then the state is saved and the
+      // daemon exits. Never an exit between two legs.
+      const stop = gracefulStop("arb auto");
 
 
       if (!isJson()) {
@@ -887,6 +938,7 @@ export function registerArbAutoCommands(
 
           // Check for close conditions on open positions
           for (let i = openPositions.length - 1; i >= 0; i--) {
+            if (stop.requested()) break; // stopping: no new close sequence
             const pos = openPositions[i];
             // Quarantined (design §12.3): hands off until a human clears it.
             if (isQuarantined(pos.symbol, (m) => console.log(chalk.red(m)))) continue;
@@ -1138,6 +1190,7 @@ export function registerArbAutoCommands(
           }
           if (openPositions.length < maxPositions) {
             for (const snap of filtered) {
+              if (stop.requested()) { console.log(chalk.yellow(`  ${now} STOP requested — no new entries`)); break; }
               if (openPositions.some(p => p.symbol === snap.symbol)) { skip(snap.symbol, "already open"); continue; }
               // Global quarantine (design §12.3): unknown / unhedged outcome on this symbol somewhere.
               if (isQuarantined(snap.symbol, (m) => console.log(chalk.red(m)))) { skip(snap.symbol, "quarantined"); continue; }
@@ -1254,17 +1307,29 @@ export function registerArbAutoCommands(
               let openedSize = sizeInAsset;
 
               if (!dryRun) {
+                // Pending-entry record BEFORE the first leg (crash between legs → quarantine at the next start).
+                const net = networkOf(program);
+                try {
+                  writePendingEntry(net, { source: "arb-auto", symbol: snap.symbol, longExchange, shortExchange, size: sizeInAsset });
+                } catch (e) {
+                  console.error(chalk.red(`  ${now} SKIP ${snap.symbol}: could not record the pending entry (${e instanceof Error ? e.message : String(e)}) — nothing sent`));
+                  continue;
+                }
+                const donePending = () => finishPendingEntry(net, "arb-auto", snap.symbol, (m) => console.error(chalk.red(m)));
+                let legsStarted = false;
                 try {
                   const longAdapter = await getAdapterForExchange(longExchange);
                   const shortAdapter = await getAdapterForExchange(shortExchange);
 
                   // Sequential verified legs (design §12.3): long, then short sized to the
                   // long's verified fill; reduce-only rollback / trim; unknown → quarantine.
+                  legsStarted = true;
                   const res = await openPerpPairVerified({
                     source: "arb-auto", sym: snap.symbol,
                     longAdapter, longExch: longExchange, longSym: snap.symbol, shortAdapter, shortExch: shortExchange, shortSym: snap.symbol,
                     size: sizeInAsset, smart: false, log: (m) => console.log(chalk.red(m)),
                   });
+                  legsStarted = false; // outcome known (opened / not opened / quarantined)
 
                   if (res.status === "opened") {
                     openedSize = res.hedged;
@@ -1278,20 +1343,29 @@ export function registerArbAutoCommands(
 
                     // Persist to state file immediately (crash-safe) — the verified hedged size.
                     const entryTime = new Date().toISOString();
-                    st.add({
-                      id: `${snap.symbol}-${Date.now()}`,
-                      symbol: snap.symbol,
-                      longExchange,
-                      shortExchange,
-                      longSize: parseFloat(res.hedged),
-                      shortSize: parseFloat(res.hedged),
-                      entryTime,
-                      entrySpread: grossSpread,
-                      entryLongPrice: snap.markPrice,
-                      entryShortPrice: snap.markPrice,
-                      accumulatedFunding: 0,
-                      lastCheckTime: entryTime,
-                    });
+                    try {
+                      st.add({
+                        id: `${snap.symbol}-${Date.now()}`,
+                        symbol: snap.symbol,
+                        longExchange,
+                        shortExchange,
+                        longSize: parseFloat(res.hedged),
+                        shortSize: parseFloat(res.hedged),
+                        entryTime,
+                        entrySpread: grossSpread,
+                        entryLongPrice: snap.markPrice,
+                        entryShortPrice: snap.markPrice,
+                        accumulatedFunding: 0,
+                        lastCheckTime: entryTime,
+                      });
+                    } catch (e) {
+                      // A hedged pair the state cannot record (write failed / conflicting entry): never
+                      // left as silent exposure — quarantined with what is open.
+                      quarantinePair("arb-auto", snap.symbol, longExchange, shortExchange,
+                        `entry opened (long ${res.hedged} on ${longExchange} / short ${res.hedged} on ${shortExchange}) but the arb state could not record it: ${e instanceof Error ? e.message : String(e)}`,
+                        (m) => console.log(chalk.red(m)));
+                    }
+                    donePending();
 
                     await notifyIfEnabled(webhookUrl, notifyEvents, "entry", {
                       symbol: snap.symbol, longExchange, shortExchange,
@@ -1306,8 +1380,10 @@ export function registerArbAutoCommands(
                       meta: { longExchange, shortExchange, grossSpread, netSpread },
                     });
                     console.error(chalk.red(`  ${now} ENTRY FAILED ${snap.symbol}: ${res.reason}${res.rolledBack !== null ? ` — rolled back long ${res.rolledBack}; no open exposure` : " — nothing opened"}`));
+                    donePending();
                     continue;
                   } else {
+                    donePending(); // quarantined (persisted) by openPerpPairVerified
                     logExecution({
                       type: "arb_entry", exchange: `${longExchange}+${shortExchange}`,
                       symbol: snap.symbol, side: "entry", size: sizeInAsset,
@@ -1333,6 +1409,12 @@ export function registerArbAutoCommands(
                     error: err instanceof Error ? err.message : String(err),
                     meta: { longExchange, shortExchange, grossSpread, netSpread },
                   });
+                  if (legsStarted) {
+                    // Threw inside the leg sequence: what is open is unknown → quarantine (never retried).
+                    quarantinePair("arb-auto", snap.symbol, longExchange, shortExchange,
+                      `entry threw mid-sequence (${err instanceof Error ? err.message : String(err)}) — legs may be open`, (m) => console.log(chalk.red(m)));
+                  }
+                  donePending();
                   console.error(chalk.red(`  ${now} ENTRY FAILED ${snap.symbol}: ${err instanceof Error ? err.message : err}`));
                   continue;
                 }
@@ -1415,9 +1497,19 @@ export function registerArbAutoCommands(
         }
       };
 
-      await cycle();
-      cycleInterval = setInterval(cycle, intervalMs);
-      await new Promise(() => {}); // keep alive
+      // Serialized cycles (never overlapping): the next starts only after this one finished.
+      while (!stop.requested()) {
+        await cycle();
+        await interruptibleSleep(intervalMs, stop.requested);
+      }
+      const finalState = st.load();
+      if (finalState) {
+        finalState.lastScanTime = new Date().toISOString();
+        st.save(finalState);
+      }
+      stop.dispose();
+      if (!isJson()) console.log(chalk.yellow("\n  Daemon stopped (current cycle finished). State saved.\n"));
+      process.exit(0);
     });
 
   // ── arb scan ── (one-shot spread scan)
@@ -1441,7 +1533,6 @@ export function registerArbAutoCommands(
     .option("--symbols <list>", "Comma-separated list of symbols")
     .option("--all", "Include all symbols (not just top)")
     .option("--hours <n>", "Hours of history to show", "24")
-    .option("--exchange <ex>", "Filter by exchange")
     .option("--max-gap <pct>", "Max price gap % (hip3 mode)")
     .option("--include-native", "Include native HL perps (hip3 mode)", true)
     .option("--no-include-native", "Exclude native HL perps (hip3 mode)")
@@ -1460,7 +1551,7 @@ export function registerArbAutoCommands(
       rates?: boolean; basis?: boolean | string; hip3?: boolean; compare?: string;
       history?: boolean | string; positions?: boolean;
       symbol?: string; symbols?: string; all?: boolean;
-      hours: string; exchange?: string; maxGap?: string; includeNative: boolean;
+      hours: string; maxGap?: string; includeNative: boolean;
       gaps?: boolean; live?: boolean; track?: boolean; alert?: string;
       interval: string; duration: string; beep?: boolean; checkLiquidity?: boolean;
     }) => {
@@ -1640,8 +1731,11 @@ export function registerArbAutoCommands(
       if (opts.rates) return handleRates(isJson, { symbol: opts.symbol, symbols: opts.symbols, all: opts.all, minSpread: opts.min, top: opts.top, includeUnverified: opts.includeUnverified === true });
       if (opts.basis) return handleBasisScan(isJson, { minBasis: opts.min, symbol: typeof opts.basis === "string" ? opts.basis : opts.symbol });
       if (opts.hip3) return handleDexScan(isJson, { minSpread: opts.min, maxGap: opts.maxGap || "5", includeNative: opts.includeNative !== false, top: opts.top || "20" });
-      if (opts.history) return handleFundingHistory(isJson, { symbol: (typeof opts.history === "string" ? opts.history : opts.symbol) || "ETH", hours: opts.hours || "24", exchange: opts.exchange });
-      if (opts.positions) return handleFundingPositions(isJson, getAdapterForExchange, { exchanges: opts.exchange });
+      // The exchange filter (--history / --positions) is the ROOT -e/--exchange (commander gives it
+      // to the root program): used only when passed on the command line, never the root default venue.
+      const exchangeFilter = program.getOptionValueSource("exchange") === "cli" ? String(program.opts().exchange) : undefined;
+      if (opts.history) return handleFundingHistory(isJson, { symbol: (typeof opts.history === "string" ? opts.history : opts.symbol) || "ETH", hours: opts.hours || "24", exchange: exchangeFilter });
+      if (opts.positions) return handleFundingPositions(isJson, getAdapterForExchange, { exchanges: exchangeFilter });
       // Default: existing scan logic continues below
       const minSpread = parseFloat(opts.min);
       const holdDays = parseFloat(opts.holdDays);
@@ -2983,6 +3077,68 @@ export function registerArbAutoCommands(
         const openPositions: DexArbPosition[] = [];
         // Consecutive definite close failures per underlying (quarantined at MAX_PAIR_CLOSE_FAILURES)
         const dexCloseFailures = new Map<string, number>();
+        const net = networkOf(program);
+        const qlog = (m: string) => console.error(chalk.red(m));
+
+        if (!dryRun) {
+          // A previous daemon that died between two legs → quarantine (legs may be open).
+          quarantineOrphanedEntries(net, "arb-dex-auto", qlog);
+          // Positions live only in memory: a restart re-reads what is held on the dexes, so a
+          // held underlying is managed (closed when the spread converges), never re-entered.
+          // Unpaired / size-mismatched legs are quarantined. An unreadable dex → not started.
+          const assets = await fetchAllDexAssets();
+          const pairsNow = findDexArbPairs(assets, { minAnnualSpread: 0, includeNative: true });
+          const legs = new Map<string, { dex: string; raw: string; base: string; side: string; size: number; sizeStr: string; underlying: string }>();
+          for (const dex of [...new Set(assets.map(a => a.dex))]) {
+            let list: Awaited<ReturnType<ExchangeAdapter["getPositions"]>>;
+            try {
+              list = await (await getHLAdapterForDex(dex)).getPositions();
+            } catch (e) {
+              throw new PerpError("EXCHANGE_ERROR", `arb auto --hip3: ${dex} positions unreadable at start (${e instanceof Error ? e.message : String(e)}) — not started (held pairs unknown)`, {
+                exchange: "hyperliquid", remediation: `Check connectivity (perp -e hyperliquid account positions), then restart`,
+              });
+            }
+            for (const p of list) {
+              const size = Math.abs(Number(p.size));
+              if (!(size > 0)) continue;
+              const raw = p.symbol.toUpperCase();
+              const asset = assets.find(a => a.dex === dex && (a.raw.toUpperCase() === raw || (dex === "hl" && a.base.toUpperCase() === raw)))
+                ?? assets.find(a => a.raw.toUpperCase() === raw);
+              const assetRaw = asset?.raw ?? p.symbol;
+              const pairOf = pairsNow.find(x => x.long.raw === assetRaw || x.short.raw === assetRaw);
+              // One entry per venue symbol (a native read that also lists HIP-3 positions is not counted twice).
+              legs.set(assetRaw.toUpperCase(), {
+                dex: asset?.dex ?? dex, raw: assetRaw, base: asset?.base ?? raw, side: p.side, size, sizeStr: p.size.replace(/^-/, ""),
+                underlying: pairOf?.underlying ?? quarantineKey(asset?.base ?? raw),
+              });
+            }
+          }
+          const all = [...legs.values()];
+          const used = new Set<(typeof all)[number]>();
+          for (const l of all) {
+            if (l.side !== "long" || used.has(l)) continue;
+            const sh = all.find(x => !used.has(x) && x.side === "short" && x.underlying === l.underlying && x.dex !== l.dex && x.size === l.size);
+            if (sh === undefined) continue;
+            used.add(l); used.add(sh);
+            openPositions.push({ underlying: l.underlying, longDex: l.dex, longSymbol: l.raw, shortDex: sh.dex, shortSymbol: sh.raw, size: l.sizeStr, entrySpread: 0, entryTime: new Date().toISOString(), longPrice: 0, shortPrice: 0 });
+          }
+          const leftover = new Map<string, (typeof all)[number][]>();
+          for (const l of all) if (!used.has(l)) leftover.set(l.underlying, [...(leftover.get(l.underlying) ?? []), l]);
+          for (const [u, group] of leftover) {
+            if (isQuarantined(u, qlog)) continue;
+            const desc = group.map(l => `${l.side} ${l.sizeStr} ${l.raw}`).join(", ");
+            const mismatched = group.some(l => l.side === "long") && group.some(l => l.side === "short");
+            quarantineSymbol("arb-dex-auto", u,
+              mismatched ? `recovery: ${u} long/short sizes do not match (${desc}) — not tracked as a pair` : `recovery: unpaired ${u} leg (${desc}) — no hedge found, not tracked`,
+              `Check ${u} on Hyperliquid (perp -e hyperliquid account positions; every HIP-3 dex); close or re-hedge by hand, then: perp strategy quarantine-clear ${u}`, qlog);
+          }
+          if (openPositions.length > 0 && !isJson()) {
+            console.log(chalk.yellow(`  Recovered ${openPositions.length} pair(s) from the dexes: ${openPositions.map(p => `${p.underlying} ${p.longDex}/${p.shortDex} ${p.size}`).join(", ")}`));
+          }
+        }
+
+        // Graceful stop: the leg sequence in flight finishes, nothing new starts, then exit.
+        const stop = gracefulStop("arb auto --hip3");
 
         if (!isJson()) {
           console.log(chalk.cyan.bold("\n  HIP-3 Cross-Dex Arb Bot\n"));
@@ -3008,6 +3164,7 @@ export function registerArbAutoCommands(
 
             // Check close conditions
             for (let i = openPositions.length - 1; i >= 0; i--) {
+              if (stop.requested()) break; // stopping: no new close sequence
               const pos = openPositions[i];
               // Find current pair for this position
               const current = pairs.find(p =>
@@ -3085,6 +3242,7 @@ export function registerArbAutoCommands(
             // Check entry conditions
             if (openPositions.length < maxPositions) {
               for (const pair of pairs) {
+                if (stop.requested()) break; // stopping: no new entries
                 if (openPositions.some(p => p.underlying === pair.underlying)) continue;
                 if (openPositions.length >= maxPositions) break;
                 if (pair.annualSpread < minSpread) continue;
@@ -3111,17 +3269,28 @@ export function registerArbAutoCommands(
 
                 let openedSize = size;
                 if (!dryRun) {
+                  // Pending-entry record BEFORE the first leg (crash between legs → quarantine at the next start).
+                  try {
+                    writePendingEntry(net, { source: "arb-dex-auto", symbol: pair.underlying, longExchange: pair.long.dex, shortExchange: pair.short.dex, size });
+                  } catch (e) {
+                    if (!isJson()) console.error(chalk.red(`  ${now} SKIP ${pair.underlying}: could not record the pending entry (${e instanceof Error ? e.message : String(e)}) — nothing sent`));
+                    continue;
+                  }
+                  let legsStarted = false;
                   try {
                     const longAdapter = await getHLAdapterForDex!(pair.long.dex);
                     const shortAdapter = await getHLAdapterForDex!(pair.short.dex);
                     // Sequential verified legs; reduce-only rollback / trim; unknown → quarantine.
+                    legsStarted = true;
                     const res = await openPerpPairVerified({
                       source: "arb-dex-auto", sym: pair.underlying,
                       longAdapter, longExch: pair.long.dex, longSym: pair.long.raw,
                       shortAdapter, shortExch: pair.short.dex, shortSym: pair.short.raw,
                       size, smart: false, log: (m) => console.error(chalk.red(m)),
                     });
+                    legsStarted = false; // outcome known
                     if (res.status !== "opened") {
+                      finishPendingEntry(net, "arb-dex-auto", pair.underlying, qlog);
                       const error = res.status === "quarantined"
                         ? `QUARANTINED: ${res.reason} (possible exposure: ${res.exposure})`
                         : `${res.reason}${res.rolledBack !== null ? ` — long ${res.rolledBack} rolled back` : ""}`;
@@ -3135,6 +3304,8 @@ export function registerArbAutoCommands(
                       continue;
                     }
                     openedSize = res.hedged;
+                    // Tracked in memory below (synchronously, before anything else can throw); a restart recovers it from the dexes.
+                    finishPendingEntry(net, "arb-dex-auto", pair.underlying, qlog);
                     logExecution({
                       type: "arb_entry", exchange: `${pair.long.dex}+${pair.short.dex}`,
                       symbol: pair.underlying, side: "entry", size: res.hedged,
@@ -3150,7 +3321,13 @@ export function registerArbAutoCommands(
                       error: err instanceof Error ? err.message : String(err),
                       meta: { longDex: pair.long.dex, shortDex: pair.short.dex, spread: pair.annualSpread },
                     });
-                    if (!isJson()) console.error(chalk.red(`  ${now} ENTRY FAILED ${pair.underlying}: ${err instanceof Error ? err.message : err} (nothing sent)`));
+                    if (legsStarted) {
+                      // Threw inside the leg sequence: what is open is unknown → quarantine (never retried).
+                      quarantinePair("arb-dex-auto", pair.underlying, pair.long.dex, pair.short.dex,
+                        `entry threw mid-sequence (${err instanceof Error ? err.message : String(err)}) — legs may be open`, qlog);
+                    }
+                    finishPendingEntry(net, "arb-dex-auto", pair.underlying, qlog);
+                    if (!isJson()) console.error(chalk.red(`  ${now} ENTRY FAILED ${pair.underlying}: ${err instanceof Error ? err.message : err}${legsStarted ? " (quarantined)" : " (nothing sent)"}`));
                     continue;
                   }
                 }
@@ -3190,9 +3367,14 @@ export function registerArbAutoCommands(
           }
         };
 
-        await cycle();
-        setInterval(cycle, intervalMs);
-        await new Promise(() => {}); // keep alive
+        // Serialized cycles (never overlapping): the next starts only after this one finished.
+        while (!stop.requested()) {
+          await cycle();
+          await interruptibleSleep(intervalMs, stop.requested);
+        }
+        stop.dispose();
+        if (!isJson()) console.log(chalk.yellow(`\n  HIP-3 daemon stopped (current cycle finished). ${openPositions.length} pair(s) left open: ${openPositions.map(p => `${p.underlying} ${p.longDex}/${p.shortDex}`).join(", ") || "none"}\n`));
+        process.exit(0);
   }
 
   // Expose inner handlers for external use

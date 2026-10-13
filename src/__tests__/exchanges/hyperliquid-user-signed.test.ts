@@ -65,7 +65,7 @@ function sigEq(sig: unknown, want: { r: string; s: string; v: number }) {
 }
 
 describe("user-signed actions — master EIP-712, exact payloads", () => {
-  it("withdraw → withdraw3 {action, nonce, signature} with python-SDK signature, no vaultAddress", async () => {
+  it("withdraw → CCTP sendToEvmWithData (not withdraw3): exact action, master signature, no vaultAddress", async () => {
     const hl = await masterAdapter();
     nowAt(1687816341423);
     await hl.withdraw("1", DEST);
@@ -74,12 +74,28 @@ describe("user-signed actions — master EIP-712, exact payloads", () => {
     const { body } = posted[0];
     expect(Object.keys(body).sort()).toEqual(["action", "nonce", "signature"]);
     expect(body.nonce).toBe(1687816341423);
-    expect(body.action).toEqual({ type: "withdraw3", signatureChainId: "0x66eee", hyperliquidChain: "Testnet", destination: DEST, amount: "1", time: 1687816341423 });
-    sigEq(body.signature, {
-      r: "0x8363524c799e90ce9bc41022f7c39b4e9bdba786e5f9c72b20e43e1462c37cf9",
-      s: "0x58b1411a775938b83e29182e8ef74975f9054c8e97ebf5ec2dc8d51bfc893881",
-      v: 28,
+    // Circle "Withdraw USDC from HyperCore to EVM chains": token USDC, sourceDex "" (perp balance of a
+    // standard account), hex address, CCTP domain 3 (Arbitrum, the default), gasLimit 200000, data "0x".
+    expect(body.action).toEqual({
+      type: "sendToEvmWithData", signatureChainId: "0x66eee", hyperliquidChain: "Testnet",
+      token: "USDC", amount: "1", sourceDex: "", destinationRecipient: DEST, addressEncoding: "hex",
+      destinationChainId: 3, gasLimit: 200000, data: "0x", nonce: 1687816341423,
     });
+    const { verifyTypedData, Wallet } = await import("ethers");
+    const { hlUserSignedTypedData } = await import("../../exchanges/hl-signing.js");
+    const { domain, types, message } = hlUserSignedTypedData(body.action as Record<string, unknown>);
+    const sig = body.signature as { r: string; s: string; v: number };
+    expect(verifyTypedData(domain, types, message, { r: sig.r, s: sig.s, v: sig.v })).toBe(new Wallet(KEY).address);
+  });
+
+  it("withdraw: unified account → sourceDex spot; --chain base → domain 6; Arbitrum amount ≤ 0.2 forwarding fee refused before sending", async () => {
+    const hl = await masterAdapter();
+    hl.isUnifiedAccount = true;
+    nowAt(1700000000000);
+    await hl.withdraw("5", DEST, { chain: "base" });
+    expect(posted[0].body.action).toMatchObject({ type: "sendToEvmWithData", sourceDex: "spot", destinationChainId: 6, amount: "5" });
+    await expect(hl.withdraw("0.2", DEST)).rejects.toMatchObject({ structured: { code: "SIZE_TOO_SMALL" } });
+    expect(posted).toHaveLength(1);
   });
 
   it("usdTransfer → usdSend (python-SDK vector)", async () => {

@@ -146,21 +146,8 @@ describe("Bridge Integration — Read-Only", { timeout: 60000 }, () => {
   // ══════════════════════════════════════════════════════════
 
   describe("deBridge DLN quotes (sequential, rate-limit aware)", () => {
-    it("solana → arbitrum: valid quote with fee breakdown", async () => {
-      const quote = await getDebridgeQuote("solana", "arbitrum", 100, DUMMY_SOLANA, DUMMY_EVM);
-
-      expect(quote.provider).toBe("debridge");
-      expect(quote.srcChain).toBe("solana");
-      expect(quote.dstChain).toBe("arbitrum");
-      expect(quote.amountIn).toBe(100);
-      expect(quote.amountOut).toBeGreaterThan(0);
-      expect(quote.amountOut).toBeLessThanOrEqual(100);
-      expect(quote.fee).toBeGreaterThanOrEqual(0);
-      expect(quote.fee).toBeLessThan(10); // < 10% for $100
-      expect(quote.estimatedTime).toBeGreaterThan(0);
-      expect(quote.raw).toBeDefined();
-      // Verify fee = amountIn - amountOut
-      expect(Math.abs(quote.fee - (quote.amountIn - quote.amountOut))).toBeLessThan(0.001);
+    it("solana → arbitrum: refused (Solana-origin deBridge transactions cannot be verified locally) — NO_BRIDGE_ROUTE, no quote call", async () => {
+      await expect(getDebridgeQuote("solana", "arbitrum", 100, DUMMY_SOLANA, DUMMY_EVM)).rejects.toMatchObject({ structured: { code: "NO_BRIDGE_ROUTE" } });
     });
 
     it("arbitrum → solana: reverse route works", async () => {

@@ -90,7 +90,6 @@ describe("HL modifyOrder surfaces per-order rejections", () => {
     const adapter = Object.create(mod.HyperliquidAdapter.prototype);
     adapter.getAssetIndex = vi.fn().mockResolvedValue(1);
     adapter.getSzDecimals = vi.fn().mockReturnValue(2);
-    adapter._hlRoundPrice = (n: number) => String(n);
     adapter._signAndSendAction = vi.fn().mockResolvedValue(sendResult);
     return adapter;
   };
@@ -324,7 +323,6 @@ describe("HL per-entry acknowledgement is validated on every action path", () =>
     adapter.ensureSigner = vi.fn();
     adapter.getAssetIndex = vi.fn().mockResolvedValue(1);
     adapter.getSzDecimals = vi.fn().mockReturnValue(2);
-    adapter._hlRoundPrice = (n: number) => String(n);
     adapter._invalidateAccountCache = vi.fn();
     adapter._signAndSendAction = vi.fn().mockResolvedValue(sendResult);
     return adapter;

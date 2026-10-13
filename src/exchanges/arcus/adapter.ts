@@ -786,7 +786,15 @@ export class ArcusAdapter implements ExchangeAdapter, TradingV2 {
     if (req.tif !== null && toArcusTif(this.venue, req.tif) !== tif) {
       throw unsupported(this.venue.displayName, "amendTimeInForce", `modify keeps the resting order's time-in-force (${tif}); got ${req.tif}`, "Omit --tif, or cancel and place a new order with the other time-in-force");
     }
-    const reduceOnly = o.reduceOnly === true;
+    // The modify re-signs reduce-only: a read-back without a boolean reduceOnly would silently
+    // turn a reduce-only order into one that can open / flip a position (r=0). Refuse.
+    if (typeof o.reduceOnly !== "boolean") {
+      throw new PerpError("EXCHANGE_ERROR", `Arcus order ${o.orderId} read-back has no reduceOnly flag (got ${JSON.stringify(o.reduceOnly ?? null)}); refusing to modify`, {
+        exchange: "arcus", venueRaw: o,
+        remediation: `Cancel it (perp trade cancel ${req.symbol} ${o.orderId} -e arcus) and place a new order`,
+      });
+    }
+    const reduceOnly = o.reduceOnly;
     const gUs = BigInt(o.goodTilTime);
     const priceTicks = this.limitTicks(m, req.price);
     const resting = tif === "GTT" || tif === "ALO";

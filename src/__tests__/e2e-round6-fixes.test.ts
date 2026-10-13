@@ -85,11 +85,11 @@ describe("Hyperliquid user-signed action refused by the venue → ACTION_REJECTE
     return hl;
   }
 
-  it("withdraw3 → {status:err, response:'Error withdrawing from bridge'} (live testnet) → ACTION_REJECTED, non-retryable", async () => {
+  it("withdraw (CCTP sendToEvmWithData) → {status:err, …} → ACTION_REJECTED, non-retryable", async () => {
     respond({ status: "err", response: "Error withdrawing from bridge" });
     const err = await (await master()).withdraw("2", DEST).then(() => null, (e: unknown) => e);
     expect(err).toBeInstanceOf(PerpError);
-    expect((err as PerpError).structured).toMatchObject({ code: "ACTION_REJECTED", retryable: false, details: { action: "withdraw3", venueResponse: "Error withdrawing from bridge" } });
+    expect((err as PerpError).structured).toMatchObject({ code: "ACTION_REJECTED", retryable: false, details: { action: "sendToEvmWithData", venueResponse: "Error withdrawing from bridge" } });
     expect(ERROR_CODES.ACTION_REJECTED.retryable).toBe(false);
     expect(DEFINITE_REJECTION_CODES.has("ACTION_REJECTED")).toBe(true);
   });

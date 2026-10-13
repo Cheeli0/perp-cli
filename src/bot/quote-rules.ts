@@ -53,6 +53,16 @@ export function prepareLimitQuote(rules: QuoteRules, venue: string, symbol: stri
   return { price: px, size: sz };
 }
 
+/**
+ * A COMPUTED limit price aligned to the venue's own price grid when the venue publishes no tick
+ * (Hyperliquid: 5 significant figures / szDecimals rule, `alignComputedPrice`), passively for
+ * `side` (buy ↓, sell ↑). Venues with a tick are already aligned by the callers; returned as is.
+ */
+export async function alignComputedLimitPrice(adapter: ExchangeAdapter, symbol: string, side: "buy" | "sell", price: string): Promise<string> {
+  const a = adapter as ExchangeAdapter & { alignComputedPrice?: (symbol: string, side: "buy" | "sell", price: string) => Promise<string> };
+  return typeof a.alignComputedPrice === "function" ? a.alignComputedPrice(symbol, side, price) : price;
+}
+
 /** Market order size floored to the lot; the minimum order value is checked against `refPrice` (null = size minimum only). */
 export function prepareMarketSize(rules: QuoteRules, venue: string, symbol: string, size: string, refPrice: number | null): string {
   const sz = floorSize(plain(size, "size"), rules.stepSize);

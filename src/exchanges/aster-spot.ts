@@ -34,7 +34,7 @@ import type {
 import type { ResolvedSlippage } from "./slippage.js";
 import { unsupported } from "./trading-v2.js";
 import { asterIocOutcome, type AsterAdapter } from "./aster.js";
-import { PerpError, isTransportFailure, orderNotSent } from "../errors.js";
+import { PerpError, isTransportFailure, orderNotSent, orderOutcomeUnknown, sendFailure, unknownActionRemediation } from "../errors.js";
 import { alignProtectionPrice, exactUnits, floorSize, requireOnTick, requirePositive, slippagePrice, subDecimal } from "./precision.js";
 
 /** Default quote for a bare base symbol (= venue spot quoteAssets[0]). */
@@ -411,16 +411,35 @@ export class AsterSpotAdapter implements SpotAdapter, SpotTransferCapable, SpotO
         remediation: SPOT_REMEDIATION,
       });
     }
-    const res = await this._signed("POST", "/api/v3/asset/wallet/transfer", {
-      amount,
-      asset: asset.toUpperCase(),
-      clientTranId: `perpcli${Date.now()}${++this._tranCounter}`,
-      kindType,
-    }) as { tranId?: unknown; status?: unknown };
+    const clientTranId = `perpcli${Date.now()}${++this._tranCounter}`;
+    const what = `wallet transfer ${kindType} ${amount} ${asset.toUpperCase()}`;
+    const remediation = `${unknownActionRemediation("aster", "transfer")} (perp -e aster spot balance / portfolio); clientTranId ${clientTranId}`;
+    let res: { tranId?: unknown; status?: unknown };
+    try {
+      res = await this._signed("POST", "/api/v3/asset/wallet/transfer", {
+        amount,
+        asset: asset.toUpperCase(),
+        clientTranId,
+        kindType,
+      }) as { tranId?: unknown; status?: unknown };
+    } catch (e) {
+      // Same contract as _submitOrder: once signed and sent, a 5xx, an unreadable 2xx body or a
+      // transport failure (socket reset, timeout) leaves the transfer's outcome unknown →
+      // ORDER_PENDING (never resubmit). No connection at all → not sent; 4xx / venue error
+      // envelopes are definite refusals.
+      const d = e instanceof PerpError ? e.structured.details : undefined;
+      const http = typeof d?.httpStatus === "number" ? d.httpStatus : null;
+      if (d?.responseUnreadable === true || (http !== null && http >= 500)) throw orderOutcomeUnknown("aster", what, e, remediation);
+      if (isTransportFailure(e)) throw sendFailure("aster", what, e, remediation);
+      if (e instanceof PerpError && e.structured.code === "EXCHANGE_ERROR" && http !== null && http >= 400 && http < 500) {
+        throw new PerpError("ACTION_REJECTED", `Aster ${what} refused (nothing was transferred): ${e.message}`, { exchange: "aster", httpStatus: http, venueCode: d?.venueCode });
+      }
+      throw e;
+    }
+    // A completed transfer answers {"tranId": …, "status": "SUCCESS"}. No other status value is
+    // known to be a definite failure, so anything else after an accepted request is unknown.
     if (res.status !== "SUCCESS") {
-      throw new PerpError("EXCHANGE_ERROR", `Aster wallet transfer ${kindType} not successful: ${JSON.stringify(res).slice(0, 200)}`, {
-        exchange: "aster",
-      });
+      throw orderOutcomeUnknown("aster", what, new Error(`venue status ${JSON.stringify(res.status ?? null)} (not "SUCCESS"): ${JSON.stringify(res).slice(0, 200)}`), remediation);
     }
     return res;
   }

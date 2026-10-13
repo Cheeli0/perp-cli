@@ -10,7 +10,12 @@
  * Adapters are created lazily from the registered agent / OWS wallet / settings (no CLI flags).
  */
 
-import "dotenv/config";
+// SSOT Rule #3: load only ~/.perp/.env, like the CLI (src/index.ts) — never a .env in the CWD
+// (a project tree's leftover dev keys would silently become this server's credentials).
+import { setQuarantineNetwork } from "./bot/quarantine.js";
+import { config as loadDotenv } from "dotenv";
+import { resolve as resolvePath } from "node:path";
+loadDotenv({ path: resolvePath(process.env.HOME || "~", ".perp", ".env") });
 import { registerAdapterNetwork } from "./exchanges/adapter-network.js";
 import { builderPlanFor } from "./exchanges/builder-fee.js";
 import { resolveAdapterSlippage } from "./exchanges/slippage.js";
@@ -30,7 +35,7 @@ import { closePerpVerified, isOutcomeUnknown } from "./bot/perp-order.js";
 import { quarantineSymbol } from "./bot/quarantine.js";
 import { fillSizeString, sizeDecimalsOf } from "./exchanges/spot-result.js";
 import { tradingV2Of } from "./exchanges/legacy-trading-v2.js";
-import { PerpError, classifyError, extractErrorMessage, isDefiniteOrderFailure, orderOutcomeUnknown } from "./errors.js";
+import { PerpError, classifyError, extractErrorMessage, isDefiniteOrderFailure, orderOutcomeUnknown, parsePositiveDecimal } from "./errors.js";
 import { invalidateCache } from "./cache.js";
 import {
   pingPacifica,
@@ -51,6 +56,8 @@ import { logClientId } from "./client-id-tracker.js";
  * every result's meta.network.
  */
 const MCP_NETWORK = resolveMcpNetwork(process.env["PERP_NETWORK"]);
+// Quarantine entries are network-scoped; the MCP server trades only MCP_NETWORK.
+setQuarantineNetwork(MCP_NETWORK);
 setSharedApiNetwork(MCP_NETWORK);
 
 // ── Adapter cache & factory ──
@@ -1639,7 +1646,7 @@ server.tool(
         : side === "buy" ? bestAsk : bestBid;
 
       const notional = estPrice ? Number(estPrice) * Number(size) : 0;
-      const existingPos = positions.find(p => p.symbol.toUpperCase().includes(symbol.toUpperCase()));
+      const existingPos = positions.find(p => symbolMatch(p.symbol, symbol));
 
       // Run validation
       // SSOT rule #2: validation failure must surface as a structured invalid
@@ -1734,8 +1741,10 @@ server.tool(
     reduceOnly: z.boolean().default(false).describe("Reduce-only order (close position only)"),
     slippageBps: z.number().optional().describe("Market orders: slippage bound in bps (default: settings defaultSlippageBps)"),
   },
-  async ({ exchange, symbol, side, size, orderType, price, tif, reduceOnly, slippageBps }) => {
+  async ({ exchange, symbol, side, size: rawSize, orderType, price, tif, reduceOnly, slippageBps }) => {
     try {
+      // One parsed size for the risk gate and the order ("1,000" / "abc" refused before any read or send).
+      const size = parsePositiveDecimal(rawSize, "size");
       const adapter = await getOrCreateAdapter(exchange);
       const def = getVenue(adapter.name);
       const caps = requireCapabilities(def);

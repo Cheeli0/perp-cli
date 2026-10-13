@@ -21,9 +21,9 @@ import chalk from "chalk";
 import { listVenues } from "./exchanges/venue.js";
 import { PerpError } from "./errors.js";
 import { loadSettings } from "./settings.js";
-import { jsonError } from "./utils.js";
+import { jsonError, jsonOk, printCliError, printJson } from "./utils.js";
 import { LANDING_EXCHANGES, asterAgentMissing as getAsterAgentMissing, renderLandingExchangeLine, type LandingExchangeStatus } from "./landing.js";
-import { buildProgram } from "./cli-program.js";
+import { buildProgram, landingData, numericNetworkFlagError } from "./cli-program.js";
 
 const _require = createRequire(import.meta.url);
 const _pkg = _require("../package.json") as { version: string };
@@ -55,11 +55,23 @@ const rawArgs = process.argv.slice(2);
 const _venueWords = listVenues().flatMap(v => [v.id, ...v.aliases]);
 const hasSubcommand = rawArgs.some((a) => !a.startsWith("-") && ![..._venueWords, "mainnet", "testnet"].includes(a));
 
+// `history list -n 5` (old record-count flag) → INVALID_PARAMS with the --limit migration, before
+// Commander turns it into a bare "invalid network" usage error.
+const _numericNetwork = numericNetworkFlagError(rawArgs);
+if (_numericNetwork !== null) {
+  printCliError(_numericNetwork, rawArgs.includes("--json"));
+  _origExit(1);
+}
+
 if (rawArgs.length === 0 || (!hasSubcommand && !rawArgs.includes("-h") && !rawArgs.includes("--help") && !rawArgs.includes("-V") && !rawArgs.includes("--version"))) {
   // No subcommand — show smart landing instead of help dump.
   // Parse root options first so an invalid -n (e.g. "Testnet") is a usage error here too.
   program.parseOptions(rawArgs);
-  (async () => {
+  if (isJson()) {
+    // JSON mode: one landing / usage document on stdout — no banner, no venue reads.
+    printJson(jsonOk(landingData(program, _pkg.version)));
+    setTimeout(() => _origExit(0), 100);
+  } else (async () => {
     try {
       const { getWalletSetupStatus } = await import("./commands/wallet.js");
       const status = getWalletSetupStatus();

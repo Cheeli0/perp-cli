@@ -181,10 +181,11 @@ describe("Extreme and malformed numeric values", () => {
   // BEHAVIOR CHANGE (design §13.3 validateOrderRequest / precision.floorSize, CHANGELOG
   // "Entry sizes are floored"): malformed or sub-lot sizes are now rejected by the CLI BEFORE
   // anything is sent (they used to be passed to the adapter "as-is"). Safer: assert not sent.
-  it("size = 0: rejected before sending (below the lot step)", async () => {
+  // Sizes are parsed once up front (parsePositiveDecimal): not a positive plain decimal → INVALID_PARAMS.
+  it("size = 0: rejected before sending (not positive)", async () => {
     const adapter = mockAdapter();
     const program = createTradeProgram(adapter);
-    await expect(run(program, ["trade", "market", "BTC", "buy", "0"])).rejects.toMatchObject({ structured: { code: "SIZE_TOO_SMALL" } });
+    await expect(run(program, ["trade", "market", "BTC", "buy", "0"])).rejects.toMatchObject({ structured: { code: "INVALID_PARAMS" } });
     expect(adapter.marketOrder).not.toHaveBeenCalled();
   });
 
@@ -205,14 +206,14 @@ describe("Extreme and malformed numeric values", () => {
   it("size = NaN string: rejected before sending (not a plain decimal)", async () => {
     const adapter = mockAdapter();
     const program = createTradeProgram(adapter);
-    await expect(run(program, ["trade", "market", "BTC", "buy", "NaN"])).rejects.toThrow(/Not a plain decimal number/);
+    await expect(run(program, ["trade", "market", "BTC", "buy", "NaN"])).rejects.toThrow(/size must be a positive decimal number/);
     expect(adapter.marketOrder).not.toHaveBeenCalled();
   });
 
   it("size = Infinity: rejected before sending (not a plain decimal)", async () => {
     const adapter = mockAdapter();
     const program = createTradeProgram(adapter);
-    await expect(run(program, ["trade", "market", "BTC", "buy", "Infinity"])).rejects.toThrow(/Not a plain decimal number/);
+    await expect(run(program, ["trade", "market", "BTC", "buy", "Infinity"])).rejects.toThrow(/size must be a positive decimal number/);
     expect(adapter.marketOrder).not.toHaveBeenCalled();
   });
 
@@ -238,11 +239,11 @@ describe("Extreme and malformed numeric values", () => {
     expect(adapter.limitOrder).not.toHaveBeenCalled();
   });
 
-  it("leverage = 0: doesn't crash", async () => {
+  it.each(["0", "abc", "2.5"])("leverage = %s: INVALID_PARAMS, never sent", async (lev) => {
     const adapter = mockAdapter();
     const program = createTradeProgram(adapter);
-    await run(program, ["trade", "leverage", "BTC", "0"]);
-    expect(adapter.setLeverage).toHaveBeenCalledWith("BTC", 0, "cross");
+    await expect(run(program, ["trade", "leverage", "BTC", lev])).rejects.toMatchObject({ structured: { code: "INVALID_PARAMS" } });
+    expect(adapter.setLeverage).not.toHaveBeenCalled();
   });
 
   it("leverage = 99999: passed through", async () => {

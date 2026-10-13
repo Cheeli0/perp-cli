@@ -2,13 +2,14 @@ import { Command, Option } from "commander";
 import { PerpError } from "../errors.js";
 import chalk from "chalk";
 import bs58 from "bs58";
-import { existsSync, mkdirSync, writeFileSync, readFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync } from "fs";
+import { writeKeystoreAtomic } from "../agent-wallet/venue-keystore.js";
 import { resolve } from "path";
 import { formatUsd, makeTable, printJson, jsonOk, withJsonErrors } from "../utils.js";
 import { EXCHANGE_ENV_MAP, validateKey, loadEnvFile, ENV_FILE } from "./init.js";
 import { scrubSecretEnv } from "../secret-env.js";
 import { loadSettings, saveSettings } from "../settings.js";
-import { registerWalletAgentCommands } from "./agent.js";
+import { deprecatedPassphraseOption, registerWalletAgentCommands, warnDeprecatedPassphrase } from "./agent.js";
 import { registerWalletManageCommands } from "./manage.js";
 import { registerWalletBuilderCommands } from "./builder.js";
 import { loadOws } from "../signer/ows-loader.js";
@@ -93,7 +94,8 @@ function loadStore(): WalletStore {
 
 function saveStore(store: WalletStore) {
   ensurePerpDir();
-  writeFileSync(WALLETS_FILE, JSON.stringify(store, null, 2), { mode: 0o600 });
+  // Atomic, explicit 0600 (writeFileSync's mode is ignored when the file already exists).
+  writeKeystoreAtomic(WALLETS_FILE, JSON.stringify(store, null, 2));
 }
 
 /** Exported for smart landing page in index.ts */
@@ -364,7 +366,7 @@ export function registerWalletCommands(
     .description("Generate a new wallet (OWS encrypted vault, multi-chain)")
     .option("--words <count>", "Mnemonic word count (12 or 24)", "12")
     .option("--show-mnemonic", "Display the mnemonic phrase (CAUTION)")
-    .option("--passphrase <pp>", "Master OWS passphrase (fallback: OWS_PASSPHRASE env / stdin)")
+    .addOption(deprecatedPassphraseOption()).hook("preAction", warnDeprecatedPassphrase)
     .addOption(new Option("--legacy <chain>", "Removed — refused (raw keys are never written to ~/.perp/.env)").hideHelp())
     .action(async (name: string | undefined, opts: { words: string; showMnemonic?: boolean; passphrase?: string; legacy?: string }, command: Command) => {
       if (opts.legacy !== undefined) {
@@ -450,7 +452,7 @@ export function registerWalletCommands(
     .option("--name <name>", "Wallet alias name", "imported")
     .option("--chain <chain>", "Key type: evm (default), solana, or dual (EVM + Solana keys: two prompts, or two stdin lines EVM first)", "evm")
     .option("--mnemonic", "Import a mnemonic phrase instead of a private key")
-    .option("--passphrase <pp>", "Master OWS passphrase (fallback: OWS_PASSPHRASE env / hidden prompt)")
+    .addOption(deprecatedPassphraseOption()).hook("preAction", warnDeprecatedPassphrase)
     .addOption(new Option("--evm <hex>", "Removed — refused (key on argv); use --chain evm|dual").hideHelp())
     .addOption(new Option("--solana <key>", "Removed — refused (key on argv); use --chain solana|dual").hideHelp())
     .addOption(new Option("--legacy <chain>", "Removed — refused (raw keys are never written to ~/.perp/.env)").hideHelp())
@@ -1312,7 +1314,7 @@ export function registerWalletCommands(
     .requiredOption("--wallets <names>", "Comma-separated OWS wallet names")
     .option("--policy <ids>", "Comma-separated policy IDs to enforce")
     .option("--expires <iso>", "Key expiry (ISO-8601)")
-    .option("-p, --passphrase <pass>", "Vault passphrase", "")
+    .addOption(deprecatedPassphraseOption("Vault passphrase", "-p, --passphrase <pass>").default("")).hook("preAction", warnDeprecatedPassphrase)
     .action(async (opts: { name: string; wallets: string; policy?: string; expires?: string; passphrase: string }, command: Command) => {
       try {
         const o = loadOws();

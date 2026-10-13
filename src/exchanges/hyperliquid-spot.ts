@@ -12,19 +12,10 @@ import { HyperliquidOutcomeAdapter } from "./hyperliquid-outcome.js";
 import type { ResolvedSlippage } from "./slippage.js";
 import { PERP_TO_SPOT_MAP, SPOT_PERP_TOKEN_MAP } from "./spot-interface.js";
 import type { HyperliquidAdapter } from "./hyperliquid.js";
-import { assertHlAppliedBps, hlIocOutcome, hlProtectionPrice, hlSizeStep, hlTif } from "./hyperliquid.js";
+import { assertHlAppliedBps, hlIocOutcome, hlProtectionPrice, hlRequirePriceOnGrid, hlSizeStep, hlTif } from "./hyperliquid.js";
 import { floorSize } from "./precision.js";
 import { PerpError, isDefiniteOrderFailure, isTransportFailure, orderNotSent, orderOutcomeUnknown } from "../errors.js";
 import { invalidateCache } from "../cache.js";
-
-/** HL official price rounding: 5 significant figures, max 8 decimals for spot */
-function hlRoundPrice(px: number, szDecimals: number): string {
-  const MAX_DECIMALS = 8; // spot uses 8 (perp uses 6)
-  if (px > 100_000) return String(Math.round(px));
-  const sig5 = Number(px.toPrecision(5));
-  const priceDec = Math.max(0, MAX_DECIMALS - szDecimals);
-  return Number(sig5.toFixed(priceDec)).toString();
-}
 
 /** HL size: floored to the szDecimals lot (never rounded up past the request); 0 → SIZE_TOO_SMALL. */
 function hlRoundSize(size: string, szDecimals: number): string {
@@ -297,6 +288,9 @@ export class HyperliquidSpotAdapter implements SpotAdapter, SpotHoldingPricesCap
 
     const szDec = this.getSpotDecimals(base).size;
     const what = `spot limit ${side} ${size} ${base} @ ${price}`;
+    // Pre-send: off-grid price → INVALID_TICK (refused, never rounded); size floored to the lot.
+    const sentPrice = hlRequirePriceOnGrid(price, szDec, 8, "spot limit price");
+    const sentSize = hlRoundSize(size, szDec);
 
     // Same send contract as spotMarketOrder: a transport failure after the request may
     // have placed the order → ORDER_PENDING; a {"status":"err"} body → definite rejection.
@@ -305,8 +299,8 @@ export class HyperliquidSpotAdapter implements SpotAdapter, SpotHoldingPricesCap
       result = await this._rawPlaceSpotOrder({
         assetIndex,
         isBuy: side === "buy",
-        price: hlRoundPrice(Number(price), szDec),
-        size: hlRoundSize(size, szDec),
+        price: sentPrice,
+        size: sentSize,
         orderType: { limit: { tif } },
       });
     } catch (e) {

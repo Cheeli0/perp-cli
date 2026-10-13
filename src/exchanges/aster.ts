@@ -992,11 +992,20 @@ export class AsterAdapter implements ExchangeAdapter {
         }
       }
       let cancelledQty: number | null = null;
+      let cancelRow: Record<string, unknown> | null = null;
       try {
         const c = await this._signedDeleteEip712("/fapi/v3/order", { symbol: apiSymbol, orderId }, r) as Record<string, unknown>;
         const q = Number(c?.executedQty);
         cancelledQty = Number.isFinite(q) ? q : null;
+        cancelRow = c;
       } catch { /* cancel failed: the order may still be live — outcome stays unknown below */ }
+      // The cancel answered with executedQty > 0: the order PARTIALLY filled before the cancel —
+      // report that fill (the cancel row carries executedQty / status CANCELED; asterIocOutcome
+      // reads it), never "not filled".
+      if (cancelledQty !== null && cancelledQty > 0 && cancelRow !== null) {
+        console.error(`[aster] market ${side} ${symbol}: order ${orderId} partially filled (${String(cancelRow.executedQty)}) before the remainder was cancelled`);
+        return { ...cancelRow, protection };
+      }
       const msg = `Market ${side} ${symbol}: order not filled after 3s, cancelled (orderId: ${orderId})`;
       // Definite only when the cancel was confirmed with 0 executed; otherwise it may have filled / be live.
       if (cancelledQty === 0) throw new PerpError("ORDER_REJECTED", msg, { exchange: "aster", orderId });
@@ -1693,9 +1702,15 @@ export class AsterAdapter implements ExchangeAdapter {
    */
   private async _handleAsterResponse(res: Response, method: string, path: string): Promise<unknown> {
     if (res.status === 429) {
-      const retryAfter = parseInt(res.headers.get("Retry-After") || "5", 10);
-      await new Promise(r => setTimeout(r, Math.min(retryAfter * 1000, 30000)));
-      throw new Error(`${method} ${path} rate limited`);
+      // HTTP 429 = refused before processing: the request was definitely NOT executed
+      // (details.sent === false → isDefiniteOrderFailure), and RATE_LIMITED stays retryable —
+      // after Retry-After (carried as retryAfterMs when the venue sends it).
+      const retryAfterSec = Number(res.headers.get("Retry-After"));
+      throw new PerpError("RATE_LIMITED", `Aster ${method} ${path} rate limited (HTTP 429); nothing was executed`, {
+        exchange: "aster", httpStatus: 429, sent: false,
+        ...(Number.isFinite(retryAfterSec) && retryAfterSec > 0 ? { retryAfterMs: retryAfterSec * 1000 } : {}),
+        remediation: "Nothing was sent to the book. Wait and retry, or reduce request frequency",
+      });
     }
     if (!res.ok) {
       const text = await res.text();

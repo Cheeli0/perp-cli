@@ -18,7 +18,7 @@ import {
 } from "./lighter.js";
 import { alignProtectionPrice, floorSize, formatComputedPrice, requireOnTick, slippagePrice, subDecimal, toUnitsExact } from "./precision.js";
 import { unsupported } from "./trading-v2.js";
-import { PerpError, orderNotSent } from "../errors.js";
+import { PerpError, orderNotSent, parsePositiveDecimal } from "../errors.js";
 
 /** The row match (market + send time) _placeOrder attached to its result; absent → null (no extra match). */
 function lighterRowMatchOf(result: Record<string, unknown>): LighterRowMatch | null {
@@ -705,12 +705,12 @@ export class LighterSpotAdapter implements SpotAdapter {
 
   /** Transfer USDC from perp account to spot account (required before spot buys) */
   async transferUsdcToSpot(amount: number): Promise<unknown> {
-    return this._selfTransfer(amount, 0, 1); // route: Perp(0) → Spot(1)
+    return this._selfTransfer(String(amount), 0, 1); // route: Perp(0) → Spot(1)
   }
 
   /** Transfer USDC from spot account back to perp account */
   async transferUsdcToPerp(amount: number): Promise<unknown> {
-    return this._selfTransfer(amount, 1, 0); // route: Spot(1) → Perp(0)
+    return this._selfTransfer(String(amount), 1, 0); // route: Spot(1) → Perp(0)
   }
 
   /** SpotTransferCapable (§12.4 #4): only the venue collateral (USDC on Lighter, USDG on Lighter RH). */
@@ -722,13 +722,11 @@ export class LighterSpotAdapter implements SpotAdapter {
     return this._selfTransfer(this._transferAmount(amount, asset), 1, 0);
   }
 
-  private _transferAmount(amount: string, asset: string): number {
+  private _transferAmount(amount: string, asset: string): string {
     if (asset !== this._quote) {
       throw new PerpError("INVALID_PARAMS", `${this.name} spot↔perp transfer only moves ${this._quote} (got ${asset})`, { exchange: this.name });
     }
-    const n = Number(amount);
-    if (!Number.isFinite(n) || n <= 0) throw new PerpError("INVALID_PARAMS", `Transfer amount must be positive (got ${amount})`);
-    return n;
+    return parsePositiveDecimal(amount, "Transfer amount");
   }
 
   /**
@@ -736,8 +734,16 @@ export class LighterSpotAdapter implements SpotAdapter {
    * WASM SignTransfer and explicit routes. Route types: 0 = Perp, 1 = Spot. Same-owner
    * transfer → no L1 signature needed (wasm-signer.md).
    */
-  private async _selfTransfer(amount: number, fromRoute: number, toRoute: number): Promise<unknown> {
+  private async _selfTransfer(amount: string, fromRoute: number, toRoute: number): Promise<unknown> {
     if (this._lt.isReadOnly) throw new Error("Transfer requires API key");
+    // Collateral scale: USDC (Lighter) and USDG (Lighter RH) both have 6 decimals at asset id 3.
+    // Exact decimal → integer units from the string (no float multiply: 0.29 * 1e6 = 289999.99…);
+    // more than 6 decimals → INVALID_TICK, never silently truncated. Checked before any request.
+    const scaled = toUnitsExact(parsePositiveDecimal(amount, "Transfer amount"), "0.000001", "transfer amount");
+    if (scaled > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw new PerpError("INVALID_PARAMS", `${this.name} transfer amount ${amount} is too large`, { exchange: this.name });
+    }
+    const scaledAmount = Number(scaled);
     // Docs (apidocs.lighter.xyz/docs/deposits-transfers-and-withdrawals, "Transfer between Lighter
     // accounts"): "Get the fee: transferFeeInfo (GET /api/v1/transferFeeInfo?account_index=…&
     // to_account_index=…, authenticated). The fee is charged **on top** of the amount and must
@@ -755,10 +761,7 @@ export class LighterSpotAdapter implements SpotAdapter {
     }
     const nonce = await this._getNextNonce();
     const apiKeyIndex = (this._lt as unknown as { _apiKeyIndex: number })._apiKeyIndex;
-    // Collateral scale: USDC (Lighter) and USDG (Lighter RH) both have 6 decimals at asset id 3.
-    const USDC_SCALE = 1_000_000;
     const collateralAssetIndex = this._lt.collateralAssetIndex;
-    const scaledAmount = Math.floor(amount * USDC_SCALE);
     const memo = "0x" + "00".repeat(32);
     const signed = this._lt.signer.signTransfer({
       toAccountIndex: this._lt.accountIndex, // self

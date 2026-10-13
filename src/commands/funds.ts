@@ -8,7 +8,7 @@ import { logExecution } from "../execution-log.js";
 import { hasPacificaSdk, hasEvmAddress, isWithdrawCapable, isUsdTransferCapable, hasLighterAccount } from "../exchanges/capabilities.js";
 import { registerFundsBridgeCommands } from "./bridge.js";
 import { registerFundsRebalanceCommands } from "./rebalance.js";
-import { PerpError, isConnectFailure, isTransportFailure, orderOutcomeUnknown, parsePositiveDecimal } from "../errors.js";
+import { PerpError, isConnectFailure, isDefiniteOrderFailure, isTransportFailure, orderOutcomeUnknown, parsePositiveDecimal } from "../errors.js";
 import { cliCredentialOptsFrom, requireMasterWallet } from "../config.js";
 import type { VenueId } from "../exchanges/venue-types.js";
 import { getVenue, requireCapabilities, READ_ONLY_CREDENTIALS, type Network as VenueNetwork, type VenueDefinition } from "../exchanges/venue.js";
@@ -18,7 +18,7 @@ import { ONDO_WITHDRAW_NETWORK } from "../exchanges/venues/ondo.js";
 import { QFEX_BANKER_NETWORK, QFEX_WITHDRAW_NETWORK } from "../exchanges/venues/qfex.js";
 import type { QfexAdapter } from "../exchanges/qfex/adapter.js";
 import { loadSettings } from "../settings.js";
-import { assertWithdrawAllowed } from "../withdraw-gate.js";
+import { assertWithdrawAllowed, forgetWithdrawAttempt, recordWithdrawAttempt } from "../withdraw-gate.js";
 import "../exchanges/venues/index.js";
 
 /**
@@ -61,6 +61,34 @@ async function relayerAvailable(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * Local withdraw-gate verdict for a Hyperliquid destination that is not (known to be) the account
+ * owner: settings.withdraw.hyperliquid allowlist + maxPerTx / maxPerDay (the QFEX gate mechanism,
+ * src/withdraw-gate.ts). "passes" or "would refuse: …"; never throws a POLICY_DENIED (dry runs).
+ */
+export function hyperliquidGateVerdict(network: string, amount: string, destination: string, nowMs: number): string {
+  const gate = loadSettings().withdraw.hyperliquid;
+  try {
+    assertWithdrawAllowed("hyperliquid", network, amount, destination, gate === undefined ? null : gate, nowMs);
+  } catch (e) {
+    if (e instanceof PerpError && e.structured.code === "POLICY_DENIED") return `would refuse: ${e.message}`;
+    throw e;
+  }
+  return "passes (destination allowlisted in settings withdraw.hyperliquid, within maxPerTx / maxPerDay)";
+}
+
+/**
+ * Enforce settings.withdraw.hyperliquid for a master-signed withdraw3 / usdSend to `destination`
+ * and record the attempt in the withdraw ledger BEFORE it is sent. Returns the ledger id (forget it
+ * only on a definite refusal), or null when the destination is the owner (no gate, no ledger).
+ */
+export function hyperliquidGateEnforce(network: string, amount: string, destination: string, owner: string | null, nowMs: number): string | null {
+  if (owner !== null && destination.toLowerCase() === owner.toLowerCase()) return null;
+  const gate = loadSettings().withdraw.hyperliquid;
+  assertWithdrawAllowed("hyperliquid", network, amount, destination, gate === undefined ? null : gate, nowMs);
+  return recordWithdrawAttempt("hyperliquid", network, amount, destination, nowMs);
 }
 
 /** Display names of `VenueNetworkConfig.settlementChain` / withdraw-network ids. */
@@ -931,25 +959,52 @@ export function registerFundsCommands(
   // ── Hyperliquid ──
 
   supportsDryRun(withdraw.command("hyperliquid <amount>"))
-    .description("Withdraw USDC from Hyperliquid to your Arbitrum wallet (supports --dry-run)")
-    .option("--to <address>", "Destination EVM address (default: your wallet)")
-    .action(async (amount: string, opts: { to?: string }) => {
-      const amountNum = Number(parsePositiveDecimal(amount, "amount"));
+    .description("Withdraw USDC from Hyperliquid over CCTP (native USDC) to your wallet on Arbitrum (default), Ethereum or Base — another address only when allowlisted in settings withdraw.hyperliquid; supports --dry-run")
+    .option("--chain <chain>", "Destination chain: arbitrum | ethereum | base", "arbitrum")
+    .option("--to <address>", "Destination EVM address (default: your wallet; any other address must be on the settings withdraw.hyperliquid allowlist)")
+    .action(async (amount: string, opts: { to?: string; chain: string }) => {
+      const { HL_CCTP_ROUTES } = await import("../exchanges/hyperliquid.js");
+      const chain = opts.chain.toLowerCase();
+      if (!(chain in HL_CCTP_ROUTES)) {
+        throw new PerpError("INVALID_PARAMS", `--chain must be one of ${Object.keys(HL_CCTP_ROUTES).join(", ")} (got "${opts.chain}")`);
+      }
+      const route = HL_CCTP_ROUTES[chain as keyof typeof HL_CCTP_ROUTES];
+      const feeNote = route.forwardingFeeUsdc !== null
+        ? `CCTP forwarding fee ${route.forwardingFeeUsdc} USDC (deducted on the way) + a small Hyperliquid send fee`
+        : "CCTP forwarding fee for this chain is not published — it is deducted on the way";
+      const amountStr = parsePositiveDecimal(amount, "amount");
+      const amountNum = Number(amountStr);
       if (isNaN(amountNum) || amountNum <= 0) throw new Error("Invalid amount");
+      if (opts.to !== undefined && !/^0x[0-9a-fA-F]{40}$/.test(opts.to)) {
+        throw new PerpError("INVALID_PARAMS", `--to must be an EVM address (got "${opts.to}")`);
+      }
       if (isDryRun()) {
-        return printFundsPlan({ action: "withdraw", venue: "hyperliquid", network: getNetwork(), asset: "USDC", amount: String(amountNum), destination: opts.to !== undefined ? opts.to : "account owner's address", chain: "arbitrum" });
+        // The owner address is not resolved in a dry run (no key is loaded): an explicit --to is
+        // judged as a non-owner destination; it needs no gate if it is the owner's own address.
+        const withdrawGate = opts.to === undefined
+          ? "not needed — destination is the account owner's own address"
+          : `${hyperliquidGateVerdict(getNetwork(), amountStr, opts.to, Date.now())} (not needed if --to is the account owner's own address; checked again when sent)`;
+        return printFundsPlan({ action: "withdraw", venue: "hyperliquid", network: getNetwork(), asset: "USDC", amount: String(amountNum), destination: opts.to !== undefined ? opts.to : "account owner's address", chain, method: "CCTP (sendToEvmWithData)", cctpDomain: route.cctpDomain, fee: feeNote, withdrawGate });
       }
       await requireMaster("hyperliquid", "Hyperliquid withdraw");
 
       // The subcommand names the venue: fetch it directly, independent of -e (like ondo / arcus).
       const adapter = await getAdapterForExchange("hyperliquid");
       if (!hasEvmAddress(adapter) || !isWithdrawCapable(adapter)) throw new Error("hyperliquid venue did not produce a withdraw-capable EVM adapter");
+      // HyperliquidAdapter.withdraw takes the CCTP destination chain.
+      const hlWithdraw = adapter.withdraw.bind(adapter) as (amount: string, destination: string, opts: { chain: keyof typeof HL_CCTP_ROUTES }) => Promise<unknown>;
 
-      const dest = opts.to || adapter.address;
+      const dest = opts.to === undefined ? adapter.address : opts.to;
+      // Owner-only unless the destination passes settings.withdraw.hyperliquid (checked before any read / send).
+      const toOwner = dest.toLowerCase() === adapter.address.toLowerCase();
+      if (!toOwner) {
+        const gate = loadSettings().withdraw.hyperliquid;
+        assertWithdrawAllowed("hyperliquid", getNetwork(), amountStr, dest, gate === undefined ? null : gate, Date.now());
+      }
 
       if (!isJson()) {
         console.log(chalk.cyan(`\n  Withdrawing $${formatUsd(amountNum)} USDC from Hyperliquid...\n`));
-        console.log(`  Destination: ${dest}`);
+        console.log(`  Destination: ${dest}${toOwner ? "" : " (allowlisted in settings withdraw.hyperliquid)"}`);
       }
 
       const balance = await adapter.getBalance();
@@ -963,20 +1018,23 @@ export function registerFundsCommands(
         process.exit(1);
       }
 
+      const attempt = hyperliquidGateEnforce(getNetwork(), amountStr, dest, adapter.address, Date.now());
       try {
-        const result = await adapter.withdraw(String(amountNum), dest);
+        const result = await hlWithdraw(amountStr, dest, { chain: chain as keyof typeof HL_CCTP_ROUTES });
 
         logExecution({
           type: "bridge", exchange: "hyperliquid", symbol: "USDC", side: "withdraw",
           size: String(amountNum), status: "success", dryRun: false,
-          meta: { action: "withdraw", destination: dest },
+          meta: { action: "withdraw", destination: dest, chain, method: "cctp" },
         });
 
-        if (isJson()) return printJson(jsonOk(result));
-        console.log(chalk.green(`\n  Withdrawal submitted!`));
-        console.log(`  Amount: $${formatUsd(amountNum)} USDC`);
+        if (isJson()) return printJson(jsonOk({ result, chain, method: "cctp", fee: feeNote }));
+        console.log(chalk.green(`\n  Withdrawal submitted (CCTP → ${chain})!`));
+        console.log(`  Amount: $${formatUsd(amountNum)} USDC — ${feeNote}`);
         console.log(chalk.gray(`\n  Processing may take a few minutes.\n`));
       } catch (err) {
+        // Only a definite refusal proves nothing left the account; an unknown outcome keeps counting.
+        if (attempt !== null && isDefiniteOrderFailure(err)) forgetWithdrawAttempt(attempt);
         logExecution({
           type: "bridge", exchange: "hyperliquid", symbol: "USDC", side: "withdraw",
           size: String(amountNum), status: fundsFailStatus(err), dryRun: false,
@@ -1258,7 +1316,7 @@ export function registerFundsCommands(
   // ═══════════════════════════════════════════════════════
 
   supportsDryRun(funds.command("transfer <amount> <destination>"))
-    .description("Transfer USDC between Hyperliquid accounts (internal, instant), or — with -e qfex — between your QFEX accounts (destination: primary | <account uuid>; supports --dry-run)")
+    .description("Transfer USDC to another Hyperliquid account (internal, instant; the destination must be on the settings withdraw.hyperliquid allowlist), or — with -e qfex — between your QFEX accounts (destination: primary | <account uuid>; supports --dry-run)")
     .option("--from <account>", "QFEX only: source account (primary | <account uuid>; default: the account the key is bound to)")
     .option("--agent <name>", "QFEX only: imported key to use")
     .action(async (amount: string, destination: string, opts: { from?: string; agent?: string }) => {
@@ -1296,10 +1354,20 @@ export function registerFundsCommands(
       if (opts.from !== undefined || opts.agent !== undefined) {
         throw new PerpError("INVALID_PARAMS", "--from / --agent apply to QFEX transfers only", { remediation: "Add -e qfex, or drop the flags for a Hyperliquid transfer" });
       }
+      // usdSend pays another account: the destination must pass settings.withdraw.hyperliquid
+      // (allowlist + maxPerTx / maxPerDay, shared with withdrawals to non-owner addresses).
+      const amountStr = parsePositiveDecimal(amount, "amount");
+      const gateOf = (): import("../settings.js").WithdrawGate | null => {
+        const g = loadSettings().withdraw.hyperliquid;
+        return g === undefined ? null : g;
+      };
       if (isDryRun()) {
-        return printFundsPlan({ action: "transfer", venue: "hyperliquid", network: getNetwork(), asset: "USDC", amount: String(amountNum), destination });
+        // The gate needs no key and no network: a dry run refuses exactly as the live send would.
+        assertWithdrawAllowed("hyperliquid", getNetwork(), amountStr, destination, gateOf(), Date.now());
+        return printFundsPlan({ action: "transfer", venue: "hyperliquid", network: getNetwork(), asset: "USDC", amount: String(amountNum), destination, withdrawGate: "passes (destination allowlisted in settings withdraw.hyperliquid, within maxPerTx / maxPerDay)" });
       }
       await requireMaster("hyperliquid", "Hyperliquid transfer");
+      assertWithdrawAllowed("hyperliquid", getNetwork(), amountStr, destination, gateOf(), Date.now());
 
       // Not -e qfex → the Hyperliquid transfer (as the dry-run plan says): fetch it directly, independent of -e.
       const adapter = await getAdapterForExchange("hyperliquid");
@@ -1307,7 +1375,15 @@ export function registerFundsCommands(
 
       if (!isJson()) console.log(chalk.cyan(`\n  Transferring $${formatUsd(amountNum)} USDC to ${destination}...\n`));
 
-      const result = await adapter.usdTransfer(amountNum, destination);
+      // owner = null: every usdSend destination is gated (sending to another account is the point).
+      const attempt = hyperliquidGateEnforce(getNetwork(), amountStr, destination, null, Date.now());
+      let result: Awaited<ReturnType<typeof adapter.usdTransfer>>;
+      try {
+        result = await adapter.usdTransfer(amountNum, destination);
+      } catch (err) {
+        if (attempt !== null && isDefiniteOrderFailure(err)) forgetWithdrawAttempt(attempt);
+        throw err;
+      }
 
       if (isJson()) return printJson(jsonOk(result));
       console.log(chalk.green(`  Transfer complete!`));

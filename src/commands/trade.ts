@@ -2,7 +2,7 @@ import { Command } from "commander";
 import { networkOf, supportsDryRun } from "../cli-flags.js";
 import type { ExchangeAdapter, ExchangePosition } from "../exchanges/index.js";
 import { printJson, errorAndExit, withJsonErrors, jsonOk, jsonError, symbolMatch, formatUsd, formatOrderResult, orderResultJson } from "../utils.js";
-import { ERROR_CODES, extractErrorMessage, isDefiniteOrderFailure, PerpError, type ErrorCode } from "../errors.js";
+import { ERROR_CODES, extractErrorMessage, isDefiniteOrderFailure, parsePositiveDecimal, PerpError, type ErrorCode } from "../errors.js";
 import { logExecution } from "../execution-log.js";
 import { validateTrade, enforceOrderRisk } from "../trade-validator.js";
 import { generateClientId, logClientId, isOrderDuplicate } from "../client-id-tracker.js";
@@ -458,6 +458,17 @@ function requirePacificaTwapSigner(adapter: ExchangeAdapter, what: string): void
   }
 }
 
+/** Venues whose cancel-by-reference needs no symbol (Ondo: DELETE /orders/<id> or client id). */
+const SYMBOLLESS_CANCEL_VENUES: ReadonlySet<VenueDefinition["id"]> = new Set(["ondo"]);
+
+/** UUID (Pacifica / QFEX / Ondo order ids) — 8-4-4-4-12 hex. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** One-arg `trade cancel <x>`: true when x is an order id (numeric, UUID or 0x-hex), never a symbol. */
+export function looksLikeOrderId(x: string): boolean {
+  return /^\d+$/.test(x) || UUID_RE.test(x) || /^0x[0-9a-f]+$/i.test(x);
+}
+
 export function registerTradeCommands(
   program: Command,
   getAdapter: () => Promise<ExchangeAdapter>,
@@ -500,6 +511,41 @@ export function registerTradeCommands(
     if (!isDryRun()) return false;
     const d = await builderPlanFor(adapter, symbol);
     return dryRunGuard(action, { ...details, builderFee: d.applied, ...(d.note !== null ? { builderNote: d.note } : {}) });
+  }
+
+  /**
+   * Pre-send gate of every order path that can open or flip a position, run BEFORE the dry-run
+   * return (a dry-run reports the refusal the live order would hit):
+   *  - quarantine (non-reduce-only): an earlier unknown outcome on the symbol blocks new orders
+   *    until a human clears it — the same gate as MCP (mcpPreTradeGate) and `arb exec`; --force
+   *    does NOT bypass it (--force is the local risk-limit override only);
+   *  - local risk limits (enforceOrderRisk; --force bypasses, reduce-only exempt).
+   */
+  /** Opening orders on a quarantined symbol are refused (reduce-only passes); --force never bypasses it. */
+  function assertNotQuarantined(venue: string, symbol: string, reduceOnly: boolean | undefined): void {
+    if (reduceOnly === true) return;
+    const q = quarantineEntryFor(symbol, (m) => { if (!isJson()) console.error(m); });
+    if (q !== null) {
+      throw new PerpError("RISK_VIOLATION", `${symbol} is quarantined by ${q.strategy}: ${q.reason}`, {
+        exchange: venue,
+        remediation: `${q.remediation} — only reduce-only orders are accepted until a human clears it (perp strategy quarantine-clear ${symbol})`,
+      });
+    }
+  }
+
+  async function openingOrderGate(adapter: ExchangeAdapter, p: { symbol: string; size: number; price?: number; reduceOnly?: boolean; force?: boolean }): Promise<void> {
+    assertNotQuarantined(adapter.name, p.symbol, p.reduceOnly);
+    await enforceOrderRisk(adapter, p);
+  }
+
+  /** Mark price of `sym` (split sizing / risk); no usable mark → PRICE_STALE, nothing sent. */
+  async function splitMarkPrice(adapter: ExchangeAdapter, sym: string): Promise<number> {
+    const market = (await adapter.getMarkets()).find(m => symbolMatch(m.symbol, sym));
+    const markPrice = market !== undefined ? Number(market.markPrice) : NaN;
+    if (!(markPrice > 0)) {
+      throw new PerpError("PRICE_STALE", `${adapter.name}: no usable mark price for ${sym} — cannot size the split; nothing was sent`, { exchange: adapter.name });
+    }
+    return markPrice;
   }
 
   const network = (): Network => networkOf(program);
@@ -758,7 +804,9 @@ export function registerTradeCommands(
   }
 
   /** One market-order path for trade market / buy / sell (every venue via TradingV2; --smart = legacy smart-order). */
-  async function runMarketOrder(sym: string, side: "buy" | "sell", size: string, opts: MarketOpts): Promise<void> {
+  async function runMarketOrder(sym: string, side: "buy" | "sell", rawSize: string, opts: MarketOpts): Promise<void> {
+    // One parsed size for the risk check and the order ("1,000" / "abc" refused before anything else).
+    const size = parsePositiveDecimal(rawSize, "size");
     const slippageFlag = parseSlippageBpsFlag(opts.slippageBps);
     if (opts.clientId && isOrderDuplicate(opts.clientId)) {
       if (isJson()) return printJson(jsonOk({ duplicate: true, clientOrderId: opts.clientId, message: "Order already submitted" }));
@@ -785,9 +833,9 @@ export function registerTradeCommands(
     }
     const req = opts.smart ? null : v2MarketRequest(venueDef, venueCaps, sym, side, size, reduceOnly, slippage, clientId);
 
-    // Read-only local risk check BEFORE the dry-run return (review L5): a dry-run reports the same
-    // RISK_VIOLATION the live order would hit. --force skips it in both modes.
-    await enforceOrderRisk(adapter, { symbol: sym, size: parseFloat(size), reduceOnly: opts.reduceOnly, force: opts.force });
+    // Read-only quarantine + local risk check BEFORE the dry-run return (review L5): a dry-run reports
+    // the same RISK_VIOLATION the live order would hit. --force skips the risk limits in both modes.
+    await openingOrderGate(adapter, { symbol: sym, size: Number(size), reduceOnly: opts.reduceOnly, force: opts.force });
 
     if (await orderDryRunGuard("market_order", adapter, sym, { exchange: adapter.name, symbol: sym, side, size, smart: !!opts.smart, ...(prices !== null ? { tp: prices.tp ?? "none", sl: prices.sl ?? "none" } : {}) })) return;
 
@@ -815,7 +863,7 @@ export function registerTradeCommands(
       }
       logExecution({ type: "market_order", exchange: adapter.name, symbol: sym, side, size, status: "success", dryRun: false, meta });
     } catch (err) {
-      logExecution({ type: "market_order", exchange: adapter.name, symbol: sym, side, size, status: "failed", dryRun: false, error: extractErrorMessage(err), meta });
+      logExecution({ type: "market_order", exchange: adapter.name, symbol: sym, side, size, status: isOutcomeUnknown(err) ? "unverified" : "failed", dryRun: false, error: extractErrorMessage(err), meta });
       throw err;
     }
 
@@ -865,16 +913,14 @@ export function registerTradeCommands(
         // runSplitOrder has no reduce-only path — refuse rather than silently place opening orders.
         if (opts.reduceOnly) errorAndExit("--reduce-only is not supported with --split");
         if (opts.tp !== undefined || opts.sl !== undefined) throw new PerpError("INVALID_PARAMS", "--tp/--sl are not supported with --split (no single verified entry fill to protect)");
+        const baseSize = Number(parsePositiveDecimal(size, "size"));
         const adapter = await getAdapter();
+        // No mark price → the base size cannot be valued in USD; never treated as a USD amount.
+        const markPrice = await splitMarkPrice(adapter, sym);
+        // Split slices are opening orders: quarantine + risk limits before the dry-run return (--force: limits only).
+        await openingOrderGate(adapter, { symbol: sym, size: baseSize, price: markPrice, force: opts.force });
         if (await orderDryRunGuard("split-order", adapter, sym, { exchange: adapter.name, symbol: sym, side: s, size })) return;
-
-        const market = (await adapter.getMarkets()).find(m => symbolMatch(m.symbol, sym));
-        const markPrice = market !== undefined ? Number(market.markPrice) : NaN;
-        if (!(markPrice > 0)) {
-          // No mark price → the base size cannot be valued in USD; never treated as a USD amount.
-          throw new PerpError("PRICE_STALE", `${adapter.name}: no usable mark price for ${sym} — cannot size the split; nothing was sent`, { exchange: adapter.name });
-        }
-        await runSplit(adapter, sym, s as "buy" | "sell", Number(size) * markPrice, { maxSlippagePct: parseFloat(opts.maxSlippage ?? "0.3") });
+        await runSplit(adapter, sym, s as "buy" | "sell", baseSize * markPrice, { maxSlippagePct: parseFloat(opts.maxSlippage ?? "0.3") });
         return;
       }
 
@@ -917,8 +963,9 @@ export function registerTradeCommands(
     .option("--max-slices <n>", "Max number of slices", "10")
     .option("--delay <ms>", "Delay between slices in ms", "1000")
     .option("--min-slice <usd>", "Minimum slice size in USD", "100")
+    .option("--force", "Bypass local risk-limit checks (maxPosition / total exposure)")
     .action(async (symbol: string, side: string, usd: string, opts: {
-      maxSlippage: string; maxSlices: string; delay: string; minSlice: string;
+      maxSlippage: string; maxSlices: string; delay: string; minSlice: string; force?: boolean;
     }) => {
       const sym = symbol.toUpperCase();
       const orderSide = side.toLowerCase() as "buy" | "sell";
@@ -928,6 +975,9 @@ export function registerTradeCommands(
       if (isNaN(totalUsd) || totalUsd <= 0) errorAndExit("USD amount must be > 0");
 
       const adapter = await getAdapter();
+      // Opening orders: quarantine + risk limits on size = usd / mark before the dry-run return (--force: limits only).
+      const markPrice = await splitMarkPrice(adapter, sym);
+      await openingOrderGate(adapter, { symbol: sym, size: totalUsd / markPrice, price: markPrice, force: opts.force });
       if (await orderDryRunGuard("split-order", adapter, sym, { exchange: adapter.name, symbol: sym, side: orderSide, totalUsd, ...opts })) return;
       await runSplit(adapter, sym, orderSide, totalUsd, {
         maxSlippagePct: parseFloat(opts.maxSlippage),
@@ -947,10 +997,12 @@ export function registerTradeCommands(
     .option("--tp <price>", "Take-profit protecting this entry's fill (ondo / arcus: attached to any entry; other venues: --tif IOC entries only)")
     .option("--sl <price>", "Stop-loss protecting this entry's fill (ondo / arcus: attached to any entry; other venues: --tif IOC entries only)")
     .option("--slippage-bps <n>", "Slippage bound in bps for protection-priced TP/SL legs (default: settings slippageBps[venue] → defaultSlippageBps)")
-    .action(async (symbol: string, side: string, price: string, size: string, opts: { tif?: string; reduceOnly?: boolean; clientId?: string; autoId?: boolean; force?: boolean; tp?: string; sl?: string; slippageBps?: string }) => {
+    .action(async (symbol: string, side: string, price: string, rawSize: string, opts: { tif?: string; reduceOnly?: boolean; clientId?: string; autoId?: boolean; force?: boolean; tp?: string; sl?: string; slippageBps?: string }) => {
       const s = side.toLowerCase();
       if (s !== "buy" && s !== "sell") errorAndExit("Side must be buy or sell");
       const sym = symbol.toUpperCase();
+      // One parsed size for the risk check and the order ("1,000" / "abc" refused up front).
+      const size = parsePositiveDecimal(rawSize, "size");
 
       if (opts.clientId && isOrderDuplicate(opts.clientId)) {
         if (isJson()) return printJson(jsonOk({ duplicate: true, clientOrderId: opts.clientId, message: "Order already submitted" }));
@@ -982,8 +1034,8 @@ export function registerTradeCommands(
       }
       const tpslSlippage = prices !== null ? resolveSlippage(venueDef.id, slippageFlag) : null;
 
-      // Read-only risk check before the dry-run return (L5) — same gate as the live order.
-      await enforceOrderRisk(adapter, { symbol: sym, size: parseFloat(size), price: parseFloat(price), reduceOnly: opts.reduceOnly, force: opts.force });
+      // Read-only quarantine + risk check before the dry-run return (L5) — same gate as the live order.
+      await openingOrderGate(adapter, { symbol: sym, size: Number(size), price: parseFloat(price), reduceOnly: opts.reduceOnly, force: opts.force });
 
       if (await orderDryRunGuard("limit_order", adapter, sym, { exchange: adapter.name, symbol: sym, side: s, size, price, tif, ...(prices !== null ? { tp: prices.tp ?? "none", sl: prices.sl ?? "none" } : {}) })) return;
 
@@ -1012,7 +1064,7 @@ export function registerTradeCommands(
       } catch (err) {
         logExecution({
           type: "limit_order", exchange: adapter.name, symbol: sym,
-          side: s, size, price, status: "failed", dryRun: false,
+          side: s, size, price, status: isOutcomeUnknown(err) ? "unverified" : "failed", dryRun: false,
           error: extractErrorMessage(err),
           meta: clientId ? { clientOrderId: clientId } : undefined,
         });
@@ -1067,19 +1119,31 @@ export function registerTradeCommands(
         return;
       }
 
-      // Single argument — is it an orderId (numeric) or a symbol name?
-      const isNumeric = /^\d+$/.test(symbolOrOrderId);
-
-      if (isNumeric) {
+      // Single argument — an order reference (c:<clientOrderId>, numeric / UUID / 0x-hex order id)
+      // or a symbol name. An explicit order reference is never treated as a symbol.
+      const ref = parseOrderRef(symbolOrOrderId);
+      const { def: venueDef } = tradingVenueOf(adapter);
+      const twoArgHint = `perp trade cancel <symbol> ${symbolOrOrderId} -e ${venueDef.id}`;
+      if (ref.kind === "clientOrderId") {
+        // Open-order listings carry no client id, so the symbol cannot be looked up from it.
+        if (!SYMBOLLESS_CANCEL_VENUES.has(venueDef.id)) {
+          throw new PerpError("INVALID_PARAMS", `${venueDef.displayName} cancels a client order id within a market — the symbol is required`, {
+            remediation: `Pass the symbol: ${twoArgHint}`,
+          });
+        }
+        await cancelOne("", symbolOrOrderId);
+        return;
+      }
+      if (looksLikeOrderId(symbolOrOrderId)) {
         // cancel <orderId> — look up symbol from open orders
         const oid = symbolOrOrderId;
         const orders = await adapter.getOpenOrders();
         const match = orders.find((o) => String(o.orderId) === oid);
         if (!match) {
-          const err = `Order ${oid} not found in open orders`;
-          if (isJson()) return printJson(jsonOk({ cancelled: false, reason: err }));
-          console.log(chalk.yellow(`\n  ${err}\n`));
-          return;
+          throw new PerpError("ORDER_NOT_FOUND", `Order ${oid} not found in the open orders on ${venueDef.displayName}; nothing was cancelled`, {
+            exchange: adapter.name,
+            remediation: `Check open orders (perp account orders -e ${venueDef.id}); if it is a stop / trigger not listed there, pass the symbol: ${twoArgHint}`,
+          });
         }
         await cancelOne(match.symbol, oid);
         return;
@@ -1141,9 +1205,11 @@ export function registerTradeCommands(
     .option("--background", "Run client-side TWAP in background (tmux) — works on all exchanges")
     .option("--slices <n>", "Number of slices for client-side TWAP")
     .option("--force", "Bypass local risk-limit checks (maxPosition / total exposure)")
-    .action(async (symbol: string, side: string, size: string, duration: string, opts: { slippageBps?: string; reduceOnly?: boolean; background?: boolean; slices?: string; force?: boolean }) => {
+    .action(async (symbol: string, side: string, rawSize: string, duration: string, opts: { slippageBps?: string; reduceOnly?: boolean; background?: boolean; slices?: string; force?: boolean }) => {
       const s = side.toLowerCase();
       if (s !== "buy" && s !== "sell") errorAndExit("Side must be buy or sell");
+      // One parsed size for the risk check and the order ("1,000" / "abc" refused up front).
+      const size = parsePositiveDecimal(rawSize, "size");
 
       // --background → client-side TWAP via tmux job
       if (opts.background) {
@@ -1151,7 +1217,7 @@ export function registerTradeCommands(
         const bgAdapter = await getAdapter();
         const exchange = bgAdapter.name;
         // Risk check (and its --force bypass) runs here: the child `strategy twap` has none.
-        await enforceOrderRisk(bgAdapter, { symbol: symbol.toUpperCase(), size: parseFloat(size), reduceOnly: opts.reduceOnly, force: opts.force });
+        await openingOrderGate(bgAdapter, { symbol: symbol.toUpperCase(), size: Number(size), reduceOnly: opts.reduceOnly, force: opts.force });
         const cliArgs = [
           "strategy", "twap", symbol.toUpperCase(), s, size, duration,
           ...(opts.slices ? ["--slices", opts.slices] : []),
@@ -1175,7 +1241,7 @@ export function registerTradeCommands(
 
       const adapter = await getAdapter();
 
-      await enforceOrderRisk(adapter, { symbol: symbol.toUpperCase(), size: parseFloat(size), reduceOnly: opts.reduceOnly, force: opts.force });
+      await openingOrderGate(adapter, { symbol: symbol.toUpperCase(), size: Number(size), reduceOnly: opts.reduceOnly, force: opts.force });
 
       // Native TWAP: Pacifica (SDK) or Hyperliquid (twapOrder)
       // Fallback: client-side TWAP for any exchange without native support
@@ -1237,9 +1303,11 @@ export function registerTradeCommands(
     .option("--no-reduce-only", "Allow the triggered order to open or flip a position (default: reduce-only)")
     .option("--trigger-type <type>", "Trigger price source: mark | last | mid (pacifica; aster mark | last; other venues: unsupported)")
     .option("--slippage-bps <n>", "Bound for protection-priced market triggers (lighter, arcus) in bps, around the trigger price (default: settings)")
-    .action(async (symbol: string, side: string, size: string, stopPrice: string, opts: { limitPrice?: string; reduceOnly: boolean; triggerType?: string; slippageBps?: string }) => {
+    .option("--force", "With --no-reduce-only: bypass local risk-limit checks (maxPosition / total exposure)")
+    .action(async (symbol: string, side: string, rawSize: string, stopPrice: string, opts: { limitPrice?: string; reduceOnly: boolean; triggerType?: string; slippageBps?: string; force?: boolean }) => {
       const s = side.toLowerCase();
       if (s !== "buy" && s !== "sell") errorAndExit("Side must be buy or sell");
+      const size = parsePositiveDecimal(rawSize, "size");
       if (opts.triggerType && !["mark", "last", "mid"].includes(opts.triggerType)) {
         errorAndExit("--trigger-type must be one of: mark, last, mid");
       }
@@ -1269,13 +1337,19 @@ export function registerTradeCommands(
       };
       validateOrderRequest(venueDef, venueCaps, req);
 
+      // --no-reduce-only can open / flip: quarantine + risk limits at the price it would execute at
+      // (limit price, else the trigger), before the dry-run return. Reduce-only stops are exempt.
+      if (!req.reduceOnly) {
+        await openingOrderGate(adapter, { symbol: sym, size: Number(size), price: parseFloat(opts.limitPrice ?? stopPrice), force: opts.force });
+      }
+
       if (await orderDryRunGuard("stop_order", adapter, sym, { exchange: adapter.name, symbol: sym, side: s, size, price: stopPrice, reduceOnly: req.reduceOnly })) return;
       let result: PlacedOrder;
       try {
         result = await placeV2(v2Of(adapter), venueCaps, req);
         logExecution({ type: "stop_order", exchange: adapter.name, symbol: sym, side: s, size, price: stopPrice, status: "success", dryRun: false, meta: { reduceOnly: req.reduceOnly } });
       } catch (err) {
-        logExecution({ type: "stop_order", exchange: adapter.name, symbol: sym, side: s, size, price: stopPrice, status: "failed", dryRun: false, error: extractErrorMessage(err), meta: { reduceOnly: req.reduceOnly } });
+        logExecution({ type: "stop_order", exchange: adapter.name, symbol: sym, side: s, size, price: stopPrice, status: isOutcomeUnknown(err) ? "unverified" : "failed", dryRun: false, error: extractErrorMessage(err), meta: { reduceOnly: req.reduceOnly } });
         throw err;
       }
 
@@ -1487,8 +1561,8 @@ export function registerTradeCommands(
       prevalidateAmend(adapter);
       const { def: venueDef, caps: venueCaps } = tradingVenueOf(adapter);
       const amendTif: TimeInForce | null = opts.tif !== undefined ? validateLegacyTif(venueDef, venueCaps, opts.tif) : null;
-      if (dryRunGuard("edit_order", { exchange: adapter.name, symbol: symbol.toUpperCase(), orderId, price, size })) return;
       if (opts.forceTif === true && amendTif === null) throw new PerpError("INVALID_PARAMS", "--force-tif needs --tif");
+      if (dryRunGuard("edit_order", { exchange: adapter.name, symbol: symbol.toUpperCase(), orderId, price, size })) return;
       const result = await v2Of(adapter).amendOrder({ symbol: symbol.toUpperCase(), ref: parseOrderRef(orderId), price, size, tif: amendTif, forceTif: opts.forceTif === true });
       if (isJson()) return printJson(jsonOk(orderResultJson(result)));
       printOrder(`Edit of ${orderId} → $${price} x ${size} on ${adapter.name}`, result);
@@ -1524,6 +1598,11 @@ export function registerTradeCommands(
     .command("cancel-twap <symbol> <twapOrderId>")
     .description("Cancel a TWAP order")
     .action(async (symbol: string, twapOrderId: string) => {
+      if (!/^\d+$/.test(twapOrderId)) {
+        throw new PerpError("INVALID_PARAMS", `TWAP order id must be a whole number (got "${twapOrderId}")`, {
+          remediation: "Pass the numeric TWAP id the venue reported when the TWAP was placed",
+        });
+      }
       const adapter = await getAdapter();
 
       let result: unknown;
@@ -1551,16 +1630,22 @@ export function registerTradeCommands(
     .description("Set leverage for a symbol")
     .option("--isolated", "Use isolated margin mode (default: cross)")
     .action(async (symbol: string, leverage: string, opts: { isolated?: boolean }) => {
+      if (!/^[1-9]\d*$/.test(leverage.trim())) {
+        throw new PerpError("INVALID_PARAMS", `leverage must be a positive whole number (got "${leverage}")`, {
+          remediation: "Pass an integer leverage, e.g. perp trade leverage BTC 5",
+        });
+      }
+      const lev = Number(leverage.trim());
       const adapter = await getAdapter();
       const mode = opts.isolated ? "isolated" : "cross";
-      if (dryRunGuard("set_leverage", { exchange: adapter.name, symbol: symbol.toUpperCase(), leverage, mode })) return;
+      if (dryRunGuard("set_leverage", { exchange: adapter.name, symbol: symbol.toUpperCase(), leverage: lev, mode })) return;
       try {
-        const result = await adapter.setLeverage(symbol.toUpperCase(), parseInt(leverage), mode);
+        const result = await adapter.setLeverage(symbol.toUpperCase(), lev, mode);
 
         logExecution({
           type: "rebalance", exchange: adapter.name, symbol: symbol.toUpperCase(), side: mode,
           size: leverage, status: "success", dryRun: false,
-          meta: { action: "set_leverage", leverage: parseInt(leverage), mode },
+          meta: { action: "set_leverage", leverage: lev, mode },
         });
 
         if (isJson()) return printJson(jsonOk(result));
@@ -1570,7 +1655,7 @@ export function registerTradeCommands(
           type: "rebalance", exchange: adapter.name, symbol: symbol.toUpperCase(), side: mode,
           size: leverage, status: "failed", dryRun: false,
           error: extractErrorMessage(err),
-          meta: { action: "set_leverage", leverage: parseInt(leverage), mode },
+          meta: { action: "set_leverage", leverage: lev, mode },
         });
         throw err;
       }
@@ -1726,8 +1811,9 @@ export function registerTradeCommands(
         const positions = await adapter.getPositions();
         const pos = positions.find(p => symbolMatch(p.symbol, sym));
         if (!pos) {
-          if (isJson()) return printJson(jsonOk({ closed: false, reason: "no_position" }));
-          errorAndExit(`No open position for ${sym}`);
+          throw new PerpError("POSITION_NOT_FOUND", `No open position for ${sym} on ${adapter.name}; nothing was closed`, {
+            exchange: adapter.name, remediation: `Check positions: perp account positions -e ${adapter.name}`,
+          });
         }
         const size = pos.size.replace(/^-/, "");
         const closeSide = pos.side === "long" ? "sell" : "buy";
@@ -1804,8 +1890,9 @@ export function registerTradeCommands(
         const positions = await adapter.getPositions();
         const pos = positions.find(p => symbolMatch(p.symbol, sym));
         if (!pos) {
-          if (isJson()) return printJson(jsonOk({ reduced: false, reason: "no_position" }));
-          errorAndExit(`No open position for ${sym}`);
+          throw new PerpError("POSITION_NOT_FOUND", `No open position for ${sym} on ${adapter.name}; nothing was reduced`, {
+            exchange: adapter.name, remediation: `Check positions: perp account positions -e ${adapter.name}`,
+          });
         }
         // Reduce-only close size: position size × percent floored to the market's LOT step from the
         // venue market info (lotStepOf) — never to the decimals the position size happens to print
@@ -2044,6 +2131,8 @@ export function registerTradeCommands(
       }
 
       const adapter = await getAdapter();
+      // Quarantine first: it refuses the whole ladder before any market / lot read.
+      assertNotQuarantined(adapter.name, sym, false);
 
       // Compute sizes for each level on the venue lot (validated before anything is sent)
       const step = await lotStepOf(adapter, sym);
@@ -2070,7 +2159,7 @@ export function registerTradeCommands(
       // is the sum across levels, expressed as total base * volume-weighted price.
       const totalBase = levelSizes.reduce((acc, l) => acc + parseFloat(l.size), 0);
       const totalNotional = levelSizes.reduce((acc, l) => acc + parseFloat(l.size) * parseFloat(l.price), 0);
-      await enforceOrderRisk(adapter, { symbol: sym, size: totalBase, price: totalBase > 0 ? totalNotional / totalBase : NaN, force: opts.force });
+      await openingOrderGate(adapter, { symbol: sym, size: totalBase, price: totalBase > 0 ? totalNotional / totalBase : NaN, force: opts.force });
 
       if (dryRunGuard("scale_in", {
         exchange: adapter.name, symbol: sym, side: s,
@@ -2671,7 +2760,7 @@ function registerMultiAction(
             logExecution({ type: "multi_leg", exchange: leg.exchange, symbol: leg.symbol, side: leg.side, size: leg.size, status: "success", dryRun: false, meta: { result: f.raw, smart: opts.smart, measuredFill: f.filledSize } });
           } catch (e) {
             r.error = extractErrorMessage(e);
-            logExecution({ type: "multi_leg", exchange: leg.exchange, symbol: leg.symbol, side: leg.side, size: leg.size, status: "failed", error: r.error, dryRun: false, meta: { smart: opts.smart, pending: isOutcomeUnknown(e) } });
+            logExecution({ type: "multi_leg", exchange: leg.exchange, symbol: leg.symbol, side: leg.side, size: leg.size, status: isOutcomeUnknown(e) ? "unverified" : "failed", error: r.error, dryRun: false, meta: { smart: opts.smart, pending: isOutcomeUnknown(e) } });
             if (isOutcomeUnknown(e)) {
               r.status = "unknown";
               quarantineLeg(leg, `trade multi: ${leg.side} ${leg.size} ${leg.symbol} on ${leg.exchange} outcome unknown (${r.error})`);

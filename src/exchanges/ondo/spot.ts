@@ -419,22 +419,11 @@ export class OndoSpotAdapter implements SpotAdapter, SpotTransferCapable, SpotOp
     }
     const symbol = asset.trim();
     if (!/^[A-Za-z0-9]{1,20}$/.test(symbol)) throw new PerpError("INVALID_PARAMS", `Invalid transfer asset "${asset}"`);
-    try {
-      await this.authed(() => this.client.postNoResult("/v1/spot/transfers", {
-        symbol, amount, from: { wallet: from }, to: { wallet: to },
-      }));
-    } catch (e) {
-      // 5xx: the web app treats the outcome as unconfirmed — do not blindly retry.
-      const http = e instanceof PerpError ? (e.structured.details as { httpStatus?: unknown } | undefined)?.httpStatus : undefined;
-      if (typeof http === "number" && http >= 500) {
-        throw new PerpError("EXCHANGE_ERROR", `Ondo transfer ${from}→${to} outcome unconfirmed (HTTP ${http})`, {
-          exchange: "ondo",
-          httpStatus: http,
-          remediation: "Check spot and perp balances (perp spot balance / perp account) before retrying",
-        });
-      }
-      throw e;
-    }
+    // A POST answered 5xx / unreadable / not answered is already ORDER_PENDING from OndoClient
+    // (never resubmit); a 4xx venue error is a definite refusal.
+    await this.authed(() => this.client.postNoResult("/v1/spot/transfers", {
+      symbol, amount, from: { wallet: from }, to: { wallet: to },
+    }));
     return { venue: "ondo", asset: symbol, amount, from, to };
   }
 }

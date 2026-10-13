@@ -1,6 +1,7 @@
 import { parsePositiveDecimal } from "../errors.js";
 import { Command } from "commander";
 import { isDryRun, networkOf, supportsDryRun } from "../cli-flags.js";
+import { setQuarantineNetwork } from "../bot/quarantine.js";
 import { assertStrategySimulatable } from "../bot/engine.js";
 import chalk from "chalk";
 import { printJson, jsonOk, jsonError } from "../utils.js";
@@ -21,6 +22,8 @@ export function registerStrategyCommands(
   isJson: () => boolean,
 ) {
   const bot = program.command("strategy").description("Trading strategies — long-running bot algorithms + one-shot scripted plans");
+  // Quarantine checks / entries of every strategy command (bots, plans, DCA / TWAP) are scoped to its -n network.
+  bot.hook("preAction", (_cmd, action) => setQuarantineNetwork(networkOf(action)));
 
   /** The root `-e` selection: resolved id + whether it was given on the command line (not the default). */
   const cliVenue = (): CliVenueSelection => ({
@@ -515,7 +518,7 @@ export function registerStrategyCommands(
       }
       console.log(chalk.red.bold(`\n  Quarantined symbols — blocked for all bots and arb paths (${QUARANTINE_FILE}):\n`));
       for (const e of entries) {
-        console.log(`    ${chalk.white(`${e.strategy} ${e.symbol}`)} ${chalk.gray(e.time)}`);
+        console.log(`    ${chalk.white(`${e.strategy} ${e.symbol}`)} ${chalk.gray(`${e.time} · ${e.network ?? "any network (set by a process that did not declare one)"}`)}`);
         console.log(`      ${e.reason}`);
         console.log(chalk.yellow(`      ${e.remediation}`));
       }

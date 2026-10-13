@@ -7,7 +7,7 @@ import { printJson, jsonOk } from "../utils.js";
 import { PerpError, classifyError } from "../errors.js";
 import chalk from "chalk";
 import bs58 from "bs58";
-import { loadSettings, type AgentMeta, type OndoAgentMeta, type ArcusAgentMeta } from "../settings.js";
+import { loadSettings, type AgentMeta, type OndoAgentMeta, type ArcusAgentMeta, type QfexAgentMeta } from "../settings.js";
 import {
   getAgent, setAgent, deleteAgent, listAgents, acquireLock, releaseLock,
   getVenueAgent, getVenueAgentForNetwork, setVenueAgent, deleteVenueAgent, listVenueAgents,
@@ -29,6 +29,22 @@ import {
   buildApproveAgentTypedData,
   buildDelAgentTypedData,
 } from "../exchanges/aster-typed-data.js";
+
+/**
+ * Subcommand `--passphrase <pp>`: still accepted (existing scripts) but deprecated like the root
+ * flag — hidden from help, and a stderr warning when it was given on the command line (it is
+ * visible in ps / shell history). Use with `.hook("preAction", warnDeprecatedPassphrase)`.
+ */
+export function deprecatedPassphraseOption(what: string = "Master OWS passphrase", flags: string = "--passphrase <pp>"): Option {
+  return new Option(flags, `DEPRECATED (visible in ps / shell history) — ${what}; prefer OWS_PASSPHRASE env or stdin`).hideHelp();
+}
+
+export const ARGV_PASSPHRASE_WARNING = "[warn] --passphrase on the command line is DEPRECATED and visible in ps / shell history. Use the OWS_PASSPHRASE env var or pipe it on stdin.\n";
+
+/** preAction hook paired with deprecatedPassphraseOption(): warns once per command run. */
+export function warnDeprecatedPassphrase(cmd: Command): void {
+  if (cmd.getOptionValueSource("passphrase") === "cli") process.stderr.write(ARGV_PASSPHRASE_WARNING);
+}
 
 /**
  * Emit a structured JSON error envelope to stdout and exit non-zero.
@@ -858,12 +874,24 @@ export async function approveVenueAgent(p: ApproveAgentParams): Promise<ApproveA
   }
 }
 
+/**
+ * Loud warning for a QFEX key that has — or may have (it cannot be checked without acting) — the
+ * "Deposit and withdraw" permission. Such a key can withdraw with the key alone, and imported keys
+ * are stored with an empty passphrase (file permissions only). Not a block: a funding key is needed
+ * for a QFEX withdrawal. Shown at import and in `wallet agent list`. null = no warning.
+ */
+export function qfexWithdrawKeyWarning(meta: Pick<QfexAgentMeta, "agentName" | "permissions">): string | null {
+  if (meta.permissions.depositWithdraw === false) return null;
+  const has = meta.permissions.depositWithdraw === true ? "HAS" : "MAY HAVE (cannot be checked without withdrawing)";
+  return `QFEX key "${meta.agentName}" ${has} the "Deposit and withdraw" permission and is stored with an EMPTY passphrase (protected by file permissions only) — anyone who can read ~/.perp can withdraw with it. Delete it right after use: perp wallet agent revoke qfex ${meta.agentName} --local-only, and delete the key on the QFEX website.`;
+}
+
 /** Venues `wallet agent rotate` (and `approve --rotate`) can rotate. */
 type RotatableVenue = "aster" | "hyperliquid" | "pacifica" | LighterVenueId;
 
 type RotatedAgentOutcome = Exclude<ApproveAgentOutcome, { venue: "ondo" | "arcus" }>;
 
-interface RotateAgentParams {
+export interface RotateAgentParams {
   exchange: RotatableVenue;
   network: Network;
   agentNameToRotate: string;
@@ -872,9 +900,10 @@ interface RotateAgentParams {
   /** Resolved lazily, after the record / master checks (null → PASSPHRASE_REQUIRED). */
   passphrase: () => Promise<string | null>;
   expiresIn: string;
-  /** All undefined → inherit the old agent's permissions. */
+  /** Both undefined → inherit the old agent's trade permissions. */
   canPerp: boolean | undefined;
   canSpot: boolean | undefined;
+  /** Never inherited: true only when --can-withdraw was passed explicitly (Aster: needs ipWhitelist). */
   canWithdraw: boolean | undefined;
   /** Aster-only IP whitelist. */
   ipWhitelist: string | undefined;
@@ -885,7 +914,7 @@ interface RotateAgentParams {
  * its dead OWS wallet and local record, then approve a fresh agent under the same name. The single
  * path of `wallet agent rotate` and `wallet agent approve --rotate`.
  */
-async function rotateVenueAgent(p: RotateAgentParams): Promise<RotatedAgentOutcome> {
+export async function rotateVenueAgent(p: RotateAgentParams): Promise<RotatedAgentOutcome> {
   const { exchange, network, agentNameToRotate } = p;
   const settings = loadSettings();
 
@@ -920,33 +949,34 @@ async function rotateVenueAgent(p: RotateAgentParams): Promise<RotatedAgentOutco
     });
   }
 
+  // Resolve permissions BEFORE anything is revoked: explicit flags > old agent's trade
+  // permissions > defaults. With --no-can-perp/spot pattern, opts values are undefined when not
+  // passed. canWithdraw is NEVER inherited: only an explicit --can-withdraw grants it.
+  const permFlagsProvided = p.canPerp !== undefined || p.canSpot !== undefined;
+  let canPerp: boolean;
+  let canSpot: boolean;
+  if (permFlagsProvided) {
+    canPerp = p.canPerp ?? true;
+    canSpot = p.canSpot ?? false;
+  } else if (existing?.permissions) {
+    // Preserve old agent's trade permissions when flags are absent
+    canPerp = existing.permissions.canPerpTrade;
+    canSpot = existing.permissions.canSpotTrade;
+  } else {
+    canPerp = true;
+    canSpot = false;
+  }
+  const canWithdraw = p.canWithdraw === true;
+  // Aster: --can-withdraw without --ip-whitelist is refused here, before the passphrase is read
+  // and before the old agent is revoked (a later refusal would leave no agent at all).
+  if (exchange === "aster") assertAsterWithdrawIpWhitelist(canWithdraw, p.ipWhitelist);
+
   // Resolve passphrase (needed for both revoke and approve phases)
   const passphrase = await p.passphrase();
   if (passphrase === null) {
     throw new PerpError("PASSPHRASE_REQUIRED", "No passphrase provided and stdin is non-TTY", {
       remediation: "Provide passphrase via --passphrase flag, OWS_PASSPHRASE env var, or stdin pipe",
     });
-  }
-
-  // Resolve permissions: explicit flags > old agent's permissions > defaults.
-  // With --no-can-perp/spot/withdraw pattern, opts values are undefined when not passed.
-  const permFlagsProvided = p.canPerp !== undefined || p.canSpot !== undefined || p.canWithdraw !== undefined;
-  let canPerp: boolean;
-  let canSpot: boolean;
-  let canWithdraw: boolean;
-  if (permFlagsProvided) {
-    canPerp = p.canPerp ?? true;
-    canSpot = p.canSpot ?? false;
-    canWithdraw = p.canWithdraw ?? false;
-  } else if (existing?.permissions) {
-    // Preserve old agent's permission set when flags are absent
-    canPerp = existing.permissions.canPerpTrade;
-    canSpot = existing.permissions.canSpotTrade;
-    canWithdraw = existing.permissions.canWithdraw;
-  } else {
-    canPerp = true;
-    canSpot = false;
-    canWithdraw = false;
   }
 
   // Revoke the existing agent (if present) BEFORE approving the new one.
@@ -1168,7 +1198,7 @@ export function registerWalletAgentCommands(
     .option("--can-withdraw", "Allow withdrawals (default: off)", false)
     .option("--no-withdraw", "Disallow withdrawals")
     .option("--rotate", "Allow re-approving an existing agent name")
-    .option("--passphrase <pp>", "Master OWS passphrase (fallback: OWS_PASSPHRASE env / stdin)")
+    .addOption(deprecatedPassphraseOption()).hook("preAction", warnDeprecatedPassphrase)
     .addOption(new Option("--builder <addr>", "Removed — use: perp wallet builder approve <venue>").hideHelp())
     .addOption(new Option("--max-fee-rate <rate>", "Removed — use: perp wallet builder approve <venue>").hideHelp())
     .addOption(new Option("--builder-name <name>", "Removed — use: perp wallet builder approve <venue>").hideHelp())
@@ -1435,10 +1465,13 @@ Examples:
           status,
           // null = set on the exchange website, not known locally (imported keys).
           permissions: agentSourceOf(ex, meta) === "imported" ? null : meta.permissions,
+          warning: null,
         } as {
           name: string; exchange: string; network: Network | null; source: "approved" | "imported";
           evmAddress: string; expiresAt: string; status: "active" | "expired" | "partial";
           permissions: AgentMeta["permissions"] | null;
+          /** Loud key-safety warning (QFEX keys that can, or may, withdraw); null = none. */
+          warning: string | null;
         };
       });
 
@@ -1459,6 +1492,7 @@ Examples:
           status,
           // QFEX permissions are set on the website and cannot be read back → null (unknown).
           permissions: meta.kind === "qfex" ? null : { canPerpTrade: true, canSpotTrade: false, canWithdraw: false },
+          warning: meta.kind === "qfex" ? qfexWithdrawKeyWarning(meta) : null,
         });
       }
 
@@ -1493,7 +1527,7 @@ Examples:
             : [
               r.permissions.canPerpTrade ? chalk.green("Y") : chalk.gray("N"),
               r.permissions.canSpotTrade ? chalk.green("Y") : chalk.gray("N"),
-              r.permissions.canWithdraw ? chalk.green("Y") : chalk.gray("N"),
+              r.permissions.canWithdraw === null ? chalk.gray("?") : r.permissions.canWithdraw ? chalk.green("Y") : chalk.gray("N"),
             ]),
         ];
         console.log("  " + cols.map((c, i) => String(c).padEnd(colWidths[i])).join("  "));
@@ -1501,6 +1535,7 @@ Examples:
       if (rows.some(r => r.source === "imported")) {
         console.log(chalk.gray("\n  imported = created on the exchange website; PERP/SPOT/WITHDRAW \"?\" = set on the website. The CLI cannot revoke these (revoke on the website)."));
       }
+      for (const r of rows) if (r.warning !== null) console.log(chalk.red.bold(`\n  [WARNING] ${r.warning}`));
       console.log();
     });
 
@@ -1510,7 +1545,7 @@ Examples:
     .description("Revoke an agent wallet registration (imported keys: --local-only — revoke them on the website)")
     .option("--force", "Skip the venue revoke call, only clear local state")
     .option("--local-only", "Only remove the local record (and, for imported keys, the local key copy) — nothing is sent; the key stays authorized on the exchange")
-    .option("--passphrase <pp>", "Master OWS passphrase")
+    .addOption(deprecatedPassphraseOption()).hook("preAction", warnDeprecatedPassphrase)
     .option("--master <name>", "Master OWS wallet (Arcus revoke). Defaults to settings.owsActiveWallet")
     .option("--json", "Machine-readable output")
     .action(async (exchangeArg: string, agentName: string, opts: {
@@ -1708,7 +1743,7 @@ Examples:
   agent
     .command("rotate <exchange> [oldAgentName]")
     .description("Rotate an agent wallet: revoke existing, then approve with same name")
-    .option("--passphrase <pp>", "Master OWS passphrase")
+    .addOption(deprecatedPassphraseOption()).hook("preAction", warnDeprecatedPassphrase)
     .option("--master <name>", "Master OWS wallet name (default: the old agent's master, then settings.owsActiveWallet)")
     .option("--agent-name <name>", "Agent name to rotate (default: first registered agent)")
     .option("--expires-in <duration>", "New expiry (default: 90d)")
@@ -1716,8 +1751,9 @@ Examples:
     .option("--no-can-perp", "Disallow perp trading")
     .option("--can-spot", "Allow spot trading (default: inherit or off)")
     .option("--no-can-spot", "Disallow spot trading")
-    .option("--can-withdraw", "Allow withdrawals (default: inherit or off)")
-    .option("--no-can-withdraw", "Disallow withdrawals")
+    .option("--can-withdraw", "Allow withdrawals (default: off — never inherited from the old agent; Aster also needs --ip-whitelist)")
+    .option("--no-can-withdraw", "Disallow withdrawals (the default)")
+    .option("--ip-whitelist <list>", "Aster IP whitelist, comma- or space-separated (required with --can-withdraw)")
     .option("--json", "Machine-readable output")
     .action(async (exchangeArg: string, oldAgentNameArg: string | undefined, opts: {
       passphrase?: string;
@@ -1727,6 +1763,7 @@ Examples:
       canPerp?: boolean;
       canSpot?: boolean;
       canWithdraw?: boolean;
+      ipWhitelist?: string;
       json?: boolean;
     }, command: Command) => {
       const useJson = opts.json ?? isJson();
@@ -1758,7 +1795,7 @@ Examples:
           passphrase: () => resolvePassphrase({ flag: passphraseFlag }),
           expiresIn: opts.expiresIn ?? "90d",
           canPerp: opts.canPerp, canSpot: opts.canSpot, canWithdraw: opts.canWithdraw,
-          ipWhitelist: undefined,
+          ipWhitelist: opts.ipWhitelist,
         });
         const rotatedAgentAddress = rotatedAgentAddressOf(outcome);
         const expiresAtIso = outcome.expiresAt;
@@ -1781,7 +1818,7 @@ Examples:
     .option("--master <name>", "Master OWS wallet name (Aster/PAC). Defaults to settings.owsActiveWallet")
     .option("--master-address <addr>", "Master EVM address (HL only)")
     .option("--account-index <n>", "Account index (Lighter only)")
-    .option("--passphrase <pp>", "Master OWS passphrase (Aster/PAC). Falls back to OWS_PASSPHRASE env.")
+    .addOption(deprecatedPassphraseOption()).hook("preAction", warnDeprecatedPassphrase)
     .option("--json", "Machine-readable output")
     .action(async (exchange: string | undefined, agentName: string | undefined, opts: {
       master?: string;

@@ -20,7 +20,20 @@ vi.mock("../jobs.js", () => ({
 
 // ── Mock adapter factory ──
 
+/**
+ * The venue reports the fill size (OrderResult `filledSize`): DCA / TWAP count only a
+ * venue-reported fill, so every mocked market order reports the requested size as filled
+ * unless the mocked result already carries its own `filledSize`.
+ */
+function reportsFill(impl: (...a: any[]) => any) {
+  return vi.fn(async (...a: any[]) => {
+    const r = await impl(...a);
+    return { ...r, status: typeof r?.status === "string" ? r.status : "FILLED", filledSize: typeof r?.filledSize === "string" ? r.filledSize : String(a[2]) };
+  });
+}
+
 function mockAdapter(overrides?: Partial<Record<string, unknown>>) {
+  const mo = overrides?.marketOrder as ((...a: any[]) => any) | undefined;
   return {
     // Registered venue id: every market order resolves its slippage bound per venue (UNKNOWN_VENUE otherwise).
     name: "hyperliquid",
@@ -37,7 +50,6 @@ function mockAdapter(overrides?: Partial<Record<string, unknown>>) {
     getFundingHistory: vi.fn().mockResolvedValue([]),
     getFundingPayments: vi.fn().mockResolvedValue([]),
     getKlines: vi.fn().mockResolvedValue([]),
-    marketOrder: vi.fn().mockResolvedValue({ orderId: "m1", price: "60000" }),
     limitOrder: vi.fn().mockResolvedValue({ orderId: "l1" }),
     editOrder: vi.fn().mockResolvedValue({}),
     cancelOrder: vi.fn().mockResolvedValue({}),
@@ -45,6 +57,7 @@ function mockAdapter(overrides?: Partial<Record<string, unknown>>) {
     setLeverage: vi.fn().mockResolvedValue({}),
     stopOrder: vi.fn().mockResolvedValue({}),
     ...overrides,
+    marketOrder: reportsFill(mo ?? (async () => ({ orderId: "m1", price: "60000" }))),
   } as any;
 }
 

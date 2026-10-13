@@ -85,7 +85,6 @@ export interface HyperliquidInternals {
   _invalidateAccountCache: HyperliquidAdapter["_invalidateAccountCache"];
   _infoPost: HyperliquidAdapter["_infoPost"];
   _signAndSendAction: HyperliquidAdapter["_signAndSendAction"];
-  _hlRoundPrice: HyperliquidAdapter["_hlRoundPrice"];
 }
 export type HyperliquidTestAdapter = WithInternals<HyperliquidAdapter, HyperliquidInternals>;
 

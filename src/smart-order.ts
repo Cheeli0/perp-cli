@@ -28,6 +28,7 @@
  * thrown error, never a silent market sweep.
  */
 
+import { alignComputedLimitPrice } from "./bot/quote-rules.js";
 import type { ExchangeAdapter } from "./exchanges/index.js";
 import { PerpError, orderNotSent } from "./errors.js";
 import { resolveAdapterSlippage, type ResolvedSlippage } from "./exchanges/slippage.js";
@@ -203,7 +204,8 @@ export async function smartOrder(
     ? bestPrice + tick * tickTolerance   // 1 tick above best ask
     : bestPrice - tick * tickTolerance;  // 1 tick below best bid
 
-  const formattedPrice = limitPrice.toFixed(decimals);
+  // Book-inferred tick; venues without a published tick (HL) are then put on their own grid (passive side).
+  const formattedPrice = await alignComputedLimitPrice(adapter, symbol, side, limitPrice.toFixed(decimals));
   if (!(Number.isFinite(bestPrice) && bestPrice > 0 && Number(formattedPrice) > 0)) {
     throw new PerpError("ORDER_REJECTED", `${venue} ${what} not sent: unusable limit price ${formattedPrice} (best ${bestEntry[0]}, tick ${tick})`, { exchange: venue });
   }

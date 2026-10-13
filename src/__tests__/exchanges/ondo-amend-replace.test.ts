@@ -99,10 +99,13 @@ describe("Ondo cancel→replace size formula", () => {
     expect(String(body.clientOrderId)).toMatch(/^pcli-p-/);
   });
 
-  it("reduce-only original → replacement reduce-only", async () => {
+  it("resting reduce-only original → refused BEFORE the cancel (the venue only takes a reduce-only limit as IOC)", async () => {
+    // venues/ondo.ts reduceOnlyTif ["IOC"]: a reduce-only GTC replacement would be refused with
+    // reduce_only_invalid_tif only after the original was already cancelled.
     const { a, client } = adapterWith({ original: { reduceOnly: true, side: "sell" } });
-    await amend(a, "100", "0.5");
-    expect(client.post).toHaveBeenCalledWith("/v1/perps/orders", expect.objectContaining({ reduceOnly: true, side: "sell" }));
+    await expect(amend(a, "100", "0.5")).rejects.toMatchObject({ structured: { code: "CAPABILITY_UNSUPPORTED" } });
+    expect(client.delete).not.toHaveBeenCalled();
+    expect(client.post).not.toHaveBeenCalled();
   });
 });
 

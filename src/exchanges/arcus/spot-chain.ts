@@ -10,7 +10,7 @@
  */
 
 import { AbiCoder, Interface, JsonRpcProvider, Network, Signature, Transaction, keccak256, toUtf8Bytes } from "ethers";
-import { PerpError } from "../../errors.js";
+import { PerpError, orderOutcomeUnknown, sendFailure } from "../../errors.js";
 import { MULTICALL3_ADDRESS, PERMIT2_ADDRESS } from "./spot-router.js";
 
 /** Approve receipt wait. */
@@ -191,18 +191,32 @@ export class ArcusSpotChain {
     if (tx.from?.toLowerCase() !== owner.toLowerCase()) {
       throw new PerpError("SIGNATURE_FAILED", `Approve tx recovered signer ${tx.from}, expected ${owner}`, { exchange: "arcus" });
     }
-    const sent = await this.provider.broadcastTransaction(tx.serialized);
+    // Once broadcast, the approve's outcome is unknown until mined: a broadcast transport failure,
+    // a receipt read failure or a receipt timeout → ORDER_PENDING (never the retryable TIMEOUT,
+    // which callers re-type as "not sent"). No connection at all → definitely not sent.
+    const signedHash = tx.hash;
+    const pendingRemediation = (hash: string | null) =>
+      `Do NOT send another approve; wait for ${hash ?? "the approve tx"} to confirm (check the wallet's Robinhood Chain transactions), then retry the swap`;
+    let sent: { hash: string };
+    try {
+      sent = await this.provider.broadcastTransaction(tx.serialized);
+    } catch (e) {
+      throw sendFailure("arcus", `Permit2 approve tx ${signedHash ?? ""}`.trim(), e, pendingRemediation(signedHash));
+    }
     let receipt;
     try {
       receipt = await this.provider.waitForTransaction(sent.hash, 1, ARCUS_APPROVE_RECEIPT_TIMEOUT_MS);
     } catch (e) {
-      if ((e as { code?: unknown }).code !== "TIMEOUT") throw e;
+      if ((e as { code?: unknown }).code !== "TIMEOUT") {
+        throw orderOutcomeUnknown("arcus", `Permit2 approve tx ${sent.hash}`, e, pendingRemediation(sent.hash));
+      }
       receipt = null;
     }
     if (receipt === null) {
-      throw new PerpError("TIMEOUT", `Permit2 approve tx ${sent.hash} not mined within ${ARCUS_APPROVE_RECEIPT_TIMEOUT_MS / 1000}s`, {
+      throw new PerpError("ORDER_PENDING", `Permit2 approve tx ${sent.hash} not mined within ${ARCUS_APPROVE_RECEIPT_TIMEOUT_MS / 1000}s`, {
         exchange: "arcus",
-        remediation: `Do NOT send another approve; wait for ${sent.hash} to confirm, then retry the swap`,
+        txHash: sent.hash,
+        remediation: pendingRemediation(sent.hash),
       });
     }
     if (receipt.status !== 1) {

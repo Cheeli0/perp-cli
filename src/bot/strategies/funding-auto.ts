@@ -577,6 +577,8 @@ class FundingAutoStrategy implements Strategy {
     opp: FundingOpportunity,
     adapters: Map<string, ExchangeAdapter>,
   ): Promise<boolean> {
+    // Engine: equity unknown → no new entries (closes still run).
+    if (ctx.state.get("equityUnknown") === true) { ctx.log(`[funding-auto] Skip ${opp.symbol}: equity unknown — no new entries`); return false; }
     const longAdapter = adapters.get(opp.longExchange);
     const shortAdapter = adapters.get(opp.shortExchange);
     if (!longAdapter || !shortAdapter) return false;

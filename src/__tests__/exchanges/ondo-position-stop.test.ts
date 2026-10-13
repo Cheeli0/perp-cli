@@ -101,7 +101,8 @@ describe("Ondo placePositionStop — the partial stop is located in the order li
       if (path === "/v1/perps/orders") return reply([TP_ORDER, { ...SL_ORDER, size: "0.004" }, { ...SL_ORDER, triggerPrice: "2500" }]);
       return reply({ [MARKET]: { markPrice: "2700" } });
     }));
-    await expect(a.placeOrder(stop("2573.5"))).rejects.toMatchObject({ structured: { code: "EXCHANGE_ERROR" } });
+    // The POST succeeded: no identifiable new stop → ORDER_PENDING (do NOT resubmit), never EXCHANGE_ERROR.
+    await expect(a.placeOrder(stop("2573.5"))).rejects.toMatchObject({ structured: { code: "ORDER_PENDING" } });
   });
 });
 

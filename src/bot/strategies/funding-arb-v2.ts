@@ -1,10 +1,11 @@
 import type { Strategy, StrategyContext, StrategyAction, EnrichedSnapshot } from "../strategy-types.js";
 import type { ExchangeAdapter } from "../../exchanges/index.js";
 import { registerStrategy } from "../strategy-registry.js";
-import { isQuarantined, quarantineSymbol } from "../quarantine.js";
+import { isQuarantined, quarantineKey, quarantineSymbol } from "../quarantine.js";
+import { PerpError } from "../../errors.js";
 import { closePerpVerified, isOutcomeUnknown, placePerpVerified, trimFirstLegToHedge } from "../perp-order.js";
 import { fillSizeString, sizeDecimalsOf } from "../../exchanges/spot-result.js";
-import { isPositionGone, assertFundingArbLegs } from "./funding-arb-utils.js";
+import { isPositionGone, assertFundingArbLegs, cancelBotSymbols } from "./funding-arb-utils.js";
 
 /**
  * Enhanced funding rate arbitrage (multi-exchange) v2 — the LIVE "funding-arb-v2"
@@ -46,6 +47,8 @@ export class FundingArbV2Strategy implements Strategy {
   readonly name = "funding-arb-v2";
 
   private _config: Record<string, unknown> = {};
+  /** Symbols this bot entered or recovered this run — the only symbols its stop cancels orders on. */
+  private _traded = new Set<string>();
 
   describe() {
     return {
@@ -69,9 +72,59 @@ export class FundingArbV2Strategy implements Strategy {
   async init(ctx: StrategyContext, _snapshot: EnrichedSnapshot): Promise<void> {
     assertFundingArbLegs(ctx);
     this._config = ctx.config;
-    ctx.state.set("positions", [] as ArbPosition[]);
+    // A restart must never re-enter (or ignore) what is already held: rebuild the pairs from the venues.
+    const recovered = await this.recoverPositions(this.getAdapters(ctx), ctx);
+    for (const p of recovered) this._traded.add(p.symbol);
+    ctx.state.set("positions", recovered);
     ctx.state.set("lastScan", 0);
+    if (recovered.length > 0) ctx.log(`  [ARB-V2] Recovered ${recovered.length} pair(s): ${recovered.map(p => `${p.symbol} ${p.longExchange}↔${p.shortExchange} ${p.size}`).join(", ")}`);
     ctx.log(`  [ARB-V2] Ready | minSpread=${this.minSpread}% closeSpread=${this.closeSpread}% maxPos=${this.maxPositions} size=$${this.sizeUsd}`);
+  }
+
+  /**
+   * Pairs held on the venues: a long on one venue + a short of the same symbol and EXACTLY the
+   * same size on another. A single leg or a size-mismatched long/short is quarantined (both
+   * sizes recorded) — never tracked, never stacked on. A venue whose positions cannot be read
+   * throws (the start fails and is retried): unknown exposure is never "flat".
+   */
+  private async recoverPositions(adapters: Map<string, ExchangeAdapter>, ctx: StrategyContext): Promise<ArbPosition[]> {
+    const legs: { venue: string; symbol: string; side: string; size: number; raw: string }[] = [];
+    for (const [venue, a] of adapters) {
+      let list: Awaited<ReturnType<ExchangeAdapter["getPositions"]>>;
+      try {
+        list = await a.getPositions();
+      } catch (e) {
+        throw new PerpError("EXCHANGE_ERROR", `[ARB-V2] ${venue} positions unreadable at start (${e instanceof Error ? e.message : String(e)}) — not started (held pairs unknown)`, {
+          exchange: venue, remediation: `Check ${venue} connectivity (perp -e ${venue} account positions); the bot retries the start`,
+        });
+      }
+      for (const p of list) {
+        const size = Math.abs(Number(p.size));
+        if (size > 0) legs.push({ venue, symbol: p.symbol.toUpperCase(), side: p.side, size, raw: p.size.replace(/^-/, "") });
+      }
+    }
+    const used = new Set<(typeof legs)[number]>();
+    const out: ArbPosition[] = [];
+    for (const l of legs) {
+      if (l.side !== "long" || used.has(l)) continue;
+      const s = legs.find(x => !used.has(x) && x.side === "short" && x.symbol === l.symbol && x.venue !== l.venue && x.size === l.size);
+      if (s === undefined) continue;
+      used.add(l); used.add(s);
+      out.push({ symbol: l.symbol, longExchange: l.venue, shortExchange: s.venue, entrySpread: 0, entryTime: 0, sizeUsd: 0, size: l.raw, longClosed: false, closeFailures: 0 });
+    }
+    const leftover = new Map<string, (typeof legs)[number][]>();
+    for (const l of legs) if (!used.has(l)) leftover.set(quarantineKey(l.symbol), [...(leftover.get(quarantineKey(l.symbol)) ?? []), l]);
+    for (const [key, group] of leftover) {
+      if (isQuarantined(key, ctx.log)) continue;
+      const desc = group.map(l => `${l.side} ${l.raw} on ${l.venue}`).join(", ");
+      const venues = [...new Set(group.map(l => l.venue))];
+      const mismatched = group.some(l => l.side === "long") && group.some(l => l.side === "short");
+      quarantineSymbol(this.name, key,
+        mismatched ? `recovery: ${key} long/short sizes do not match (${desc}) — not tracked as a pair` : `recovery: unpaired ${key} perp leg (${desc}) — no hedge found, not tracked`,
+        `Check ${key} on ${venues.join(" and ")} (${venues.map(v => `perp -e ${v} positions`).join("; ")}); close or re-hedge by hand, then: perp strategy quarantine-clear ${key}`,
+        ctx.log);
+    }
+    return out;
   }
 
   async onTick(ctx: StrategyContext, _snapshot: EnrichedSnapshot): Promise<StrategyAction[]> {
@@ -140,6 +193,11 @@ export class FundingArbV2Strategy implements Strategy {
 
     // Phase 2: Scan for new opportunities
     if (positions.length >= this.maxPositions) return [];
+    // Engine: equity unknown → no new entries (the closes above still ran).
+    if (ctx.state.get("equityUnknown") === true) {
+      ctx.log(`  [ARB-V2] Equity unknown — no new entries this scan`);
+      return positions.length > 0 ? [{ type: "noop" }] : [];
+    }
 
     const exchangeNames = [...ratesByExchange.keys()];
     const allSymbols = new Set<string>();
@@ -194,10 +252,13 @@ export class FundingArbV2Strategy implements Strategy {
     const slotsAvailable = this.maxPositions - positions.length;
     const toOpen = opportunities.slice(0, slotsAvailable);
 
+    const live = new Map<string, Promise<{ symbol: string; size: string }[]>>();
     for (const opp of toOpen) {
       const longAdapter = adapters.get(opp.longExchange);
       const shortAdapter = adapters.get(opp.shortExchange);
       if (!longAdapter || !shortAdapter || opp.price <= 0) continue;
+      if (await this.heldUntracked(opp.symbol, [[opp.longExchange, longAdapter], [opp.shortExchange, shortAdapter]], live, ctx)) continue;
+      this._traded.add(opp.symbol);
 
       const size = (this.sizeUsd / opp.price).toFixed(6);
       ctx.log(`  [ARB-V2] Opening ${opp.symbol}: spread ${opp.spread.toFixed(1)}% (long ${opp.longExchange}, short ${opp.shortExchange})`);
@@ -231,8 +292,6 @@ export class FundingArbV2Strategy implements Strategy {
    */
   async onStop(ctx: StrategyContext): Promise<StrategyAction[]> {
     const positions = ctx.state.get("positions") as ArbPosition[];
-    if (positions.length === 0) return [];
-
     const adapters = this.getAdapters(ctx);
     const remaining: ArbPosition[] = [];
     for (const pos of positions) {
@@ -250,7 +309,29 @@ export class FundingArbV2Strategy implements Strategy {
       }
     }
     ctx.state.set("positions", remaining);
-    return [{ type: "cancel_all" }];
+    // Only the bot's own symbols, on each venue it used — never an account-wide cancel.
+    await cancelBotSymbols(adapters, this._traded, "[ARB-V2]", ctx.log);
+    return [];
+  }
+
+  /** A live position of `symbol` on one of the venues that the bot does not track (or an unreadable venue): no entry on top of it. */
+  private async heldUntracked(symbol: string, venues: [string, ExchangeAdapter][], cache: Map<string, Promise<{ symbol: string; size: string }[]>>, ctx: StrategyContext): Promise<boolean> {
+    const key = quarantineKey(symbol);
+    for (const [v, a] of venues) {
+      if (!cache.has(v)) cache.set(v, a.getPositions());
+      let list: { symbol: string; size: string }[];
+      try {
+        list = await cache.get(v)!;
+      } catch (e) {
+        ctx.log(`  [ARB-V2] Skip ${symbol}: ${v} positions unreadable (${e instanceof Error ? e.message : String(e)}) — no entry on unknown exposure`);
+        return true;
+      }
+      if (list.some(p => quarantineKey(p.symbol) === key && Number(p.size) !== 0)) {
+        ctx.log(`  [ARB-V2] Skip ${symbol}: a ${symbol} position on ${v} is not one of the bot's pairs — no entry on top of it`);
+        return true;
+      }
+    }
+    return false;
   }
 
   private quarantine(pos: { symbol: string; longExchange: string; shortExchange: string }, reason: string, ctx: StrategyContext): void {
