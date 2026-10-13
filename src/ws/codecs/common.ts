@@ -63,6 +63,39 @@ export function badFieldsError(venue: string, wire: string, bad: Array<{ symbol:
 }
 
 /** Start of the next hour after `ts` (hourly-settling venues; intervalSource "venue-definition"). */
+/** `{price,size}` level → [price, size]; absent/null level → [null, null]; malformed → bad. */
+export function level(o: unknown, bad: string[], name: string): [Dec | null, Dec | null] {
+  if (o === null || o === undefined) return [null, null];
+  if (!isObj(o)) { bad.push(name); return [null, null]; }
+  const p = readDec(o, "price", bad);
+  const s = readDec(o, "size", bad);
+  return [p === undefined ? null : p, s === undefined ? null : s];
+}
+
+/** Enum lookup without prototype keys; unknown → null. */
+export function pick<T>(m: Record<string, T>, v: unknown): T | null {
+  return typeof v === "string" && Object.prototype.hasOwnProperty.call(m, v) ? m[v] : null;
+}
+
+/** A required string/number id → string; anything else → null (caller reports). */
+export function idOf(v: unknown): string | null {
+  if (typeof v === "string" && v !== "") return v;
+  if (typeof v === "number" && Number.isFinite(v)) return String(v);
+  return null;
+}
+
+/** Dec or null (absent → null) for row fields; malformed → bad. */
+export function dec(o: Obj, key: string, bad: string[]): Dec | null {
+  const v = readDec(o, key, bad);
+  return v === undefined ? null : v;
+}
+
+/** Number timestamp or null; `scale` 1e-3 converts µs → ms. */
+export function ts(o: Obj, key: string, bad: string[], scale = 1): number | null {
+  const v = readTs(o, key, bad, scale);
+  return v === undefined || v === null ? null : Math.floor(v);
+}
+
 export function nextHour(ts: number): number {
   return Math.floor(ts / 3_600_000) * 3_600_000 + 3_600_000;
 }
@@ -70,6 +103,7 @@ export function nextHour(ts: number): number {
 export function capabilities(
   p: {
     testnet: boolean;
+    user: boolean;
     fields: Record<Exclude<MarketField, "rate">, boolean>;
     notes: Record<string, string>;
   },
@@ -77,13 +111,12 @@ export function capabilities(
   return {
     browser: true, // Phase 0: no WS server checks Origin; REST CORS is `*`
     networks: { mainnet: true, testnet: p.testnet },
-    channels: { allMarkets: true, market: true, bbo: false, book: false, trades: false, user: false },
+    channels: { allMarkets: true, market: true, bbo: true, book: false, trades: false, user: p.user },
     fields: p.fields,
     notes: {
-      bbo: "Not in this release (0.14.4 Phase 2)",
       book: "Not in this release (0.14.5)",
       trades: "Not in this release (0.14.5)",
-      user: "Not in this release (0.14.4 Phase 2)",
+      ...(p.user ? {} : { user: "Not in this release (0.14.5)" }),
       ...p.notes,
     },
   };

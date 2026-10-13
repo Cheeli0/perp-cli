@@ -10,8 +10,10 @@
 
 import { badShape, fetchJson } from "../directory.js";
 import { VENUE_STATIC } from "../venue-static.js";
-import type { DecodedEvent, MarketDirectoryEntry, MarketPatch, VenueCodec, WireSub } from "../types.js";
-import { badFieldsError, capabilities, compact, isObj, parseFrame, readDec, readTs, unrecognised } from "./common.js";
+import type { DecodedEvent, FillRow, MarketDirectoryEntry, MarketPatch, OrderRow, PositionRow, VenueCodec, WireSub } from "../types.js";
+import {
+  badFieldsError, capabilities, compact, dec, idOf, isObj, parseFrame, protocolError, readDec, readTs, ts, unrecognised, pick,
+} from "./common.js";
 
 const S = VENUE_STATIC.pacifica;
 const PRICES = "prices";
@@ -25,6 +27,7 @@ export const pacifica: VenueCodec = {
   venue: "pacifica",
   capabilities: capabilities({
     testnet: true,
+    user: true,
     fields: {
       mark: true, index: true, bestBid: false, bestAsk: false, last: false, predictedRate: true,
       nextFundingTime: false, fundingInterval: true, openInterest: true, volume24hNotional: true,
@@ -35,6 +38,8 @@ export const pacifica: VenueCodec = {
       last: "Not in `prices`",
       nextFundingTime: "Not in `prices`",
       openInterest: "Base units",
+      user: "By account (Solana address), no auth. account_order_updates / account_trades send no snapshot → gap refetch-required for orders (at subscribe and after a reconnect) and fills (after a reconnect)",
+      bbo: "bbo{symbol} ≤ 20 per connection; `li` orders frames (non-contiguous)",
     },
   }),
   url: (n) => S.wsUrl[n],
@@ -42,7 +47,7 @@ export const pacifica: VenueCodec = {
   secretKeys: [],
   secretUrlPatterns: [/PF-API-KEY=[^&\s"']+/gi],
   ping: S.ping,
-  limits: S.limits,
+  limits: { ...S.limits, perGroup: { bbo: 20 } },
   closesOnBadSubscribe: false,
   staleAfterMs: S.staleAfterMs,
   openInterest: { unit: "base", sides: null },
@@ -70,8 +75,26 @@ export const pacifica: VenueCodec = {
     intervalSource: "venue-definition", intervalAsOf: null, marketClosed: null,
   }),
 
-  wiresFor(_target, _dir, staleOverrideMs): WireSub[] {
-    return [{ key: PRICES, staleAfterMs: staleOverrideMs === null ? S.staleAfterMs : staleOverrideMs, params: { source: PRICES } }];
+  wiresFor(target, _dir, staleOverrideMs): WireSub[] {
+    const prices: WireSub = { key: PRICES, staleAfterMs: staleOverrideMs === null ? S.staleAfterMs : staleOverrideMs, params: { source: PRICES } };
+    if (target.kind === "allMarkets") return [prices];
+    const out: WireSub[] = [];
+    if (target.channels.includes("market")) out.push(prices);
+    if (target.channels.includes("bbo")) out.push({ key: `bbo:${target.symbol}`, staleAfterMs: null, group: "bbo", params: { source: "bbo", symbol: target.symbol } });
+    return out;
+  },
+  user: {
+    inPageSecrets: false,
+    wires(ref, channels) {
+      if (ref.venue !== "pacifica") return [];
+      const w = (source: string, gaps?: WireSub["gaps"]): WireSub => ({ key: source, staleAfterMs: null, params: { source, account: ref.account }, ...(gaps === undefined ? {} : { gaps }) });
+      const out: WireSub[] = [];
+      if (channels.includes("account")) out.push(w("account_info"));
+      if (channels.includes("positions")) out.push(w("account_positions"));
+      if (channels.includes("orders")) out.push(w("account_order_updates", { onReconnect: ["orders"], onSubscribe: ["orders"] }));
+      if (channels.includes("fills")) out.push(w("account_trades", { onReconnect: ["fills"] }));
+      return out;
+    },
   },
   encodeSubscribe: (w) => JSON.stringify({ method: "subscribe", params: w.params }),
   encodeUnsubscribe: (w) => JSON.stringify({ method: "unsubscribe", params: w.params }),
@@ -87,6 +110,16 @@ export const pacifica: VenueCodec = {
       case "subscribe":
       case "unsubscribe":
         return [{ t: "ack", wire: sourceKey(f.data), reqId: null, unsubscribe: f.channel === "unsubscribe" }];
+      case "account_info":
+        return decodeAccount(f.data);
+      case "account_positions":
+        return decodePositions(f.data);
+      case "account_order_updates":
+        return decodeOrders(f.data);
+      case "account_trades":
+        return decodeTrades(f.data);
+      case "bbo":
+        return decodeBbo(f.data);
       case PRICES: {
         if (!Array.isArray(f.data)) return [unrecognised("pacifica")];
         const patches: MarketPatch[] = [];
@@ -115,3 +148,98 @@ export const pacifica: VenueCodec = {
     }
   },
 };
+
+const BOOK_SIDE: Record<string, "buy" | "sell"> = { bid: "buy", ask: "sell" };
+// account_trades `ts`: the trade side relative to the position.
+const TRADE_SIDE: Record<string, "buy" | "sell"> = { open_long: "buy", close_short: "buy", open_short: "sell", close_long: "sell" };
+const OPEN_STATUSES = new Set(["open", "partially_filled"]);
+
+function decodeAccount(d: unknown): DecodedEvent[] {
+  if (!isObj(d)) return [protocolError("pacifica account_info frame without data", "account_info")];
+  const bad: string[] = [];
+  const out: DecodedEvent[] = [{
+    t: "user", wire: "account_info",
+    deltas: [{
+      kind: "account", snapshot: true, dex: null, venueTs: ts(d, "t", bad), // every frame carries the full account
+      equity: dec(d, "ae", bad), available: dec(d, "as", bad), marginUsed: dec(d, "mu", bad),
+      unrealizedPnl: null, // not in account_info
+    }],
+  }];
+  if (bad.length > 0) out.push(badFieldsError("pacifica", "account_info", [{ symbol: "account", fields: bad }]));
+  return out;
+}
+
+function decodePositions(d: unknown): DecodedEvent[] {
+  // Every frame is the account's full position set ("closed" = an empty array; docs).
+  if (!Array.isArray(d)) return [protocolError("pacifica account_positions data is not an array", "account_positions")];
+  const bad: string[] = [];
+  const rows: PositionRow[] = [];
+  for (const p of d) {
+    if (!isObj(p) || typeof p.s !== "string") { bad.push("position"); continue; }
+    const side = pick(BOOK_SIDE, p.d);
+    rows.push({
+      symbol: p.s, dex: null, side: side === null ? null : side === "buy" ? "long" : "short",
+      size: dec(p, "a", bad), entryPrice: dec(p, "p", bad), markPrice: null, positionValue: null, unrealizedPnl: null,
+      liquidationPrice: dec(p, "l", bad), marginUsed: dec(p, "m", bad), leverage: null, venueTs: ts(p, "t", bad),
+    });
+  }
+  const out: DecodedEvent[] = [{ t: "user", wire: "account_positions", deltas: [{ kind: "positions", snapshot: true, scope: "", rows, remove: [] }] }];
+  if (bad.length > 0) out.push(badFieldsError("pacifica", "account_positions", [{ symbol: "positions", fields: bad }]));
+  return out;
+}
+
+function decodeOrders(d: unknown): DecodedEvent[] {
+  if (!Array.isArray(d)) return [protocolError("pacifica account_order_updates data is not an array", "account_order_updates")];
+  const bad: string[] = [];
+  const rows: OrderRow[] = [];
+  const remove: string[] = [];
+  for (const o of d) {
+    const id = isObj(o) ? idOf(o.i) : null;
+    if (!isObj(o) || id === null || typeof o.s !== "string") { bad.push("order"); continue; }
+    if (!OPEN_STATUSES.has(String(o.os))) { remove.push(id); continue; }
+    const size = dec(o, "a", bad);
+    const filled = dec(o, "f", bad);
+    rows.push({
+      orderId: id, clientId: typeof o.I === "string" ? o.I : null, symbol: o.s, dex: null, side: pick(BOOK_SIDE, o.d),
+      type: typeof o.ot === "string" ? o.ot : null, status: typeof o.os === "string" ? o.os : null,
+      price: dec(o, "ip", bad), size, filled, remaining: null,
+      reduceOnly: typeof o.r === "boolean" ? o.r : null, createdAt: ts(o, "ct", bad), updatedAt: ts(o, "ut", bad),
+    });
+  }
+  const out: DecodedEvent[] = [{ t: "user", wire: "account_order_updates", deltas: [{ kind: "orders", snapshot: false, scope: "", rows, remove }] }];
+  if (bad.length > 0) out.push(badFieldsError("pacifica", "account_order_updates", [{ symbol: "orders", fields: bad }]));
+  return out;
+}
+
+function decodeTrades(d: unknown): DecodedEvent[] {
+  if (!Array.isArray(d)) return [protocolError("pacifica account_trades data is not an array", "account_trades")];
+  const bad: string[] = [];
+  const fills: FillRow[] = [];
+  for (const t of d) {
+    const h = isObj(t) ? idOf(t.h) : null;
+    const i = isObj(t) ? idOf(t.i) : null;
+    if (!isObj(t) || h === null || typeof t.s !== "string") { bad.push("h/s"); continue; }
+    fills.push({
+      fillId: i === null ? h : `${h}:${i}`,
+      symbol: t.s, dex: null, side: pick(TRADE_SIDE, t.ts), price: dec(t, "p", bad), size: dec(t, "a", bad),
+      fee: dec(t, "f", bad), feeToken: null, closedPnl: dec(t, "n", bad), orderId: i,
+      liquidity: t.te === "fulfill_maker" ? "maker" : t.te === "fulfill_taker" ? "taker" : null, time: ts(t, "t", bad),
+    });
+  }
+  const out: DecodedEvent[] = [{ t: "user", wire: "account_trades", deltas: [{ kind: "fills", snapshot: false, fills }] }];
+  if (bad.length > 0) out.push(badFieldsError("pacifica", "account_trades", [{ symbol: "fills", fields: bad }]));
+  return out;
+}
+
+function decodeBbo(d: unknown): DecodedEvent[] {
+  if (!isObj(d) || typeof d.s !== "string") return [protocolError("pacifica bbo frame without symbol")];
+  const wire = `bbo:${d.s}`;
+  const bad: string[] = [];
+  const out: DecodedEvent[] = [{
+    t: "bbo", wire, symbol: d.s, seq: typeof d.li === "number" ? d.li : null,
+    bid: dec(d, "b", bad), bidSize: dec(d, "B", bad), ask: dec(d, "a", bad), askSize: dec(d, "A", bad), venueTs: ts(d, "t", bad),
+  }];
+  if (bad.length > 0) out.push(badFieldsError("pacifica", wire, [{ symbol: d.s, fields: bad }]));
+  return out;
+}
+

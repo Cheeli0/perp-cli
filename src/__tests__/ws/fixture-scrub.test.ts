@@ -70,4 +70,15 @@ describe("WS fixture scrub", () => {
       || text.includes(DUMMY_SOLANA) || [...DUMMY_LIGHTER_ACCOUNTS].some(d => text.includes(d));
     expect(hasDummy, "private fixture shows no sign of anonymization").toBe(true);
   });
+
+  // Phase 2 auth paths: no Lighter auth token ("<deadline>:<account>:<apiKey>:<hex sig>", optionally
+  // "ro:"-prefixed), Aster listenKey, Bearer token or EIP-712 signature may appear in any fixture.
+  it.each(all.map(f => [f.rel, f] as const))("%s: no auth tokens, listenKeys or signatures", (_rel, f) => {
+    const text = JSON.stringify(f.json);
+    expect(/(?:ro:)?\d{9,}:\d+:\d+:[0-9a-fA-F]{40,}/.test(text), "lighter auth token").toBe(false);
+    expect(/\bro:[A-Za-z0-9:_-]{16,}/.test(text), "ro: token").toBe(false);
+    expect(/listenKey|\/ws\/[A-Za-z0-9]{40,}/.test(text), "listenKey").toBe(false);
+    expect(/Bearer\s+\S+/i.test(text), "bearer token").toBe(false);
+    expect(/0x[0-9a-fA-F]{130}(?![0-9a-fA-F])/.test(text), "65-byte signature").toBe(false);
+  });
 });

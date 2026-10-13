@@ -6,18 +6,19 @@
 
 import { defaultCanonicalize } from "./canonical.js";
 import { Connection, closedError, type WireLiveness } from "./connection.js";
-import { WsError, type WsErrorCode } from "./errors.js";
+import { WsError, isPerpError, type WsErrorCode } from "./errors.js";
 import { MarketStore } from "./market-state.js";
-import { createRedactor, excerpt, type Redactor } from "./redact.js";
+import { REDACTED, createRedactor, excerpt, type Redactor } from "./redact.js";
 import { SubscriptionImpl } from "./subscription.js";
 import { defaultVisibility, resolveFetch, resolveTransport } from "./transport.js";
+import { UserStore } from "./user-state.js";
 import type {
   BboUpdate, BookUpdate, CloseReason, CodecContext, CodecDirectory, ConnectionState, DecodedEvent, MarketDirectoryEntry,
-  MarketTarget, MarketUpdate, Network, StreamControl, StreamLog, Subscription, TradeUpdate, VenueCodec, VenueStream,
-  VenueStreamOptions, WireSub,
+  MarketTarget, MarketUpdate, Network, StreamControl, StreamLog, Subscription, TradeUpdate, UserChannel, UserRef, UserUpdate,
+  VenueCodec, VenueStream, VenueStreamOptions, WireSub,
 } from "./types.js";
 
-type AnyEvent = MarketUpdate | BboUpdate | BookUpdate | TradeUpdate;
+type AnyEvent = MarketUpdate | BboUpdate | BookUpdate | TradeUpdate | UserUpdate;
 type Sub = SubscriptionImpl<AnyEvent>;
 
 interface WireState {
@@ -34,16 +35,56 @@ interface WireState {
    * resubscribed one at a time (as a probe) until acked, so a bad one is isolated. */
   suspect: boolean;
   ackTimer: ReturnType<typeof setTimeout> | null;
+  /** Acked/data on some socket: a later resubscribe is a reconnect (non-replayable channels → gap). */
+  everAcked: boolean;
+  /** Last venue ordering number seen (bbo); frames at or below it are dropped. Reset on resubscribe. */
+  lastSeq: number | null;
 }
 
 interface SubMeta {
   symbols: Set<string> | null; // null = all
   wires: string[];
+  /** kind:"user": the requested user channels (events of other channels on a shared wire are filtered). */
+  userChannels: Set<UserChannel> | null;
 }
+
+interface TokenState { token: string; expiresAt: number; refreshAt: number; timer: ReturnType<typeof setTimeout> | null }
+
+const USER_CHANNELS: ReadonlyArray<UserChannel> = ["account", "positions", "orders", "fills"];
+const EVENT_CHANNEL: Record<UserUpdate["type"], UserChannel> = { account: "account", positions: "positions", orders: "orders", fill: "fills", fills: "fills" };
+/** A handed-out token stays redacted until its expiry plus this margin. */
+const TOKEN_REDACT_MARGIN_MS = 15 * 60_000;
+/** authToken() retry on a transient failure: backoff 1 s → 30 s, while the current token is still valid. */
+const TOKEN_RETRY_BASE_MS = 1000;
+const TOKEN_RETRY_MAX_MS = 30_000;
+/** With no valid token left (reconnect after expiry), a transient failure is retried this many times. */
+const TOKEN_RETRIES_WITHOUT_VALID = 5;
 
 /** A subscribe that the venue answers by dropping the socket (HL) is attributed within this window. */
 const BAD_SUBSCRIBE_WINDOW_MS = 1500;
 const DEFAULT_BUFFER = 1024;
+
+const EVM_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
+
+function userRefProblem(venue: string, ref: UserRef): string | null {
+  if (ref === null || typeof ref !== "object") return "not an object";
+  if (ref.venue !== venue) return `venue is "${String((ref as { venue?: unknown }).venue)}", expected "${venue}"`;
+  switch (ref.venue) {
+    case "hyperliquid": return EVM_ADDRESS.test(ref.address) ? null : "address is not a 0x EVM address";
+    case "pacifica": return typeof ref.account === "string" && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(ref.account) ? null : "account is not a base58 Solana address";
+    case "lighter":
+    case "lighter-rh": return Number.isInteger(ref.accountIndex) && ref.accountIndex >= 0 ? null : "accountIndex is not a non-negative integer";
+    case "arcus":
+      if (!EVM_ADDRESS.test(ref.address)) return "address is not a 0x EVM address";
+      return ref.subaccount === null || (Number.isInteger(ref.subaccount) && ref.subaccount >= 0) ? null : "subaccount is not null or a non-negative integer";
+    default: return null;
+  }
+}
+
+function isBrowserLike(): boolean {
+  const g = globalThis as { window?: unknown; document?: unknown };
+  return g.window !== undefined && g.document !== undefined;
+}
 
 export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = {}): VenueStream {
   const venue = codec.venue;
@@ -52,7 +93,14 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
   const transport = resolveTransport(opts, venue);
   const fetchFn = resolveFetch(opts, venue);
   const clock = opts.clock === undefined ? () => Date.now() : opts.clock;
-  const redact: Redactor = createRedactor(codec.secretKeys, codec.secretUrlPatterns);
+  const baseRedact: Redactor = createRedactor(codec.secretKeys, codec.secretUrlPatterns);
+  /** Exact secrets handed to the library (auth tokens) are redacted wherever they would appear. */
+  const liveSecrets: Array<{ secret: string; until: number }> = [];
+  const redact: Redactor = (s: string) => {
+    let out = baseRedact(s);
+    for (const { secret } of liveSecrets) if (out.includes(secret)) out = out.split(secret).join(REDACTED);
+    return out;
+  };
   const bufferSize = opts.buffer === undefined ? DEFAULT_BUFFER : opts.buffer.size;
   if (!Number.isInteger(bufferSize) || bufferSize < 1) {
     throw new WsError("INVALID_PARAMS", `${venue}: buffer.size must be a positive integer (got ${String(bufferSize)})`, {
@@ -74,6 +122,13 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
   let refreshTimer: ReturnType<typeof setInterval> | null = null;
   /** Non-fatal problems found while building the directory; delivered to each new subscription. */
   let directoryWarnings: string[] = [];
+  const userStore = new UserStore(venue);
+  let userRef: UserRef | null = null;
+  const tokens = new Map<string, TokenState>();
+  const tokenFetches = new Map<string, Promise<TokenState>>();
+  const tokenRetryTimers = new Set<ReturnType<typeof setTimeout>>();
+  /** Running acquireToken loops per purpose, with everyone waiting on them. */
+  const tokenLoops = new Map<string, Array<{ onOk: (t: TokenState) => void; onFail: (err: WsError) => void }>>();
 
   function log(level: StreamLog["level"], event: string, message: string, details?: Record<string, unknown>): void {
     if (opts.logger === undefined) return;
@@ -114,6 +169,13 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
     onOpen: () => {
       const now = clock();
       for (const w of wires.values()) {
+        const g = w.wire.gaps?.onReconnect;
+        if (w.everAcked && g !== undefined) {
+          for (const ch of g) {
+            emitGap(w, ch, "reconnected; the venue does not replay this channel");
+            if (ch === "orders") dispatchUser(w, userStore.clearOrders(now)); // pre-disconnect orders are unknown now
+          }
+        }
         w.firstFrameSeen = false;
         w.lastAt = null;
         if (w.suspect) { w.sentAt = null; continue; } // probed one at a time below
@@ -214,12 +276,179 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
 
   function sendSubscribe(w: WireState, now: number, probe: boolean): void {
     if (connection === null || !connection.isOpen) return;
+    let auth: string | null = null;
+    const need = w.wire.auth;
+    if (need !== undefined) {
+      const t = tokens.get(need.purpose);
+      if (t === undefined || clock() >= t.expiresAt) {
+        // Not subscribed on this socket until the token arrives: no ack timer, no liveness, no unsubscribe.
+        clearAckTimer(w);
+        w.acked = false;
+        w.sentAt = null;
+        w.lastSeq = null;
+        acquireToken(need,
+          () => { if (!closed && wires.get(w.wire.key) === w && connection.isOpen && w.sentAt === null) sendSubscribe(w, clock(), probe); },
+          (err) => failWire(w, err));
+        return;
+      }
+      auth = t.token;
+      // A refresh that came due while offline was skipped: send with the still-valid token, refresh now.
+      if (clock() >= t.refreshAt && t.timer === null) Promise.resolve().then(() => refreshToken(need));
+    }
+    w.lastSeq = null;
     w.reqId = nextReqId++;
     w.sentAt = now;
     w.acked = false;
     w.probe = probe;
-    connection.send(codec.encodeSubscribe(w.wire, w.reqId));
+    connection.send(codec.encodeSubscribe(w.wire, w.reqId, auth));
     armAckTimeout(w);
+  }
+
+  function failWire(w: WireState, err: WsError): void {
+    if (w.refs.size === 0) return;
+    log("error", "wire-failed", err.message, { wire: w.wire.key });
+    for (const sub of Array.from(w.refs)) dropSub(sub, err);
+  }
+
+  function dispatchUser(w: WireState, u: UserUpdate, only?: Sub): void {
+    const ch = EVENT_CHANNEL[u.type];
+    for (const sub of only === undefined ? w.refs : [only]) {
+      const meta = subs.get(sub);
+      if (meta !== undefined && meta.userChannels !== null && meta.userChannels.has(ch)) sub.emit(u);
+    }
+  }
+
+  function emitGap(w: WireState, channel: "fills" | "orders", why: string): void {
+    log("warn", "gap", `${w.wire.key}: ${channel} ${why} → refetch-required`);
+    for (const sub of w.refs) {
+      const meta = subs.get(sub);
+      if (meta === undefined || meta.userChannels === null || !meta.userChannels.has(channel)) continue;
+      sub.emit({ type: "gap", venue, channel, symbol: null, expected: null, got: null, action: "refetch-required" });
+    }
+  }
+
+  // ── auth tokens (CredentialProvider.authToken; re-called at 80 % of the TTL) ──
+
+  /**
+   * authToken() failures: a structured non-retryable error from the provider (e.g. PASSPHRASE_REQUIRED,
+   * WS_AUTH_FAILED) is definite; anything else (network, signer hiccup) is transient (details.transient).
+   */
+  function toAuthError(e: unknown): WsError {
+    if (e instanceof WsError && e.structured.code === "WS_AUTH_FAILED") return e;
+    const definite = isPerpError(e) && (e as { structured: { retryable?: unknown } }).structured.retryable === false;
+    return wsError("WS_AUTH_FAILED", `${venue} authToken() failed: ${e instanceof Error ? e.message : String(e)}`,
+      "Check the credential provider (token for the right account / API key; a read-only ro: token in browsers)",
+      definite ? undefined : { transient: true });
+  }
+
+  function usesPurpose(purpose: string): boolean {
+    for (const w of wires.values()) if (w.wire.auth !== undefined && w.wire.auth.purpose === purpose) return true;
+    return false;
+  }
+
+  /**
+   * getToken with retry on transient failures while a valid token remains (or a few times without one).
+   * ONE loop per purpose: later callers (reconnects, the refresh timer) join the running loop instead of
+   * starting another. The loop stops quietly once no channel uses the purpose any more.
+   */
+  function acquireToken(need: { purpose: string; maxTtlSec: number }, onOk: (t: TokenState) => void, onFail: (err: WsError) => void): void {
+    const waiting = tokenLoops.get(need.purpose);
+    if (waiting !== undefined) { waiting.push({ onOk, onFail }); return; }
+    tokenLoops.set(need.purpose, [{ onOk, onFail }]);
+    const settle = (f: (cb: { onOk: (t: TokenState) => void; onFail: (err: WsError) => void }) => void): void => {
+      const list = tokenLoops.get(need.purpose);
+      tokenLoops.delete(need.purpose);
+      if (list !== undefined) for (const cb of list) f(cb);
+    };
+    const attempt = (n: number): void => {
+      getToken(need).then(t => settle(cb => cb.onOk(t)), (e: unknown) => {
+        const err = toAuthError(e);
+        if (closed) { tokenLoops.delete(need.purpose); return; }
+        const delay = Math.min(TOKEN_RETRY_MAX_MS, TOKEN_RETRY_BASE_MS * Math.pow(2, n));
+        const cur = tokens.get(need.purpose);
+        const stillValid = cur !== undefined && clock() + delay < cur.expiresAt;
+        const transient = err.structured.details?.transient === true;
+        if (!transient || !(stillValid || n < TOKEN_RETRIES_WITHOUT_VALID)) { settle(cb => cb.onFail(err)); return; }
+        const msg = `${err.message}; retrying in ${delay} ms${stillValid ? " (current token still valid)" : ""}`;
+        log("warn", "auth-token-retry", msg);
+        for (const w of wires.values()) {
+          if (w.wire.auth === undefined || w.wire.auth.purpose !== need.purpose) continue;
+          for (const sub of w.refs) sub.emit(errorEvent("WS_AUTH_FAILED", msg, "Retried automatically; fails once the token expires", null, false));
+        }
+        const timer = setTimeout(() => {
+          tokenRetryTimers.delete(timer);
+          if (closed) return;
+          if (!usesPurpose(need.purpose)) {
+            tokenLoops.delete(need.purpose);
+            log("info", "auth-token-retry-stopped", `${need.purpose}: no channel uses this token any more`);
+            return;
+          }
+          attempt(n + 1);
+        }, delay);
+        tokenRetryTimers.add(timer);
+      });
+    };
+    attempt(0);
+  }
+
+  function getToken(need: { purpose: string; maxTtlSec: number }): Promise<TokenState> {
+    const have = tokens.get(need.purpose);
+    if (have !== undefined && clock() < have.refreshAt) return Promise.resolve(have);
+    const inflight = tokenFetches.get(need.purpose);
+    if (inflight !== undefined) return inflight;
+    const p = (async (): Promise<TokenState> => {
+      const provider = opts.credentials;
+      if (provider === undefined || provider.authToken === undefined) {
+        throw wsError("WS_AUTH_FAILED", `${venue}: ${need.purpose} needs an auth token but the credential provider has no authToken()`,
+          "Pass credentials.authToken (Lighter: a read-only ro: token is recommended in browsers)");
+      }
+      let r: { token: string; expiresAt: number };
+      try {
+        r = await provider.authToken({ purpose: need.purpose, maxTtlSec: need.maxTtlSec });
+      } catch (e) {
+        throw toAuthError(e);
+      }
+      const now = clock();
+      if (r === null || typeof r !== "object" || typeof r.token !== "string" || r.token === "" || typeof r.expiresAt !== "number" || !(r.expiresAt > now)) {
+        throw wsError("WS_AUTH_FAILED", `${venue} authToken() returned no usable token (need { token, expiresAt: epoch ms in the future })`);
+      }
+      for (let i = liveSecrets.length - 1; i >= 0; i--) if (liveSecrets[i].until < now) liveSecrets.splice(i, 1);
+      liveSecrets.push({ secret: r.token, until: r.expiresAt + TOKEN_REDACT_MARGIN_MS });
+      const old = tokens.get(need.purpose);
+      if (old !== undefined && old.timer !== null) clearTimeout(old.timer);
+      const refreshAt = now + Math.floor(0.8 * (r.expiresAt - now));
+      const st: TokenState = { token: r.token, expiresAt: r.expiresAt, refreshAt, timer: null };
+      if (!closed) st.timer = setTimeout(() => { st.timer = null; refreshToken(need); }, refreshAt - now);
+      tokens.set(need.purpose, st);
+      log("info", "auth-token", `${need.purpose} token obtained (refresh in ${refreshAt - now} ms)`);
+      return st;
+    })();
+    tokenFetches.set(need.purpose, p);
+    p.then(() => tokenFetches.delete(need.purpose), () => tokenFetches.delete(need.purpose));
+    return p;
+  }
+
+  /** At 80 % TTL: fetch a new token, then resubscribe every channel that uses it. */
+  function refreshToken(need: { purpose: string; maxTtlSec: number }): void {
+    if (closed) return;
+    const users = () => Array.from(wires.values()).filter(w => w.wire.auth !== undefined && w.wire.auth.purpose === need.purpose);
+    if (users().length === 0) { tokens.delete(need.purpose); return; }
+    // Offline: nothing to resubscribe. The reconnect's sendSubscribe uses the token while valid (and
+    // refreshes then), or fetches a new one once it expired.
+    if (connection === null || !connection.isOpen) return;
+    if (tokenLoops.has(need.purpose)) return; // a refresh (or reconnect fetch) is already running
+    acquireToken(need,
+      () => {
+        for (const w of users()) {
+          if (connection === null || !connection.isOpen || w.sentAt === null) continue;
+          connection.send(codec.encodeUnsubscribe(w.wire, nextReqId++));
+          w.firstFrameSeen = false;
+          sendSubscribe(w, clock(), false);
+        }
+        log("info", "auth-token-refreshed", `${need.purpose}: resubscribed with a fresh token`);
+      },
+      (err) => { for (const w of users()) failWire(w, err); },
+    );
   }
 
   /** No ack and no data within the wire's staleAfterMs → pending subscriptions fail (WS_PROTOCOL_ERROR). */
@@ -257,6 +486,7 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
   function markAcked(w: WireState): void {
     if (w.acked) return;
     w.acked = true;
+    w.everAcked = true;
     w.probe = false;
     clearAckTimer(w);
     if (w.suspect) { w.suspect = false; probeNextSuspect(); }
@@ -304,13 +534,59 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
         const w = ev.wire !== null ? wires.get(ev.wire) : ev.reqId !== undefined ? findWire({ wire: null, reqId: ev.reqId }) : undefined;
         const e = errorEvent(ev.code, ev.message, ev.remediation, text, ev.fatal);
         log(ev.fatal ? "error" : "warn", "protocol-error", e.type === "error" ? e.message : "", { wire: ev.wire });
-        if (w === undefined) { broadcast(e); return; }
+        if (w === undefined) {
+          // Not attributable to a subscribed channel: report it, but it ends nothing.
+          broadcast(e.type === "error" && e.fatal ? { ...e, fatal: false } : e);
+          return;
+        }
         if (ev.fatal) {
           const err = wsError(ev.code, ev.message, ev.remediation === null ? undefined : ev.remediation);
           for (const sub of Array.from(w.refs)) dropSub(sub, err);
         } else {
           for (const sub of w.refs) sub.emit(e);
         }
+        return;
+      }
+      case "user": {
+        const w = wires.get(ev.wire);
+        if (w === undefined) {
+          log("info", "late-frame", `frame for ${ev.wire} after its unsubscribe (in flight)`);
+          return;
+        }
+        w.lastAt = recvTs;
+        markAcked(w);
+        connection?.markHealthy();
+        for (const d of ev.deltas) {
+          const r = userStore.apply(d, recvTs);
+          // The replay snapshot does not reach back to fills seen before: fills in between may be missing.
+          if (r.fillsGap) emitGap(w, "fills", "replayed snapshot does not overlap the fills seen before (outage longer than the replay window)");
+          for (const u of r.updates) dispatchUser(w, u);
+        }
+        return;
+      }
+      case "bbo": {
+        const w = wires.get(ev.wire);
+        if (w === undefined) {
+          log("info", "late-frame", `frame for ${ev.wire} after its unsubscribe (in flight)`);
+          return;
+        }
+        w.lastAt = recvTs;
+        markAcked(w);
+        connection?.markHealthy();
+        if (ev.seq !== null) {
+          if (w.lastSeq !== null && ev.seq <= w.lastSeq) return; // out of order / duplicate (sequences are non-contiguous: no gap)
+          w.lastSeq = ev.seq;
+        }
+        const entry = (store as MarketStore).entry(ev.symbol);
+        if (entry === undefined) {
+          for (const sub of w.refs) sub.emit(errorEvent("WS_PROTOCOL_ERROR", `bbo for ${ev.symbol} which is not in the market directory`, null, null, false));
+          return;
+        }
+        const u: BboUpdate = {
+          type: "bbo", schema: 1, venue, dex: entry.dex, symbol: entry.symbol,
+          bid: ev.bid, bidSize: ev.bidSize, ask: ev.ask, askSize: ev.askSize, venueTs: ev.venueTs, recvTs,
+        };
+        for (const sub of w.refs) sub.emit(u);
         return;
       }
       case "market": {
@@ -420,27 +696,39 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
         codec.capabilities.notes[`network:${network}`] === undefined ? undefined : codec.capabilities.notes[`network:${network}`]);
     }
     if (target.kind === "market") {
-      const extra = target.channels.filter(c => c !== "market");
+      const supported = (c: string) => c === "market" || (c === "bbo" && codec.capabilities.channels.bbo);
+      const extra = target.channels.filter(c => !supported(c));
       if (extra.length > 0 || target.channels.length === 0) {
         throw wsError("CAPABILITY_UNSUPPORTED",
           target.channels.length === 0 ? "kind \"market\" needs at least one channel" : `${venue} channel(s) ${extra.join(", ")} are not available in this release`,
-          "Use channels: [\"market\"] (bbo arrives in 0.14.4 Phase 2; book/trades in 0.14.5)");
+          "Use channels \"market\" / \"bbo\" (book and trades arrive in 0.14.5)");
       }
     }
+    if (target.kind === "user") checkUserTarget(target.channels);
     const d = await loadDirectory();
     if (closed) throw closedError(venue);
     terminalCheck();
     if (sub.closed) return;
-    const known = new Set(d.entries.map(e => e.symbol));
-    const wanted = target.kind === "allMarkets" ? (target.symbols === undefined ? null : target.symbols) : [target.symbol];
-    if (wanted !== null) {
-      const missing = wanted.filter(s => !known.has(s));
-      if (missing.length > 0) {
-        throw wsError("INVALID_PARAMS", `${venue}: unknown symbol(s) ${missing.slice(0, 20).join(", ")}`,
-          venue === "hyperliquid" ? "Use stream.markets() symbols; HIP-3 markets need opts.hip3Dexes" : "Use stream.markets() symbols");
+    let list: WireSub[];
+    let wanted: string[] | null = null;
+    if (target.kind === "user") {
+      const ref = await resolveUser();
+      list = (codec.user as NonNullable<VenueCodec["user"]>).wires(ref, target.channels, d);
+      for (const w of list) if (w.auth !== undefined) await getToken(w.auth); // auth fails before any socket opens
+      if (closed) throw closedError(venue);
+      if (sub.closed) return;
+    } else {
+      const known = new Set(d.entries.map(e => e.symbol));
+      wanted = target.kind === "allMarkets" ? (target.symbols === undefined ? null : target.symbols) : [target.symbol];
+      if (wanted !== null) {
+        const missing = wanted.filter(s => !known.has(s));
+        if (missing.length > 0) {
+          throw wsError("INVALID_PARAMS", `${venue}: unknown symbol(s) ${missing.slice(0, 20).join(", ")}`,
+            venue === "hyperliquid" ? "Use stream.markets() symbols; HIP-3 markets need opts.hip3Dexes" : "Use stream.markets() symbols");
+        }
       }
+      list = codec.wiresFor(target, d, opts.staleAfterMs === undefined ? null : opts.staleAfterMs);
     }
-    const list = codec.wiresFor(target, d, opts.staleAfterMs === undefined ? null : opts.staleAfterMs);
     const fresh = list.filter(w => !wires.has(w.key));
     const allowed = Math.min(codec.limits.subscriptionsPerSocket, opts.budget?.maxSubscriptions === undefined ? Infinity : opts.budget.maxSubscriptions);
     if (opts.budget?.maxSockets !== undefined && opts.budget.maxSockets < 1) {
@@ -450,20 +738,87 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
       throw wsError("SUBSCRIPTION_LIMIT", `${venue}: ${wires.size + fresh.length} wire subscriptions needed, ${allowed} allowed`,
         "Unsubscribe something, narrow the symbols, or raise budget.maxSubscriptions (≤ the venue limit)", { needed: wires.size + fresh.length, allowed });
     }
-    subs.set(sub, { symbols: wanted === null ? null : new Set(wanted), wires: list.map(w => w.key) });
+    const perGroup = codec.limits.perGroup;
+    if (perGroup !== undefined) {
+      for (const [group, cap] of Object.entries(perGroup)) {
+        const needed = Array.from(wires.values()).filter(w => w.wire.group === group).length + fresh.filter(w => w.group === group).length;
+        if (needed > cap) {
+          throw wsError("SUBSCRIPTION_LIMIT", `${venue}: ${needed} "${group}" channels needed on one connection, ${cap} allowed`,
+            `Unsubscribe some ${group} channels`, { needed, allowed: cap });
+        }
+      }
+    }
+    subs.set(sub, {
+      symbols: wanted === null ? null : new Set(wanted),
+      wires: list.map(w => w.key),
+      userChannels: target.kind === "user" ? new Set(target.channels) : null,
+    });
     const now = clock();
     for (const w of list) {
       let st = wires.get(w.key);
       if (st === undefined) {
-        st = { wire: w, refs: new Set(), reqId: 0, sentAt: null, lastAt: null, acked: false, firstFrameSeen: false, probe: false, suspect: false, ackTimer: null };
+        st = {
+          wire: w, refs: new Set(), reqId: 0, sentAt: null, lastAt: null, acked: false, firstFrameSeen: false,
+          probe: false, suspect: false, ackTimer: null, everAcked: false, lastSeq: null,
+        };
         wires.set(w.key, st);
         sendSubscribe(st, now, true);
       }
       st.refs.add(sub);
     }
     for (const w of directoryWarnings) sub.emit(errorEvent("EXCHANGE_ERROR", w, null, null, false));
+    if (target.kind === "user") {
+      for (const w of list) {
+        const g = w.gaps?.onSubscribe;
+        if (g === undefined) continue;
+        for (const ch of g) {
+          if (!target.channels.includes(ch)) continue;
+          sub.emit({ type: "gap", venue, channel: ch, symbol: null, expected: null, got: null, action: "refetch-required" });
+          const st = wires.get(w.key);
+          // No venue snapshot: tell this subscriber the current (incomplete) open-order set.
+          if (ch === "orders" && st !== undefined) dispatchUser(st, userStore.currentOrders(clock()), sub);
+        }
+      }
+    }
     maybeReady(sub);
     connection.ensureOpen();
+  }
+
+  function checkUserTarget(channels: UserChannel[]): void {
+    if (codec.user === null) {
+      const note = codec.capabilities.notes.user;
+      throw wsError("CAPABILITY_UNSUPPORTED", `${venue} user channels are not available in this release`, note === undefined ? undefined : note);
+    }
+    if (codec.user.inPageSecrets && isBrowserLike() && opts.allowInPageSecrets !== true) {
+      throw wsError("CAPABILITY_UNSUPPORTED", `${venue} user channels need a signing secret in the page`,
+        "Pass allowInPageSecrets: true to accept that trade-off, or run the stream server-side (perp-cli/ws/node)");
+    }
+    const bad = channels.filter(c => !USER_CHANNELS.includes(c));
+    if (channels.length === 0 || bad.length > 0) {
+      throw wsError("INVALID_PARAMS", channels.length === 0 ? "kind \"user\" needs at least one channel" : `unknown user channel(s) ${bad.join(", ")}`,
+        `Use ${USER_CHANNELS.join(" / ")}`);
+    }
+    if (opts.credentials === undefined) {
+      throw wsError("WS_AUTH_FAILED", `${venue} user channels need opts.credentials (CredentialProvider.user())`,
+        "Pass credentials: { user: async () => ({ venue, … }) }; the library never holds keys");
+    }
+  }
+
+  /** CredentialProvider.user(), once per stream (wire keys assume one account). */
+  async function resolveUser(): Promise<UserRef> {
+    if (userRef !== null) return userRef;
+    const provider = opts.credentials;
+    if (provider === undefined) throw wsError("WS_AUTH_FAILED", `${venue}: no credential provider`);
+    let ref: UserRef;
+    try {
+      ref = await provider.user();
+    } catch (e) {
+      throw toAuthError(e);
+    }
+    const problem = userRefProblem(venue, ref);
+    if (problem !== null) throw wsError("INVALID_PARAMS", `${venue} credentials.user(): ${problem}`, "Return the UserRef shape documented for this venue");
+    if (userRef === null) userRef = ref;
+    return userRef;
   }
 
   /** The connection stopped for good (reconnects exhausted): new subscriptions fail with its reason. */
@@ -499,7 +854,7 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
       }
       return connection.state;
     },
-    subscribe: subscribe as VenueStream["subscribe"],
+    subscribe: subscribe as unknown as VenueStream["subscribe"],
     onState(cb) {
       stateListeners.add(cb);
       return () => { stateListeners.delete(cb); };
@@ -512,6 +867,10 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
       if (closed) return;
       closed = true;
       if (refreshTimer !== null) { clearInterval(refreshTimer); refreshTimer = null; }
+      for (const t of tokens.values()) if (t.timer !== null) { clearTimeout(t.timer); t.timer = null; }
+      for (const t of tokenRetryTimers) clearTimeout(t);
+      tokenRetryTimers.clear();
+      tokenLoops.clear();
       for (const w of wires.values()) clearAckTimer(w);
       wires.clear();
       connection?.close(); // subscribers see state → closed (CLIENT_CLOSE) first

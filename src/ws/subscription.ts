@@ -5,8 +5,9 @@
  * subscriptions and the subscription ends.
  *
  * Buffering starts at construction, so an iterator created later still sees the events since
- * subscribe(). Until an iterator exists, control events are kept in a ring of the latest `size`
- * (never fatal: a subscription held without a consumer on a flapping connection cannot overflow);
+ * subscribe(). Until an iterator exists, state/non-fatal-error control events are kept in a ring of
+ * the latest `size` (a subscription held without a consumer on a flapping connection cannot overflow
+ * from them); fills and gap events are never evicted — when they alone fill the buffer it overflows;
  * when the iterator attaches, a non-fatal STREAM_OVERFLOW event first reports how many older control
  * events were discarded. Overflow is fatal only once an iterator is attached.
  * A consumer that attaches an on() callback before creating an iterator is a callback consumer: the
@@ -14,16 +15,46 @@
  */
 
 import { WsError } from "./errors.js";
-import type { MarketUpdate, StreamControl, Subscription, VenueId } from "./types.js";
+import type { BboUpdate, MarketUpdate, StreamControl, Subscription, UserUpdate, VenueId } from "./types.js";
 
 type Item<E> = E | StreamControl;
 
+/** STATE events coalesce by key; events (fill, trade) and controls do not. */
 function coalesceKey(e: { type: string }): string | null {
-  if (e.type === "market") {
-    const m = e as MarketUpdate;
-    return `market|${m.dex === null ? "" : m.dex}|${m.symbol}`;
+  switch (e.type) {
+    case "market": { const m = e as MarketUpdate; return `market|${m.dex === null ? "" : m.dex}|${m.symbol}`; }
+    case "bbo": { const b = e as BboUpdate; return `bbo|${b.dex === null ? "" : b.dex}|${b.symbol}`; }
+    case "account": { const a = e as Extract<UserUpdate, { type: "account" }>; return `account|${a.dex === null ? "" : a.dex}`; }
+    case "positions": return "positions";
+    case "orders": return "orders";
+    default: return null;
   }
-  return null;
+}
+
+/** Before an iterator exists only these may be evicted from the ring (never fills or gaps). */
+function evictable(e: { type: string }): boolean {
+  return e.type === "state" || (e.type === "error" && !(e as Extract<StreamControl, { type: "error" }>).fatal);
+}
+
+/** Merge a coalesced STATE item: the latest wins; snapshot-ness and market `changed` accumulate. */
+function merge(prev: { type: string }, next: { type: string }): { type: string } {
+  if (next.type === "market") {
+    const p = prev as unknown as MarketUpdate;
+    const n = next as unknown as MarketUpdate;
+    const changed = Array.from(new Set([...p.changed, ...n.changed]));
+    // A coalesced row that contains a snapshot stays a snapshot.
+    const source = p.source === "snapshot" || n.source === "snapshot" ? "snapshot" : n.source;
+    const merged: MarketUpdate = { ...n, changed, source };
+    return merged;
+  }
+  if (next.type === "positions" || next.type === "orders") {
+    const p = prev as unknown as { snapshot: boolean };
+    const n = next as unknown as { type: string; snapshot: boolean; source: string };
+    const snapshot = p.snapshot || n.snapshot;
+    const merged = { ...n, snapshot, source: snapshot ? "snapshot" : n.source };
+    return merged;
+  }
+  return next;
 }
 
 export class SubscriptionImpl<E extends { type: string }> implements Subscription<E> {
@@ -112,12 +143,7 @@ export class SubscriptionImpl<E extends { type: string }> implements Subscriptio
     if (key !== null) {
       const box = this.keyed.get(key);
       if (box !== undefined) {
-        const prev = box.v as unknown as MarketUpdate;
-        const next = e as unknown as MarketUpdate;
-        const changed = Array.from(new Set([...prev.changed, ...next.changed]));
-        // A coalesced row that contains a snapshot stays a snapshot.
-        const source = prev.source === "snapshot" || next.source === "snapshot" ? "snapshot" : next.source;
-        box.v = { ...next, changed, source } as unknown as Item<E>;
+        box.v = merge(box.v, e) as Item<E>;
         return;
       }
       const nb = { v: e, key };
@@ -126,10 +152,12 @@ export class SubscriptionImpl<E extends { type: string }> implements Subscriptio
       return;
     }
     if (!force && !this.iterating && this.controlsQueued >= this.bufferSize) {
-      const oldest = this.queue.findIndex(b => b.key === null);
-      this.queue.splice(oldest, 1);
-      this.controlsQueued--;
-      this.droppedBeforeIterator++;
+      const oldest = this.queue.findIndex(b => b.key === null && evictable(b.v));
+      if (oldest >= 0) {
+        this.queue.splice(oldest, 1);
+        this.controlsQueued--;
+        this.droppedBeforeIterator++;
+      }
     }
     if (!force && this.controlsQueued >= this.bufferSize) {
       this.onOverflow(this, new WsError("STREAM_OVERFLOW", `Subscription buffer full (${this.bufferSize} events not consumed)`, {
@@ -155,8 +183,9 @@ export class SubscriptionImpl<E extends { type: string }> implements Subscriptio
 
   [Symbol.asyncIterator](): AsyncIterator<Item<E>> {
     if (!this.iterating && this.droppedBeforeIterator > 0) {
-      if (this.controlsQueued >= this.bufferSize) { // make room for the summary (counted in the buffer)
-        this.queue.splice(this.queue.findIndex(b => b.key === null), 1);
+      const oldest = this.queue.findIndex(b => b.key === null && evictable(b.v));
+      if (this.controlsQueued >= this.bufferSize && oldest >= 0) { // make room for the summary (counted in the buffer)
+        this.queue.splice(oldest, 1);
         this.controlsQueued--;
         this.droppedBeforeIterator++;
       }

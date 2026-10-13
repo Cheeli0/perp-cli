@@ -199,10 +199,10 @@ describe("wire subscriptions", () => {
     expect(t.last().sent.length).toBe(sent);
   });
 
-  it("channels other than market → CAPABILITY_UNSUPPORTED in this release", async () => {
+  it("book / trades channels → CAPABILITY_UNSUPPORTED in this release", async () => {
     const t = fakeTransport();
     const stream = createVenueStream(pacifica, { transport: t.factory, fetch: fakeFetch(PACIFICA_ROUTES), visibility: null });
-    await expect(stream.subscribe({ kind: "market", symbol: "BTC", channels: ["bbo"] }).ready).rejects.toMatchObject({ structured: { code: "CAPABILITY_UNSUPPORTED" } });
+    await expect(stream.subscribe({ kind: "market", symbol: "BTC", channels: ["book"] }).ready).rejects.toMatchObject({ structured: { code: "CAPABILITY_UNSUPPORTED" } });
   });
 
   it("hyperliquid drops the socket right after a subscribe → that subscription gets INVALID_PARAMS, others reconnect", async () => {

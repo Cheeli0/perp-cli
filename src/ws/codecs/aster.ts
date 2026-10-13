@@ -16,7 +16,7 @@ import { badShape, fetchJson } from "../directory.js";
 import { VENUE_STATIC } from "../venue-static.js";
 import type { CodecContext, DecodedEvent, MarketDirectoryEntry, MarketPatch, VenueCodec, WireSub } from "../types.js";
 import {
-  badFieldsError, capabilities, compact, isObj, parseFrame, protocolError, readDec, readTs, unrecognised, type Obj,
+  badFieldsError, capabilities, compact, dec, isObj, ts, parseFrame, protocolError, readDec, readTs, unrecognised, type Obj,
 } from "./common.js";
 
 const S = VENUE_STATIC.aster;
@@ -55,6 +55,7 @@ export const aster: VenueCodec = {
   venue: "aster",
   capabilities: capabilities({
     testnet: true,
+    user: false,
     fields: {
       mark: true, index: true, bestBid: false, bestAsk: false, last: true, predictedRate: false,
       nextFundingTime: true, fundingInterval: true, openInterest: false, volume24hNotional: true,
@@ -66,6 +67,8 @@ export const aster: VenueCodec = {
       openInterest: "Not on WS (REST only)",
       fundingInterval: `Labelled REST source ${FUNDING_INFO}, refreshed hourly; missing → null`,
       volume24hNotional: "!ticker@arr q (quote-asset volume)",
+      user: "Aster private channels (signed USER_STREAM listenKey) arrive in 0.14.5",
+      bbo: "<symbol>@bookTicker; `u` orders frames (non-contiguous)",
     },
   }),
   url: (n) => `${S.wsUrl[n]}/stream`,
@@ -134,12 +137,17 @@ export const aster: VenueCodec = {
     };
   },
 
-  wiresFor(_target, _dir, staleOverrideMs): WireSub[] {
-    return [
+  wiresFor(target, _dir, staleOverrideMs): WireSub[] {
+    const all: WireSub[] = [
       { key: MARK, staleAfterMs: staleOverrideMs === null ? S.staleAfterMs : staleOverrideMs, params: {} },
       { key: TICKER, staleAfterMs: staleOverrideMs === null ? TICKER_STALE_MS : staleOverrideMs, params: {} },
     ];
+    if (target.kind === "allMarkets") return all;
+    const out: WireSub[] = target.channels.includes("market") ? all : [];
+    if (target.channels.includes("bbo")) out.push({ key: `${target.symbol.toLowerCase()}@bookTicker`, staleAfterMs: null, params: { symbol: target.symbol } });
+    return out;
   },
+  user: null,
   encodeSubscribe: (w, reqId) => JSON.stringify({ method: "SUBSCRIBE", params: [w.key], id: reqId }),
   encodeUnsubscribe: (w, reqId) => JSON.stringify({ method: "UNSUBSCRIBE", params: [w.key], id: reqId }),
 
@@ -163,9 +171,21 @@ export const aster: VenueCodec = {
     const d = dir.data as AsterData;
     if (f.stream === MARK) return decodeArr(MARK, f.data, d, markPatch);
     if (f.stream === TICKER) return decodeArr(TICKER, f.data, d, tickerPatch);
+    if (f.stream.endsWith("@bookTicker")) return decodeBookTicker(f.stream, f.data);
     return [unrecognised("aster")];
   },
 };
+
+function decodeBookTicker(wire: string, d: unknown): DecodedEvent[] {
+  if (!isObj(d) || d.e !== "bookTicker" || typeof d.s !== "string") return [protocolError(`aster ${wire} frame without bookTicker data`, wire)];
+  const bad: string[] = [];
+  const out: DecodedEvent[] = [{
+    t: "bbo", wire, symbol: d.s, seq: typeof d.u === "number" ? d.u : null,
+    bid: dec(d, "b", bad), bidSize: dec(d, "B", bad), ask: dec(d, "a", bad), askSize: dec(d, "A", bad), venueTs: ts(d, "E", bad),
+  }];
+  if (bad.length > 0) out.push(badFieldsError("aster", wire, [{ symbol: d.s, fields: bad }]));
+  return out;
+}
 
 function markPatch(r: Obj, bad: string[]): MarketPatch | null {
   if (r.e !== "markPriceUpdate" || typeof r.s !== "string") return null;

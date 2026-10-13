@@ -130,6 +130,114 @@ export interface TradeUpdate {
   side: "buy" | "sell" | null; tradeId: string | null; venueTs: number | null; recvTs: number;
 }
 
+// ── Private (user) channels ──
+
+export type UserChannel = "account" | "positions" | "orders" | "fills";
+
+export interface PositionRow {
+  symbol: string;
+  dex: string | null;
+  side: "long" | "short" | null;
+  /** Absolute size in base units. */
+  size: Dec | null;
+  entryPrice: Dec | null;
+  /** Mark price is not part of every venue's position stream; join MarketUpdate by symbol. */
+  markPrice: Dec | null;
+  positionValue: Dec | null;
+  unrealizedPnl: Dec | null;
+  liquidationPrice: Dec | null;
+  marginUsed: Dec | null;
+  leverage: Dec | null;
+  venueTs: number | null;
+}
+
+export interface OrderRow {
+  orderId: string;
+  clientId: string | null;
+  symbol: string;
+  dex: string | null;
+  side: "buy" | "sell" | null;
+  type: string | null;
+  /** Venue status string, verbatim. */
+  status: string | null;
+  price: Dec | null;
+  size: Dec | null;
+  filled: Dec | null;
+  remaining: Dec | null;
+  reduceOnly: boolean | null;
+  createdAt: number | null;
+  updatedAt: number | null;
+}
+
+export interface FillRow {
+  /** Venue fill key (HL tid, Pacifica h:i, Lighter trade_id, Arcus tradeId). With `side` and `orderId` it is the dedupe key. */
+  fillId: string;
+  symbol: string;
+  dex: string | null;
+  side: "buy" | "sell" | null;
+  price: Dec | null;
+  size: Dec | null;
+  fee: Dec | null;
+  feeToken: string | null;
+  closedPnl: Dec | null;
+  orderId: string | null;
+  liquidity: "maker" | "taker" | null;
+  time: number | null;
+}
+
+export type UserUpdate =
+  | {
+    type: "account"; schema: 1; venue: VenueId;
+    /** HL: one account per perp dex ("" native → null); other venues null. */
+    dex: string | null;
+    equity: Dec | null; available: Dec | null; marginUsed: Dec | null; unrealizedPnl: Dec | null;
+    venueTs: number | null; source: Source; recvTs: number;
+  }
+  /** The full current position set (snapshot + merged deltas). snapshot = it came from (or coalesced) a venue snapshot. */
+  | { type: "positions"; schema: 1; venue: VenueId; snapshot: boolean; positions: PositionRow[]; source: Source; recvTs: number }
+  /**
+   * The current OPEN order set (snapshot + merged deltas). `complete`: the set is known to be every open
+   * order — true once the venue sent a snapshot for every part of it; false for venues without an
+   * order snapshot (Pacifica: refetch over REST; the library cannot be told) and after a refetch gap.
+   */
+  | { type: "orders"; schema: 1; venue: VenueId; snapshot: boolean; complete: boolean; orders: OrderRow[]; source: Source; recvTs: number }
+  /** One live fill (de-duplicated in-library). */
+  | { type: "fill"; schema: 1; venue: VenueId; snapshot: false; fillId: string; fill: FillRow; source: Source; recvTs: number }
+  /**
+   * A venue fill SNAPSHOT (HL / Arcus replay recent fills on every (re)subscribe; up to 2000 on HL) as ONE
+   * event: only fills not seen before, oldest venue order preserved. Never split, so it cannot overflow
+   * a subscription buffer. Empty snapshots (everything already seen) are not emitted.
+   */
+  | { type: "fills"; schema: 1; venue: VenueId; snapshot: true; fills: FillRow[]; source: Source; recvTs: number };
+
+export type UserRef =
+  | { venue: "hyperliquid"; address: `0x${string}` }
+  | { venue: "pacifica"; account: string }
+  | { venue: "lighter" | "lighter-rh"; accountIndex: number }
+  | { venue: "aster"; user: `0x${string}`; signer: `0x${string}` }
+  /** subaccount null = the venue default account (0). */
+  | { venue: "arcus"; address: `0x${string}`; subaccount: number | null }
+  | { venue: "ondo"; keyId: string }
+  | { venue: "qfex"; publicKey: string; accountId: string };
+
+export interface TypedData {
+  domain: Record<string, unknown>;
+  types: Record<string, Array<{ name: string; type: string }>>;
+  primaryType: string;
+  message: Record<string, unknown>;
+}
+
+/** Async credentials; the library never holds keys (only short-lived tokens it is handed). */
+export interface CredentialProvider {
+  user(): Promise<UserRef>;
+  /** Ondo login, QFEX auth (secret stays with the provider). Lowercase hex. */
+  hmacSha256?(message: string): Promise<string>;
+  /** Aster V3 USER_STREAM (API-wallet signer). */
+  signTypedData?(td: TypedData): Promise<`0x${string}`>;
+  /** Lighter auth token (a read-only `ro:` token is recommended in browsers). Re-called at 80 % of its TTL. */
+  authToken?(req: { purpose: string; maxTtlSec: number }): Promise<{ token: string; expiresAt: number }>;
+}
+
 export type StreamControl =
   | { type: "state"; venue: VenueId; state: ConnectionState }
   | {
@@ -169,6 +277,7 @@ export interface VenueWsCapabilities {
 
 export type MarketTarget =
   | { kind: "allMarkets"; symbols?: string[] }
+  | { kind: "user"; channels: UserChannel[] }
   | { kind: "market"; symbol: string; channels: Array<"market" | "bbo" | "book" | "trades"> };
 
 export interface VenueStreamOptions {
@@ -180,6 +289,10 @@ export interface VenueStreamOptions {
   /** Default: globalThis.fetch, resolved at call time. */
   fetch?: FetchLike;
   canonicalize?: Canonicalize;
+  /** Needed for kind:"user". */
+  credentials?: CredentialProvider;
+  /** Default false. Required for user channels whose auth needs a signing secret in the page (Aster/Ondo/QFEX, 0.14.5). */
+  allowInPageSecrets?: boolean;
   /** ≤ venue limits. */
   budget?: { maxSubscriptions?: number; maxSockets?: number; newConnectionsPerMin?: number };
   /** Overrides the per-venue default for every public channel. */
@@ -212,6 +325,7 @@ export interface VenueStream {
   readonly capabilities: VenueWsCapabilities;
   subscribe(t: { kind: "allMarkets"; symbols?: string[] }): Subscription<MarketUpdate>;
   subscribe(t: { kind: "market"; symbol: string; channels: Array<"market" | "bbo" | "book" | "trades"> }): Subscription<MarketUpdate | BboUpdate | BookUpdate | TradeUpdate>;
+  subscribe(t: { kind: "user"; channels: UserChannel[] }): Subscription<UserUpdate>;
   onState(cb: (s: ConnectionState) => void): () => void;
   /** The market directory (REST bootstrap, loaded once). */
   markets(): Promise<MarketDirectoryEntry[]>;
@@ -228,7 +342,22 @@ export interface WireSub {
   /** Silence beyond this → `stale`; 2× → forced reconnect. null = no stale check. */
   staleAfterMs: number | null;
   params: Record<string, unknown>;
+  /** Needs an auth token from CredentialProvider.authToken (sent with the subscribe). */
+  auth?: { purpose: string; maxTtlSec: number };
+  /** Per-socket channel group for venue caps (limits.perGroup), e.g. Pacifica "bbo" ≤ 20. */
+  group?: string;
+  /** Non-replayable channels: gap{action:"refetch-required"} after a reconnect / at subscribe. */
+  gaps?: { onReconnect?: Array<"fills" | "orders">; onSubscribe?: Array<"orders"> };
 }
+
+/** A user-state change decoded from one frame. `scope` partitions snapshots (HL: per dex). */
+export type UserDelta =
+  | { kind: "account"; snapshot: boolean; dex: string | null; equity?: Dec | null; available?: Dec | null; marginUsed?: Dec | null; unrealizedPnl?: Dec | null; venueTs: number | null }
+  /** snapshot: replace every row in `scope`; else upsert rows and remove `remove` keys (symbol). */
+  | { kind: "positions"; snapshot: boolean; scope: string; rows: PositionRow[]; remove: string[] }
+  /** snapshot: replace every open order in `scope`; else upsert rows and remove `remove` order ids. */
+  | { kind: "orders"; snapshot: boolean; scope: string; rows: OrderRow[]; remove: string[] }
+  | { kind: "fills"; snapshot: boolean; fills: FillRow[] };
 
 /** A partial market patch: a key present = the frame carried it (its value may be null). */
 export interface MarketPatch {
@@ -248,6 +377,9 @@ export interface MarketPatch {
 
 export type DecodedEvent =
   | { t: "market"; wire: string; patches: MarketPatch[] }
+  | { t: "user"; wire: string; deltas: UserDelta[] }
+  /** seq: a venue ordering number (only drops out-of-order/duplicate frames; never a gap signal). */
+  | { t: "bbo"; wire: string; symbol: string; seq: number | null; bid: Dec | null; bidSize: Dec | null; ask: Dec | null; askSize: Dec | null; venueTs: number | null }
   | { t: "ack"; wire: string | null; reqId: number | null; unsubscribe: boolean }
   | { t: "pong" }
   /** An allowlisted, documented control frame with nothing to do (e.g. "connected"). */
@@ -311,6 +443,8 @@ export interface VenueCodec {
     subscriptionsPerSocket: number;
     newConnectionsPerMin: number;
     outboundPerMin: number;
+    /** Per-socket caps per WireSub.group. */
+    perGroup?: Record<string, number>;
   };
   /** true → the venue drops the socket (no error frame) on an invalid subscribe (HL). */
   readonly closesOnBadSubscribe: boolean;
@@ -320,8 +454,15 @@ export interface VenueCodec {
   readonly refresh: LabelledRefresh | null;
   fundingMeta(entry: MarketDirectoryEntry, dir: CodecDirectory): FundingMeta;
   /** Wire channels for a target; throws WsError(INVALID_PARAMS / CAPABILITY_UNSUPPORTED). */
-  wiresFor(target: MarketTarget, dir: CodecDirectory, staleOverrideMs: number | null): WireSub[];
-  encodeSubscribe(w: WireSub, reqId: number): string;
+  wiresFor(target: Exclude<MarketTarget, { kind: "user" }>, dir: CodecDirectory, staleOverrideMs: number | null): WireSub[];
+  /** User channels, or null when this release does not support them (→ CAPABILITY_UNSUPPORTED). */
+  readonly user: {
+    /** Auth needs a signing secret in the page (gated by allowInPageSecrets in browsers). */
+    inPageSecrets: boolean;
+    wires(ref: UserRef, channels: UserChannel[], dir: CodecDirectory): WireSub[];
+  } | null;
+  /** `auth`: the token for a WireSub with `auth`, else null. */
+  encodeSubscribe(w: WireSub, reqId: number, auth: string | null): string;
   encodeUnsubscribe(w: WireSub, reqId: number): string;
   /** Pure decode of one text frame. Throws nothing: problems are `error` events. */
   decode(text: string, dir: CodecDirectory, recvTs: number): DecodedEvent[];
