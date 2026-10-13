@@ -1,5 +1,5 @@
 /**
- * `funds deposit aster|ondo`, `funds withdraw aster`, `funds address-book add ondo` — fund movements
+ * `funds deposit aster|ondo`, `funds withdraw aster` — fund movements
  * whose on-chain leg is signed by the OWS master wallet (src/evm-master-tx.ts).
  *
  * Every command: `--dry-run` prints the plan and returns before any key, adapter or network is
@@ -15,7 +15,7 @@ import { PerpError, parsePositiveDecimal } from "../errors.js";
 import { logExecution } from "../execution-log.js";
 import type { ExchangeAdapter } from "../exchanges/index.js";
 import { unsupported } from "../exchanges/trading-v2.js";
-import { getVenue, networkConfig, type Network } from "../exchanges/venue.js";
+import { getVenue, type Network } from "../exchanges/venue.js";
 import { ASTER_FUNDS_CHAINS } from "../exchanges/venues/aster.js";
 import { ONDO_DEPOSIT_CHAINS } from "../exchanges/venues/ondo.js";
 import { jsonOk, printJson } from "../utils.js";
@@ -248,47 +248,16 @@ export function registerOnchainFundsCommands(ctx: OnchainFundsContext): void {
     });
 
   // ═══ Address book (Ondo withdrawal destinations) ═══
+  // Ondo Perps withdrawals are web-app only (the API does not allow them), so an address-book
+  // entry made here would serve nothing. The command stays so the refusal is explicit.
 
-  const addressBook = funds.command("address-book").description("Withdrawal address book (Ondo Perps only withdraws to listed addresses)");
+  const addressBook = funds.command("address-book").description("Not available: the Ondo Perps withdrawal address book is managed in the web app");
 
   supportsDryRun(addressBook.command("add <venue> <address>"))
-    .description("Add the master wallet's own address to the Ondo Perps withdrawal address book (SIWE challenge signed by the OWS master wallet; supports --dry-run)")
-    .option("--label <text>", "Label of the address book entry")
-    .action(async (venue: string, address: string, opts: { label?: string }) => {
+    .description("Not available: Ondo Perps withdrawals and their address book are web-app only (refused, also with --dry-run)")
+    .option("--label <text>", "Ignored")
+    .action(async (venue: string) => {
       const def = getVenue(venue);
-      if (def.id !== "ondo") {
-        throw unsupported(def.displayName, "address-book", "only Ondo Perps has a withdrawal address book", "perp funds address-book add ondo <address>");
-      }
-      const net = getNetwork();
-      if (!/^0x[0-9a-fA-F]{40}$/.test(address)) throw new PerpError("INVALID_PARAMS", `"${address}" is not an EVM address`);
-      const plan = {
-        venue: "ondo", network: net, address, label: opts.label === undefined ? null : opts.label,
-        steps: "POST /v1/auth/erc-4361/address_book/get_challenge → personal_sign with the OWS master wallet → POST …/complete_challenge",
-      };
-      if (isDryRun()) {
-        if (isJson()) return printJson(jsonOk({ dryRun: true, sent: false, action: "address-book add", ...plan }));
-        console.log(chalk.yellow(`\n  [dry-run] Would add ${address} to the Ondo Perps address book (${net})`));
-        console.log(`  steps: ${plan.steps}`);
-        console.log(chalk.gray("  Nothing was signed or sent.\n"));
-        return;
-      }
-      const { loadMasterEvmSigner } = await import("../evm-master-tx.js");
-      const signer = await loadMasterEvmSigner("ondo", creds(), "Adding an Ondo address book entry");
-      if (signer.getAddress().toLowerCase() !== address.toLowerCase()) {
-        throw new PerpError("INVALID_PARAMS", `The CLI only adds the master wallet's own address (${signer.getAddress()}) to the Ondo address book; ${address} is a different address`, {
-          remediation: "Add other addresses in the Ondo Perps web app (Withdraw → address book)",
-        });
-      }
-      const { OndoAdapter } = await import("../exchanges/ondo/adapter.js");
-      const adapter = await getAdapterForExchange("ondo");
-      if (!(adapter instanceof OndoAdapter)) throw new Error("ondo venue did not produce an OndoAdapter");
-      const { addOndoAddressBookEntry } = await import("../exchanges/ondo/funds.js");
-      const res = await addOndoAddressBookEntry(adapter.restClient, {
-        wallet: signer.getAddress(), restUrl: networkConfig(def, net).restUrl, label: plan.label, signMessage: m => signer.signMessage(m),
-      });
-      if (isJson()) return printJson(jsonOk({ venue: "ondo", network: net, ...res }));
-      if (res.alreadyListed) console.log(chalk.green(`\n  ${res.address} is already on the Ondo Perps address book.\n`));
-      else if (res.listed) console.log(chalk.green(`\n  Added ${res.address} to the Ondo Perps address book.\n`));
-      else console.log(chalk.yellow(`\n  Ondo accepted the challenge, but ${res.address} is not listed yet (a cooldown may apply). Check the Ondo Perps app before withdrawing.\n`));
+      throw unsupported(def.displayName, "address-book", "the Ondo Perps API does not allow withdrawals, so the CLI keeps no withdrawal address book", "Manage withdrawals and the address book in the Ondo Perps web app");
     });
 }

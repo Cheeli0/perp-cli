@@ -446,17 +446,14 @@ describe("--dry-run prints the plan and loads no key (Aster / Ondo / address boo
     noKeys();
   });
 
-  it("funds address-book add ondo: plan only; another venue → CAPABILITY_UNSUPPORTED", async () => {
-    const out = captureJson();
-    await program().parseAsync(["--dry-run", "funds", "address-book", "add", "ondo", MASTER], { from: "user" });
-    expect(out()).toMatchObject({ ok: true, data: { dryRun: true, sent: false, venue: "ondo", address: MASTER } });
-    await expect(program().parseAsync(["--dry-run", "funds", "address-book", "add", "aster", MASTER], { from: "user" })).rejects.toMatchObject({ structured: { code: "CAPABILITY_UNSUPPORTED" } });
-    noKeys();
-  });
-
-  it("funds address-book add ondo (live) refuses an address that is not the master wallet's own", async () => {
-    await expect(run(program(), ["funds", "address-book", "add", "ondo", "0x000000000000000000000000000000000000dEaD"])).rejects.toMatchObject({ structured: { code: "INVALID_PARAMS" } });
+  it.each([
+    [["--dry-run", "funds", "address-book", "add", "ondo", MASTER]],
+    [["funds", "address-book", "add", "ondo", MASTER]],
+    [["--dry-run", "funds", "address-book", "add", "aster", MASTER]],
+  ])("funds address-book add %j → CAPABILITY_UNSUPPORTED (Ondo withdrawals are web-app only), nothing signed", async (argv) => {
+    await expect(program().parseAsync(argv, { from: "user" })).rejects.toMatchObject({ structured: { code: "CAPABILITY_UNSUPPORTED" } });
     expect(masterSigner.signMessage).not.toHaveBeenCalled();
+    noKeys();
   });
 });
 

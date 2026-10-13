@@ -54,7 +54,6 @@ import type {
   TimeInForce, VenueMarket,
 } from "../venue-types.js";
 import { parseOrderRef, toLegacyMarketInfo } from "../venue-types.js";
-import { ONDO_WITHDRAW_NETWORK } from "../venues/ondo.js";
 import { builderGateOf, builderRejectionOf, NO_BUILDER, requireFeeBps, type BuilderDecision, type BuilderFeeGate } from "../builder-fee.js";
 import { loadOndoCredentials, ONDO_APPROVE_REMEDIATION } from "./agent.js";
 import { OndoClient, type OndoCredentials } from "./client.js";
@@ -128,12 +127,6 @@ interface OndoStopOrders { market: string; positionDirection: string; stopLoss?:
 interface OndoBatchCancel {
   successfulCancels: OndoOrder[] | null;
   failedCancels: Array<{ orderId: string; error?: string; errorCode?: string }> | null;
-}
-interface OndoWithdrawal {
-  withdrawal_status: string;
-  withdrawal_id: string;
-  customer_withdrawal_id: string;
-  hash?: string;
 }
 
 const ORDERS_PAGE_LIMIT = 100;
@@ -320,11 +313,6 @@ export class OndoAdapter implements ExchangeAdapter, TradingV2 {
   async accountId(): Promise<string> {
     const account = await this.client.get<{ accountID: string }>("/v1/account", null);
     return account.accountID;
-  }
-
-  /** Withdrawal address book (GET /v1/wallet/address_book) — withdrawals go only to these addresses. */
-  async addressBook(): Promise<string[]> {
-    return (await import("./funds.js")).ondoAddressBook(this.client);
   }
 
   // ── Helpers ──
@@ -951,30 +939,11 @@ export class OndoAdapter implements ExchangeAdapter, TradingV2 {
   // ── Withdraw (capabilities.WithdrawCapable) ──
 
   /**
-   * Withdraw USDC from the perps (margin) wallet to an Ethereum address.
-   * Requires an API key with the `transfer` scope. The destination may need to
-   * be on the account's address book (venue error bad_withdrawal_address).
+   * Withdrawals are not available over the API (account owner, 2026-10-13): Ondo pays only
+   * address-book destinations and refuses API-key auth for adding one
+   * (`key_not_allowed_for_action`). Refused before any request — withdraw in the web app.
    */
-  async withdraw(amount: string, destination: string, opts?: { assetId?: number; routeType?: number }): Promise<OndoWithdrawal & { withdrawalFeeUSD: string }> {
-    if (opts?.assetId !== undefined || opts?.routeType !== undefined) {
-      throw new PerpError("INVALID_PARAMS", "Ondo Perps withdraw takes no assetId/routeType (USDC on Ethereum only)");
-    }
-    if (!/^0x[0-9a-fA-F]{40}$/.test(destination)) {
-      throw new PerpError("INVALID_PARAMS", `Ondo Perps withdraw destination must be an Ethereum address (got "${destination}")`);
-    }
-    if (!/^\d+(\.\d+)?$/.test(amount) || !isPositive(amount)) {
-      throw new PerpError("INVALID_PARAMS", `Withdraw amount must be a positive decimal (got "${amount}")`);
-    }
-    // AccountInfo.withdrawalFeeUSD (required in the OpenAPI spec) is reported with the result.
-    const account = await this.client.get<{ accountID: string; withdrawalFeeUSD: string }>("/v1/account", null);
-    const res = await this.client.post<OndoWithdrawal>("/v1/withdraw", {
-      customer_withdrawal_id: randomUUID(),
-      symbol: "USDC",
-      network: ONDO_WITHDRAW_NETWORK,
-      amount,
-      address: destination,
-      from: { id: account.accountID, wallet: "margin" },
-    });
-    return { ...res, withdrawalFeeUSD: account.withdrawalFeeUSD };
+  async withdraw(_amount: string, _destination: string): Promise<never> {
+    throw unsupported("Ondo Perps", "withdraw", "the Ondo Perps API does not allow withdrawals", "Withdraw from the Ondo Perps web app");
   }
 }

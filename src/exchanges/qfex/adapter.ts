@@ -61,7 +61,7 @@ import type {
   OrderStatus, VenueMarket,
 } from "../venue-types.js";
 import { parseOrderRef, toLegacyMarketInfo } from "../venue-types.js";
-import { QFEX_BANKER_NETWORK, QFEX_ENDPOINTS } from "../venues/qfex.js";
+import { QFEX_BANKER_NETWORK, QFEX_ENDPOINTS, QFEX_WITHDRAW_DISABLED, QFEX_WITHDRAW_ENABLED } from "../venues/qfex.js";
 import { loadQfexCredentials, QFEX_IMPORT_REMEDIATION } from "./agent.js";
 import { QfexClient } from "./client.js";
 import { qfexStatusClass } from "./errors.js";
@@ -1386,6 +1386,9 @@ export class QfexAdapter implements ExchangeAdapter, TradingV2 {
   async withdraw(amount: string, destination: string, opts?: { assetId?: number; routeType?: number }): Promise<{
     accepted: true; amount: string; address: string; network: string; asset: "USDC"; fee: null; note: string;
   }> {
+    if (!QFEX_WITHDRAW_ENABLED) {
+      throw unsupported("QFEX", "withdraw", QFEX_WITHDRAW_DISABLED.reason, QFEX_WITHDRAW_DISABLED.remediation);
+    }
     const meta = this.requireMeta();
     if (opts?.assetId !== undefined || opts?.routeType !== undefined) {
       throw new PerpError("INVALID_PARAMS", "QFEX withdraw takes no assetId/routeType (USDC on Arbitrum One only)");

@@ -19,12 +19,14 @@ perp --json -e <EX> market book <SYMBOL>       # orderbook (bids/asks)
 perp --json -e <EX> market trades <SYMBOL>     # recent trades
 perp --json -e <EX> market funding <SYMBOL>    # funding rate history
 perp --json -e <EX> market kline <SYM> <INT>   # OHLCV candles (1m,5m,15m,1h,4h,1d)
-perp --json market hip3                        # list HIP-3 deployed perp dexes (Hyperliquid)
+perp --json -e hyperliquid market hip3         # list HIP-3 deployed perp dexes (needs -e hyperliquid; other -e → INVALID_PARAMS)
+perp --json -e hyperliquid --dex <DEX> market list           # one HIP-3 dex's markets (e.g. --dex xyz)
+perp --json -e hyperliquid --dex <DEX> market book <SYMBOL>  # any market/account/trade command takes --dex the same way
 ```
 
 ## Account (read-only, safe)
 ```bash
-perp --json portfolio -e <VENUE_ID>            # perp balance + spot holdings + 24h funding; full venue id only (hl → INVALID_PARAMS)
+perp --json portfolio -e <VENUE_ID>            # perp balance + spot holdings + 24h funding; venue id or alias (hl, lt, …)
 perp --json -e <EX> account positions          # open positions
 perp --json -e <EX> account orders             # open/pending orders
 perp --json -e <EX> account history            # order history
@@ -195,15 +197,14 @@ perp --json funds withdraw hyperliquid <AMOUNT> [--chain arbitrum|ethereum|base]
 #   --to another address only if it is on settings withdraw.hyperliquid (else POLICY_DENIED).
 perp --json funds withdraw lighter <AMOUNT>                 # -e lighter: USDC → Ethereum; -e lighter-rh: USDG → Robinhood Chain
 perp --json funds deposit lighter-rh <AMOUNT>               # USDG on Robinhood Chain (min 1, mainnet only)
-perp --json funds withdraw ondo <AMOUNT> --to <ADDRESS>     # USDC → Ethereum (address-book destination)
+# Ondo Perps: NO API withdrawals — `funds withdraw ondo` → CAPABILITY_UNSUPPORTED; withdraw in the Ondo web app
 perp --json funds withdraw arcus <AMOUNT>                   # USDG → the account owner (min 1)
 perp --json funds deposit qfex                              # prints the USDC / Arbitrum One deposit address (sends nothing)
-perp --json --dry-run funds withdraw qfex <AMOUNT> --to <0x>  # plan + local gate verdict (settings withdraw.qfex; user-only, terminal)
+# QFEX: withdrawals disabled in perp-cli for now — `funds withdraw qfex` → CAPABILITY_UNSUPPORTED; withdraw in the QFEX web app
 perp --json -e qfex funds transfer <AMOUNT> primary --from <account-uuid>   # between your QFEX accounts
 perp --json funds deposit aster <AMOUNT> [--chain bsc|arbitrum] [--asset USDT|USDC]   # vault approve + deposit (mainnet; default BNB Chain USDT)
 perp --json funds withdraw aster <AMOUNT> [--chain bsc|arbitrum] [--asset USDT|USDC]   # → the account's own address (default USDT; mainnet; agent approved with --can-withdraw --ip-whitelist)
 perp --json funds deposit ondo <AMOUNT> [--chain arbitrum|ethereum] [--probe <AMT>]   # USDC transfer to the account's funding address (mainnet)
-perp --json funds address-book add ondo <MASTER_ADDRESS>    # SIWE challenge → Ondo withdrawal address book (own address only)
 perp --json funds transfer <AMOUNT> <ADDRESS>               # HL internal transfer (instant); destination must be on settings withdraw.hyperliquid
 # settings withdraw.<venue> (allowlist + limits) is set ONLY by the user in an interactive terminal
 # (--json / piped → POLICY_DENIED). Agents never set or change it.
@@ -307,7 +308,7 @@ perp --json wallet list                        # all named wallets
 perp --json wallet use <name>                  # set active wallet
 perp --json wallet rename <old> <new>
 perp --json wallet remove <name>
-perp --json wallet balance                     # on-chain USDC balances
+perp --json wallet balance   # gas token + USDC/USDT per chain (Arbitrum, Ethereum, Base, BNB, Robinhood USDG, Solana); failed reads → balance null + error
 perp --json wallet solana <address>            # check arbitrary Solana address
 perp --json wallet arbitrum <address>          # check arbitrary Arbitrum address
 perp --json wallet migrate                     # migrate legacy ~/.perp/.env config

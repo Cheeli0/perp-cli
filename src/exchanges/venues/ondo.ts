@@ -20,12 +20,6 @@ const publicData: VenuePublicData = {
   },
 };
 
-/**
- * Chain Ondo Perps withdrawals are paid out on (POST /v1/withdraw `network`).
- * The venue settles off-chain (settlementChain "offchain"); USDC leaves on Ethereum.
- */
-export const ONDO_WITHDRAW_NETWORK = "ethereum";
-
 /** Chains the CLI funds an Ondo Perps account from (`funds deposit ondo --chain`). */
 export type OndoDepositChain = "arbitrum" | "ethereum";
 
@@ -123,7 +117,8 @@ export const ondoVenue: VenueDefinition = {
     amend: "cancelReplace",
     batchPlaceMax: 20,
     marginModes: ["cross"],
-    withdrawAssets: ["USDC"],
+    // The API does not allow withdrawals (web app only) — OndoAdapter.withdraw refuses.
+    withdrawAssets: null,
   },
   rateLimit: { capacity: 1, refillPerSec: 1, weights: null },
   // Docs (account-set-up, about): "outside the U.S., Panama and other prohibited

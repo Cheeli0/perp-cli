@@ -10,7 +10,6 @@ import { registerFundsCommands, chainLabel, lighterFamilyWithdrawSummary } from 
 import { listVenues, getVenue } from "../exchanges/venue.js";
 import { ensureVenuesRegistered } from "../exchanges/venues/index.js";
 import { asterVenue } from "../exchanges/venues/aster.js";
-import { ONDO_WITHDRAW_NETWORK } from "../exchanges/venues/ondo.js";
 import { QFEX_WITHDRAW_NETWORK } from "../exchanges/venues/qfex.js";
 import { legacyPublicBaseUrl } from "../api/public/urls.js";
 import { LighterAdapter } from "../exchanges/lighter.js";
@@ -162,13 +161,6 @@ function captureJson(): { out: () => Record<string, unknown> } {
 const DEST = "0x000000000000000000000000000000000000dEaD";
 const OWNER = "0x1111111111111111111111111111111111111111";
 
-function fakeOndo(withdraw = vi.fn(async () => ({ withdrawal_id: "w1" })), book: string[] = [DEST]): { adapter: ExchangeAdapter; withdraw: typeof withdraw } {
-  const a = Object.create(OndoAdapter.prototype) as Record<string, unknown>;
-  a.withdraw = withdraw;
-  a.addressBook = async () => book;
-  return { adapter: a as unknown as ExchangeAdapter, withdraw };
-}
-
 function fakeArcus(withdraw = vi.fn(async () => ({ ok: true }))): { adapter: ExchangeAdapter; withdraw: typeof withdraw } {
   const a = Object.create(ArcusAdapter.prototype) as Record<string, unknown>;
   Object.defineProperty(a, "withdrawDestination", { get: () => OWNER });
@@ -176,36 +168,22 @@ function fakeArcus(withdraw = vi.fn(async () => ({ ok: true }))): { adapter: Exc
   return { adapter: a as unknown as ExchangeAdapter, withdraw };
 }
 
-describe("#4 funds withdraw ondo / arcus / aster", () => {
-  it("ondo --dry-run plans and sends nothing", async () => {
-    const { adapter, withdraw } = fakeOndo();
-    const cap = captureJson();
-    await fundsProgram(async ex => { expect(ex).toBe("ondo"); return adapter; })
-      .parseAsync(["--dry-run", "funds", "withdraw", "ondo", "5", "--to", DEST], { from: "user" });
-    expect(withdraw).not.toHaveBeenCalled();
-    expect(cap.out()).toMatchObject({ ok: true, data: { dryRun: true, sent: false, venue: "ondo", asset: "USDC", amount: "5", destination: DEST, chain: "Ethereum" } });
+describe("#4 funds withdraw ondo (refused) / arcus / aster", () => {
+  it.each([
+    [["--dry-run", "funds", "withdraw", "ondo", "5", "--to", DEST]],
+    [["funds", "withdraw", "ondo", "5", "--to", DEST]],
+    [["funds", "withdraw", "ondo"]],
+  ])("ondo %j → CAPABILITY_UNSUPPORTED (API cannot withdraw), adapter never created", async (argv) => {
+    const get = vi.fn(async () => { throw new Error("must not create an adapter"); });
+    await expect(fundsProgram(get).parseAsync(argv, { from: "user" }))
+      .rejects.toMatchObject({ structured: { code: "CAPABILITY_UNSUPPORTED", details: { venue: "Ondo Perps", feature: "withdraw" }, remediation: expect.stringContaining("web app") } });
+    expect(get).not.toHaveBeenCalled();
+    expect(getVenue("ondo").capabilities?.withdrawAssets).toBeNull();
   });
 
-  it("ondo sends through the adapter and returns jsonOk(result)", async () => {
-    const { adapter, withdraw } = fakeOndo();
-    const cap = captureJson();
-    await fundsProgram(async () => adapter).parseAsync(["funds", "withdraw", "ondo", "5", "--to", DEST], { from: "user" });
-    expect(withdraw).toHaveBeenCalledWith("5", DEST);
-    expect(cap.out()).toMatchObject({ ok: true, data: { withdrawal_id: "w1" } });
-  });
-
-  it("ondo destination not on the address book → INVALID_PARAMS with the address-book remediation, nothing sent", async () => {
-    const { adapter, withdraw } = fakeOndo(undefined, [OWNER]);
-    await expect(fundsProgram(async () => adapter).parseAsync(["funds", "withdraw", "ondo", "5", "--to", DEST], { from: "user" }))
-      .rejects.toMatchObject({ structured: { code: "INVALID_PARAMS", remediation: expect.stringContaining("perp funds address-book add ondo") } });
-    expect(withdraw).not.toHaveBeenCalled();
-  });
-
-  it("ondo without --to → INVALID_PARAMS before anything is sent", async () => {
-    const { adapter, withdraw } = fakeOndo();
-    await expect(fundsProgram(async () => adapter).parseAsync(["funds", "withdraw", "ondo", "5"], { from: "user" }))
-      .rejects.toMatchObject({ structured: { code: "INVALID_PARAMS" } });
-    expect(withdraw).not.toHaveBeenCalled();
+  it("OndoAdapter.withdraw refuses before any request (rebalance / MCP paths)", async () => {
+    const a = Object.create(OndoAdapter.prototype) as OndoAdapter;
+    await expect(a.withdraw("5", DEST)).rejects.toMatchObject({ structured: { code: "CAPABILITY_UNSUPPORTED" } });
   });
 
   it("arcus --dry-run targets the account owner and sends nothing", async () => {
@@ -253,8 +231,8 @@ describe("#4 funds withdraw ondo / arcus / aster", () => {
   });
 
   it("negative / malformed amounts are refused", async () => {
-    const { adapter } = fakeOndo();
-    await expect(fundsProgram(async () => adapter).parseAsync(["funds", "withdraw", "ondo", "abc", "--to", DEST], { from: "user" }))
+    const { adapter } = fakeArcus();
+    await expect(fundsProgram(async () => adapter).parseAsync(["funds", "withdraw", "arcus", "abc"], { from: "user" }))
       .rejects.toBeInstanceOf(PerpError);
   });
 });
@@ -267,8 +245,7 @@ describe("#5 Lighter-family withdraw help + lighter-rh deposit wiring", () => {
     expect(lt.description()).toContain(lighterFamilyWithdrawSummary());
     expect(lighterFamilyWithdrawSummary()).toBe("-e lighter: USDC → Ethereum; -e lighter-rh: USDG → Robinhood Chain");
     const ondo = wd.commands.find(c => c.name() === "ondo")!;
-    expect(ondo.description()).toContain("USDC");
-    expect(ondo.description()).toContain("Ethereum");
+    expect(ondo.description()).toContain("Not available");
   });
 
   it("deposit lighter-rh is registered with the venue collateral in its help", () => {
@@ -323,8 +300,8 @@ describe("#5 Lighter-family withdraw help + lighter-rh deposit wiring", () => {
       for (const net of ["mainnet", "testnet"] as const) {
         const cfg = def.networks[net];
         if (cfg === null) continue;
-        // Venues that settle off-chain pay out on a public chain (ondo: Ethereum, qfex: Arbitrum One).
-        const chain = def.id === "ondo" ? ONDO_WITHDRAW_NETWORK : def.id === "qfex" ? QFEX_WITHDRAW_NETWORK : cfg.settlementChain;
+        // Venues that settle off-chain pay out on a public chain (qfex: Arbitrum One).
+        const chain = def.id === "qfex" ? QFEX_WITHDRAW_NETWORK : cfg.settlementChain;
         expect(() => chainLabel(chain), `${def.id} ${net} ${chain}`).not.toThrow();
       }
     }

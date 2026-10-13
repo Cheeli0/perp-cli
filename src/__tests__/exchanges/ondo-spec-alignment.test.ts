@@ -128,14 +128,11 @@ describe("approveOndoAgent", () => {
 });
 
 describe("OndoAdapter.withdraw", () => {
-  it("returns withdrawalFeeUSD from GET /v1/account alongside the venue result", async () => {
-    fetchMock
-      .mockResolvedValueOnce(reply(200, { success: true, result: { accountID: "acc1", withdrawalFeeUSD: "2.00" } }))
-      .mockResolvedValueOnce(reply(200, { success: true, result: { withdrawal_status: "pending", withdrawal_id: "w1", customer_withdrawal_id: "c1" } }));
+  it("the API cannot withdraw: CAPABILITY_UNSUPPORTED before any request", async () => {
     const a = Object.create(OndoAdapter.prototype) as OndoAdapter;
     (a as unknown as { client: OndoAdapter["client"] }).client = client();
-    const r = await a.withdraw("10", "0x" + "1".repeat(40));
-    expect(r).toMatchObject({ withdrawal_id: "w1", withdrawalFeeUSD: "2.00" });
-    expect(JSON.parse(fetchMock.mock.calls[1][1].body as string).from).toEqual({ id: "acc1", wallet: "margin" });
+    await expect(a.withdraw("10", "0x" + "1".repeat(40)))
+      .rejects.toMatchObject({ structured: { code: "CAPABILITY_UNSUPPORTED", remediation: expect.stringContaining("web app") } });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

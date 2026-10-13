@@ -45,7 +45,7 @@ describe("market commands use the read-only adapter", () => {
   }, 90_000);
 
   it("a credentialed ondo command with the same config still fails on credential resolution (contrast)", () => {
-    const { json } = runCli(["-e", "ondo", "--json", "--dry-run", "funds", "withdraw", "ondo", "5", "--to", "0x000000000000000000000000000000000000dEaD"]);
+    const { json } = runCli(["-e", "ondo", "--json", "account", "positions"]);
     expect(json.ok).toBe(false);
     // The OWS wallet does not exist in the isolated HOME → KEY_NOT_FOUND; with a real wallet
     // but no Ondo key it is NO_SIGNER_AVAILABLE. Either way it never reaches the network.

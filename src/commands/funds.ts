@@ -14,8 +14,7 @@ import type { VenueId } from "../exchanges/venue-types.js";
 import { getVenue, requireCapabilities, READ_ONLY_CREDENTIALS, type Network as VenueNetwork, type VenueDefinition } from "../exchanges/venue.js";
 import { unsupported } from "../exchanges/trading-v2.js";
 import { registerOnchainFundsCommands } from "./funds-onchain.js";
-import { ONDO_WITHDRAW_NETWORK } from "../exchanges/venues/ondo.js";
-import { QFEX_BANKER_NETWORK, QFEX_WITHDRAW_NETWORK } from "../exchanges/venues/qfex.js";
+import { QFEX_BANKER_NETWORK, QFEX_WITHDRAW_DISABLED, QFEX_WITHDRAW_ENABLED, QFEX_WITHDRAW_NETWORK } from "../exchanges/venues/qfex.js";
 import type { QfexAdapter } from "../exchanges/qfex/adapter.js";
 import { loadSettings } from "../settings.js";
 import { assertWithdrawAllowed, forgetWithdrawAttempt, recordWithdrawAttempt } from "../withdraw-gate.js";
@@ -119,11 +118,10 @@ function withdrawAssetOf(def: VenueDefinition): string {
 
 /** Withdrawal chain of venues that settle off-chain and pay out on a public chain. */
 const OFFCHAIN_WITHDRAW_CHAIN: { readonly [K in VenueId]?: string } = {
-  ondo: ONDO_WITHDRAW_NETWORK,
   qfex: QFEX_WITHDRAW_NETWORK,
 };
 
-/** Chain a venue's withdrawals arrive on (Ondo / QFEX settle off-chain and pay out on Ethereum / Arbitrum). */
+/** Chain a venue's withdrawals arrive on (QFEX settles off-chain and pays out on Arbitrum). */
 function withdrawChainOf(def: VenueDefinition, net: VenueNetwork): string {
   const payout = OFFCHAIN_WITHDRAW_CHAIN[def.id];
   if (payout !== undefined) return payout;
@@ -1103,16 +1101,23 @@ export function registerFundsCommands(
       }
     });
 
-  // ── Ondo Perps / Arcus — uniform surface (design §13.1): same <amount> + --to,
+  // ── Arcus — uniform surface (design §13.1): same <amount> + --to,
   //    same jsonOk(result), global --dry-run plans without sending. ──
 
 
-  for (const venueId of ["ondo", "arcus"] as const) {
+  // Ondo Perps: the API does not allow withdrawals (address-book destinations only; adding one is
+  // refused for API keys). The command stays so the refusal is explicit — also under --dry-run.
+  supportsDryRun(withdraw.command("ondo [amount]"))
+    .description("Not available: Ondo Perps withdrawals are web-app only (refused, also with --dry-run)")
+    .option("--to <address>", "Ignored — the API cannot withdraw")
+    .action(async () => {
+      throw unsupported("Ondo Perps", "withdraw", "the Ondo Perps API does not allow withdrawals", "Withdraw from the Ondo Perps web app");
+    });
+
+  for (const venueId of ["arcus"] as const) {
     const def = getVenue(venueId);
     const asset = withdrawAssetOf(def);
-    const toHelp = venueId === "ondo"
-      ? "Destination EVM address (required; must be on the Ondo address book — see: perp funds address-book add ondo <address>)"
-      : "Destination EVM address (must equal the Arcus account owner — the default)";
+    const toHelp = "Destination EVM address (must equal the Arcus account owner — the default)";
     supportsDryRun(withdraw.command(`${venueId} <amount>`))
       .description(`Withdraw ${asset} from ${def.displayName} to your ${chainLabel(withdrawChainOf(def, "mainnet"))} wallet (supports --dry-run)`)
       .option("--to <address>", toHelp)
@@ -1126,25 +1131,15 @@ export function registerFundsCommands(
         const adapter = await getAdapterForExchange(venueId);
         if (!isWithdrawCapable(adapter)) throw new Error(`${def.id} adapter has no withdraw()`);
 
-        let destination: string;
-        if (venueId === "ondo") {
-          if (opts.to === undefined) {
-            throw new PerpError("INVALID_PARAMS", "Ondo Perps withdraw needs a destination address (the API key has no owner address)", {
-              remediation: `perp funds withdraw ondo ${amount} --to <0x address on your Ondo address book>`,
-            });
-          }
-          destination = opts.to;
-        } else {
-          const { ArcusAdapter } = await import("../exchanges/arcus/adapter.js");
-          if (!(adapter instanceof ArcusAdapter)) throw new Error("arcus venue did not produce an ArcusAdapter");
-          const owner = adapter.withdrawDestination;
-          if (opts.to !== undefined && opts.to.toLowerCase() !== owner.toLowerCase()) {
-            throw new PerpError("INVALID_PARAMS", `Arcus only withdraws to the account owner ${owner}`, {
-              remediation: `Omit --to (defaults to ${owner})`,
-            });
-          }
-          destination = owner;
+        const { ArcusAdapter } = await import("../exchanges/arcus/adapter.js");
+        if (!(adapter instanceof ArcusAdapter)) throw new Error("arcus venue did not produce an ArcusAdapter");
+        const owner = adapter.withdrawDestination;
+        if (opts.to !== undefined && opts.to.toLowerCase() !== owner.toLowerCase()) {
+          throw new PerpError("INVALID_PARAMS", `Arcus only withdraws to the account owner ${owner}`, {
+            remediation: `Omit --to (defaults to ${owner})`,
+          });
         }
+        const destination = owner;
 
         const plan = { venue: def.id, network: net, asset, amount: String(amountNum), destination, chain };
         if (isDryRun()) {
@@ -1158,16 +1153,6 @@ export function registerFundsCommands(
           console.log(`  Destination: ${destination} (${chain})`);
           console.log(chalk.gray("  Nothing was sent.\n"));
           return;
-        }
-
-        if (venueId === "ondo") {
-          // Address-book preflight (read-only): Ondo refuses destinations that are not listed.
-          const { OndoAdapter } = await import("../exchanges/ondo/adapter.js");
-          if (!(adapter instanceof OndoAdapter)) throw new Error("ondo venue did not produce an OndoAdapter");
-          const book = await adapter.addressBook();
-          if (!book.some(a => a.toLowerCase() === destination.toLowerCase())) {
-            throw (await import("../exchanges/ondo/funds.js")).ondoAddressNotOnBook(destination, book);
-          }
         }
 
         if (!isJson()) {
@@ -1198,7 +1183,7 @@ export function registerFundsCommands(
   }
 
   // ── QFEX (design §14.6, §14.12 #8) — custodial; deposit = address display, withdraw = banker POST
-  //    gated by settings.withdraw.qfex inside QfexAdapter.withdraw(). ──
+  //    gated by settings.withdraw.qfex inside QfexAdapter.withdraw(); switched off (QFEX_WITHDRAW_ENABLED). ──
 
   /** QFEX adapter for the active network — the default imported key, or the one named by --agent. */
   const qfexAdapterFor = async (agentName: string | undefined): Promise<QfexAdapter> => {
@@ -1222,11 +1207,14 @@ export function registerFundsCommands(
     return adapter;
   };
 
-  supportsDryRun(withdraw.command("qfex <amount>"))
-    .description("Withdraw USDC from QFEX to an allowlisted Arbitrum One address (needs settings withdraw.qfex and a key with the \"Deposit and withdraw\" permission; supports --dry-run)")
+  supportsDryRun(withdraw.command(QFEX_WITHDRAW_ENABLED ? "qfex <amount>" : "qfex [amount]"))
+    .description(QFEX_WITHDRAW_ENABLED
+      ? "Withdraw USDC from QFEX to an allowlisted Arbitrum One address (needs settings withdraw.qfex and a key with the \"Deposit and withdraw\" permission; supports --dry-run)"
+      : "Not available: QFEX withdrawals are disabled in perp-cli for now — use the QFEX web app (refused, also with --dry-run)")
     .option("--to <address>", "Destination EVM address on Arbitrum One (required; must be on the settings withdraw.qfex allowlist)")
     .option("--agent <name>", "Imported QFEX key to use (a key with the \"Deposit and withdraw\" permission, bound to the primary account)")
     .action(async (amount: string, opts: { to?: string; agent?: string }) => {
+      if (!QFEX_WITHDRAW_ENABLED) throw unsupported("QFEX", "withdraw", QFEX_WITHDRAW_DISABLED.reason, QFEX_WITHDRAW_DISABLED.remediation);
       const def = getVenue("qfex");
       const net = getNetwork();
       if (!/^\d+(\.\d+)?$/.test(amount) || !(Number(amount) > 0)) {
@@ -1304,7 +1292,7 @@ export function registerFundsCommands(
       console.log(chalk.gray("  perp-cli did not send anything — transfer from your own wallet or exchange.\n"));
     });
 
-  // ── Aster deposit / withdraw, Ondo deposit, Ondo address book (OWS-master on-chain legs) ──
+  // ── Aster deposit / withdraw, Ondo deposit (OWS-master on-chain legs; address book refused) ──
 
   registerOnchainFundsCommands({
     program, funds, deposit, withdraw, isJson, isDryRun, getNetwork, getAdapterForExchange,
@@ -1418,8 +1406,8 @@ export function registerFundsCommands(
             hyperliquid: { chain: "Arbitrum", token: "USDC", speed: "minutes", fee: "$1" },
             lighter: { chain: "Ethereum L1", token: "USDC", speed: "~12 hours (standard), minutes (fast)", fee: "varies" },
             "lighter-rh": { chain: "Robinhood Chain", token: "USDG", command: "perp -e lighter-rh funds withdraw lighter <amount>" },
-            ondo: { chain: "Ethereum", token: "USDC", command: "perp funds withdraw ondo <amount> --to <address>", addressBook: "destination must be listed: perp funds address-book add ondo <master address>" },
-            qfex: { chain: "Arbitrum", token: "USDC", command: "perp funds withdraw qfex <amount> --to <allowlisted address>", gate: "settings withdraw.qfex (allowlist, maxPerTx, maxPerDay)", note: "needs a key with the \"Deposit and withdraw\" permission (All accounts access)" },
+            ondo: { supported: false, note: "the Ondo Perps API does not allow withdrawals — withdraw in the Ondo Perps web app" },
+            qfex: { supported: false, note: "QFEX withdrawals are disabled in perp-cli for now — withdraw in the QFEX web app" },
             arcus: { chain: "Robinhood Chain", token: "USDG", command: "perp funds withdraw arcus <amount>" },
             aster: { chain: "BNB Chain (default) / Arbitrum", token: "USDT (default) / USDC", command: "perp funds withdraw aster <amount> [--chain bsc|arbitrum] [--asset USDT|USDC]", fee: "POST /fapi/v3/aster/user-withdraw-info (taken from the amount)", requires: "mainnet; API wallet approved with --can-withdraw --ip-whitelist; destination = the account's own address" },
           },
@@ -1482,9 +1470,8 @@ export function registerFundsCommands(
       console.log(chalk.white.bold("\n  Lighter RH") + chalk.gray(" → Robinhood Chain (USDG)"));
       console.log(`  Command: ${chalk.green("perp -e lighter-rh funds withdraw lighter <amount>")}`);
 
-      console.log(chalk.white.bold("\n  Ondo Perps") + chalk.gray(" → Ethereum (USDC)"));
-      console.log(`  Command: ${chalk.green("perp funds withdraw ondo <amount> --to <address>")}`);
-      console.log(`  Address book: ${chalk.green("perp funds address-book add ondo <your master address>")}`);
+      console.log(chalk.white.bold("\n  Ondo Perps") + chalk.gray(" — not available over the API"));
+      console.log(chalk.gray("  Withdraw in the Ondo Perps web app."));
 
       console.log(chalk.white.bold("\n  Arcus") + chalk.gray(" → Robinhood Chain (USDG, to the account owner)"));
       console.log(`  Command: ${chalk.green("perp funds withdraw arcus <amount>")}`);

@@ -217,8 +217,26 @@ export function buildProgram(opts: { defaultExchange: string; version: string })
     return resolveVenueId(program.opts().exchange as string);
   }
 
+  /**
+   * The `--dex` value for the single `-e` venue. HIP-3 dexes exist only on Hyperliquid, so a
+   * `--dex` with another `-e` venue is refused instead of being dropped (the command would
+   * otherwise read / trade that venue's own markets while the user asked for a HIP-3 dex).
+   * Multi-venue commands (arb, portfolio) apply `--dex` to their Hyperliquid leg only and do
+   * not go through this check.
+   */
+  function dexForExchange(): string | null {
+    const dex = (program.opts().dex as string | undefined) ?? null;
+    if (dex !== null && getExchange() !== "hyperliquid") {
+      const venue = program.getOptionValueSource("exchange") === "cli" ? `-e ${getExchange()}` : `the default exchange (${getExchange()})`;
+      throw new PerpError("INVALID_PARAMS", `--dex ${dex} is a Hyperliquid HIP-3 dex; ${venue} has no HIP-3 dexes`, {
+        remediation: `Use -e hyperliquid --dex ${dex}, or drop --dex for ${getExchange()}.`,
+      });
+    }
+    return dex;
+  }
+
   async function getAdapter(): Promise<ExchangeAdapter> {
-    _adapter = await createVenueAdapter(getExchange(), (program.opts().dex as string | undefined) ?? null);
+    _adapter = await createVenueAdapter(getExchange(), dexForExchange());
     return _adapter;
   }
 
@@ -245,7 +263,7 @@ export function buildProgram(opts: { defaultExchange: string; version: string })
 
   // Public market-data adapters (read-only; no credential resolution).
   async function getPublicAdapter(): Promise<ExchangeAdapter> {
-    return createVenueAdapter(getExchange(), (program.opts().dex as string | undefined) ?? null, true);
+    return createVenueAdapter(getExchange(), dexForExchange(), true);
   }
   async function getPublicAdapterForExchange(rawExchange: string): Promise<ExchangeAdapter> {
     return createVenueAdapter(rawExchange, (program.opts().dex as string | undefined) ?? null, true);
