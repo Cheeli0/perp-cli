@@ -1,5 +1,5 @@
 /**
- * Ondo Perps funding (mainnet only) + withdrawal address book.
+ * Ondo Perps funding (mainnet only). Withdrawals are web-app only (the API cannot withdraw).
  *
  * Deposit = a plain ERC-20 transfer of USDC to the account's own funding address
  * (docs.ondoperps.xyz/funding-ondo-perps, api-reference/integration_guide "Deposit USDC").
@@ -13,13 +13,9 @@
  *   - With a probe amount the transfer is two-step: probe → wait until GET /v1/wallet/deposits
  *     shows it confirmed → remainder. A probe that is not credited within the window stops the
  *     flow (ORDER_PENDING with the probe tx hash); the remainder is NOT sent.
- *
- * Address book: withdrawals go only to addresses on the account's address book. An address is
- * added by signing a SIWE challenge with the account's wallet
- * (POST /v1/auth/erc-4361/address_book/get_challenge → personal_sign → …/complete_challenge).
  */
 
-import { formatUnits, parseUnits, verifyMessage } from "ethers";
+import { formatUnits, parseUnits } from "ethers";
 import { PerpError } from "../../errors.js";
 import {
   ERC20, EVM_ADDRESS_RE, assertRpcChainId, erc20Balance, erc20Decimals, evmProvider, sameAddress, sendMasterTx, type TxSigner,
@@ -244,95 +240,4 @@ export async function executeOndoDeposit(
     await send("deposit", plan.amountRaw);
   }
   return { transfers, depositAddress: plan.depositAddress };
-}
-
-// ── Address book ──
-
-const ADDRESS_BOOK_UI = "add the address in the Ondo Perps web app (Withdraw → address book)";
-
-/** Withdrawal addresses on the account's address book (GET /v1/wallet/address_book). */
-export async function ondoAddressBook(client: OndoFundsClient): Promise<string[]> {
-  const res = await client.get<{ addressBook?: unknown }>("/v1/wallet/address_book", null);
-  if (!Array.isArray(res.addressBook)) throw venueError("GET /v1/wallet/address_book returned no addressBook list");
-  return (res.addressBook as Array<{ withdrawalAddress?: unknown }>).map(e => {
-    if (typeof e?.withdrawalAddress !== "string") throw venueError("address book entry has no withdrawalAddress");
-    return e.withdrawalAddress;
-  });
-}
-
-/** Refusal for a withdraw destination that is not on the address book (nothing was sent). */
-export function ondoAddressNotOnBook(destination: string, book: readonly string[]): PerpError {
-  return new PerpError("INVALID_PARAMS", `${destination} is not on the Ondo Perps withdrawal address book (${book.length === 0 ? "the book is empty" : `listed: ${book.join(", ")}`}) — nothing was sent`, {
-    exchange: "ondo",
-    remediation: `Ondo only withdraws to address-book entries. An entry is added by signing a SIWE challenge with the account's wallet (api-reference/auth/get-siwe-address-book-challenge + complete). For the master wallet's own address run: perp funds address-book add ondo ${destination} — otherwise ${ADDRESS_BOOK_UI}`,
-  });
-}
-
-/** A challenge the master key will sign must be about this address book entry — never an arbitrary message. */
-export function assertOndoAddressBookChallenge(message: string, wallet: string, withdrawalAddress: string, restUrl: string): void {
-  const refuse = (why: string): never => {
-    throw new PerpError("POLICY_DENIED", `Ondo address-book challenge refused: ${why}. Nothing was signed.`, {
-      exchange: "ondo", challenge: message.slice(0, 600), remediation: `If this message is expected, ${ADDRESS_BOOK_UI}`,
-    });
-  };
-  if (!message.toLowerCase().includes(withdrawalAddress.toLowerCase())) refuse(`the message does not name the withdrawal address ${withdrawalAddress}`);
-  // The endpoint is POST /v1/auth/erc-4361/address_book/get_challenge — "Get a Sign-In with Ethereum
-  // challenge for adding a withdrawal address" (Ondo REST spec). ERC-4361 shape:
-  // "<domain> wants you to sign in with your Ethereum account:\n<address>\n…". Any other message
-  // is refused: the master key never signs free-form text.
-  const siwe = /^(\S+) wants you to sign in with your Ethereum account:\n(0x[0-9a-fA-F]{40})\n/.exec(message);
-  if (siwe === null) return refuse("the message is not a Sign-In with Ethereum (ERC-4361) message");
-  const venueHost = new URL(restUrl).hostname.split(".").slice(-2).join(".");
-  const domain = siwe[1].replace(/^[a-z]+:\/\//, "").split(":")[0];
-  if (domain !== venueHost && !domain.endsWith(`.${venueHost}`)) refuse(`its domain "${siwe[1]}" is not ${venueHost}`);
-  if (!sameAddress(siwe[2], wallet)) refuse(`it is addressed to ${siwe[2]}, not the signing wallet ${wallet}`);
-}
-
-/** A venue refusal of the SIWE address-book endpoints, re-raised with the web-app route. */
-function addressBookAuthError(e: unknown, step: string): unknown {
-  if (!(e instanceof PerpError) || e.structured.code === "ORDER_PENDING") return e;
-  return new PerpError(e.structured.code, `${e.message} — Ondo refused the address-book ${step} with API-key auth`, {
-    ...e.structured.details, exchange: "ondo",
-    remediation: `These endpoints may need a wallet (SIWE/JWT) session instead of an API key: ${ADDRESS_BOOK_UI}`,
-  });
-}
-
-export interface OndoAddressBookAddResult { address: string; alreadyListed: boolean; listed: boolean; challengeId: string | null }
-
-/**
- * Add the signing wallet's own address to the address book: get_challenge → personal_sign
- * (EIP-191) with the wallet → complete_challenge. Challenge chainId "1" (enum: 1 | 43114).
- */
-export async function addOndoAddressBookEntry(client: OndoFundsClient, p: {
-  wallet: string; restUrl: string; label: string | null; signMessage: (message: string) => Promise<string>;
-}): Promise<OndoAddressBookAddResult> {
-  const before = await ondoAddressBook(client);
-  if (before.some(a => sameAddress(a, p.wallet))) return { address: p.wallet, alreadyListed: true, listed: true, challengeId: null };
-
-  let challenge: { id?: unknown; message?: unknown };
-  try {
-    challenge = await client.post<{ id?: unknown; message?: unknown }>("/v1/auth/erc-4361/address_book/get_challenge", {
-      walletAddress: p.wallet, chainId: "1", withdrawalAddress: p.wallet,
-    });
-  } catch (e) {
-    throw addressBookAuthError(e, "challenge");
-  }
-  if (typeof challenge.id !== "string" || typeof challenge.message !== "string" || challenge.message === "") {
-    throw venueError("address_book/get_challenge returned no id / message");
-  }
-  assertOndoAddressBookChallenge(challenge.message, p.wallet, p.wallet, p.restUrl);
-
-  const signature = await p.signMessage(challenge.message);
-  if (!sameAddress(verifyMessage(challenge.message, signature), p.wallet)) {
-    throw new PerpError("SIGNATURE_FAILED", `The address-book challenge signature does not recover to ${p.wallet} — nothing was submitted`, { exchange: "ondo" });
-  }
-  try {
-    await client.postNoResult("/v1/auth/erc-4361/address_book/complete_challenge", {
-      id: challenge.id, signature, ...(p.label !== null ? { addressLabel: p.label } : {}),
-    });
-  } catch (e) {
-    throw addressBookAuthError(e, "completion");
-  }
-  const after = await ondoAddressBook(client);
-  return { address: p.wallet, alreadyListed: false, listed: after.some(a => sameAddress(a, p.wallet)), challengeId: challenge.id };
 }

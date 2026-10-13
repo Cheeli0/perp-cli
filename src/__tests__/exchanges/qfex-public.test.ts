@@ -47,7 +47,7 @@ describe("venue definition", () => {
     expect(caps.clientOrderId).toBe(true);
     expect(caps.timeInForce).toEqual(["GTC", "IOC", "FOK", "ALO"]);
     expect(caps.marginModes).toEqual(["cross"]);
-    expect(caps.withdrawAssets).toEqual(["USDC"]);
+    expect(caps.withdrawAssets).toBeNull(); // API withdrawals off (QFEX_WITHDRAW_ENABLED)
   });
 
   it("rate limit takes a quarter of the venue budget with the documented weights", () => {

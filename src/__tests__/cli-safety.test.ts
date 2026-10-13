@@ -361,3 +361,31 @@ describe("L10 — root -k is rejected, --passphrase warns (real root program)", 
     expect(errs.join("")).toMatch(/--passphrase on the command line is DEPRECATED/);
   });
 });
+
+// ── --dex is Hyperliquid-only: never dropped for another -e venue ───────────
+
+describe("root --dex with a non-Hyperliquid -e venue (real root program)", () => {
+  const codeOf = async (argv: string[]): Promise<string | undefined> => {
+    try {
+      await run(argv);
+    } catch (e) {
+      return (e as { structured?: { code?: string } }).structured?.code;
+    }
+    return (lastJson() as { error?: { code?: string } }).error?.code;
+  };
+
+  it.each([
+    [["--json", "-e", "pacifica", "--dex", "xyz", "account", "positions"]],
+    [["--json", "-e", "pacifica", "--dex", "xyz", "market", "list"]],
+  ])("%j → INVALID_PARAMS, the venue is never read", async (argv) => {
+    expect(await codeOf(argv)).toBe("INVALID_PARAMS");
+    expect(stubAdapter.getPositions).not.toHaveBeenCalled();
+    expect(stubAdapter.getMarkets).not.toHaveBeenCalled();
+  });
+
+  it("-e hyperliquid --dex xyz is accepted", async () => {
+    await run(["--json", "-e", "hyperliquid", "--dex", "xyz", "account", "positions"]);
+    expect(stubAdapter.getPositions).toHaveBeenCalled();
+    expect(lastJson()).toMatchObject({ ok: true });
+  });
+});

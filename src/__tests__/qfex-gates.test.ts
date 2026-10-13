@@ -317,19 +317,17 @@ describe("CLI gates (-e qfex), nothing is sent", () => {
     expect(r.error!.details ?? {}).not.toMatchObject({ feature: "amend" });
   });
 
-  it("funds withdraw qfex --dry-run evaluates the local gate: unset → POLICY_DENIED; set → a plan, nothing sent", async () => {
-    let r = await run(["--dry-run", "funds", "withdraw", "qfex", "10", "--to", DEST]);
-    expect(r.error!.code).toBe("POLICY_DENIED");
-    expect(r.error!.message).toMatch(/settings.withdraw.qfex is not configured/);
-
+  it("funds withdraw qfex is disabled: CAPABILITY_UNSUPPORTED live and under --dry-run, even with the gate set; nothing sent", async () => {
     writeSettings({ withdraw: { qfex: { allowlist: [DEST], maxPerTx: 100, maxPerDay: 200 } } });
-    r = await run(["--dry-run", "funds", "withdraw", "qfex", "10", "--to", DEST]);
-    expect(r.ok).toBe(true);
-    expect(r.data).toMatchObject({ dryRun: true, sent: false, venue: "qfex", amount: "10", destination: DEST, bankerNetwork: "ARBITRUM_ONE" });
-    r = await run(["--dry-run", "funds", "withdraw", "qfex", "101", "--to", DEST]);
-    expect(r.error!.message).toMatch(/exceeds maxPerTx/);
-    r = await run(["--dry-run", "funds", "withdraw", "qfex", "10"]);
-    expect(r.error!.code).toBe("INVALID_PARAMS");
+    for (const argv of [
+      ["--dry-run", "funds", "withdraw", "qfex", "10", "--to", DEST],
+      ["funds", "withdraw", "qfex", "10", "--to", DEST],
+      ["funds", "withdraw", "qfex"],
+    ]) {
+      const r = await run(argv);
+      expect(r.error!.code).toBe("CAPABILITY_UNSUPPORTED");
+      expect(r.error!.remediation).toMatch(/QFEX web app/);
+    }
     expect(fetchMock).not.toHaveBeenCalled();
   });
 

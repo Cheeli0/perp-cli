@@ -828,67 +828,106 @@ export class AsterAdapter implements ExchangeAdapter {
     return result;
   }
 
-  async getOrderHistory(limit = 30): Promise<ExchangeOrder[]> {
+  /**
+   * Symbols with account activity: open positions plus every symbol with a COMMISSION income row
+   * in the venue's default window (GET /fapi/v3/income without a time range: recent 7 days).
+   * Aster's userTrades / allOrders both require `symbol`, so this is the per-symbol fan-out set.
+   * 1000 rows (the endpoint max) may be a truncated window → EXCHANGE_ERROR, never a partial list.
+   */
+  private async _tradedApiSymbols(r: ReturnType<AsterAdapter["_resolveSigner"]>): Promise<Set<string>> {
     const positions = await this.getPositions();
     const apiSymbols = new Set(positions.map(p => this._toApi(p.symbol)));
-    if (apiSymbols.size === 0) {
-      for (const s of ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]) {
-        apiSymbols.add(s);
-      }
+    const income = await this._signedGetEip712("/fapi/v3/income", { incomeType: "COMMISSION", limit: "1000" }, r);
+    if (!Array.isArray(income)) {
+      throw new PerpError("EXCHANGE_ERROR", `Aster income history is not a list (${JSON.stringify(income).slice(0, 120)})`, { exchange: "aster" });
     }
-
-    const r = this._resolveSigner();
-    const allOrders: ExchangeOrder[] = [];
-    for (const sym of apiSymbols) {
-      try {
-        const orders = await this._signedGetEip712("/fapi/v3/allOrders", {
-          symbol: sym,
-          limit: String(limit),
-        }, r) as Array<Record<string, unknown>>;
-
-        for (const o of orders ?? []) {
-          allOrders.push({
-            orderId: String(o.orderId ?? ""),
-            symbol: this._fromApi(String(o.symbol ?? "")),
-            side: String(o.side).toLowerCase() as "buy" | "sell",
-            price: String(o.price ?? "0"),
-            size: String(o.origQty ?? "0"),
-            filled: String(o.executedQty ?? "0"),
-            status: String(o.status ?? ""),
-            type: String(o.type ?? ""),
-            triggerPrice: Number(o.stopPrice) > 0 ? String(o.stopPrice) : null,
-          });
-        }
-      } catch { /* skip */ }
+    if (income.length >= 1000) {
+      throw new PerpError("EXCHANGE_ERROR", "Aster returned 1000 commission rows (the endpoint maximum) — the 7-day symbol list may be truncated", {
+        exchange: "aster", remediation: "Query a single symbol in the Aster web app, or retry later",
+      });
     }
-    return allOrders.slice(0, limit);
+    for (const row of income as Array<Record<string, unknown>>) {
+      if (typeof row.symbol === "string" && row.symbol !== "") apiSymbols.add(row.symbol);
+    }
+    return apiSymbols;
   }
 
-  async getTradeHistory(limit = 30): Promise<ExchangeTrade[]> {
-    const positions = await this.getPositions();
-    const apiSymbols = new Set(positions.map(p => this._toApi(p.symbol)));
-    if (apiSymbols.size === 0) apiSymbols.add("BTCUSDT");
-
+  /**
+   * Recent orders across the symbols with account activity (see _tradedApiSymbols), newest first.
+   * A failed read throws (never an empty list); a row without a readable field → EXCHANGE_ERROR.
+   */
+  async getOrderHistory(limit = 30): Promise<ExchangeOrder[]> {
     const r = this._resolveSigner();
+    const apiSymbols = await this._tradedApiSymbols(r);
+    const field = (o: Record<string, unknown>, k: string): string => {
+      const v = o[k];
+      if ((typeof v === "string" && v !== "") || typeof v === "number") return String(v);
+      throw new PerpError("EXCHANGE_ERROR", `Aster allOrders row without a readable ${k}: ${JSON.stringify(o).slice(0, 160)}`, { exchange: "aster" });
+    };
+    const rows: Array<{ time: number; order: ExchangeOrder }> = [];
+    for (const sym of apiSymbols) {
+      const orders = await this._signedGetEip712("/fapi/v3/allOrders", { symbol: sym, limit: String(limit) }, r);
+      if (!Array.isArray(orders)) {
+        throw new PerpError("EXCHANGE_ERROR", `Aster allOrders for ${sym} is not a list (${JSON.stringify(orders).slice(0, 120)})`, { exchange: "aster" });
+      }
+      for (const o of orders as Array<Record<string, unknown>>) {
+        const side = field(o, "side").toLowerCase();
+        if (side !== "buy" && side !== "sell") {
+          throw new PerpError("EXCHANGE_ERROR", `Aster allOrders row with unknown side "${side}"`, { exchange: "aster" });
+        }
+        rows.push({
+          time: Number(field(o, "time")),
+          order: {
+            orderId: field(o, "orderId"),
+            symbol: this._fromApi(field(o, "symbol")),
+            side,
+            price: field(o, "price"),
+            size: field(o, "origQty"),
+            filled: field(o, "executedQty"),
+            status: field(o, "status"),
+            type: field(o, "type"),
+            triggerPrice: Number(o.stopPrice) > 0 ? String(o.stopPrice) : null,
+          },
+        });
+      }
+    }
+    return rows.sort((x, y) => y.time - x.time).slice(0, limit).map(x => x.order);
+  }
+
+
+  /**
+   * Recent fills. `GET /fapi/v3/userTrades` requires a symbol (asterdex/api-docs V3), so the
+   * symbols come from the open positions plus every symbol with a COMMISSION income row in the
+   * venue's default window (`GET /fapi/v3/income`: "the recent 7-day data" when no time is sent).
+   * A failed read throws (never an empty list); a row without a readable field → EXCHANGE_ERROR.
+   */
+  async getTradeHistory(limit = 30): Promise<ExchangeTrade[]> {
+    const r = this._resolveSigner();
+    const apiSymbols = await this._tradedApiSymbols(r);
+    const field = (t: Record<string, unknown>, k: string): string => {
+      const v = t[k];
+      if ((typeof v === "string" && v !== "") || typeof v === "number") return String(v);
+      throw new PerpError("EXCHANGE_ERROR", `Aster userTrades row without a readable ${k}: ${JSON.stringify(t).slice(0, 160)}`, { exchange: "aster" });
+    };
     const allTrades: ExchangeTrade[] = [];
     for (const sym of apiSymbols) {
-      try {
-        const trades = await this._signedGetEip712("/fapi/v3/userTrades", {
-          symbol: sym,
-          limit: String(limit),
-        }, r) as Array<Record<string, unknown>>;
-
-        for (const t of trades ?? []) {
-          allTrades.push({
-            time: Number(t.time ?? 0),
-            symbol: this._fromApi(String(t.symbol ?? "")),
-            side: t.buyer ? "buy" as const : "sell" as const,
-            price: String(t.price ?? "0"),
-            size: String(t.qty ?? "0"),
-            fee: String(t.commission ?? "0"),
-          });
+      const trades = await this._signedGetEip712("/fapi/v3/userTrades", { symbol: sym, limit: String(limit) }, r);
+      if (!Array.isArray(trades)) {
+        throw new PerpError("EXCHANGE_ERROR", `Aster userTrades for ${sym} is not a list (${JSON.stringify(trades).slice(0, 120)})`, { exchange: "aster" });
+      }
+      for (const t of trades as Array<Record<string, unknown>>) {
+        if (typeof t.buyer !== "boolean") {
+          throw new PerpError("EXCHANGE_ERROR", `Aster userTrades row without a boolean buyer: ${JSON.stringify(t).slice(0, 160)}`, { exchange: "aster" });
         }
-      } catch { /* skip */ }
+        allTrades.push({
+          time: Number(field(t, "time")),
+          symbol: this._fromApi(field(t, "symbol")),
+          side: t.buyer ? "buy" as const : "sell" as const,
+          price: field(t, "price"),
+          size: field(t, "qty"),
+          fee: field(t, "commission"),
+        });
+      }
     }
     return allTrades.sort((a, b) => b.time - a.time).slice(0, limit);
   }

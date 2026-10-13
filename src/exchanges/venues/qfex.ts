@@ -26,6 +26,16 @@ export const QFEX_ENDPOINTS: Readonly<Record<Network, { rest: string; tradeWs: s
 
 /** Chain QFEX USDC deposits / withdrawals use in perp-cli (banker network ARBITRUM_ONE). */
 export const QFEX_WITHDRAW_NETWORK = "arbitrum";
+
+/**
+ * API withdrawals are switched off (owner decision 2026-10-13): `funds withdraw qfex` and
+ * QfexAdapter.withdraw refuse with CAPABILITY_UNSUPPORTED. The implementation (banker POST
+ * /withdraw behind settings.withdraw.qfex) is kept; flip this to re-enable it.
+ */
+export const QFEX_WITHDRAW_ENABLED: boolean = false;
+
+/** The uniform refusal while QFEX_WITHDRAW_ENABLED is false. */
+export const QFEX_WITHDRAW_DISABLED = { reason: "QFEX withdrawals are disabled in perp-cli for now", remediation: "Withdraw from the QFEX web app" } as const;
 /** Banker `network` value for QFEX_WITHDRAW_NETWORK. */
 export const QFEX_BANKER_NETWORK = "ARBITRUM_ONE";
 
@@ -100,8 +110,8 @@ export const qfexVenue: VenueDefinition = {
     amend: QFEX_MODIFY_KEEPS_CLIENT_ID === true ? "native" : null,
     batchPlaceMax: null,
     marginModes: ["cross"],
-    // TRON USDT and USD bank rails are out of scope.
-    withdrawAssets: ["USDC"],
+    // TRON USDT and USD bank rails are out of scope. API withdrawals are off (QFEX_WITHDRAW_ENABLED).
+    withdrawAssets: QFEX_WITHDRAW_ENABLED ? ["USDC"] : null,
   },
   // Venue budget: 12,000 weight / 60 s per USER across all connections and keys (general and
   // cancel buckets separate). This process takes 25% (50/s, burst 100); the rest is left to the

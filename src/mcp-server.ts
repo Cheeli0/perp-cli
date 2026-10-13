@@ -233,7 +233,7 @@ const HL_SCOPE_NOTE = "Hyperliquid: native perps only (HIP-3 dexes via the CLI -
  */
 export const MCP_DEPOSIT_VENUES: readonly string[] = ["pacifica", "hyperliquid", "lighter", "lighter-rh", "aster", "ondo", "qfex"];
 /** Venues with a `perp funds withdraw <venue>` command. Tested against the real command tree. */
-export const MCP_WITHDRAW_VENUES: readonly string[] = ["pacifica", "hyperliquid", "lighter", "aster", "ondo", "arcus", "qfex"];
+export const MCP_WITHDRAW_VENUES: readonly string[] = ["pacifica", "hyperliquid", "lighter", "aster", "arcus"];
 
 // ── MCP Server ──
 
@@ -1565,7 +1565,7 @@ server.resource(
           subcommands: {
             show: { usage: "perp wallet show", description: "Show configured wallets with public addresses" },
             list: { usage: "perp wallet list", description: "List all wallets (OWS vault + legacy)" },
-            balance: { usage: "perp wallet balance [name]", description: "On-chain balances" },
+            balance: { usage: "perp wallet balance [name]", description: "On-chain gas token + USDC/USDT on Arbitrum, Ethereum, Base, BNB Chain, Robinhood Chain (USDG) and Solana" },
             generate: { usage: "perp wallet generate [name]", description: "Generate new OWS wallet (encrypted, multi-chain)" },
             import: { usage: "printf '%s' \"$KEY\" | OWS_PASSPHRASE=<pp> perp wallet import --name <name> [--chain evm|solana|dual]", description: "Import key into OWS vault (stdin / hidden prompt — never argv)" },
             migrate: { usage: "perp wallet migrate", description: "Migrate legacy wallets to OWS vault" },

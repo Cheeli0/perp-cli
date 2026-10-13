@@ -26,6 +26,12 @@ const fakeSession = {
 };
 const sessionOpts: Array<Record<string, unknown>> = [];
 const marketStats = vi.fn();
+// The withdraw implementation is kept behind QFEX_WITHDRAW_ENABLED (off in the product); these
+// tests exercise it with the switch on. The disabled refusal is covered in qfex-gates.test.ts.
+vi.mock("../../exchanges/venues/qfex.js", async (orig) => ({
+  ...(await orig<typeof import("../../exchanges/venues/qfex.js")>()),
+  QFEX_WITHDRAW_ENABLED: true,
+}));
 vi.mock("../../exchanges/qfex/ws-transport.js", async (orig) => ({
   ...(await orig<typeof import("../../exchanges/qfex/ws-transport.js")>()),
   qfexTradeSession: (opts: Record<string, unknown>) => { sessionOpts.push(opts); return fakeSession; },

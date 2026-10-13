@@ -1475,22 +1475,39 @@ export class PacificaAdapter implements ExchangeAdapter {
     }));
   }
 
+  /**
+   * Recent orders, newest first (GET /orders/history; PacificaClient.get already unwraps the
+   * `{success, data}` envelope, so the list is the result itself). A non-list or a row without a
+   * readable field → EXCHANGE_ERROR, never an empty list or a placeholder value.
+   */
   async getOrderHistory(limit = 30): Promise<ExchangeOrder[]> {
     if (!this._hasRealKey) throw new Error("No private key configured — account data unavailable. Run: perp setup");
-    const result = await this.client.getOrderHistory(this.account) as Record<string, unknown>;
-    const data = (result.data ?? result.orders ?? []) as Record<string, unknown>[];
-    if (!Array.isArray(data)) return [];
-    return data.slice(0, limit).map((o) => ({
-      orderId: String(o.order_id ?? ""),
-      symbol: String(o.symbol ?? ""),
-      side: String(o.side) === "bid" ? "buy" as const : "sell" as const,
-      price: String(o.initial_price ?? o.price ?? "0"),
-      size: String(o.amount ?? o.initial_amount ?? ""),
-      filled: String(o.filled_amount ?? "0"),
-      status: String(o.order_status ?? "done"),
-      type: String(o.order_type ?? ""),
-      triggerPrice: Number(o.stop_price) > 0 ? String(o.stop_price) : null,
-    }));
+    const rows = await this.client.getOrderHistory(this.account, { limit });
+    if (!Array.isArray(rows)) {
+      throw new PerpError("EXCHANGE_ERROR", `Pacifica /orders/history returned no order list (${JSON.stringify(rows).slice(0, 120)})`, { exchange: "pacifica" });
+    }
+    const field = (o: Record<string, unknown>, k: string): string => {
+      const v = o[k];
+      if ((typeof v === "string" && v !== "") || typeof v === "number") return String(v);
+      throw new PerpError("EXCHANGE_ERROR", `Pacifica order-history row without a readable ${k}: ${JSON.stringify(o).slice(0, 160)}`, { exchange: "pacifica" });
+    };
+    return (rows as Array<Record<string, unknown>>).slice(0, limit).map((o) => {
+      const side = field(o, "side");
+      if (side !== "bid" && side !== "ask") {
+        throw new PerpError("EXCHANGE_ERROR", `Pacifica order-history row with unknown side "${side}"`, { exchange: "pacifica" });
+      }
+      return {
+        orderId: field(o, "order_id"),
+        symbol: field(o, "symbol"),
+        side: side === "bid" ? "buy" as const : "sell" as const,
+        price: field(o, "initial_price"),
+        size: field(o, "amount"),
+        filled: field(o, "filled_amount"),
+        status: field(o, "order_status"),
+        type: field(o, "order_type"),
+        triggerPrice: Number(o.stop_price) > 0 ? String(o.stop_price) : null,
+      };
+    });
   }
 
   async getTradeHistory(limit = 30): Promise<ExchangeTrade[]> {

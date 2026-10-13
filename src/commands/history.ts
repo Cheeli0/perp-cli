@@ -748,24 +748,32 @@ function registerAnalyticsSubcommands(
         let totalEquity = 0;
         let totalUPnl = 0;
         const symbolSet = new Set<string>();
+        // A venue whose read failed is reported here and left out of the totals — never counted as 0.
+        const errors: Record<string, string> = {};
+        const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
         await Promise.allSettled(
           exchanges.map(async (ex) => {
+            let adapter;
             try {
-              const adapter = await getAdapterForExchange(ex);
-              const [balance, trades, funding] = await Promise.all([
-                adapter.getBalance(),
-                adapter.getTradeHistory(50).catch(() => []),
-                adapter.getFundingPayments(50).catch(() => []),
-              ]);
+              adapter = await getAdapterForExchange(ex);
+              const balance = await adapter.getBalance();
               totalEquity += Number(balance.equity);
               totalUPnl += Number(balance.unrealizedPnl);
-              for (const t of trades) {
+            } catch (e) {
+              errors[`${ex}.balance`] = errText(e);
+              return;
+            }
+            const [trades, funding] = await Promise.allSettled([adapter.getTradeHistory(50), adapter.getFundingPayments(50)]);
+            if (trades.status === "fulfilled") {
+              for (const t of trades.value) {
                 totalFees += Number(t.fee);
                 symbolSet.add(t.symbol);
               }
-              for (const f of funding) totalFunding += Number(f.payment);
-            } catch { /* skip */ }
+            } else errors[`${ex}.trades`] = errText(trades.reason);
+            if (funding.status === "fulfilled") {
+              for (const f of funding.value) totalFunding += Number(f.payment);
+            } else errors[`${ex}.funding`] = errText(funding.reason);
           }),
         );
 
@@ -794,6 +802,7 @@ function registerAnalyticsSubcommands(
               ? (stats.totalTrades / Math.max(1, (Date.now() - new Date(records[records.length - 1]?.timestamp ?? Date.now()).getTime()) / 86400000)).toFixed(1)
               : "0",
           },
+          errors,
         };
 
         if (isJson()) return printJson(jsonOk(report));
@@ -813,6 +822,7 @@ function registerAnalyticsSubcommands(
         console.log(`    Trading Fees:    ${chalk.red(`-$${formatUsd(totalFees)}`)}`);
         console.log(`    Funding Income:  ${formatPnl(totalFunding)}`);
         console.log(`    Net:             ${formatPnl(totalFunding - totalFees)}`);
+        for (const [k, msg] of Object.entries(errors)) console.log(chalk.yellow(`    ⚠ ${k} unavailable (left out of the totals): ${msg}`));
         console.log();
       });
     });

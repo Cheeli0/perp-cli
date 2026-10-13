@@ -1,4 +1,5 @@
 import { Command, Option } from "commander";
+import { evmOnchainBalances, solanaOnchainBalances, stableTotal, type OnchainBalance } from "../onchain-balances.js";
 import { PerpError } from "../errors.js";
 import chalk from "chalk";
 import bs58 from "bs58";
@@ -128,90 +129,30 @@ export function getWalletKeyByName(name: string): string | null {
 
 // ── Balance helpers ───────────────────────────────────────────
 
-interface TokenBalance {
-  token: string;
-  balance: string;
-  usdValue: string;
-}
+type TokenBalance = OnchainBalance;
 
+/** SOL + USDC / USDT on Solana (devnet: USDP). */
 async function getSolanaBalances(address: string, isTestnet: boolean): Promise<TokenBalance[]> {
-  const { Connection, PublicKey } = await import("@solana/web3.js");
-  const rpcUrl = isTestnet
-    ? "https://api.devnet.solana.com"
-    : "https://api.mainnet-beta.solana.com";
-  const connection = new Connection(rpcUrl);
-  const pubkey = new PublicKey(address);
-
-  const balances: TokenBalance[] = [];
-
-  const solLamports = await connection.getBalance(pubkey);
-  const solBalance = solLamports / 1e9;
-  balances.push({ token: "SOL", balance: solBalance.toFixed(6), usdValue: "" });
-
-  const usdcMint = isTestnet
-    ? "USDPqRbLidFGufty2s3oizmDEKdqx7ePTqzDMbf5ZKM"
-    : "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-  try {
-    const tokenAccounts = await connection.getParsedTokenAccountsByOwner(pubkey, {
-      mint: new PublicKey(usdcMint),
-    });
-    let usdcBalance = 0;
-    for (const { account } of tokenAccounts.value) {
-      const parsed = account.data.parsed?.info;
-      if (parsed) usdcBalance += Number(parsed.tokenAmount?.uiAmount ?? 0);
-    }
-    balances.push({
-      token: isTestnet ? "USDP" : "USDC",
-      balance: usdcBalance.toFixed(2),
-      usdValue: `$${formatUsd(usdcBalance)}`,
-    });
-  } catch {
-    balances.push({ token: isTestnet ? "USDP" : "USDC", balance: "0.00", usdValue: "$0.00" });
-  }
-
-  try {
-    const res = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd");
-    const json = (await res.json()) as Record<string, Record<string, number>>;
-    balances[0].usdValue = `$${formatUsd(solBalance * (json.solana?.usd ?? 0))}`;
-  } catch {
-    balances[0].usdValue = "-";
-  }
-  return balances;
+  return solanaOnchainBalances(address, isTestnet);
 }
 
-async function getEvmBalances(address: string, isTestnet: boolean): Promise<TokenBalance[]> {
-  const { ethers } = await import("ethers");
-  const rpcUrl = isTestnet
-    ? "https://sepolia-rollup.arbitrum.io/rpc"
-    : "https://arb1.arbitrum.io/rpc";
-  const provider = new ethers.JsonRpcProvider(rpcUrl);
+/** Gas token + USDC / USDT (USDG on Robinhood Chain) on every EVM chain perp-cli uses; `only` limits the chains. */
+async function getEvmBalances(address: string, isTestnet: boolean, only?: readonly string[]): Promise<TokenBalance[]> {
+  return evmOnchainBalances(address, isTestnet, only);
+}
 
-  const balances: TokenBalance[] = [];
-
-  const ethBal = await provider.getBalance(address);
-  const ethBalance = Number(ethers.formatEther(ethBal));
-  balances.push({ token: "ETH", balance: ethBalance.toFixed(6), usdValue: "" });
-
-  const usdcAddr = isTestnet
-    ? "0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d"
-    : "0xaf88d065e77c8cC2239327C5EDb3A432268e5831";
-  try {
-    const usdc = new ethers.Contract(usdcAddr, ["function balanceOf(address) view returns (uint256)"], provider);
-    const rawBal = await usdc.balanceOf(address);
-    const usdcBalance = Number(ethers.formatUnits(rawBal, 6));
-    balances.push({ token: "USDC", balance: usdcBalance.toFixed(2), usdValue: `$${formatUsd(usdcBalance)}` });
-  } catch {
-    balances.push({ token: "USDC", balance: "0.00", usdValue: "$0.00" });
-  }
-
-  try {
-    const res = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd");
-    const json = (await res.json()) as Record<string, Record<string, number>>;
-    balances[0].usdValue = `$${formatUsd(ethBalance * (json.ethereum?.usd ?? 0))}`;
-  } catch {
-    balances[0].usdValue = "-";
-  }
-  return balances;
+/** Human table: non-zero balances and failed reads (JSON keeps every row), then the stablecoin total. */
+function balanceTable(balances: readonly TokenBalance[]): string {
+  const shown = balances.filter(b => b.error !== null || Number(b.balance) !== 0);
+  const rows = shown.map((b) => [
+    b.chain,
+    chalk.white.bold(b.token),
+    b.balance === null ? chalk.red("read failed") : b.balance,
+    b.usdValue === null ? chalk.gray("-") : `$${formatUsd(b.usdValue)}`,
+  ]);
+  const total = stableTotal(balances);
+  rows.push([chalk.gray("total"), chalk.white.bold("stablecoins"), "", `$${formatUsd(total.usd)}${total.errors.length > 0 ? chalk.red(" (some reads failed)") : ""}`]);
+  return makeTable(["Chain", "Token", "Balance", "USD Value"], rows);
 }
 
 // ── Derive address from private key ──────────────────────────
@@ -909,7 +850,7 @@ export function registerWalletCommands(
 
   wallet
     .command("balance [name]")
-    .description("Check on-chain balance for a saved wallet (or active wallet)")
+    .description("On-chain balances for a saved wallet (or the active one): gas token + USDC / USDT on Arbitrum, Ethereum, Base, BNB Chain, Robinhood Chain (USDG) and Solana")
     .option("--testnet", "Use testnet", false)
     .action(async (name: string | undefined, opts: { testnet: boolean }) => {
       const store = loadStore();
@@ -964,7 +905,7 @@ export function registerWalletCommands(
               const { loadOws } = await import("../signer/ows-loader.js");
               const ows = loadOws();
               const owsWallet = ows.getWallet(settings.owsActiveWallet);
-              const owsResults: { wallet: string; chain: "evm" | "solana"; address: string; balances: unknown }[] = [];
+              const owsResults: { wallet: string; chain: "evm" | "solana"; address: string; balances: unknown; stableUsd: number; errors: string[] }[] = [];
               for (const acct of owsWallet.accounts) {
                 const isEvm = (acct as { chainId: string }).chainId.startsWith("eip155:");
                 const isSol = (acct as { chainId: string }).chainId.startsWith("solana:");
@@ -979,13 +920,12 @@ export function registerWalletCommands(
                     chain: isSol ? "solana" : "evm",
                     address,
                     balances,
+                    stableUsd: stableTotal(balances).usd,
+                    errors: stableTotal(balances).errors,
                   });
                 } else {
                   console.log(chalk.cyan.bold(`\n  ${settings.owsActiveWallet} (${isSol ? "solana" : "evm"} ${address.slice(0, 8)}...)`));
-                  const rows = balances.map((b) => [
-                    chalk.white.bold(b.token), b.balance, b.usdValue || chalk.gray("-"),
-                  ]);
-                  console.log(makeTable(["Token", "Balance", "USD Value"], rows));
+                  console.log(balanceTable(balances));
                 }
               }
               if (isJson()) printJson(jsonOk(owsResults));
@@ -1024,10 +964,7 @@ export function registerWalletCommands(
 
             if (isJson()) { printJson(jsonOk({ exchange: we.exchange, address: we.address, balances })); continue; }
 
-            const rows = balances.map((b) => [
-              chalk.white.bold(b.token), b.balance, b.usdValue || chalk.gray("-"),
-            ]);
-            console.log(makeTable(["Token", "Balance", "USD Value"], rows));
+            console.log(balanceTable(balances));
           }
           console.log();
           return;
@@ -1041,10 +978,7 @@ export function registerWalletCommands(
 
           if (isJson()) { printJson(jsonOk({ wallet: ae.name, exchange: ae.exchange, balances })); continue; }
 
-          const rows = balances.map((b) => [
-            chalk.white.bold(b.token), b.balance, b.usdValue || chalk.gray("-"),
-          ]);
-          console.log(makeTable(["Token", "Balance", "USD Value"], rows));
+          console.log(balanceTable(balances));
         }
         console.log();
         return;
@@ -1057,10 +991,7 @@ export function registerWalletCommands(
 
       if (isJson()) return printJson(jsonOk({ wallet: entry.name, balances }));
 
-      const rows = balances.map((b) => [
-        chalk.white.bold(b.token), b.balance, b.usdValue || chalk.gray("-"),
-      ]);
-      console.log(makeTable(["Token", "Balance", "USD Value"], rows));
+      console.log(balanceTable(balances));
       console.log();
     });
 
@@ -1074,8 +1005,7 @@ export function registerWalletCommands(
       if (!isJson()) console.log(chalk.cyan(`\n  Fetching Solana balances for ${address.slice(0, 8)}...${address.slice(-4)}\n`));
       const balances = await getSolanaBalances(address, opts.testnet);
       if (isJson()) return printJson(jsonOk(balances));
-      const rows = balances.map((b) => [chalk.white.bold(b.token), b.balance, b.usdValue || chalk.gray("-")]);
-      console.log(makeTable(["Token", "Balance", "USD Value"], rows));
+      console.log(balanceTable(balances));
       console.log(chalk.gray(`\n  Network: ${opts.testnet ? "Devnet" : "Mainnet"}\n`));
     });
 
@@ -1085,10 +1015,9 @@ export function registerWalletCommands(
     .option("--testnet", "Use Sepolia testnet", false)
     .action(async (address: string, opts: { testnet: boolean }) => {
       if (!isJson()) console.log(chalk.cyan(`\n  Fetching Arbitrum balances for ${address.slice(0, 8)}...${address.slice(-4)}\n`));
-      const balances = await getEvmBalances(address, opts.testnet);
+      const balances = await getEvmBalances(address, opts.testnet, [opts.testnet ? "arbitrum-sepolia" : "arbitrum"]);
       if (isJson()) return printJson(jsonOk(balances));
-      const rows = balances.map((b) => [chalk.white.bold(b.token), b.balance, b.usdValue || chalk.gray("-")]);
-      console.log(makeTable(["Token", "Balance", "USD Value"], rows));
+      console.log(balanceTable(balances));
       console.log(chalk.gray(`\n  Network: Arbitrum ${opts.testnet ? "Sepolia" : "One"}\n`));
     });
 
