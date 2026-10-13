@@ -389,6 +389,24 @@ export function isPacificaStopType(type: string): boolean {
   return /^(stop|take_profit|stop_loss)_/.test(type);
 }
 
+/** Fill sides of GET /trades/history (position effect) plus the order sides bid / ask. */
+const PACIFICA_FILL_BUY_SIDES: ReadonlySet<string> = new Set(["open_long", "close_short", "bid"]);
+const PACIFICA_FILL_SELL_SIDES: ReadonlySet<string> = new Set(["open_short", "close_long", "ask"]);
+
+/** `created_at` (ms) of a Pacifica history row; non-numeric → EXCHANGE_ERROR (never NaN). */
+function pacificaTime(row: Record<string, unknown>, endpoint: string): number {
+  const t = Number(pacificaField(row, "created_at", endpoint));
+  if (!Number.isFinite(t)) throw new PerpError("EXCHANGE_ERROR", `Pacifica ${endpoint} row with a non-numeric created_at`, { exchange: "pacifica" });
+  return t;
+}
+
+/** A required field of a Pacifica history row as a string; missing / empty → EXCHANGE_ERROR. */
+function pacificaField(row: Record<string, unknown>, key: string, endpoint: string): string {
+  const v = row[key];
+  if ((typeof v === "string" && v !== "") || (typeof v === "number" && Number.isFinite(v))) return String(v);
+  throw new PerpError("EXCHANGE_ERROR", `Pacifica ${endpoint} row without a readable ${key}: ${JSON.stringify(row).slice(0, 160)}`, { exchange: "pacifica" });
+}
+
 export class PacificaAdapter implements ExchangeAdapter {
   readonly name = "pacifica";
   readonly chain = "solana";
@@ -1486,11 +1504,7 @@ export class PacificaAdapter implements ExchangeAdapter {
     if (!Array.isArray(rows)) {
       throw new PerpError("EXCHANGE_ERROR", `Pacifica /orders/history returned no order list (${JSON.stringify(rows).slice(0, 120)})`, { exchange: "pacifica" });
     }
-    const field = (o: Record<string, unknown>, k: string): string => {
-      const v = o[k];
-      if ((typeof v === "string" && v !== "") || typeof v === "number") return String(v);
-      throw new PerpError("EXCHANGE_ERROR", `Pacifica order-history row without a readable ${k}: ${JSON.stringify(o).slice(0, 160)}`, { exchange: "pacifica" });
-    };
+    const field = (o: Record<string, unknown>, k: string): string => pacificaField(o, k, "/orders/history");
     return (rows as Array<Record<string, unknown>>).slice(0, limit).map((o) => {
       const side = field(o, "side");
       if (side !== "bid" && side !== "ask") {
@@ -1510,30 +1524,46 @@ export class PacificaAdapter implements ExchangeAdapter {
     });
   }
 
+  /**
+   * Recent fills, newest first (GET /trades/history; the client unwraps `{success, data}`).
+   * `side` is the position effect — open_long / close_short buy, open_short / close_long sell
+   * (live 2026-10-13: `"side":"close_short"` on a buy-to-close fill); bid / ask are accepted for
+   * rows that carry an order side. Anything else, a non-list or an unreadable field → EXCHANGE_ERROR.
+   */
   async getTradeHistory(limit = 30): Promise<ExchangeTrade[]> {
     if (!this._hasRealKey) throw new Error("No private key configured — account data unavailable. Run: perp setup");
-    const raw = await this.client.getTradeHistory(this.account);
-    const trades = ((raw as Record<string, unknown>).data ?? raw) as Record<string, unknown>[];
-    if (!Array.isArray(trades)) return [];
-    return trades.slice(0, limit).map((t) => ({
-      time: Number(t.created_at ?? 0),
-      symbol: String(t.symbol ?? ""),
-      side: String(t.side) === "bid" ? "buy" as const : "sell" as const,
-      price: String(t.price ?? "0"),
-      size: String(t.amount ?? ""),
-      fee: String(t.fee ?? "0"),
-    }));
+    const rows = await this.client.getTradeHistory(this.account, { limit });
+    if (!Array.isArray(rows)) {
+      throw new PerpError("EXCHANGE_ERROR", `Pacifica /trades/history returned no list (${JSON.stringify(rows).slice(0, 120)})`, { exchange: "pacifica" });
+    }
+    return (rows as Array<Record<string, unknown>>).slice(0, limit).map((t) => {
+      const side = pacificaField(t, "side", "/trades/history");
+      const buy = PACIFICA_FILL_BUY_SIDES.has(side);
+      if (!buy && !PACIFICA_FILL_SELL_SIDES.has(side)) {
+        throw new PerpError("EXCHANGE_ERROR", `Pacifica /trades/history row with unknown side "${side}"`, { exchange: "pacifica" });
+      }
+      return {
+        time: pacificaTime(t, "/trades/history"),
+        symbol: pacificaField(t, "symbol", "/trades/history"),
+        side: buy ? "buy" as const : "sell" as const,
+        price: pacificaField(t, "price", "/trades/history"),
+        size: pacificaField(t, "amount", "/trades/history"),
+        fee: pacificaField(t, "fee", "/trades/history"),
+      };
+    });
   }
 
+  /** Funding paid / received per position (GET /funding/history, `payout` signed). Strict like getTradeHistory. */
   async getFundingPayments(limit = 200): Promise<ExchangeFundingPayment[]> {
     if (!this._hasRealKey) throw new Error("No private key configured — account data unavailable. Run: perp setup");
-    const raw = await this.client.getFundingAccountHistory(this.account);
-    const history = ((raw as Record<string, unknown>).data ?? raw) as Record<string, unknown>[];
-    if (!Array.isArray(history)) return [];
-    return history.slice(0, limit).map((h) => ({
-      time: Number(h.created_at ?? 0),
-      symbol: String(h.symbol ?? ""),
-      payment: String(h.payout ?? "0"),
+    const rows = await this.client.getFundingAccountHistory(this.account, { limit });
+    if (!Array.isArray(rows)) {
+      throw new PerpError("EXCHANGE_ERROR", `Pacifica /funding/history returned no list (${JSON.stringify(rows).slice(0, 120)})`, { exchange: "pacifica" });
+    }
+    return (rows as Array<Record<string, unknown>>).slice(0, limit).map((h) => ({
+      time: pacificaTime(h, "/funding/history"),
+      symbol: pacificaField(h, "symbol", "/funding/history"),
+      payment: pacificaField(h, "payout", "/funding/history"),
     }));
   }
 }

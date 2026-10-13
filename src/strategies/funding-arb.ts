@@ -4,7 +4,7 @@ import { symbolMatch, logSettledRejections } from "../utils.js";
 import { logExecution } from "../execution-log.js";
 import { updateJobState } from "../jobs.js";
 import { invalidateCache } from "../cache.js";
-import { fetchAllBalances, computeRebalancePlan, hasEnoughBalance, marketLeverageOf, requiredArbMargin, type ExchangeBalanceSnapshot } from "../rebalance.js";
+import { fetchBalancesWithFailures, computeRebalancePlan, hasEnoughBalance, marketLeverageOf, requiredArbMargin, type ExchangeBalanceSnapshot } from "../rebalance.js";
 import { checkArbLiquidity } from "../liquidity.js";
 import { computeAnnualSpread, toHourlyRate } from "../funding.js";
 import {
@@ -19,6 +19,13 @@ import { isPositionGone, matchSymbol } from "../bot/strategies/funding-arb-utils
 
 /** Quarantine source for `perp strategy funding-arb` (src/bot/quarantine.ts). */
 const SOURCE = "funding-arb-cli";
+
+
+/** The market's published size decimals on `adapter` (null = not published / market not listed). */
+async function sizeDecimalsOf(adapter: ExchangeAdapter, symbol: string): Promise<number | null> {
+  const m = (await adapter.getMarkets()).find((x) => symbolMatch(x.symbol, symbol));
+  return m === undefined ? null : m.sizeDecimals;
+}
 
 export interface FundingArbParams {
   minSpread: number;       // minimum annual spread % to trigger entry
@@ -192,9 +199,16 @@ export async function runFundingArb(
       // ── Phase 2: Max drawdown check ──
       if (params.maxDrawdown && params.autoExecute && positions.length > 0) {
         try {
-          const snapshots = await fetchAllBalances(adapters);
+          const { snapshots, failed } = await fetchBalancesWithFailures(adapters);
           const totalPnl = snapshots.reduce((s, e) => s + e.unrealizedPnl, 0);
-          if (totalPnl < -params.maxDrawdown) {
+          // Only a failed venue that holds one of the bot's legs makes the uPnL sum unknown; a venue
+          // without credentials (notConfigured) cannot hold one.
+          const legVenues = new Set(positions.flatMap(p => [p.longExchange, p.shortExchange]));
+          const failedLegs = failed.filter(f => legVenues.has(f.exchange));
+          if (failedLegs.length > 0) {
+            // A partial uPnL sum is not the bot's drawdown: never close everything on it.
+            log(`[ARB] Drawdown check skipped — balance unavailable on ${failedLegs.map(f => `${f.exchange} (${f.error})`).join(", ")}`);
+          } else if (totalPnl < -params.maxDrawdown) {
             log(`[ARB] MAX DRAWDOWN hit: uPnL $${totalPnl.toFixed(2)} < -$${params.maxDrawdown}`);
             log(`[ARB] Closing all ${positions.length} positions...`);
             const stillOpen = await closeAllPositions(positions, adapters, log);
@@ -212,7 +226,10 @@ export async function runFundingArb(
 
       if (shouldCheckBalance || (params.autoExecute && positions.length < maxPos)) {
         try {
-          balanceSnapshots = await fetchAllBalances(adapters);
+          const read = await fetchBalancesWithFailures(adapters);
+          balanceSnapshots = read.snapshots;
+          // A venue missing from the snapshots has no balance for entry checks (no entry there).
+          for (const f of read.failed) log(`[ARB] ${f.exchange} balance unavailable — no entries / rebalance on it this cycle: ${f.error}`);
           lastRebalanceCheck = Date.now();
 
           if (params.autoRebalance) {
@@ -277,8 +294,21 @@ export async function runFundingArb(
               const liq = await checkArbLiquidity(longAdapter, shortAdapter, symbol, requestedUsd, 0.5, log);
               if (!liq.viable) continue;
 
-              // Compute matched size (same for both legs)
-              let matched = computeMatchedSize(liq.adjustedSizeUsd, highest.markPrice, longEx, shortEx);
+              // Compute matched size (same for both legs) at each venue's published size precision —
+              // the per-venue defaults (HL 2 decimals) would reject small BTC legs or over-round.
+              let longDec: number | null;
+              let shortDec: number | null;
+              try {
+                [longDec, shortDec] = await Promise.all([sizeDecimalsOf(longAdapter, symbol), sizeDecimalsOf(shortAdapter, symbol)]);
+              } catch (e) {
+                log(`[ARB] Skip ${symbol}: could not read the market size precision (${e instanceof Error ? e.message : String(e)})`);
+                continue;
+              }
+              if (longDec === null || shortDec === null) {
+                log(`[ARB] Skip ${symbol}: size precision not published on ${longDec === null ? longEx : shortEx}`);
+                continue;
+              }
+              let matched = computeMatchedSize(liq.adjustedSizeUsd, highest.markPrice, longEx, shortEx, { longSizeDecimals: longDec, shortSizeDecimals: shortDec });
               if (!matched) {
                 log(`[ARB] Skip ${symbol}: can't compute matched size (min notional or precision issue)`);
                 continue;
@@ -315,7 +345,7 @@ export async function runFundingArb(
                 // The LONG was definitely rejected for lot size (nothing placed): recompute once.
                 const lotSize = res.lotSize;
                 log(`[ARB] Lot size ${lotSize} on ${longEx} — recalculating (nothing was placed)`);
-                matched = computeMatchedSize(liq.adjustedSizeUsd, highest.markPrice, longEx, shortEx, { lotSize });
+                matched = computeMatchedSize(liq.adjustedSizeUsd, highest.markPrice, longEx, shortEx, { lotSize, longSizeDecimals: longDec, shortSizeDecimals: shortDec });
                 if (!matched) { log(`[ARB] Skip ${symbol}: can't meet lot size ${lotSize}`); continue; }
                 log(`[ARB] Retry: ${matched.size} ${symbol} ($${matched.notional.toFixed(0)}/leg)`);
                 res = await openPair(matched.size);

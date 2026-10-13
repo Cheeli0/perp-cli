@@ -45,7 +45,7 @@ import {
 } from "../venue-types.js";
 import { ArcusClient, arcusLeverageRejectError, arcusRejectionError } from "./client.js";
 import { ed25519PubHexFromBase58 } from "./agent.js";
-import { fetchArcusRawMarkets, toArcusVenueMarket, type ArcusRawMarket } from "./public.js";
+import { fetchArcusRawMarkets, onlineArcusMarkets, toArcusVenueMarket, type ArcusRawMarket } from "./public.js";
 import {
   QUOTE_QUANTUM, assertArcusClientId, canonicalJson, cancelPayload, modifyPayload, nowNs, placePayload,
   signUtf8Hex, splitEvmSignature, withdrawTypedData, type ArcusTif, type Ed25519SignFn,
@@ -68,6 +68,18 @@ const CLIENT_ID_HISTORY_SCAN = 200;
 /** GET /v1/openOrders page cap (default = max = 1000). */
 const OPEN_ORDERS_PAGE = 1000;
 const CANDLE_TIMEFRAMES: ReadonlySet<string> = new Set(["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "8h", "12h", "1d", "3d", "1w"]);
+/** Bar length (ms) per timeframe — sizes the GET /v1/candles windows. */
+const CANDLE_MS: Readonly<Record<string, number>> = {
+  "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000,
+  "4h": 14_400_000, "8h": 28_800_000, "12h": 43_200_000, "1d": 86_400_000, "3d": 259_200_000, "1w": 604_800_000,
+};
+/**
+ * GET /v1/candles returns at most 1500 candles (newest first; live 2026-10-13: a 48 h 1m request
+ * answers `total: 1500` covering the newest ~25 h). Ranges are read in windows of this many bars.
+ */
+const CANDLE_WINDOW_BARS = 1450;
+/** Window cap per call (≈ 72 500 bars); a wider range is refused rather than truncated. */
+const CANDLE_MAX_WINDOWS = 50;
 
 // ── Raw response shapes (docs openapi) ──
 
@@ -581,7 +593,7 @@ export class ArcusAdapter implements ExchangeAdapter, TradingV2 {
 
   async getVenueMarkets(): Promise<VenueMarket[]> {
     const raw = await fetchArcusRawMarkets(this.client);
-    return raw.map(toArcusVenueMarket);
+    return onlineArcusMarkets(raw).map(toArcusVenueMarket);
   }
 
   async placeOrder(input: OrderRequest): Promise<OrderResult> {
@@ -1036,11 +1048,26 @@ export class ArcusAdapter implements ExchangeAdapter, TradingV2 {
       });
     }
     const m = await this.market(symbol);
-    const res = await this.client.get<{ candles: Array<{ openTime: number; open: string; high: string; low: string; close: string; volume: string; tradeCount: number }> }>(
-      "/v1/candles", "candles", { market: m.marketDisplayName, timeframe: interval, from: startTime * 1000, to: endTime * 1000 });
-    return res.candles
-      .map(c => ({ time: usToMs(c.openTime), open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume, trades: c.tradeCount }))
-      .sort((x, y) => x.time - y.time);
+    const span = CANDLE_WINDOW_BARS * CANDLE_MS[interval];
+    const windows = Math.max(1, Math.ceil((endTime - startTime) / span));
+    if (windows > CANDLE_MAX_WINDOWS) {
+      throw new PerpError("INVALID_PARAMS", `Arcus: ${interval} candles over this range need ${windows} requests (max ${CANDLE_MAX_WINDOWS})`, {
+        remediation: "Narrow --start / --end or use a longer interval",
+      });
+    }
+    // Disjoint windows [from, to) — the venue caps one response at 1500 candles, so one wide
+    // request would silently drop the oldest bars. Merged and deduped by open time.
+    const byTime = new Map<number, ExchangeKline>();
+    for (let from = startTime; from < endTime; from += span) {
+      const to = Math.min(from + span, endTime);
+      const res = await this.client.get<{ candles: Array<{ openTime: number; open: string; high: string; low: string; close: string; volume: string; tradeCount: number }> }>(
+        "/v1/candles", "candles", { market: m.marketDisplayName, timeframe: interval, from: from * 1000, to: to * 1000 });
+      for (const c of res.candles) {
+        const time = usToMs(c.openTime);
+        byTime.set(time, { time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume, trades: c.tradeCount });
+      }
+    }
+    return [...byTime.values()].sort((x, y) => x.time - y.time);
   }
 
   // ── Legacy: account ──

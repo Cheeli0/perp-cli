@@ -107,6 +107,14 @@ export function chainLabel(chain: string): string {
   return label;
 }
 
+/** Circle forwarding fee per HL CCTP destination, from HL_CCTP_ROUTES (null = not published). */
+async function hlCctpFeeText(): Promise<string> {
+  const { HL_CCTP_ROUTES } = await import("../exchanges/hyperliquid.js");
+  return Object.entries(HL_CCTP_ROUTES)
+    .map(([chain, r]) => `${chain}: ${r.forwardingFeeUsdc === null ? "fee not published" : `${r.forwardingFeeUsdc} USDC`}`)
+    .join(", ");
+}
+
 /** Withdraw asset declared by the venue definition (capabilities.withdrawAssets[0]). */
 function withdrawAssetOf(def: VenueDefinition): string {
   const assets = requireCapabilities(def).withdrawAssets;
@@ -1403,11 +1411,13 @@ export function registerFundsCommands(
           },
           withdraw: {
             pacifica: { chain: "Solana", token: "USDC", speed: "~10s", fee: "none" },
-            hyperliquid: { chain: "Arbitrum", token: "USDC", speed: "minutes", fee: "$1" },
+            hyperliquid: { chain: "Arbitrum (default) / Ethereum / Base", token: "USDC", speed: "minutes (CCTP attestation)", method: "CCTP (sendToEvmWithData)", fee: await hlCctpFeeText(), command: "perp funds withdraw hyperliquid <amount> [--chain arbitrum|ethereum|base]" },
             lighter: { chain: "Ethereum L1", token: "USDC", speed: "~12 hours (standard), minutes (fast)", fee: "varies" },
             "lighter-rh": { chain: "Robinhood Chain", token: "USDG", command: "perp -e lighter-rh funds withdraw lighter <amount>" },
             ondo: { supported: false, note: "the Ondo Perps API does not allow withdrawals — withdraw in the Ondo Perps web app" },
-            qfex: { supported: false, note: "QFEX withdrawals are disabled in perp-cli for now — withdraw in the QFEX web app" },
+            qfex: QFEX_WITHDRAW_ENABLED
+              ? { chain: chainLabel(QFEX_WITHDRAW_NETWORK), token: "USDC", command: "perp funds withdraw qfex <amount> --to <allowlisted address>", gate: "settings withdraw.qfex (allowlist, maxPerTx, maxPerDay)", note: "needs a key with the \"Deposit and withdraw\" permission" }
+              : { supported: false, note: `${QFEX_WITHDRAW_DISABLED.reason} — ${QFEX_WITHDRAW_DISABLED.remediation}` },
             arcus: { chain: "Robinhood Chain", token: "USDG", command: "perp funds withdraw arcus <amount>" },
             aster: { chain: "BNB Chain (default) / Arbitrum", token: "USDT (default) / USDC", command: "perp funds withdraw aster <amount> [--chain bsc|arbitrum] [--asset USDT|USDC]", fee: "POST /fapi/v3/aster/user-withdraw-info (taken from the amount)", requires: "mainnet; API wallet approved with --can-withdraw --ip-whitelist; destination = the account's own address" },
           },
@@ -1459,9 +1469,9 @@ export function registerFundsCommands(
       console.log(`  Speed: ~10s  |  Fee: none`);
       console.log(`  Command: ${chalk.green("perp funds withdraw pacifica <amount>")}`);
 
-      console.log(chalk.white.bold("\n  Hyperliquid") + chalk.gray(" → Arbitrum"));
-      console.log(`  Speed: minutes  |  Fee: ~$1`);
-      console.log(`  Command: ${chalk.green("perp -e hl funds withdraw hyperliquid <amount>")}`);
+      console.log(chalk.white.bold("\n  Hyperliquid") + chalk.gray(" → Arbitrum (default) / Ethereum / Base over CCTP"));
+      console.log(`  Fee: ${await hlCctpFeeText()}`);
+      console.log(`  Command: ${chalk.green("perp funds withdraw hyperliquid <amount> [--chain arbitrum|ethereum|base]")}`);
 
       console.log(chalk.white.bold("\n  Lighter") + chalk.gray(" → Ethereum L1"));
       console.log(`  Speed: ~12h (standard)  |  Fee: varies`);
@@ -1475,6 +1485,11 @@ export function registerFundsCommands(
 
       console.log(chalk.white.bold("\n  Arcus") + chalk.gray(" → Robinhood Chain (USDG, to the account owner)"));
       console.log(`  Command: ${chalk.green("perp funds withdraw arcus <amount>")}`);
+
+      console.log(chalk.white.bold("\n  QFEX") + chalk.gray(QFEX_WITHDRAW_ENABLED ? ` → ${chainLabel(QFEX_WITHDRAW_NETWORK)} (USDC, allowlisted address)` : " — disabled in perp-cli for now"));
+      console.log(QFEX_WITHDRAW_ENABLED
+        ? `  Command: ${chalk.green("perp funds withdraw qfex <amount> --to <allowlisted address>")}`
+        : chalk.gray(`  ${QFEX_WITHDRAW_DISABLED.remediation}.`));
 
       console.log(chalk.white.bold("\n  Aster") + chalk.gray(" → BNB Chain / Arbitrum (USDT, to the account's own address; mainnet only)"));
       console.log(`  Needs an API wallet approved with --can-withdraw --ip-whitelist; fee from user-withdraw-info`);

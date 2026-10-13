@@ -139,3 +139,16 @@ describe("rebalance.fetchAllBalances — non-finite balance guard (Rule #2)", ()
     expect(snaps[0]?.exchange).toBe("hyperliquid");
   });
 });
+
+describe("rebalance — failed venue balance reads are returned, never silently dropped (audit M5)", () => {
+  it("fetchBalancesWithFailures returns the failed venues with their error", async () => {
+    const { fetchBalancesWithFailures } = await import("../rebalance.js");
+    const adapters = new Map<string, ExchangeAdapter>([
+      ["hyperliquid", makeAdapter("hyperliquid", CLEAN)],
+      ["lighter", makeAdapter("lighter", async () => { throw new Error("HTTP 503"); })],
+    ]);
+    const { snapshots, failed } = await fetchBalancesWithFailures(adapters);
+    expect(snapshots.map(s => s.exchange)).toEqual(["hyperliquid"]);
+    expect(failed).toEqual([{ exchange: "lighter", error: "HTTP 503" }]);
+  });
+});

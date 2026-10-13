@@ -300,11 +300,11 @@ export function lighterTakerFilledBase(eventInfo: unknown, sentBaseAmount: numbe
  * A required open-order row field as a string (Rule #2): missing / empty / non-finite numeric →
  * EXCHANGE_ERROR, never listed as price / size "0" or status "open".
  */
-export function lighterRowField(o: Record<string, unknown>, key: string, venue: string): string {
+export function lighterRowField(o: Record<string, unknown>, key: string, venue: string, what: "open order" | "order history" = "open order"): string {
   const v = o[key];
   if ((typeof v === "string" && v.trim() !== "") || (typeof v === "number" && Number.isFinite(v))) return String(v);
-  throw new PerpError("EXCHANGE_ERROR", `${venue} open order ${lighterOrderIdOf(o) || "(no id)"}: row has no ${key} (got ${JSON.stringify(v ?? null)})`, {
-    exchange: venue, remediation: `Retry: perp -e ${venue} account orders`,
+  throw new PerpError("EXCHANGE_ERROR", `${venue} ${what} ${lighterOrderIdOf(o) || "(no id)"}: row has no ${key} (got ${JSON.stringify(v ?? null)})`, {
+    exchange: venue, remediation: `Retry: perp -e ${venue} ${what === "open order" ? "account orders" : "account history"}`,
   });
 }
 
@@ -1560,7 +1560,7 @@ export class LighterAdapter implements ExchangeAdapter {
         size: lighterRowField(o, "initial_base_amount", this.name),
         filled: lighterRowField(o, "filled_base_amount", this.name),
         status: lighterRowField(o, "status", this.name),
-        type: String(o.type ?? "limit"),
+        type: lighterRowField(o, "type", this.name),
         triggerPrice: Number(o.trigger_price) > 0 ? String(o.trigger_price) : null,
       };
     });
@@ -2220,15 +2220,17 @@ export class LighterAdapter implements ExchangeAdapter {
   async getOrderHistory(limit = 30): Promise<ExchangeOrder[]> {
     if (!this._address) throw new Error("No private key configured — account data unavailable. Run: perp setup");
     const orders = await this.historyRows("/accountInactiveOrders", "orders", { market_type: "perp" }, limit, true);
+    // Every field is required: a missing price / size / status / type is an unreadable row, never "0" / "done" / "limit".
+    const req = (o: Record<string, unknown>, k: string): string => lighterRowField(o, k, this.name, "order history");
     return orders.map((o) => ({
       orderId: lighterOrderIdOf(o),
       symbol: this.historySymbol(o.market_index, "order history", o),
       side: this.sideOfIsAsk(o.is_ask, "order history", o),
-      price: String(o.price ?? "0"),
-      size: String(o.initial_base_amount ?? o.base_amount ?? ""),
-      filled: String(o.filled_base_amount ?? "0"),
-      status: String(o.status ?? "done"),
-      type: String(o.type ?? "limit"),
+      price: req(o, "price"),
+      size: req(o, "initial_base_amount"),
+      filled: req(o, "filled_base_amount"),
+      status: req(o, "status"),
+      type: req(o, "type"),
       triggerPrice: Number(o.trigger_price) > 0 ? String(o.trigger_price) : null,
     }));
   }

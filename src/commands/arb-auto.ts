@@ -18,7 +18,7 @@ import {
   fetchHyperliquidMetaRaw, parseHyperliquidMetaRaw,
   fetchLighterOrderBookDetailsRaw, fetchLighterFundingRatesRaw, parseLighterRaw,
 } from "../shared-api.js";
-import { fetchAllDexAssets, findDexArbPairs, scanDexArb, type DexArbPair } from "../dex-asset-map.js";
+import { fetchAllDexAssetsDetailed, findDexArbPairs, scanDexArb, type DexArbPair } from "../dex-asset-map.js";
 import { logExecution, readExecutionLog } from "../execution-log.js";
 import { smartOrder } from "../smart-order.js";
 import {
@@ -31,7 +31,7 @@ import {
   notifyIfEnabled,
 } from "../arb-utils.js";
 import {
-  checkChainMargins, isCriticalMargin, shouldBlockEntries,
+  checkChainMargins, marginEntryBlocks, type ChainMarginCheck,
   computeAutoSize,
 } from "../cross-chain-margin.js";
 import {
@@ -474,6 +474,66 @@ export function isSpreadReversed(
   return longHourly > shortHourly;
 }
 
+export interface ArbPnlPosition { exchange: string; symbol: string; side: string; size: number; entry: number; mark: number; upnl: number; lev: number }
+
+/**
+ * Read open positions on each venue for `arb pnl`. A venue whose adapter/positions read
+ * fails lands in `positionErrors` (never silently dropped); a venue with no credentials
+ * (read-only adapter) lands in `notConfigured`.
+ */
+export async function collectArbPnlPositions(
+  exchangeNames: string[],
+  getAdapterForExchange: (exchange: string) => Promise<ExchangeAdapter>,
+): Promise<{ positions: ArbPnlPosition[]; positionErrors: Record<string, string>; notConfigured: string[] }> {
+  const positions: ArbPnlPosition[] = [];
+  const positionErrors: Record<string, string> = {};
+  const notConfigured: string[] = [];
+  for (const exName of exchangeNames) {
+    try {
+      const adapter = await getAdapterForExchange(exName);
+      if ((adapter as { isReadOnly?: boolean }).isReadOnly === true) { notConfigured.push(exName); continue; }
+      for (const p of await adapter.getPositions()) {
+        positions.push({
+          exchange: exName,
+          symbol: p.symbol.replace("-PERP", ""),
+          side: p.side,
+          size: Math.abs(Number(p.size)),
+          entry: Number(p.entryPrice),
+          mark: Number(p.markPrice),
+          upnl: Number(p.unrealizedPnl),
+          lev: p.leverage,
+        });
+      }
+    } catch (e) {
+      positionErrors[exName] = e instanceof Error ? e.message : String(e);
+    }
+  }
+  return { positions, positionErrors, notConfigured };
+}
+
+/**
+ * "arb" when the symbol has both a long and a short leg; otherwise "unknown" if any venue's
+ * positions were unread (its missing leg may be there — never call it naked), else "single".
+ */
+export function arbPnlPairStatus(positions: Array<{ side: string }>, failedVenues: string[]): "arb" | "single" | "unknown" {
+  if (positions.length >= 2 && positions.some(p => p.side === "long") && positions.some(p => p.side === "short")) return "arb";
+  return failedVenues.length > 0 ? "unknown" : "single";
+}
+
+/**
+ * HIP-3 auto-arb: the dex (either leg) whose market read failed this cycle, or null.
+ * A non-null result means the pair's spread is UNKNOWN — the position is kept (never
+ * closed as "pair disappeared"); only a pair missing from a successfully read dex is gone.
+ */
+export function dexCloseBlockedBy(
+  pos: { longDex: string; shortDex: string },
+  failedDexes: Record<string, string>,
+): string | null {
+  if (Object.hasOwn(failedDexes, pos.longDex)) return pos.longDex;
+  if (Object.hasOwn(failedDexes, pos.shortDex)) return pos.shortDex;
+  return null;
+}
+
 const _warnedArbPriceMismatch = new Set<string>();
 
 async function fetchFundingSpreads(): Promise<FundingSnapshot[]> {
@@ -766,6 +826,8 @@ export function registerArbAutoCommands(
       const openPositions: ArbPosition[] = [];
       // Track which exchanges have low margin (block entries)
       const blockedExchanges = new Set<string>();
+      // Venues whose margin was unknown last cycle (webhook sent once per transition)
+      const marginUnknownNotified = new Set<string>();
       // Track close times per symbol to prevent close→re-entry loops
       const closeCooldowns = new Map<string, number>(); // symbol → close timestamp ms
       // Consecutive definite close failures per symbol (quarantined at MAX_PAIR_CLOSE_FAILURES)
@@ -1141,39 +1203,66 @@ export function registerArbAutoCommands(
             }
           }
 
-          try {
-            // Only check margins when we have open positions (avoid slow adapter init)
-            const needMarginCheck = openPositions.length > 0;
-            const adaptersMap = new Map<string, ExchangeAdapter>();
-            if (needMarginCheck) {
-              const marginExchanges = ["hyperliquid", "lighter", "pacifica"];
-              for (const name of marginExchanges) {
-                try { adaptersMap.set(name, await getAdapterForExchange(name)); } catch { /* skip */ }
+          // Only check margins when we have open positions (avoid slow adapter init).
+          // An unreadable margin is UNKNOWN, never healthy: logged every cycle (stderr) and new
+          // entries on that venue are blocked (closing / reducing stays allowed).
+          if (openPositions.length > 0) {
+            const marginCheck: ChainMarginCheck = { statuses: [], unknown: [] };
+            try {
+              const adaptersMap = new Map<string, ExchangeAdapter>();
+              for (const name of ["hyperliquid", "lighter", "pacifica"]) {
+                try {
+                  const a = await getAdapterForExchange(name);
+                  // No credentials (read-only adapter): no positions / margin there to monitor, and
+                  // the bot cannot enter on it either — not "unknown".
+                  if ((a as { isReadOnly?: unknown }).isReadOnly === true) { blockedExchanges.add(name); continue; }
+                  adaptersMap.set(name, a);
+                } catch (e) { marginCheck.unknown.push({ exchange: name, error: `adapter init failed: ${e instanceof Error ? e.message : String(e)}` }); }
+              }
+              if (adaptersMap.size > 0) {
+                const res = await checkChainMargins(adaptersMap, minMarginPct);
+                marginCheck.statuses.push(...res.statuses);
+                marginCheck.unknown.push(...res.unknown);
+              }
+            } catch (e) {
+              const msg = e instanceof Error ? e.message : String(e);
+              for (const name of ["hyperliquid", "lighter", "pacifica"]) {
+                if (blockedExchanges.has(name)) continue;
+                if (!marginCheck.statuses.some(s => s.exchange === name) && !marginCheck.unknown.some(u => u.exchange === name)) marginCheck.unknown.push({ exchange: name, error: msg });
               }
             }
-            if (adaptersMap.size > 0) {
-              const marginStatuses = await checkChainMargins(adaptersMap, minMarginPct);
-              for (const ms of marginStatuses) {
-                if (isCriticalMargin(ms)) {
-                  console.log(chalk.red.bold(
-                    `  ${now} EMERGENCY: ${ms.exchange} margin ratio ${ms.marginRatio.toFixed(1)}% — CRITICAL (below 15%)`
-                  ));
-                  blockedExchanges.add(ms.exchange);
+            const nowUnknown = new Set<string>();
+            for (const b of marginEntryBlocks(marginCheck, minMarginPct)) {
+              blockedExchanges.add(b.exchange);
+              if (b.level === "critical") {
+                console.log(chalk.red.bold(
+                  `  ${now} EMERGENCY: ${b.exchange} margin ratio ${b.marginPct!.toFixed(1)}% — CRITICAL (below 15%)`
+                ));
+                await notifyIfEnabled(webhookUrl, notifyEvents, "margin", {
+                  exchange: b.exchange, marginPct: b.marginPct, threshold: 15,
+                });
+              } else if (b.level === "low") {
+                console.log(chalk.yellow(
+                  `  ${now} WARNING: ${b.exchange} margin ${b.marginPct!.toFixed(1)}% below ${minMarginPct}% — blocking new entries`
+                ));
+                await notifyIfEnabled(webhookUrl, notifyEvents, "margin", {
+                  exchange: b.exchange, marginPct: b.marginPct, threshold: minMarginPct,
+                });
+              } else {
+                nowUnknown.add(b.exchange);
+                console.error(chalk.yellow(`  ${now} MARGIN UNKNOWN: ${b.exchange} (${b.error}) — blocking new entries until margin is readable`));
+                // Webhook once per transition into unknown (stderr carries the per-cycle signal).
+                if (!marginUnknownNotified.has(b.exchange)) {
                   await notifyIfEnabled(webhookUrl, notifyEvents, "margin", {
-                    exchange: ms.exchange, marginPct: ms.marginRatio, threshold: 15,
-                  });
-                } else if (shouldBlockEntries(ms, minMarginPct)) {
-                  console.log(chalk.yellow(
-                    `  ${now} WARNING: ${ms.exchange} margin ${ms.marginRatio.toFixed(1)}% below ${minMarginPct}% — blocking new entries`
-                  ));
-                  blockedExchanges.add(ms.exchange);
-                  await notifyIfEnabled(webhookUrl, notifyEvents, "margin", {
-                    exchange: ms.exchange, marginPct: ms.marginRatio, threshold: minMarginPct,
+                    exchange: b.exchange, marginPct: null, threshold: minMarginPct,
+                    message: `MARGIN UNKNOWN: ${b.exchange} (${b.error}) — new entries blocked`,
                   });
                 }
               }
             }
-          } catch { /* margin check failed, continue without blocking */ }
+            marginUnknownNotified.clear();
+            for (const ex of nowUnknown) marginUnknownNotified.add(ex);
+          }
 
           // Entry decisions: every monitored symbol that is not entered gets its reason — logged per
           // symbol for --symbols, summarized per cycle for a full scan (a silent run is impossible).
@@ -1222,7 +1311,7 @@ export function registerArbAutoCommands(
 
               // Block entries if either exchange has low margin
               if (blockedExchanges.has(longExchange) || blockedExchanges.has(shortExchange)) {
-                skip(snap.symbol, `entries blocked on ${blockedExchanges.has(longExchange) ? longExchange : shortExchange} (margin low / venue down)`);
+                skip(snap.symbol, `entries blocked on ${blockedExchanges.has(longExchange) ? longExchange : shortExchange} (margin low / margin unknown / venue down)`);
                 continue;
               }
 
@@ -2798,31 +2887,20 @@ export function registerArbAutoCommands(
       if (!isJson()) console.log(chalk.cyan("\n  Checking arb positions...\n"));
 
       const exchangeNames = ["hyperliquid", "lighter", "pacifica"];
-      const allPositions: { exchange: string; symbol: string; side: string; size: number; entry: number; mark: number; upnl: number; lev: number }[] = [];
-
-      for (const exName of exchangeNames) {
-        try {
-          const adapter = await getAdapterForExchange(exName);
-          const positions = await adapter.getPositions();
-          for (const p of positions) {
-            allPositions.push({
-              exchange: exName,
-              symbol: p.symbol.replace("-PERP", ""),
-              side: p.side,
-              size: Math.abs(Number(p.size)),
-              entry: Number(p.entryPrice),
-              mark: Number(p.markPrice),
-              upnl: Number(p.unrealizedPnl),
-              lev: p.leverage,
-            });
-          }
-        } catch {
-          // exchange not configured, skip
-        }
+      // A venue whose positions could not be read is reported (never dropped): pairs that may
+      // involve it are UNKNOWN, not naked. Only a venue with no credentials is skipped — and said so.
+      const { positions: allPositions, positionErrors, notConfigured } = await collectArbPnlPositions(exchangeNames, getAdapterForExchange);
+      const failedVenues = Object.keys(positionErrors);
+      if (!isJson()) {
+        for (const ex of notConfigured) console.log(chalk.gray(`  ${ex}: not configured (no credentials) — skipped`));
+        for (const [ex, msg] of Object.entries(positionErrors)) console.error(chalk.red(`  ${ex}: positions unavailable — ${msg} (pairs involving ${ex} are UNKNOWN)`));
       }
 
       if (allPositions.length === 0) {
-        console.log(chalk.gray("  No positions found on any exchange.\n"));
+        if (isJson()) return printJson(jsonOk({ pairs: [], positionErrors, notConfigured }));
+        console.log(failedVenues.length > 0
+          ? chalk.yellow(`  No positions read — ${failedVenues.join(", ")} unavailable, holdings there are UNKNOWN.\n`)
+          : chalk.gray("  No positions found on any configured exchange.\n"));
         return;
       }
 
@@ -2843,6 +2921,8 @@ export function registerArbAutoCommands(
 
       // Fetch actual settled funding payments from each exchange
       const actualFundingByExSymbol = new Map<string, number>(); // "exchange:SYMBOL" → total settled USD
+      // Venues whose funding history could not be read: their symbols' actualFunding is null, never 0.
+      const fundingErrors: Record<string, string> = {};
       for (const exName of exchangeNames) {
         try {
           const adapter = await getAdapterForExchange(exName);
@@ -2852,34 +2932,42 @@ export function registerArbAutoCommands(
             const key = `${exName}:${sym}`;
             actualFundingByExSymbol.set(key, (actualFundingByExSymbol.get(key) ?? 0) + Number(fp.payment));
           }
-        } catch {
-          // exchange not configured or API error, skip
+        } catch (e) {
+          fundingErrors[exName] = e instanceof Error ? e.message : String(e);
         }
       }
+      /** Settled funding of `symbol` across its legs; null when a leg's venue history was not read. */
+      const actualFundingOf = (symbol: string, positions: Array<{ exchange: string }>): number | null => {
+        let sum = 0;
+        for (const p of positions) {
+          if (fundingErrors[p.exchange] !== undefined) return null;
+          sum += actualFundingByExSymbol.get(`${p.exchange}:${symbol}`) ?? 0; // read, no payment for this symbol = 0
+        }
+        return sum;
+      };
 
       if (isJson()) {
         const result = [...bySymbol.entries()].map(([symbol, positions]) => {
           const spread = spreadMap.get(symbol);
-          // Sum actual funding across exchanges for this symbol
-          let actualFunding = 0;
-          for (const p of positions) {
-            actualFunding += actualFundingByExSymbol.get(`${p.exchange}:${symbol}`) ?? 0;
-          }
-          return { symbol, positions, currentSpread: spread?.spread ?? 0, actualFunding };
+          const failed = positions.map(p => fundingErrors[p.exchange] === undefined ? null : `${p.exchange}: ${fundingErrors[p.exchange]}`).filter((x): x is string => x !== null);
+          return { symbol, positions, pairStatus: arbPnlPairStatus(positions, failedVenues), currentSpread: spread === undefined ? null : spread.spread, actualFunding: actualFundingOf(symbol, positions), fundingError: failed.length > 0 ? failed.join("; ") : null };
         });
-        return printJson(jsonOk(result));
+        return printJson(jsonOk({ pairs: result, positionErrors, notConfigured }));
       }
 
       let totalUpnl = 0;
       let totalFees = 0;
       let totalEstFunding = 0;
       let totalActualFunding = 0;
+      let actualFundingIncomplete = false;
 
       for (const [symbol, positions] of bySymbol) {
-        const isArb = positions.length >= 2 && positions.some(p => p.side === "long") && positions.some(p => p.side === "short");
+        const pairStatus = arbPnlPairStatus(positions, failedVenues);
         const spread = spreadMap.get(symbol);
 
-        console.log(chalk.white.bold(`  ${symbol}`) + (isArb ? chalk.green(" [ARB PAIR]") : chalk.gray(" [single]")));
+        console.log(chalk.white.bold(`  ${symbol}`) + (pairStatus === "arb" ? chalk.green(" [ARB PAIR]")
+          : pairStatus === "unknown" ? chalk.yellow(` [UNKNOWN — ${failedVenues.join(", ")} positions unread]`)
+          : chalk.gray(" [single]")));
 
         for (const p of positions) {
           const sideColor = p.side === "long" ? chalk.green : chalk.red;
@@ -2925,23 +3013,24 @@ export function registerArbAutoCommands(
             // Estimated funding based on current spread × hold time
             const estFunding = holdHours !== null ? hourlyIncome * holdHours : 0;
 
-            // Actual settled funding from exchange APIs
-            let actualFunding = 0;
-            for (const p of positions) {
-              actualFunding += actualFundingByExSymbol.get(`${p.exchange}:${symbol}`) ?? 0;
-            }
+            // Actual settled funding from exchange APIs (null = a leg's venue history was not read)
+            const actualFunding = actualFundingOf(symbol, positions);
 
             totalEstFunding += estFunding;
-            totalActualFunding += actualFunding;
-
-            const diff = actualFunding - estFunding;
-            const diffColor = Math.abs(diff) < 0.01 ? chalk.gray : diff >= 0 ? chalk.green : chalk.red;
             const fmtVal = (v: number) => v >= 0 ? `$${v.toFixed(4)}` : `-$${Math.abs(v).toFixed(4)}`;
-            console.log(chalk.white(
-              `    Funding: Est. ${chalk.yellow(fmtVal(estFunding))} / ` +
-              `Actual ${chalk.cyan(fmtVal(actualFunding))} / ` +
-              `Diff: ${diffColor(fmtVal(diff))}`
-            ));
+            if (actualFunding === null) {
+              actualFundingIncomplete = true;
+              console.log(chalk.white(`    Funding: Est. ${chalk.yellow(fmtVal(estFunding))} / Actual ${chalk.yellow("unavailable")}`));
+            } else {
+              totalActualFunding += actualFunding;
+              const diff = actualFunding - estFunding;
+              const diffColor = Math.abs(diff) < 0.01 ? chalk.gray : diff >= 0 ? chalk.green : chalk.red;
+              console.log(chalk.white(
+                `    Funding: Est. ${chalk.yellow(fmtVal(estFunding))} / ` +
+                `Actual ${chalk.cyan(fmtVal(actualFunding))} / ` +
+                `Diff: ${diffColor(fmtVal(diff))}`
+              ));
+            }
           }
         }
         console.log();
@@ -2961,10 +3050,11 @@ export function registerArbAutoCommands(
         const fundingDiff = totalActualFunding - totalEstFunding;
         const diffPct = totalEstFunding !== 0 ? ((fundingDiff / Math.abs(totalEstFunding)) * 100).toFixed(1) : "N/A";
         console.log(`    Est. funding:    ${chalk.yellow(`$${totalEstFunding.toFixed(4)}`)}`);
-        console.log(`    Actual funding:  ${chalk.cyan(`$${totalActualFunding.toFixed(4)}`)}`);
+        console.log(`    Actual funding:  ${chalk.cyan(`$${totalActualFunding.toFixed(4)}`)}${actualFundingIncomplete ? chalk.yellow(" (incomplete: some venues' funding history unavailable)") : ""}`);
         console.log(`    Funding diff:    ${fundingDiff >= 0 ? chalk.green(`+$${fundingDiff.toFixed(4)}`) : chalk.red(`-$${Math.abs(fundingDiff).toFixed(4)}`)} (${diffPct}%)`);
       }
-      console.log(`    Net (if closed now): ${netColor(`$${netPnl.toFixed(4)}`)}`);
+      console.log(`    Net (if closed now): ${netColor(`$${netPnl.toFixed(4)}`)}${actualFundingIncomplete ? chalk.yellow(" (excludes unread funding)") : ""}`);
+      for (const [ex, msg] of Object.entries(fundingErrors)) console.log(chalk.yellow(`    ${ex} funding history unavailable: ${msg}`));
       console.log(chalk.gray(`    (Fees assume ${(TAKER_FEE * 100).toFixed(3)}% taker. Actual may vary.)`));
       console.log(chalk.gray(`    * Net includes actual settled funding where available.\n`));
   }
@@ -2989,10 +3079,12 @@ export function registerArbAutoCommands(
         const ts = new Date().toLocaleTimeString();
 
         try {
-          const pairs = await scanDexArb({
+          const { pairs, failedDexes } = await scanDexArb({
             minAnnualSpread: minSpread,
             includeNative: opts.includeNative,
           });
+          // Failed dex reads are reported, never shown as "no opportunities" for that dex.
+          for (const [dex, msg] of Object.entries(failedDexes)) console.error(chalk.yellow(`  ${ts} HIP-3 dex ${dex} unavailable: ${msg} — its pairs are missing this cycle`));
           const shown = pairs.slice(0, topN);
 
           // Clear previous output
@@ -3086,7 +3178,21 @@ export function registerArbAutoCommands(
           // Positions live only in memory: a restart re-reads what is held on the dexes, so a
           // held underlying is managed (closed when the spread converges), never re-entered.
           // Unpaired / size-mismatched legs are quarantined. An unreadable dex → not started.
-          const assets = await fetchAllDexAssets();
+          // A transient 429 / timeout on one of the deployed dexes is retried (2 s, 5 s) before
+          // refusing: a partial read is never cached, so each attempt re-reads every dex.
+          let { assets, failedDexes: startFailed } = await fetchAllDexAssetsDetailed();
+          for (const waitMs of [2_000, 5_000]) {
+            if (Object.keys(startFailed).length === 0) break;
+            console.error(chalk.yellow(`  HIP-3 dex read failed at start (${Object.keys(startFailed).join(", ")}) — retrying in ${waitMs / 1000}s`));
+            await new Promise(r => setTimeout(r, waitMs));
+            ({ assets, failedDexes: startFailed } = await fetchAllDexAssetsDetailed());
+          }
+          if (Object.keys(startFailed).length > 0) {
+            // A dex not read → its held legs are unknown: not started (never re-enter a held pair).
+            throw new PerpError("EXCHANGE_ERROR", `arb auto --hip3: dex market data unreadable at start (${Object.entries(startFailed).map(([d, m]) => `${d}: ${m}`).join("; ")}) — not started (held pairs unknown)`, {
+              exchange: "hyperliquid", remediation: `Check connectivity (perp arb scan --hip3), then restart`,
+            });
+          }
           const pairsNow = findDexArbPairs(assets, { minAnnualSpread: 0, includeNative: true });
           const legs = new Map<string, { dex: string; raw: string; base: string; side: string; size: number; sizeStr: string; underlying: string }>();
           for (const dex of [...new Set(assets.map(a => a.dex))]) {
@@ -3155,17 +3261,24 @@ export function registerArbAutoCommands(
 
         const cycle = async () => {
           try {
-            const pairs = await scanDexArb({
+            const { pairs, failedDexes } = await scanDexArb({
               minAnnualSpread: 0, // get all, filter ourselves
               includeNative: true,
             });
 
             const now = new Date().toLocaleTimeString();
+            for (const [dex, msg] of Object.entries(failedDexes)) console.error(chalk.yellow(`  ${now} HIP-3 dex ${dex} unavailable: ${msg}`));
 
             // Check close conditions
             for (let i = openPositions.length - 1; i >= 0; i--) {
               if (stop.requested()) break; // stopping: no new close sequence
               const pos = openPositions[i];
+              // A leg's dex not read this cycle → spread unknown: never close on missing data.
+              const unreadDex = dexCloseBlockedBy(pos, failedDexes);
+              if (unreadDex !== null) {
+                console.error(chalk.yellow(`  ${now} dex ${unreadDex} unavailable — ${pos.underlying} position kept, re-checked next cycle`));
+                continue;
+              }
               // Find current pair for this position
               const current = pairs.find(p =>
                 p.underlying === pos.underlying &&

@@ -1,7 +1,7 @@
 /**
- * Ondo Perps funding (USDC transfer to the account's funding address, optional probe) and the
- * withdrawal address book (SIWE challenge). Chain RPC (ethers JsonRpcProvider) and the venue
- * client are mocked — nothing is sent.
+ * Ondo Perps funding (USDC transfer to the account's funding address, optional probe).
+ * Withdrawals are web-app only, so there is no address-book flow. Chain RPC (ethers
+ * JsonRpcProvider) and the venue client are mocked — nothing is sent.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { Interface, SigningKey, Transaction, Wallet, parseUnits } from "ethers";
@@ -10,8 +10,6 @@ import { PerpError } from "../../errors.js";
 const KEY = `0x${"42".repeat(32)}`;
 const WALLET = new Wallet(KEY);
 const DEPOSITOR = WALLET.address;
-/** ERC-4361 address-book challenge as the venue issues it (domain = the venue, account = the signing wallet). */
-const SIWE_CHALLENGE = `app.ondoperps.xyz wants you to sign in with your Ethereum account:\n${DEPOSITOR}\n\nAdd withdrawal address ${DEPOSITOR}\n\nURI: https://app.ondoperps.xyz\nVersion: 1\nChain ID: 1\nNonce: 1`;
 const ARB_USDC = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831";
 const ADDR_A = "0x00000000000000000000000000000000000000A1";
 const ADDR_B = "0x00000000000000000000000000000000000000b2";
@@ -59,14 +57,13 @@ const { ONDO_DEPOSIT_CHAINS } = await import("../../exchanges/venues/ondo.js");
 const row = (network: string, address: string, id = ACCOUNT, wallet = "margin", coin = "USDC") => ({ coin, network, address, depositDestination: { id, wallet } });
 
 /** Venue client stub: records every call; `rows` is the live deposit-address list. */
-function client(o: { rows?: unknown[]; accountID?: string; provisionAccount?: string; book?: string[]; challenge?: unknown; onPost?: (path: string) => void } = {}) {
-  const state = { rows: [...(o.rows ?? [])], book: [...(o.book ?? [])] };
+function client(o: { rows?: unknown[]; accountID?: string; provisionAccount?: string; onPost?: (path: string) => void } = {}) {
+  const state = { rows: [...(o.rows ?? [])] };
   const calls: Array<{ method: string; path: string; body: unknown }> = [];
   const c = {
     get: vi.fn(async (path: string) => {
       calls.push({ method: "GET", path, body: null });
       if (path === "/v1/account") return { accountID: o.accountID ?? ACCOUNT };
-      if (path === "/v1/wallet/address_book") return { addressBook: state.book.map(a => ({ withdrawalAddress: a, label: "", lastUpdated: "" })) };
       throw new Error(`unexpected GET ${path}`);
     }),
     post: vi.fn(async (path: string, body: unknown) => {
@@ -78,13 +75,6 @@ function client(o: { rows?: unknown[]; accountID?: string; provisionAccount?: st
         state.rows.push(row(b.network, ADDR_B));
         return { chain: b.network, accountId: o.provisionAccount ?? ACCOUNT, symbol: "USDC", address: ADDR_B };
       }
-      if (path === "/v1/auth/erc-4361/address_book/get_challenge") return o.challenge ?? { id: "chg_1", message: SIWE_CHALLENGE };
-      throw new Error(`unexpected POST ${path}`);
-    }),
-    postNoResult: vi.fn(async (path: string, body: unknown) => {
-      calls.push({ method: "POST", path, body });
-      o.onPost?.(path);
-      if (path === "/v1/auth/erc-4361/address_book/complete_challenge") { state.book.push(DEPOSITOR); return; }
       throw new Error(`unexpected POST ${path}`);
     }),
   };

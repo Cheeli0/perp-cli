@@ -58,7 +58,7 @@ describe("checkChainMargins", () => {
     const adapters = new Map<string, ExchangeAdapter>();
     adapters.set("hyperliquid", mockAdapter({ name: "hyperliquid", equity: 1000, marginUsed: 200 }));
 
-    const statuses = await checkChainMargins(adapters, 30);
+    const { statuses } = await checkChainMargins(adapters, 30);
 
     expect(statuses).toHaveLength(1);
     expect(statuses[0].exchange).toBe("hyperliquid");
@@ -75,7 +75,7 @@ describe("checkChainMargins", () => {
     const adapters = new Map<string, ExchangeAdapter>();
     adapters.set("lighter", mockAdapter({ name: "lighter", equity: 1000, marginUsed: 800 }));
 
-    const statuses = await checkChainMargins(adapters, 30);
+    const { statuses } = await checkChainMargins(adapters, 30);
 
     expect(statuses).toHaveLength(1);
     // marginRatio = (200/1000)*100 = 20% < 30%
@@ -89,7 +89,7 @@ describe("checkChainMargins", () => {
     adapters.set("pacifica", mockAdapter({ name: "pacifica", equity: 500, marginUsed: 400 }));
     adapters.set("lighter", mockAdapter({ name: "lighter", equity: 2000, marginUsed: 500 }));
 
-    const statuses = await checkChainMargins(adapters, 30);
+    const { statuses } = await checkChainMargins(adapters, 30);
 
     expect(statuses).toHaveLength(3);
 
@@ -113,7 +113,7 @@ describe("checkChainMargins", () => {
     const adapters = new Map<string, ExchangeAdapter>();
     adapters.set("hyperliquid", mockAdapter({ name: "hyperliquid", equity: 0, marginUsed: 0 }));
 
-    const statuses = await checkChainMargins(adapters, 30);
+    const { statuses } = await checkChainMargins(adapters, 30);
 
     expect(statuses[0].marginRatio).toBe(0);
     expect(statuses[0].belowThreshold).toBe(true);

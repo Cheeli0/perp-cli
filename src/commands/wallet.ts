@@ -148,7 +148,7 @@ function balanceTable(balances: readonly TokenBalance[]): string {
     b.chain,
     chalk.white.bold(b.token),
     b.balance === null ? chalk.red("read failed") : b.balance,
-    b.usdValue === null ? chalk.gray("-") : `$${formatUsd(b.usdValue)}`,
+    b.usdValue !== null ? `$${formatUsd(b.usdValue)}` : b.priceError !== null ? chalk.gray("price unavailable") : chalk.gray("-"),
   ]);
   const total = stableTotal(balances);
   rows.push([chalk.gray("total"), chalk.white.bold("stablecoins"), "", `$${formatUsd(total.usd)}${total.errors.length > 0 ? chalk.red(" (some reads failed)") : ""}`]);

@@ -133,14 +133,19 @@ class FundingAutoStrategy implements Strategy {
   private get defaultFeeRate(): number { return Number(this._config.defaultFeeRate ?? 0.0005); }
   private get defaultSlippage(): number { return Number(this._config.defaultSlippage ?? 0.001); }
   private get scanIntervalTicks(): number { return Number(this._config.scanIntervalTicks ?? 1); }
-  /** Position size: min of sizeUsd (if set) and maxCapitalPct% of total equity */
-  private _cachedEquity = 0;
-  private getSizeUsd(): number {
+  /** Total equity across all venues, read this tick; null = some venue's balance is unknown. */
+  private _cachedEquity: number | null = null;
+  /**
+   * Position size: min of sizeUsd (if set) and maxCapitalPct% of total equity. null = cannot be
+   * sized (equity unknown, or no capital and no sizeUsd) — no entry, never a substituted size.
+   */
+  private getSizeUsd(): number | null {
+    if (this._cachedEquity === null) return null;
     const fixedSize = Number(this._config.sizeUsd ?? 0);
     const capitalLimit = this._cachedEquity * (this.maxCapitalPct / 100);
     if (fixedSize > 0 && capitalLimit > 0) return Math.min(fixedSize, capitalLimit);
     if (capitalLimit > 0) return capitalLimit;
-    return fixedSize > 0 ? fixedSize : 100; // fallback
+    return null;
   }
 
   describe() {
@@ -176,21 +181,25 @@ class FundingAutoStrategy implements Strategy {
   }
 
   async onTick(ctx: StrategyContext, _snapshot: EnrichedSnapshot): Promise<StrategyAction[]> {
-    // Cache total equity across ALL exchanges for capital-based sizing
-    try {
-      const adapters = this.getAdapters(ctx);
-      let totalEquity = 0;
-      for (const [, adapter] of adapters) {
-        try {
-          const bal = await adapter.getBalance();
-          totalEquity += Number(bal.equity) || 0;
-        } catch { /* skip */ }
-      }
-      this._cachedEquity = totalEquity > 0 ? totalEquity : this._cachedEquity;
-    } catch { /* keep previous cached value */ }
-
     // Get all adapters
     const adapters = this.getAdapters(ctx);
+
+    // Total equity across ALL exchanges for capital-based sizing, read fresh every tick.
+    // Any unknown balance → equity unknown (null): no new entry is sized this tick (never a
+    // stale value, a venue counted as $0, or a substituted size).
+    let totalEquity: number | null = 0;
+    for (const [name, adapter] of adapters) {
+      try {
+        const bal = await adapter.getBalance();
+        const eq = Number(bal.equity);
+        if (!Number.isFinite(eq)) throw new Error(`equity "${bal.equity}" is not a number`);
+        if (totalEquity !== null) totalEquity += eq;
+      } catch (e) {
+        totalEquity = null;
+        ctx.log(`[funding-auto] ${name} balance unreadable (${e instanceof Error ? e.message : String(e)}) — equity unknown, no new entries this tick`);
+      }
+    }
+    this._cachedEquity = totalEquity;
     if (adapters.size < 2) {
       ctx.log(`[funding-auto] Need 2+ exchanges, have ${adapters.size}. Skipping.`);
       return [];
@@ -204,6 +213,8 @@ class FundingAutoStrategy implements Strategy {
     // Fetch funding rates from all exchanges (price data cached for position sizing)
     const ratesByExchange = new Map<string, Map<string, { rate: number; price: number; exchange: string; fundingHours: number | null }>>();
     const priceCache = new Map<string, number>(); // "exchange:symbol" -> price
+    // Venues whose markets could not be read this tick: no open / close decision touches them.
+    const ratesUnavailable = new Set<string>();
     for (const [name, adapter] of adapters) {
       try {
         const markets = await adapter.getMarkets();
@@ -224,18 +235,20 @@ class FundingAutoStrategy implements Strategy {
           }
         }
         ratesByExchange.set(name, map);
-      } catch {
-        // Skip unavailable exchange
+      } catch (e) {
+        ratesUnavailable.add(name);
+        ctx.log(`[funding-auto] ${name} markets unreadable (${e instanceof Error ? e.message : String(e)}) — no open / close decision on ${name} this tick`);
       }
     }
     // Store priceCache for use by openPosition/closePosition
     ctx.state.set("priceCache", priceCache);
 
     // Calculate notional for discovered positions (using current price)
+    // (unknown price → notional left unset, never valued at $0)
     for (const pos of positions) {
       const price = priceCache.get(`${pos.longExchange}:${pos.symbol}`)
-        || priceCache.get(`${pos.shortExchange}:${pos.symbol}`) || 0;
-      if (price > 0) {
+        ?? priceCache.get(`${pos.shortExchange}:${pos.symbol}`);
+      if (price !== undefined) {
         pos.notional = Math.max(pos.longSize, pos.shortSize) * price;
       }
     }
@@ -252,16 +265,30 @@ class FundingAutoStrategy implements Strategy {
         // Check if spread has converged below close threshold
         const longRates = ratesByExchange.get(pos.longExchange);
         const shortRates = ratesByExchange.get(pos.shortExchange);
-        if (!longRates || !shortRates) { surviving.push(pos); continue; }
+        if (!longRates || !shortRates) {
+          const down = [pos.longExchange, pos.shortExchange].filter(n => ratesUnavailable.has(n) || !ratesByExchange.has(n));
+          ctx.log(`[funding-auto] ${pos.symbol}: rates unavailable on ${down.join(", ")} — skipping the exit decision this tick`);
+          surviving.push(pos);
+          continue;
+        }
 
         const longInfo = longRates.get(pos.symbol);
         const shortInfo = shortRates.get(pos.symbol);
-        if (!longInfo || !shortInfo) { surviving.push(pos); continue; }
+        if (!longInfo || !shortInfo) {
+          ctx.log(`[funding-auto] ${pos.symbol}: market missing on ${!longInfo ? pos.longExchange : pos.shortExchange} — skipping the exit decision this tick`);
+          surviving.push(pos);
+          continue;
+        }
 
         // SIGNED spread for the held direction: short-venue hourly − long-venue hourly
         // (each normalized by its own funding basis), annualized %. Positive = still
         // earning; ≤ 0 = the pair has reversed and now pays.
         const currentSpread = annualizeHourlyRate(hourlyOf(shortInfo, pos.shortExchange) - hourlyOf(longInfo, pos.longExchange));
+        if (!Number.isFinite(currentSpread)) {
+          ctx.log(`[funding-auto] ${pos.symbol}: funding rate unknown (${pos.longExchange}↔${pos.shortExchange}) — skipping the exit decision this tick`);
+          surviving.push(pos);
+          continue;
+        }
 
         // Calculate real P&L from exchange history. An unreadable history is never "0":
         // no close decision for this pair this tick.
@@ -300,9 +327,16 @@ class FundingAutoStrategy implements Strategy {
     if (ctx.tick % this.scanIntervalTicks !== 0) return surviving.length > 0 ? [{ type: "noop" }] : [];
     if (surviving.length >= this.maxPositions) return [{ type: "noop" }];
 
+    // Unknown sizing (equity unknown, or no capital and no sizeUsd): no new entries this tick.
+    const sizeUsd = this.getSizeUsd();
+    if (sizeUsd === null) {
+      ctx.log(`[funding-auto] No new entries: position size unknown (equity ${this._cachedEquity === null ? "unknown" : `$${this._cachedEquity.toFixed(2)}`}, sizeUsd ${Number(this._config.sizeUsd ?? 0)})`);
+      return surviving.length > 0 ? [{ type: "noop" }] : [];
+    }
+
     ctx.state.set("lastScan", Date.now());
 
-    ctx.log(`[funding-auto] Scanning ${ratesByExchange.size} exchanges, equity: $${this._cachedEquity.toFixed(2)}, size: $${this.getSizeUsd().toFixed(2)}/pos, active: ${surviving.length}`);
+    ctx.log(`[funding-auto] Scanning ${ratesByExchange.size} exchanges, equity: $${(this._cachedEquity as number).toFixed(2)}, size: $${sizeUsd.toFixed(2)}/pos, active: ${surviving.length}`);
 
     const activeSymbols = new Set(surviving.map(p => `${p.symbol}:${p.mode}`));
     // Also block symbols we already tried to enter (prevents re-entry on failed/tiny orders)
@@ -343,7 +377,7 @@ class FundingAutoStrategy implements Strategy {
       if (annualSpread < this.perpPerpMinSpread) continue;
 
       // Calculate cost and break-even
-      const notional = this.getSizeUsd();
+      const notional = sizeUsd;
       const hourlyIncome = Math.abs(maxRate - minRate) * notional;
       const { totalCost } = calculateCosts(
         notional,
@@ -403,7 +437,7 @@ class FundingAutoStrategy implements Strategy {
       attempted.add(`${opp.symbol}:${opp.mode}`);
       ctx.state.set("attemptedSymbols", attempted);
 
-      const success = await this.openPosition(ctx, opp, adapters);
+      const success = await this.openPosition(ctx, opp, adapters, sizeUsd);
       if (success) {
         currentCount++;
         perpPerpOpened++;
@@ -461,17 +495,10 @@ class FundingAutoStrategy implements Strategy {
     return adapters;
   }
 
-  /** Resolve cached price for a symbol on a given exchange */
-  private getCachedPrice(ctx: StrategyContext, exchange: string, symbol: string): number {
+  /** Cached (this tick's) price for a symbol on a given exchange; undefined = unknown. */
+  private getCachedPrice(ctx: StrategyContext, exchange: string, symbol: string): number | undefined {
     const cache = ctx.state.get("priceCache") as Map<string, number> | undefined;
-    return cache?.get(`${exchange}:${symbol}`) ?? 0;
-  }
-
-  /** Format size with exchange-appropriate precision based on asset price */
-  private formatSize(rawSize: number, _symbol: string): string {
-    // Use price to determine precision
-    const price = rawSize > 0 ? this.getSizeUsd() / rawSize : 0;
-    return formatSizeForPrice(rawSize, price);
+    return cache?.get(`${exchange}:${symbol}`);
   }
 
   /** Discover existing arb pairs from live exchange positions; `unreadable` = venues whose positions failed to load. */
@@ -576,6 +603,7 @@ class FundingAutoStrategy implements Strategy {
     ctx: StrategyContext,
     opp: FundingOpportunity,
     adapters: Map<string, ExchangeAdapter>,
+    notionalUsd: number,
   ): Promise<boolean> {
     // Engine: equity unknown → no new entries (closes still run).
     if (ctx.state.get("equityUnknown") === true) { ctx.log(`[funding-auto] Skip ${opp.symbol}: equity unknown — no new entries`); return false; }
@@ -584,11 +612,13 @@ class FundingAutoStrategy implements Strategy {
     if (!longAdapter || !shortAdapter) return false;
 
     const price = this.getCachedPrice(ctx, opp.longExchange, opp.symbol)
-      || this.getCachedPrice(ctx, opp.shortExchange, opp.symbol);
-    if (price <= 0) return false;
+      ?? this.getCachedPrice(ctx, opp.shortExchange, opp.symbol);
+    if (price === undefined) {
+      ctx.log(`[funding-auto] Skip ${opp.symbol}: price unknown on ${opp.longExchange} / ${opp.shortExchange}`);
+      return false;
+    }
 
-    const notionalUsd = this.getSizeUsd();
-    const size = this.formatSize(notionalUsd / price, opp.symbol);
+    const size = formatSizeForPrice(notionalUsd / price, price);
 
     // Minimum notional check — skip if below exchange minimums
     if (notionalUsd < MIN_NOTIONAL_USD) {

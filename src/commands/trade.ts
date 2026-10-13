@@ -2010,7 +2010,7 @@ export function registerTradeCommands(
 
   trade
     .command("fills [symbol]")
-    .description("Recent trade fills, optionally filtered by symbol")
+    .description("Recent trade fills, optionally filtered by symbol (Aster: last 7 days, symbols with a position, open order or fill in that window)")
     .option("-l, --limit <n>", "Number of fills", "30")
     .action(async (symbol: string | undefined, opts: { limit: string }) => {
       await withJsonErrors(isJson(), async () => {
@@ -2218,14 +2218,16 @@ export function registerTradeCommands(
 
           // Fetch funding payments (recent) for display
           let fundingBySymbol: Record<string, number> = {};
+          let fundingError: string | null = null;
           try {
             const payments = await adapter.getFundingPayments(50);
             for (const fp of payments) {
               const sym = fp.symbol.toUpperCase();
               fundingBySymbol[sym] = (fundingBySymbol[sym] || 0) + parseFloat(fp.payment);
             }
-          } catch {
-            // funding payments may not be supported on all exchanges
+          } catch (e) {
+            // Shown under the table: funding columns are then unknown, not 0.
+            fundingError = e instanceof Error ? e.message : String(e);
           }
 
           console.clear();
@@ -2253,7 +2255,7 @@ export function registerTradeCommands(
                 `$${formatUsd(p.markPrice)}`,
                 pnlColor(`${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`),
                 pctColor(`${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%`),
-                funding !== 0 ? `$${funding.toFixed(4)}` : "-",
+                fundingError !== null ? chalk.yellow("n/a") : funding !== 0 ? `$${funding.toFixed(4)}` : "-",
               ];
             });
             console.log(makeTable(
@@ -2262,6 +2264,7 @@ export function registerTradeCommands(
             ));
           }
 
+          if (fundingError !== null) console.log(chalk.yellow(`\n  Funding history unavailable (Funding column n/a): ${fundingError}`));
           console.log(chalk.gray(`\n  Refreshing every ${intervalSec}s... Press Ctrl+C to stop.`));
           await new Promise(r => setTimeout(r, intervalSec * 1000));
         }

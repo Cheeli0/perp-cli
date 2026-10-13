@@ -7,9 +7,9 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "http";
 import { WebSocketServer, WebSocket } from "ws";
-import type { ExchangeAdapter, ExchangeBalance, ExchangePosition, ExchangeOrder, ExchangeMarketInfo } from "../exchanges/index.js";
+import type { ExchangeAdapter, ExchangeOrder, ExchangeMarketInfo } from "../exchanges/index.js";
 import { getUI } from "./ui.js";
-import { WsFeedManager, type WsFeedState } from "./ws-feeds.js";
+import { WsFeedManager, isFeedStale, type DashboardBalance, type DashboardPosition } from "./ws-feeds.js";
 
 export interface DashboardExchange {
   name: string;
@@ -39,15 +39,33 @@ export interface DexAssetRow {
   dexes: { dex: string; rate: number; annualizedPct: number; markPrice: number; oi: number }[];
 }
 
+/**
+ * JSON shape served on /api/snapshot and pushed over the WS ("snapshot" messages).
+ *
+ * A venue part that could not be read is null — never a $0 balance / empty list:
+ *   exchanges[].balance / positions / orders: null = unavailable, the reason is in `error`.
+ *   exchanges[].balance.unrealizedPnl, positions[].entryPrice / markPrice / unrealizedPnl: null = unknown.
+ *   exchanges[].feed: live-feed health (WS manager only) — stale = no fresh data (see isFeedStale).
+ *   totals cover only the known values; totals.partial = some venue part was left out,
+ *   totals.unavailable lists which ("<venue>.<part>").
+ */
+export interface DashboardExchangeData {
+  name: string;
+  balance: DashboardBalance | null;
+  positions: DashboardPosition[] | null;
+  orders: ExchangeOrder[] | null;
+  topMarkets: ExchangeMarketInfo[];
+  /** Why topMarkets could not be refreshed (the list shown is the last good read); null = fresh. */
+  marketsError: string | null;
+  /** Why a part is null / the feed is stale; null = everything read. */
+  error: string | null;
+  feed?: { mode: "ws" | "rest" | "connecting"; lastOkAt: number | null; lastError: string | null; stale: boolean };
+  dexBalances?: { name: string; balance: DashboardBalance | null }[];
+}
+
 export interface DashboardSnapshot {
   timestamp: string;
-  exchanges: {
-    name: string;
-    balance: ExchangeBalance;
-    positions: ExchangePosition[];
-    orders: ExchangeOrder[];
-    topMarkets: ExchangeMarketInfo[];
-  }[];
+  exchanges: DashboardExchangeData[];
   totals: {
     equity: number;
     available: number;
@@ -55,6 +73,10 @@ export interface DashboardSnapshot {
     unrealizedPnl: number;
     positionCount: number;
     orderCount: number;
+    /** true = some venue part (or a stale feed) is not reflected in these sums. */
+    partial: boolean;
+    /** "<venue>.<part>" left out of the sums (balance, unrealizedPnl, positions, orders, stale). */
+    unavailable: string[];
   };
   arb: {
     opportunities: ArbOpportunity[];
@@ -78,6 +100,8 @@ export interface DashboardOpts {
 let cachedArb: DashboardSnapshot["arb"] = { opportunities: [], dexArb: [], dexAssets: [], dexNames: [], exchangeStatus: {}, exchangeErrors: {} };
 // Cached market data (polled with arb cycle — market metadata rarely changes)
 const cachedMarkets = new Map<string, ExchangeMarketInfo[]>();
+/** venue → why its last markets refresh failed (cleared on the next good read). */
+const marketsErrors = new Map<string, string>();
 
 /**
  * Find an available port starting from the given port.
@@ -182,8 +206,10 @@ async function pollArbData(): Promise<DashboardSnapshot["arb"]> {
       const spreadB = Math.max(...b.dexes.map((d) => d.annualizedPct)) - Math.min(...b.dexes.map((d) => d.annualizedPct));
       return spreadB - spreadA;
     });
-  } catch {
-    // dex arb unavailable
+  } catch (e) {
+    // Reported next to the funding errors — an empty dex table is never shown as "no opportunities".
+    exchangeStatus = { ...exchangeStatus, dexArb: "error" };
+    exchangeErrors = { ...exchangeErrors, dexArb: e instanceof Error ? e.message : String(e) };
   }
 
   const dexNames = [...dexNamesSet].sort();
@@ -200,8 +226,12 @@ async function pollMarkets(exchanges: DashboardExchange[]): Promise<void> {
       try {
         const markets = await ex.adapter.getMarkets();
         cachedMarkets.set(ex.name, markets.slice(0, 10));
-      } catch {
-        // keep previous cached data
+        marketsErrors.delete(ex.name);
+      } catch (e) {
+        // The last good list stays on screen, flagged by marketsError (never shown as fresh).
+        const msg = e instanceof Error ? e.message : String(e);
+        if (!marketsErrors.has(ex.name)) process.stderr.write(`[warn] dashboard ${ex.name} markets refresh failed: ${msg}\n`);
+        marketsErrors.set(ex.name, msg);
       }
     }),
   );
@@ -214,13 +244,20 @@ function buildSnapshotFromFeeds(feedMgr: WsFeedManager, exchanges: DashboardExch
 
   for (const ex of exchanges) {
     const state = states.get(ex.name);
-    const emptyBal: ExchangeBalance = { equity: "0", available: "0", marginUsed: "0", unrealizedPnl: "0" };
+    if (!state) {
+      exchangeData.push({ name: ex.name, balance: null, positions: null, orders: null, topMarkets: cachedMarkets.get(ex.name) ?? [], marketsError: marketsErrors.get(ex.name) ?? null, error: "no feed" });
+      continue;
+    }
+    const stale = isFeedStale(state);
     exchangeData.push({
       name: ex.name,
-      balance: state?.balance ?? emptyBal,
-      positions: [...(state?.positions ?? [])],  // copy — mergeAndTotal mutates
-      orders: [...(state?.orders ?? [])],
-      topMarkets: cachedMarkets.get(ex.name) ?? [],
+      // Not read yet = null (unavailable), never a $0 / empty placeholder.
+      balance: state.balance,
+      positions: state.positions ? [...state.positions] : null,  // copy — mergeAndTotal mutates
+      orders: state.orders ? [...state.orders] : null,
+      topMarkets: cachedMarkets.get(ex.name) ?? [], marketsError: marketsErrors.get(ex.name) ?? null,
+      error: state.lastError ?? (state.lastOkAt === null ? "no data received yet" : null),
+      feed: { mode: state.mode, lastOkAt: state.lastOkAt, lastError: state.lastError, stale },
     });
   }
 
@@ -234,70 +271,100 @@ async function pollSnapshot(exchanges: DashboardExchange[], feedMgr?: WsFeedMana
     return buildSnapshotFromFeeds(feedMgr, exchanges);
   }
 
-  const { withCache, TTL_ACCOUNT } = await import("../cache.js");
-  const emptyBalance: ExchangeBalance = { equity: "0", available: "0", marginUsed: "0", unrealizedPnl: "0" };
-  const results = await Promise.allSettled(
-    exchanges.map(async (ex) => {
-      const [balance, positions, orders] = await Promise.all([
-        withCache(`dash:${ex.name}:balance`, TTL_ACCOUNT, () => ex.adapter.getBalance()).catch(() => emptyBalance),
-        withCache(`dash:${ex.name}:positions`, TTL_ACCOUNT, () => ex.adapter.getPositions()).catch(() => [] as ExchangePosition[]),
-        withCache(`dash:${ex.name}:orders`, TTL_ACCOUNT, () => ex.adapter.getOpenOrders()).catch(() => [] as ExchangeOrder[]),
-      ]);
-      return { name: ex.name, balance, positions, orders, topMarkets: cachedMarkets.get(ex.name) ?? [] };
-    }),
-  );
-
-  let exchangeData = results
-    .filter((r): r is PromiseFulfilledResult<DashboardSnapshot["exchanges"][0]> => r.status === "fulfilled")
-    .map((r) => r.value);
-
-  return mergeAndTotal(exchangeData);
+  return mergeAndTotal(await readExchangesRest(exchanges));
 }
 
-/** Merge HL dex entries + compute totals */
-function mergeAndTotal(exchangeData: DashboardSnapshot["exchanges"]): DashboardSnapshot {
+/**
+ * REST read of every venue. A failed read is null + its reason in `error` — never a $0
+ * balance or an empty position / order list (those would read as "flat, no money").
+ */
+export async function readExchangesRest(exchanges: DashboardExchange[]): Promise<DashboardExchangeData[]> {
+  const { withCache, TTL_ACCOUNT } = await import("../cache.js");
+  const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
+  return Promise.all(
+    exchanges.map(async (ex) => {
+      const [balance, positions, orders] = await Promise.allSettled([
+        withCache(`dash:${ex.name}:balance`, TTL_ACCOUNT, () => ex.adapter.getBalance()),
+        withCache(`dash:${ex.name}:positions`, TTL_ACCOUNT, () => ex.adapter.getPositions()),
+        withCache(`dash:${ex.name}:orders`, TTL_ACCOUNT, () => ex.adapter.getOpenOrders()),
+      ]);
+      const errs: string[] = [];
+      if (balance.status === "rejected") errs.push(`balance: ${errText(balance.reason)}`);
+      if (positions.status === "rejected") errs.push(`positions: ${errText(positions.reason)}`);
+      if (orders.status === "rejected") errs.push(`orders: ${errText(orders.reason)}`);
+      return {
+        name: ex.name,
+        balance: balance.status === "fulfilled" ? balance.value : null,
+        positions: positions.status === "fulfilled" ? positions.value : null,
+        orders: orders.status === "fulfilled" ? orders.value : null,
+        topMarkets: cachedMarkets.get(ex.name) ?? [], marketsError: marketsErrors.get(ex.name) ?? null,
+        error: errs.length > 0 ? errs.join("; ") : null,
+      };
+    }),
+  );
+}
+
+/** Merge HL dex entries + compute totals. Unknown (null) parts are skipped and listed in totals.unavailable. */
+export function mergeAndTotal(exchangeData: DashboardExchangeData[]): DashboardSnapshot {
+  const unavailable: string[] = [];
+  for (const ex of exchangeData) {
+    if (ex.balance === null) unavailable.push(`${ex.name}.balance`);
+    else if (ex.balance.unrealizedPnl === null) unavailable.push(`${ex.name}.unrealizedPnl`);
+    if (ex.positions === null) unavailable.push(`${ex.name}.positions`);
+    if (ex.orders === null) unavailable.push(`${ex.name}.orders`);
+    if (ex.feed?.stale) unavailable.push(`${ex.name}.stale`);
+  }
+
   // Merge hl:* dex entries into main hyperliquid (same wallet, dex pools are subsets of main balance)
   const hlEntry = exchangeData.find(e => e.name === "hyperliquid");
   if (hlEntry) {
     const dexEntries = exchangeData.filter(e => e.name.startsWith("hl:") && e.name !== "hyperliquid");
     // Main accountValue already includes dex pool funds — DON'T add dex balances (would double-count).
     // Only merge positions/orders, and attach dex breakdown for UI display.
-    const dexBalances: { name: string; balance: ExchangeBalance }[] = [];
+    const dexBalances: { name: string; balance: DashboardBalance | null }[] = [];
     let dexPnlSum = 0;
+    let dexPnlUnknown = false;
     for (const dex of dexEntries) {
       const dexName = dex.name.replace("hl:", "");
-      dexBalances.push({ name: dexName, balance: { ...dex.balance } });
-      hlEntry.positions.push(...dex.positions);
-      hlEntry.orders.push(...dex.orders);
-      dexPnlSum += Number(dex.balance.unrealizedPnl) || 0;
+      dexBalances.push({ name: dexName, balance: dex.balance ? { ...dex.balance } : null });
+      // An unread dex list is not merged; it is listed in totals.unavailable and in hlEntry.error below.
+      if (hlEntry.positions && dex.positions) hlEntry.positions.push(...dex.positions);
+      if (hlEntry.orders && dex.orders) hlEntry.orders.push(...dex.orders);
+      if (dex.balance?.unrealizedPnl == null) dexPnlUnknown = true;
+      else dexPnlSum += Number(dex.balance.unrealizedPnl);
+      if (dex.error) hlEntry.error = hlEntry.error ? `${hlEntry.error}; ${dex.name}: ${dex.error}` : `${dex.name}: ${dex.error}`;
     }
     // Add dex unrealizedPnl to main HL balance (equity already includes dex funds, but PnL doesn't)
-    if (dexPnlSum !== 0) {
-      const hlPnl = Number(hlEntry.balance.unrealizedPnl) || 0;
-      hlEntry.balance = { ...hlEntry.balance, unrealizedPnl: String(hlPnl + dexPnlSum) };
+    if (hlEntry.balance && hlEntry.balance.unrealizedPnl !== null) {
+      hlEntry.balance = {
+        ...hlEntry.balance,
+        unrealizedPnl: dexPnlUnknown ? null : String(Number(hlEntry.balance.unrealizedPnl) + dexPnlSum),
+      };
     }
-    if (dexEntries.length > 0) {
-      (hlEntry as Record<string, unknown>).dexBalances = dexBalances;
-    }
+    if (dexEntries.length > 0) hlEntry.dexBalances = dexBalances;
     exchangeData = exchangeData.filter(e => !e.name.startsWith("hl:") || e.name === "hyperliquid");
   }
 
-  const totals = {
+  const totals: DashboardSnapshot["totals"] = {
     equity: 0,
     available: 0,
     marginUsed: 0,
     unrealizedPnl: 0,
     positionCount: 0,
     orderCount: 0,
+    partial: unavailable.length > 0,
+    unavailable,
   };
 
   for (const ex of exchangeData) {
-    totals.equity += Number(ex.balance.equity) || 0;
-    totals.available += Number(ex.balance.available) || 0;
-    totals.marginUsed += Number(ex.balance.marginUsed) || 0;
-    totals.unrealizedPnl += Number(ex.balance.unrealizedPnl) || 0;
-    totals.positionCount += ex.positions.length;
-    totals.orderCount += ex.orders.length;
+    if (ex.balance) {
+      totals.equity += Number(ex.balance.equity);
+      totals.available += Number(ex.balance.available);
+      totals.marginUsed += Number(ex.balance.marginUsed);
+      if (ex.balance.unrealizedPnl !== null) totals.unrealizedPnl += Number(ex.balance.unrealizedPnl);
+    }
+    if (ex.positions) totals.positionCount += ex.positions.length;
+    if (ex.orders) totals.orderCount += ex.orders.length;
   }
 
   return { timestamp: new Date().toISOString(), exchanges: exchangeData, totals, arb: cachedArb };
@@ -373,8 +440,10 @@ export async function startDashboard(
     try {
       const snap = await pollSnapshot(exchanges, feedMgr);
       ws.send(JSON.stringify({ type: "snapshot", data: snap }));
-    } catch {
-      // ignore
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      process.stderr.write(`[warn] dashboard initial snapshot failed: ${msg}\n`);
+      ws.send(JSON.stringify({ type: "error", data: { message: `initial snapshot failed: ${msg}` } }));
     }
   });
 
@@ -390,12 +459,17 @@ export async function startDashboard(
         ]);
         if (arbResult.status === "fulfilled") {
           cachedArb = arbResult.value;
+        } else {
+          // Keep the last good opportunities on screen but mark them as not refreshed.
+          const msg = arbResult.reason instanceof Error ? arbResult.reason.message : String(arbResult.reason);
+          process.stderr.write(`[warn] dashboard arb refresh failed: ${msg}\n`);
+          cachedArb = { ...cachedArb, exchangeStatus: { ...cachedArb.exchangeStatus, arb: "error" }, exchangeErrors: { ...cachedArb.exchangeErrors, arb: msg } };
         }
         if (hasClients()) {
           broadcast(wss, { type: "arb", data: cachedArb });
         }
-      } catch {
-        // ignore
+      } catch (e) {
+        process.stderr.write(`[warn] dashboard arb broadcast failed: ${e instanceof Error ? e.message : String(e)}\n`);
       }
     };
     pollArbAndMarkets(); // initial fetch

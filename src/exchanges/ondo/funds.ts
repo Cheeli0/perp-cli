@@ -28,7 +28,6 @@ import { ONDO_DEPOSIT_CHAINS, type OndoDepositChain } from "../venues/ondo.js";
 export interface OndoFundsClient {
   get<T>(path: string, query: null): Promise<T>;
   post<T>(path: string, body: unknown): Promise<T>;
-  postNoResult(path: string, body: unknown): Promise<void>;
 }
 
 export const ONDO_DEPOSIT_CREDIT_TIMEOUT_MS = 600_000;

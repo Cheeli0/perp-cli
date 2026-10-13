@@ -298,3 +298,51 @@ export async function cancelBotSymbols(
   }
   log(`  ${tag} Cancel requested for ${[...symbols].join(", ")} on ${[...adapters.keys()].join(", ")}`);
 }
+
+/** Venues whose funding history is CAPABILITY_UNSUPPORTED, already reported once (collectFundingSince). */
+const _fundingUnsupportedLogged = new Set<string>();
+
+/**
+ * Books settled funding not yet booked (shared by the funding-arb and spot-perp bots).
+ * `since[venue]` is a per-venue HIGH-WATER MARK of the newest payment time already booked
+ * (initially `defaultStart`, the bot's start — recovery booked the 24 h before it): only payments
+ * strictly newer are summed, so consecutive reads never count a payment twice. A venue whose read
+ * fails keeps its mark and is re-read next time; the others are booked — one failure never drops
+ * or blocks the rest, and a failed read is never counted as 0. When a catching-up read returns a
+ * full page whose oldest row is still newer than the mark, older payments may be beyond the page
+ * and a warning is logged. `since` is mutated in place.
+ */
+export async function collectFundingSince(
+  adapters: ReadonlyMap<string, { getFundingPayments(limit?: number): Promise<Array<{ time: number; payment: string }>> }>,
+  since: Record<string, number>,
+  defaultStart: number,
+  log: (msg: string) => void,
+): Promise<{ total: number; failed: string[] }> {
+  const PAGE = 50;
+  let total = 0;
+  const failed: string[] = [];
+  for (const [name, a] of adapters) {
+    try {
+      const payments = await a.getFundingPayments(PAGE);
+      const mark = since[name] ?? defaultStart;
+      const fresh = payments.filter(fp => fp.time > mark);
+      const sum = fresh.reduce((s, fp) => s + parseFloat(fp.payment), 0);
+      total += sum;
+      since[name] = fresh.reduce((m, fp) => Math.max(m, fp.time), mark);
+      if (payments.length >= PAGE && fresh.length === payments.length) {
+        log(`  [FUND] ${name}: ${PAGE} unbooked payments in one read — older ones since the last booked payment may be missing from fundingIncome`);
+      }
+      if (Math.abs(sum) > 0.001) log(`  [FUND] ${name}: $${sum.toFixed(4)} funding`);
+    } catch (e) {
+      failed.push(name);
+      // A venue that does not offer funding history at all (QFEX: CAPABILITY_UNSUPPORTED) is said
+      // once per process; a read failure is logged every time.
+      const unsupported = e instanceof PerpError && e.structured.code === "CAPABILITY_UNSUPPORTED";
+      if (!unsupported || !_fundingUnsupportedLogged.has(name)) {
+        log(`  [FUND] ${name}: ${unsupported ? "funding history not supported — its funding is not counted" : "funding history unavailable (re-read next check)"}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      if (unsupported) _fundingUnsupportedLogged.add(name);
+    }
+  }
+  return { total, failed };
+}

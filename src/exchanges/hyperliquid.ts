@@ -14,7 +14,7 @@ import { LocalEvmSigner } from "../signer/index.js";
 import type { AgentMeta } from "../settings.js";
 import { DEFINITE_ORDER_FAILURE_CODES, PerpError, classifyError, extractErrorMessage, orderNotSent, orderOutcomeUnknown, sendFailure, type ErrorCode } from "../errors.js";
 import { parseFiniteVenueNumber, venueRateField } from "../utils/numeric.js";
-import { alignProtectionPrice, floorSize, formatComputedPrice, slippagePrice } from "./precision.js";
+import { alignProtectionPrice, floorSize, formatComputedPrice, slippagePrice, subDecimal } from "./precision.js";
 import { unsupported } from "./trading-v2.js";
 import { buildHlUserSignedAction, hlUserSignedNonceField, signHlL1Action, signHlUserSignedAction, type HlSignature, type HlUserSignedType } from "./hl-signing.js";
 import type { Network } from "./venue.js";
@@ -374,6 +374,30 @@ export function hlL1ActionRejection(type: string, e: unknown): unknown {
     exchange: "hyperliquid", action: type, venueResponse: e.message,
     remediation: "The venue refused the whole request and executed nothing; fix the cause named in the venue message above before sending it again",
   });
+}
+
+/** POST /info userFunding page size (docs: at most 500 rows per response). */
+const HL_FUNDING_PAGE = 500;
+/** 7 days of hourly funding = 168 rows per coin; 20 pages = 10 000 rows (~60 coins). */
+const HL_FUNDING_MAX_PAGES = 20;
+
+/** A required field of an HL info row as a string; missing / empty → EXCHANGE_ERROR. */
+function hlField(row: Record<string, unknown>, key: string, endpoint: string): string {
+  const v = row[key];
+  if ((typeof v === "string" && v !== "") || (typeof v === "number" && Number.isFinite(v))) return String(v);
+  throw new PerpError("EXCHANGE_ERROR", `Hyperliquid ${endpoint} row without a readable ${key}: ${JSON.stringify(row).slice(0, 160)}`, { exchange: "hyperliquid" });
+}
+
+/** historicalOrders status precedence on equal statusTimestamp: open < triggered < any terminal status. */
+function hlStatusRank(status: string): number {
+  return status === "open" ? 0 : status === "triggered" ? 1 : 2;
+}
+
+/** HL side "B" (bid) → buy, "A" (ask) → sell; anything else → EXCHANGE_ERROR. */
+function hlSide(v: unknown, endpoint: string): "buy" | "sell" {
+  if (v === "B") return "buy";
+  if (v === "A") return "sell";
+  throw new PerpError("EXCHANGE_ERROR", `Hyperliquid ${endpoint} row with unknown side ${JSON.stringify(v)}`, { exchange: "hyperliquid" });
 }
 
 export class HyperliquidAdapter implements ExchangeAdapter {
@@ -1882,50 +1906,146 @@ export class HyperliquidAdapter implements ExchangeAdapter {
     }));
   }
 
+  /**
+   * Order history: POST /info {type:"historicalOrders"} ("Retrieve a user's historical orders",
+   * at most 2000 most recent; live 2026-10-13: newest first, each order listed once per status —
+   * e.g. "open" then "filled" — with equal statusTimestamp possible). One row per oid with its
+   * final status (latest statusTimestamp; on a tie a non-"open" status wins). Includes canceled /
+   * rejected orders (the previous userFills read showed fills only). Unreadable rows → EXCHANGE_ERROR.
+   * The info endpoint is account-wide; rows are scoped to this adapter (see _inHistoryScope).
+   */
   async getOrderHistory(limit = 30): Promise<ExchangeOrder[]> {
     this.ensureAddress();
-    const fills = await this._infoPost({ type: "userFills", user: this._address }) as Record<string, unknown>[];
-    return (fills ?? []).slice(0, limit).map((f: Record<string, unknown>) => ({
-      orderId: String(f.oid ?? ""),
-      symbol: this._displaySymbol(String(f.coin ?? "")),
-      side: String(f.side) === "B" ? "buy" as const : String(f.side) === "A" ? "sell" as const : (String(f.side).toLowerCase() as "buy" | "sell"),
-      price: String(f.px ?? "0"),
-      size: String(f.sz ?? ""),
-      filled: String(f.sz ?? ""),
-      status: "filled",
-      type: String(f.dir ?? ""),
-      triggerPrice: null, // fills carry no trigger price
-    }));
+    const rows = await this._infoPost({ type: "historicalOrders", user: this._address });
+    if (!Array.isArray(rows)) {
+      throw new PerpError("EXCHANGE_ERROR", `Hyperliquid historicalOrders returned no list (${JSON.stringify(rows).slice(0, 120)})`, { exchange: "hyperliquid" });
+    }
+    await this._historyScopeReady();
+    const latest = new Map<string, { at: number; status: string; o: Record<string, unknown> }>();
+    for (const row of rows as Array<Record<string, unknown>>) {
+      const o = row.order as Record<string, unknown> | undefined;
+      const at = Number(row.statusTimestamp);
+      if (o === undefined || o === null || typeof row.status !== "string" || !Number.isFinite(at) || (typeof o.oid !== "number" && typeof o.oid !== "string")) {
+        throw new PerpError("EXCHANGE_ERROR", `Hyperliquid historicalOrders row without order / oid / status / statusTimestamp: ${JSON.stringify(row).slice(0, 160)}`, { exchange: "hyperliquid" });
+      }
+      if (!this._inHistoryScope(hlField(o, "coin", "historicalOrders"))) continue;
+      const key = String(o.oid);
+      const prev = latest.get(key);
+      if (prev === undefined || at > prev.at || (at === prev.at && hlStatusRank(row.status) > hlStatusRank(prev.status))) {
+        latest.set(key, { at, status: row.status, o });
+      }
+    }
+    return [...latest.values()].sort((x, y) => y.at - x.at).slice(0, limit).map(({ status, o }) => {
+      const origSz = hlField(o, "origSz", "historicalOrders");
+      const remaining = hlField(o, "sz", "historicalOrders");
+      const triggerPx = Number(o.triggerPx);
+      return {
+        orderId: String(o.oid),
+        symbol: this._displaySymbol(hlField(o, "coin", "historicalOrders")),
+        side: hlSide(o.side, "historicalOrders"),
+        price: hlField(o, "limitPx", "historicalOrders"),
+        size: origSz,
+        filled: subDecimal(origSz, remaining),
+        status,
+        type: hlField(o, "orderType", "historicalOrders"),
+        triggerPrice: o.isTrigger === true && Number.isFinite(triggerPx) && triggerPx > 0 ? String(o.triggerPx) : null,
+      };
+    });
   }
 
+  /** Fills: POST /info {type:"userFills"} (at most 2000 most recent, newest first — live 2026-10-13). */
   async getTradeHistory(limit = 30): Promise<ExchangeTrade[]> {
     this.ensureAddress();
-    const fills = await this._infoPost({ type: "userFills", user: this._address }) as Record<string, unknown>[];
-    return (fills ?? []).slice(0, limit).map((f: Record<string, unknown>) => ({
-      time: Number(f.time ?? 0),
-      symbol: this._displaySymbol(String(f.coin ?? "")),
-      side: String(f.side) === "B" ? "buy" as const : String(f.side) === "A" ? "sell" as const : (String(f.side).toLowerCase() as "buy" | "sell"),
-      price: String(f.px ?? "0"),
-      size: String(f.sz ?? ""),
-      fee: String(f.fee ?? "0"),
-    }));
+    const fills = await this._infoPost({ type: "userFills", user: this._address });
+    if (!Array.isArray(fills)) {
+      throw new PerpError("EXCHANGE_ERROR", `Hyperliquid userFills returned no list (${JSON.stringify(fills).slice(0, 120)})`, { exchange: "hyperliquid" });
+    }
+    await this._historyScopeReady();
+    return (fills as Array<Record<string, unknown>>).filter((f) => this._inHistoryScope(hlField(f, "coin", "userFills"))).slice(0, limit).map((f) => {
+      const time = Number(hlField(f, "time", "userFills"));
+      if (!Number.isFinite(time)) throw new PerpError("EXCHANGE_ERROR", "Hyperliquid userFills row with a non-numeric time", { exchange: "hyperliquid" });
+      return {
+        time,
+        symbol: this._displaySymbol(hlField(f, "coin", "userFills")),
+        side: hlSide(f.side, "userFills"),
+        price: hlField(f, "px", "userFills"),
+        size: hlField(f, "sz", "userFills"),
+        fee: hlField(f, "fee", "userFills"),
+      };
+    });
   }
 
+  /**
+   * Funding payments in this adapter's scope (see _inHistoryScope), newest first, at most `limit`.
+   * Reads the last 24 h first and widens to 7 days only when that holds fewer than `limit` rows
+   * (POST /info userFunding weighs per row returned; bots poll it).
+   */
   async getFundingPayments(limit = 200): Promise<ExchangeFundingPayment[]> {
     this.ensureAddress();
-    // Direct API call — SDK's getUserFunding silently truncates results
-    const apiUrl = this._testnet ? "https://api.hyperliquid-testnet.xyz/info" : "https://api.hyperliquid.xyz/info";
-    const res = await fetch(apiUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ type: "userFunding", user: this._address, startTime: Date.now() - 7 * 24 * 60 * 60 * 1000 }),
-    });
-    const data = await res.json() as { time: number; delta: { coin: string; usdc: string } }[];
-    return (data ?? []).slice(0, limit).map((h) => ({
-      time: h.time,
-      symbol: h.delta.coin + "-PERP",
-      payment: h.delta.usdc,
-    }));
+    await this._historyScopeReady();
+    const now = Date.now();
+    let rows = await this._fundingSince(now - 24 * 60 * 60 * 1000);
+    if (rows.length < limit) rows = await this._fundingSince(now - 7 * 24 * 60 * 60 * 1000);
+    return rows.sort((a, b) => b.time - a.time).slice(0, limit);
+  }
+
+  /**
+   * Every userFunding row since `startTime`. The endpoint returns rows OLDEST first, at most 500
+   * per response (live 2026-10-13), and every coin of a funding hour shares one millisecond — so
+   * pages continue from the last row's time INCLUSIVE and rows are deduped by time + coin (funding
+   * rows carry a zero hash). A full page that adds nothing new, or more than HL_FUNDING_MAX_PAGES
+   * pages → EXCHANGE_ERROR (never a list with payments silently missing).
+   */
+  private async _fundingSince(startTime: number): Promise<ExchangeFundingPayment[]> {
+    const out: ExchangeFundingPayment[] = [];
+    const seen = new Set<string>();
+    let from = startTime;
+    for (let page = 0; ; page++) {
+      if (page >= HL_FUNDING_MAX_PAGES) {
+        throw new PerpError("EXCHANGE_ERROR", `Hyperliquid funding history needs more than ${HL_FUNDING_MAX_PAGES} pages — the result would be incomplete`, { exchange: "hyperliquid" });
+      }
+      const rows = await this._infoPost({ type: "userFunding", user: this._address, startTime: from });
+      if (!Array.isArray(rows)) {
+        throw new PerpError("EXCHANGE_ERROR", `Hyperliquid userFunding returned no list (${JSON.stringify(rows).slice(0, 120)})`, { exchange: "hyperliquid" });
+      }
+      let last = -Infinity;
+      let fresh = 0;
+      for (const h of rows as Array<Record<string, unknown>>) {
+        const time = Number(h.time);
+        const delta = h.delta as Record<string, unknown> | undefined;
+        if (!Number.isFinite(time) || delta === undefined || delta === null || typeof delta.coin !== "string" || delta.coin === "" || typeof delta.usdc !== "string" || delta.usdc === "") {
+          throw new PerpError("EXCHANGE_ERROR", `Hyperliquid userFunding row without time / delta.coin / delta.usdc: ${JSON.stringify(h).slice(0, 160)}`, { exchange: "hyperliquid" });
+        }
+        last = Math.max(last, time);
+        const key = `${time}|${delta.coin}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        fresh++;
+        if (this._inHistoryScope(delta.coin)) out.push({ time, symbol: this._displaySymbol(delta.coin), payment: delta.usdc });
+      }
+      if (rows.length < HL_FUNDING_PAGE) break;
+      if (fresh === 0) {
+        throw new PerpError("EXCHANGE_ERROR", `Hyperliquid returned ${HL_FUNDING_PAGE}+ funding rows at one millisecond (${last}) — paging cannot advance`, { exchange: "hyperliquid" });
+      }
+      from = last;
+    }
+    return out;
+  }
+
+  /** The asset map backs _displaySymbol / _inHistoryScope; load it before mapping history rows. */
+  private async _historyScopeReady(): Promise<void> {
+    if (this._assetMap.size === 0) await this._loadAssetMap();
+    if (this._assetMapError) throw this._assetMapError;
+  }
+
+  /**
+   * Whether an account-wide history row (historicalOrders / userFills / userFunding carry every
+   * dex, spot "@n" / "PAIR/USDC" and outcome "#n" coins) belongs to this adapter: a HIP-3 dex
+   * adapter keeps "<dex>:…" coins, the native adapter keeps native perp coins only.
+   */
+  private _inHistoryScope(coin: string): boolean {
+    if (this._dex) return coin.startsWith(`${this._dex}:`);
+    return !/[:@#/]/.test(coin);
   }
 
   async getFundingHistory(symbol: string, limit = 10): Promise<{ time: number; rate: string; price: string | null }[]> {

@@ -450,6 +450,7 @@ describe("--dry-run prints the plan and loads no key (Aster / Ondo / address boo
     [["--dry-run", "funds", "address-book", "add", "ondo", MASTER]],
     [["funds", "address-book", "add", "ondo", MASTER]],
     [["--dry-run", "funds", "address-book", "add", "aster", MASTER]],
+    [["funds", "address-book", "add"]],
   ])("funds address-book add %j → CAPABILITY_UNSUPPORTED (Ondo withdrawals are web-app only), nothing signed", async (argv) => {
     await expect(program().parseAsync(argv, { from: "user" })).rejects.toMatchObject({ structured: { code: "CAPABILITY_UNSUPPORTED" } });
     expect(masterSigner.signMessage).not.toHaveBeenCalled();

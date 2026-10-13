@@ -383,12 +383,31 @@ export async function getSolanaUsdcBalance(ownerPubkey: string): Promise<number>
     new PublicKey(ASSOCIATED_TOKEN_PROGRAM),
   );
 
+  let info: Awaited<ReturnType<typeof connection.getTokenAccountBalance>>;
   try {
-    const info = await connection.getTokenAccountBalance(ata);
-    return Number(info.value.uiAmount ?? 0);
-  } catch {
-    return 0; // ATA doesn't exist
+    info = await connection.getTokenAccountBalance(ata);
+  } catch (e) {
+    // Only a missing USDC token account is a real 0 balance. Any other RPC failure is unknown:
+    // reporting it as 0 would read as "no USDC" (or, inverted, mask a balance check).
+    if (isSolanaAccountNotFound(e)) return 0;
+    throw new PerpError("EXCHANGE_UNREACHABLE", `Solana USDC balance of ${ownerPubkey} could not be read: ${e instanceof Error ? e.message : String(e)}`, {
+      remediation: "Retry, or set a working Solana RPC (settings rpc.solana) — the balance is unknown, not 0",
+    });
   }
+  // Raw amount / decimals (uiAmount may be null) — a malformed answer is an error, not 0.
+  const raw = Number(info.value.amount);
+  if (!Number.isFinite(raw) || !Number.isInteger(info.value.decimals)) {
+    throw new PerpError("EXCHANGE_ERROR", `Solana RPC returned a malformed USDC balance for ${ownerPubkey}: ${JSON.stringify(info.value)}`, {
+      remediation: "Retry, or set a different Solana RPC (settings rpc.solana)",
+    });
+  }
+  return raw / 10 ** info.value.decimals;
+}
+
+/** RPC "account not found" for getTokenAccountBalance (the ATA was never created ⇒ balance 0). */
+export function isSolanaAccountNotFound(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e);
+  return /could not find account|account not found|AccountNotFound/i.test(msg);
 }
 
 /**
@@ -509,42 +528,42 @@ async function getHyperCoreCctpFees(
   srcDomain: number,
   amount: number,
 ): Promise<{ protocolFee: number; forwardingFee: number; totalFee: number; maxFee: number }> {
+  // SSOT rule #2 (same as getCctpRelayFee): the burn's maxFee comes from Circle's fee schedule.
+  // A hardcoded default (formerly 1bp + $0.20) could under-fee (transfer stuck) or over-fee —
+  // so an unreadable schedule is an error, never a silently-used guess.
   const url = `${HYPERCORE_FEES_API}/${srcDomain}/${HYPERCORE_CCTP_DOMAIN}?forward=true&hyperCoreDeposit=true`;
+  const fail = (why: string) => new PerpError("EXCHANGE_UNREACHABLE", `CCTP HyperCore fee schedule ${srcDomain}→${HYPERCORE_CCTP_DOMAIN} unavailable: ${why} — nothing was sent`, {
+    remediation: "Retry shortly (Circle iris-api); the bridge fee cannot be set without it",
+  });
+  let res: Response;
   try {
-    const res = await fetch(url);
-    if (res.ok) {
-      // API returns array: [{finalityThreshold, minimumFee, forwardFee: {low, med, high}}, ...]
-      const schedules = await res.json() as Array<{
-        finalityThreshold: number;
-        minimumFee: number;
-        feeRate?: number;
-        forwardFee?: { low: number; med: number; high: number };
-      }>;
-      // Use fast transfer schedule (threshold=1000) if available, else first
-      const fast = schedules.find(s => s.finalityThreshold === 1000) ?? schedules[0];
-      if (fast) {
-        const bps = Number(fast.feeRate ?? 1); // basis points, default 1bp
-        const forwardFee = Number(fast.forwardFee?.med ?? fast.forwardFee?.low ?? 200000); // subunits
-        const protocolFee = Math.ceil(amount * 1e6 * bps / 10000);
-        return {
-          protocolFee: protocolFee / 1e6,
-          forwardingFee: forwardFee / 1e6,
-          totalFee: (protocolFee + forwardFee) / 1e6,
-          maxFee: protocolFee + forwardFee, // in subunits for instruction
-        };
-      }
-    }
-  } catch {
-    // fallback to defaults
+    res = await fetch(url);
+  } catch (e) {
+    throw fail(e instanceof Error ? e.message : String(e));
   }
-  // Default: 1bp + $0.20
-  const protocolFee = Math.ceil(amount * 1e6 / 10000);
-  const forwardingFee = 200000;
+  if (!res.ok) throw fail(`HTTP ${res.status}`);
+  // API returns array: [{finalityThreshold, minimumFee, forwardFee: {low, med, high}}, ...]
+  const schedules = await res.json().catch((e: unknown) => { throw fail(`invalid JSON (${e instanceof Error ? e.message : String(e)})`); }) as Array<{
+    finalityThreshold: number;
+    minimumFee: number;
+    feeRate?: number;
+    forwardFee?: { low: number; med: number; high: number };
+  }>;
+  if (!Array.isArray(schedules)) throw fail(`unexpected response ${JSON.stringify(schedules).slice(0, 200)}`);
+  // Use fast transfer schedule (threshold=1000) if available, else the first published tier
+  const fast = schedules.find(s => s.finalityThreshold === 1000) ?? schedules[0];
+  if (!fast) throw fail("no fee schedule");
+  // Protocol fee rate in basis points: feeRate when published, else minimumFee (Circle's bps field).
+  const bps = Number(fast.feeRate ?? fast.minimumFee);
+  const forwardFee = Number(fast.forwardFee?.med ?? fast.forwardFee?.low); // subunits
+  if (!Number.isFinite(bps) || bps < 0) throw fail("schedule without a protocol fee rate");
+  if (!Number.isFinite(forwardFee) || forwardFee < 0) throw fail("schedule without a forwarding fee");
+  const protocolFee = Math.ceil(amount * 1e6 * bps / 10000);
   return {
     protocolFee: protocolFee / 1e6,
-    forwardingFee: 0.20,
-    totalFee: (protocolFee + forwardingFee) / 1e6,
-    maxFee: protocolFee + forwardingFee,
+    forwardingFee: forwardFee / 1e6,
+    totalFee: (protocolFee + forwardFee) / 1e6,
+    maxFee: protocolFee + forwardFee, // in subunits for instruction
   };
 }
 
@@ -2166,9 +2185,20 @@ export async function getAllQuotes(
   ]);
 
   const quotes: BridgeQuote[] = [];
-  for (const r of results) {
+  const failures: string[] = [];
+  const providers = ["cctp", "relay", "debridge"] as const;
+  results.forEach((r, i) => {
     if (r.status === "fulfilled") quotes.push(r.value);
+    else failures.push(`${providers[i]}: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`);
+  });
+  // A provider without this route is normal; still say which ones were left out and why, and
+  // never answer "no quotes" without the reasons.
+  if (quotes.length === 0) {
+    throw new PerpError("NO_BRIDGE_ROUTE", `No bridge quote for ${srcChain} → ${dstChain} (${failures.join("; ")})`, {
+      remediation: "Check the chains / amount, or retry if a provider was unreachable",
+    });
   }
+  if (failures.length > 0) process.stderr.write(`[bridge] providers without a quote: ${failures.join("; ")}\n`);
 
   // Price native fees (deBridge fixFee) so quotes compare on the same basis; an unpriced native
   // fee ranks that quote last (its total cost is unknown), never as free.

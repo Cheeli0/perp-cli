@@ -11,27 +11,67 @@ import type { ExchangeBalance, ExchangePosition, ExchangeOrder } from "../exchan
 import type { DashboardExchange } from "./server.js";
 import type { LighterAdapter } from "../exchanges/lighter.js";
 
+/** Balance as the dashboard knows it: unrealizedPnl null = the venue feed does not report it / unknown. */
+export type DashboardBalance = Omit<ExchangeBalance, "unrealizedPnl"> & { unrealizedPnl: string | null };
+/** Position as the dashboard knows it: a price / PnL the WS message did not carry is null (unknown), never "0". */
+export type DashboardPosition = Omit<ExchangePosition, "entryPrice" | "markPrice" | "unrealizedPnl"> & {
+  entryPrice: string | null;
+  markPrice: string | null;
+  unrealizedPnl: string | null;
+};
+
+/** Venue number → string, or null when the field is absent / not a finite number. */
+function numStr(v: unknown): string | null {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? String(v) : null;
+}
+
 export interface WsFeedState {
-  balance: ExchangeBalance;
-  positions: ExchangePosition[];
-  orders: ExchangeOrder[];
+  /** null = not read yet (never a zero placeholder). */
+  balance: DashboardBalance | null;
+  /** null = not read yet. */
+  positions: DashboardPosition[] | null;
+  /** null = not read yet. */
+  orders: ExchangeOrder[] | null;
   lastUpdate: number;
   mode: "ws" | "rest" | "connecting";
+  /** Last time a venue read / WS message was applied successfully (ms), null = never. */
+  lastOkAt: number | null;
+  /** Last read / parse failure ("<source>: <message>"), null = none since the feed started. */
+  lastError: string | null;
+  lastErrorAt: number | null;
 }
+
+/** A feed is stale when it has no data yet, its last failure is newer than its last success,
+ *  or (polling mode) its last success is older than this. */
+export const FEED_STALE_MS = 30_000;
+
+export function isFeedStale(state: WsFeedState, now = Date.now()): boolean {
+  if (state.lastOkAt === null) return true;
+  if (state.lastErrorAt !== null && state.lastErrorAt > state.lastOkAt) return true;
+  return state.mode !== "ws" && now - state.lastOkAt > FEED_STALE_MS;
+}
+
+/** Log the first failure of a source, then every Nth consecutive one (avoid log spam). */
+const LOG_EVERY_N_FAILURES = 20;
 
 export interface WsFeedManagerOpts {
   onUpdate: (exchange: string, state: WsFeedState) => void;
   signal?: AbortSignal;
 }
 
-const EMPTY_BALANCE: ExchangeBalance = { equity: "0", available: "0", marginUsed: "0", unrealizedPnl: "0" };
 const MAX_RECONNECT_DELAY = 30_000;
 
 // ── Base WS Feed ──
 
 abstract class ExchangeWsFeed {
   protected ws: NodeWebSocket | null = null;
-  protected state: WsFeedState = { balance: { ...EMPTY_BALANCE }, positions: [], orders: [], lastUpdate: 0, mode: "connecting" };
+  protected state: WsFeedState = {
+    balance: null, positions: null, orders: null, lastUpdate: 0, mode: "connecting",
+    lastOkAt: null, lastError: null, lastErrorAt: null,
+  };
+  protected failureCounts = new Map<string, number>();
   protected reconnectDelay = 1000;
   protected reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   protected closed = false;
@@ -52,6 +92,32 @@ abstract class ExchangeWsFeed {
 
   getState(): WsFeedState { return this.state; }
 
+  /** A read / parse succeeded: the data is fresh again. */
+  protected recordOk(source: string) {
+    this.state.lastOkAt = Date.now();
+    this.failureCounts.delete(source);
+  }
+
+  /** A read / parse failed: record it on the state (the UI marks the feed stale) and log it
+   *  on the first failure and every LOG_EVERY_N_FAILURES consecutive ones after that. */
+  protected recordError(source: string, err: unknown) {
+    const msg = this.logFailure(source, err);
+    this.state.lastError = `${source}: ${msg}`;
+    this.state.lastErrorAt = Date.now();
+    this.onUpdate(this.state);
+  }
+
+  /** Log-only (data is still flowing from another path, e.g. REST while WS reconnects). */
+  protected logFailure(source: string, err: unknown): string {
+    const msg = err instanceof Error ? err.message : String(err);
+    const n = (this.failureCounts.get(source) ?? 0) + 1;
+    this.failureCounts.set(source, n);
+    if (n === 1 || n % LOG_EVERY_N_FAILURES === 0) {
+      process.stderr.write(`[warn] dashboard ${this.exchange.name} ${source} failed (${n}x): ${msg}\n`);
+    }
+    return msg;
+  }
+
   /** Start a timer: if no WS data arrives within WS_DATA_TIMEOUT, switch to REST */
   protected startWsDataTimeout() {
     if (this.wsDataTimer) clearTimeout(this.wsDataTimer);
@@ -65,6 +131,7 @@ abstract class ExchangeWsFeed {
 
   protected emitUpdate() {
     this.state.lastUpdate = Date.now();
+    this.state.lastOkAt = this.state.lastUpdate;
     this.wsDataReceived = true;
     // WS is delivering data — stop REST fallback if running
     if (this.state.mode === "rest" && this.ws?.readyState === NodeWebSocket.OPEN) {
@@ -80,9 +147,10 @@ abstract class ExchangeWsFeed {
     try {
       const { setCached, TTL_ACCOUNT } = await import("../cache.js");
       const name = this.exchange.name;
-      setCached(`dash:${name}:balance`, this.state.balance, TTL_ACCOUNT);
-      setCached(`dash:${name}:positions`, this.state.positions, TTL_ACCOUNT);
-      setCached(`dash:${name}:orders`, this.state.orders, TTL_ACCOUNT);
+      // Only data actually read is shared — an unread (null) part is never cached as empty.
+      if (this.state.balance) setCached(`dash:${name}:balance`, this.state.balance, TTL_ACCOUNT);
+      if (this.state.positions) setCached(`dash:${name}:positions`, this.state.positions, TTL_ACCOUNT);
+      if (this.state.orders) setCached(`dash:${name}:orders`, this.state.orders, TTL_ACCOUNT);
     } catch { /* non-fatal */ }
   }
 
@@ -92,7 +160,10 @@ abstract class ExchangeWsFeed {
       try {
         await this.connect();
         this.reconnectDelay = 1000; // reset on success
-      } catch {
+        this.failureCounts.delete("ws-reconnect");
+      } catch (e) {
+        // REST fallback keeps the data flowing; the reconnect failure is logged, not hidden.
+        this.logFailure("ws-reconnect", e);
         this.reconnectDelay = Math.min(this.reconnectDelay * 2, MAX_RECONNECT_DELAY);
         this.scheduleReconnect();
       }
@@ -114,7 +185,10 @@ abstract class ExchangeWsFeed {
         this.state.positions = positions.filter(p => Number(p.size) !== 0);
         this.state.orders = orders;
         this.emitUpdate();
-      } catch { /* ignore */ }
+      } catch (e) {
+        // Keep the last-read data but mark the feed stale (lastError) — never blank it to 0 / empty.
+        this.recordError("rest-poll", e);
+      }
     };
     doRestPoll(); // immediate first fetch
     this.restFallbackTimer = setInterval(doRestPoll, 5000);
@@ -190,7 +264,7 @@ class HyperliquidFeed extends ExchangeWsFeed {
             if (msg.channel === "webData2" && msg.data) {
               this.handleWebData2(msg.data);
             }
-          } catch { /* ignore parse errors */ }
+          } catch (e) { this.recordError("ws-parse", e); }
         });
 
         this.ws.on("close", () => {
@@ -220,7 +294,8 @@ class HyperliquidFeed extends ExchangeWsFeed {
     const poll = async () => {
       try {
         this.state.balance = await this.exchange.adapter.getBalance();
-      } catch { /* ignore */ }
+        this.recordOk("balance-poll");
+      } catch (e) { this.recordError("balance-poll", e); }
     };
     poll(); // immediate
     this.balanceTimer = setInterval(poll, 5000);
@@ -240,19 +315,23 @@ class HyperliquidFeed extends ExchangeWsFeed {
         this.state.positions = assetPositions
           .filter((ap) => {
             const pos = (ap.position ?? ap) as Record<string, unknown>;
-            return Number(pos.szi ?? 0) !== 0;
+            const szi = numStr(pos.szi);
+            if (szi === null) throw new Error(`webData2 position without szi: ${JSON.stringify(pos).slice(0, 200)}`);
+            return Number(szi) !== 0;
           })
           .map((ap) => {
             const pos = (ap.position ?? ap) as Record<string, string>;
             const szi = Number(pos.szi);
+            const posValue = numStr(pos.positionValue);
             return {
               symbol: String(pos.coin ?? ""),
               side: (szi > 0 ? "long" : "short") as "long" | "short",
               size: String(Math.abs(szi)),
-              entryPrice: pos.entryPx ?? "0",
-              markPrice: String(pos.positionValue ? (Number(pos.positionValue) / Math.abs(szi)).toFixed(2) : "0"),
+              // A field the message did not carry is unknown (null), never "0".
+              entryPrice: numStr(pos.entryPx),
+              markPrice: posValue !== null ? (Number(posValue) / Math.abs(szi)).toFixed(2) : null,
               liquidationPrice: pos.liquidationPx ?? null, // HL sends null when there is no liquidation price
-              unrealizedPnl: pos.unrealizedPnl ?? "0",
+              unrealizedPnl: numStr(pos.unrealizedPnl),
               leverage: Number((ap.leverage as Record<string, { value?: number }>)?.value ?? 1),
             };
           });
@@ -275,7 +354,7 @@ class HyperliquidFeed extends ExchangeWsFeed {
       }
 
       this.emitUpdate();
-    } catch { /* ignore */ }
+    } catch (e) { this.recordError("ws-webData2", e); }
   }
 
   close() {
@@ -336,7 +415,7 @@ class PacificaFeed extends ExchangeWsFeed {
             if (ch === "account_info") this.handleAccountInfo(msg.data ?? msg);
             else if (ch === "account_positions") this.handlePositions(msg.data ?? msg);
             else if (ch === "account_order_updates") this.handleOrders(msg.data ?? msg);
-          } catch { /* ignore */ }
+          } catch (e) { this.recordError("ws-parse", e); }
         });
 
         this.ws.on("close", () => {
@@ -376,26 +455,30 @@ class PacificaFeed extends ExchangeWsFeed {
         for (const p of positions) {
           this.markPrices.set(p.symbol, p.markPrice);
         }
+        this.recordOk("mark-poll");
         // Update existing WS positions with mark prices + compute PnL
-        if (this.state.positions.length > 0) {
+        if (this.state.positions && this.state.positions.length > 0) {
           let changed = false;
           for (const pos of this.state.positions) {
             const mark = this.markPrices.get(pos.symbol);
-            if (mark && mark !== "0" && pos.markPrice === "0") {
+            if (mark && Number(mark) > 0 && pos.markPrice !== mark) {
               pos.markPrice = mark;
-              const markNum = Number(mark);
-              const entry = Number(pos.entryPrice);
-              const amount = Number(pos.size);
-              const pnl = pos.side === "long"
-                ? (markNum - entry) * amount
-                : (entry - markNum) * amount;
-              pos.unrealizedPnl = pnl.toFixed(4);
+              if (pos.entryPrice !== null) {
+                const markNum = Number(mark);
+                const entry = Number(pos.entryPrice);
+                const amount = Number(pos.size);
+                const pnl = pos.side === "long"
+                  ? (markNum - entry) * amount
+                  : (entry - markNum) * amount;
+                pos.unrealizedPnl = pnl.toFixed(4);
+              }
               changed = true;
             }
           }
+          if (changed && this.state.balance) this.state.balance = { ...this.state.balance, unrealizedPnl: this.positionsUpnl() };
           if (changed) this.emitUpdate();
         }
-      } catch { /* ignore */ }
+      } catch (e) { this.recordError("mark-poll", e); }
     };
     poll(); // immediate
     this.markPriceTimer = setInterval(poll, 5000);
@@ -407,57 +490,83 @@ class PacificaFeed extends ExchangeWsFeed {
 
   private handleAccountInfo(data: Record<string, unknown>) {
     // Abbreviated fields: ae=account_equity, as=available_to_spend, mu=margin_used
-    const eq = String(data.ae ?? data.account_equity ?? this.state.balance.equity);
-    const av = String(data.as ?? data.available_to_spend ?? this.state.balance.available);
-    const mu = String(data.mu ?? data.margin_used ?? this.state.balance.marginUsed);
-    this.state.balance = { equity: eq, available: av, marginUsed: mu, unrealizedPnl: this.state.balance.unrealizedPnl };
+    // A field missing from this (partial) update keeps its previously-read value; with no
+    // previous value it is unknown → the update is rejected (recorded), never read as 0.
+    const prev = this.state.balance;
+    const eq = numStr(data.ae ?? data.account_equity) ?? prev?.equity;
+    const av = numStr(data.as ?? data.available_to_spend) ?? prev?.available;
+    const mu = numStr(data.mu ?? data.margin_used) ?? prev?.marginUsed;
+    if (eq == null || av == null || mu == null) {
+      this.recordError("ws-account_info", new Error("account_info without equity / available / margin_used"));
+      return;
+    }
+    // account_info carries no unrealized PnL: the sum of the positions' PnL when all are known, else null.
+    this.state.balance = { equity: eq, available: av, marginUsed: mu, unrealizedPnl: this.positionsUpnl() };
     this.emitUpdate();
+  }
+
+  /** Sum of the positions' unrealized PnL; null when positions are unread or any PnL is unknown. */
+  private positionsUpnl(): string | null {
+    const ps = this.state.positions;
+    if (!ps || ps.some(p => p.unrealizedPnl === null)) return null;
+    return ps.reduce((s, p) => s + Number(p.unrealizedPnl), 0).toFixed(4);
   }
 
   private handlePositions(data: unknown) {
     if (!Array.isArray(data)) return;
     // WS uses abbreviated fields: s=symbol, d=side, a=amount, p=entry_price, l=liquidation, m=margin
-    this.state.positions = data
-      .filter((p: Record<string, unknown>) => {
-        const amount = Number(p.a ?? p.amount ?? 0);
-        const symbol = p.s ?? p.symbol;
-        return amount !== 0 && symbol;
-      })
-      .map((p: Record<string, unknown>) => {
-        const symbol = String(p.s ?? p.symbol ?? "");
-        const side = String(p.d ?? p.side ?? "") === "bid" ? "long" as const : "short" as const;
-        const size = Number(p.a ?? p.amount ?? 0);
-        const entryPrice = Number(p.p ?? p.entry_price ?? 0);
-        const mark = this.markPrices.get(symbol);
-        const markNum = mark ? Number(mark) : 0;
-        const pnl = markNum > 0
-          ? (side === "long" ? (markNum - entryPrice) * size : (entryPrice - markNum) * size)
-          : 0;
-        return {
-          symbol,
-          side,
-          size: String(size),
-          entryPrice: String(entryPrice),
-          markPrice: mark ?? "0",
-          liquidationPrice: p.l != null ? String(p.l) : p.liquidation_price != null ? String(p.liquidation_price) : null,
-          unrealizedPnl: pnl.toFixed(4),
-          leverage: Number(p.leverage ?? 1),
-        };
+    const positions: DashboardPosition[] = [];
+    for (const p of data as Record<string, unknown>[]) {
+      const symbol = p.s ?? p.symbol;
+      const amount = numStr(p.a ?? p.amount);
+      if (!symbol || amount === null) {
+        // A row without a symbol / amount cannot be shown — reported, not read as "no position".
+        this.recordError("ws-account_positions", new Error(`position row without symbol/amount: ${JSON.stringify(p).slice(0, 200)}`));
+        continue;
+      }
+      const size = Number(amount);
+      if (size === 0) continue;
+      const side = String(p.d ?? p.side ?? "") === "bid" ? "long" as const : "short" as const;
+      const entry = numStr(p.p ?? p.entry_price);
+      const mark = this.markPrices.get(String(symbol)) ?? null;
+      const markNum = mark !== null ? Number(mark) : NaN;
+      // PnL needs both prices; unknown (null) otherwise — never 0.
+      const pnl = entry !== null && markNum > 0
+        ? (side === "long" ? (markNum - Number(entry)) * size : (Number(entry) - markNum) * size).toFixed(4)
+        : null;
+      positions.push({
+        symbol: String(symbol),
+        side,
+        size: String(size),
+        entryPrice: entry,
+        markPrice: mark,
+        liquidationPrice: p.l != null ? String(p.l) : p.liquidation_price != null ? String(p.liquidation_price) : null,
+        unrealizedPnl: pnl,
+        leverage: Number(p.leverage ?? 1),
       });
+    }
+    this.state.positions = positions;
+    if (this.state.balance) this.state.balance = { ...this.state.balance, unrealizedPnl: this.positionsUpnl() };
     this.emitUpdate();
   }
 
   private handleOrders(data: unknown) {
     if (!Array.isArray(data)) return;
-    this.state.orders = data
-      .filter((o: Record<string, unknown>) => String(o.os ?? o.order_status ?? "") === "open")
+    const open = data.filter((o: Record<string, unknown>) => String(o.os ?? o.order_status ?? "") === "open");
+    // A row without a readable price / size / filled amount is reported, never shown as "0".
+    const readable = open.filter((o: Record<string, unknown>) => {
+      const ok = numStr(o.p ?? o.price) !== null && numStr(o.a ?? o.amount) !== null && numStr(o.f ?? o.filled) !== null;
+      if (!ok) this.recordError("order-row", `order ${String(o.i ?? o.order_id ?? "?")} without price / amount / filled`);
+      return ok;
+    });
+    this.state.orders = readable
       .map((o: Record<string, unknown>) => ({
         orderId: String(o.i ?? o.order_id ?? ""),
         symbol: String(o.s ?? o.symbol ?? ""),
         side: (o.d ?? o.side) === "bid" ? "buy" as const : "sell" as const,
-        price: String(o.p ?? o.price ?? "0"),
-        size: String(o.a ?? o.amount ?? ""),
-        filled: String(o.f ?? o.filled ?? "0"),
+        price: numStr(o.p ?? o.price)!,
+        size: numStr(o.a ?? o.amount)!,
+        filled: numStr(o.f ?? o.filled)!,
         status: "open",
         type: String(o.ot ?? o.order_type ?? ""),
         triggerPrice: Number(o.sp ?? o.stop_price) > 0 ? String(o.sp ?? o.stop_price) : null,
@@ -508,7 +617,9 @@ class LighterFeed extends ExchangeWsFeed {
       const deadline = Math.floor(Date.now() / 1000) + 3600;
       const auth = await adapter.signer.createAuthToken(deadline);
       return auth.authToken;
-    } catch {
+    } catch (e) {
+      // No token → REST polling serves the data; the signer failure is logged, not hidden.
+      this.logFailure("ws-auth", e);
       return null;
     }
   }
@@ -552,7 +663,7 @@ class LighterFeed extends ExchangeWsFeed {
           try {
             const msg = JSON.parse(String(raw));
             this.handleMessage(msg);
-          } catch { /* ignore */ }
+          } catch (e) { this.recordError("ws-parse", e); }
         });
 
         this.ws.on("close", () => {
@@ -586,11 +697,22 @@ class LighterFeed extends ExchangeWsFeed {
       const stats = (msg.stats ?? msg) as Record<string, unknown>;
       // total_stats includes cross-margin + isolated totals
       const src = (stats.total_stats ?? stats) as Record<string, unknown>;
-      const equity = String(src.portfolio_value ?? src.collateral ?? this.state.balance.equity);
-      const available = String(src.available_balance ?? this.state.balance.available);
-      const marginUsed = String(src.margin_usage ?? this.state.balance.marginUsed);
-      this.state.balance = { equity, available, marginUsed, unrealizedPnl: this.state.balance.unrealizedPnl };
-      this.emitUpdate();
+      // A field missing from this update keeps its previously-read value; never read as 0.
+      const prev = this.state.balance;
+      const equity = numStr(src.portfolio_value ?? src.collateral) ?? prev?.equity;
+      const available = numStr(src.available_balance) ?? prev?.available;
+      const marginUsed = numStr(src.margin_usage) ?? prev?.marginUsed;
+      if (equity == null || available == null || marginUsed == null) {
+        this.recordError("ws-user_stats", new Error("user_stats without portfolio_value / available_balance / margin_usage"));
+      } else {
+        // user_stats carries no unrealized PnL: the sum over the positions when all are known, else null.
+        const ps = this.state.positions;
+        const upnl = ps && ps.every(p => p.unrealizedPnl !== null)
+          ? ps.reduce((s, p) => s + Number(p.unrealizedPnl), 0).toFixed(4)
+          : null;
+        this.state.balance = { equity, available, marginUsed, unrealizedPnl: upnl };
+        this.emitUpdate();
+      }
     }
 
     // Positions: subscribed/ = full snapshot, update/ = incremental
@@ -613,19 +735,26 @@ class LighterFeed extends ExchangeWsFeed {
 
         // Rebuild positions from map
         this.state.positions = [...this.positionMap.values()]
-          .filter(p => Number(p.position ?? 0) !== 0)
+          .filter(p => {
+            // A position entry without a size cannot be shown — reported, not read as flat.
+            if (numStr(p.position) === null) {
+              this.recordError("ws-account_all_positions", new Error(`position without size (market ${String(p.market_id)})`));
+              return false;
+            }
+            return Number(p.position) !== 0;
+          })
           .map(p => {
-            const posSize = Number(p.position ?? 0);
+            const posSize = Number(p.position);
+            const posValue = numStr(p.position_value);
             return {
               symbol: String(p.symbol ?? `Market-${p.market_id}`),
               side: (Number(p.sign) > 0 ? "long" : "short") as "long" | "short",
               size: String(Math.abs(posSize)),
-              entryPrice: String(p.avg_entry_price ?? "0"),
-              markPrice: posSize !== 0
-                ? String((Number(p.position_value ?? 0) / Math.abs(posSize)).toFixed(4))
-                : "0",
+              // A field the message did not carry is unknown (null), never "0".
+              entryPrice: numStr(p.avg_entry_price),
+              markPrice: posValue !== null ? String((Number(posValue) / Math.abs(posSize)).toFixed(4)) : null,
               liquidationPrice: p.liquidation_price ? String(p.liquidation_price) : null,
-              unrealizedPnl: String(p.unrealized_pnl ?? "0"),
+              unrealizedPnl: numStr(p.unrealized_pnl),
               leverage: Number(p.initial_margin_fraction ?? 0) > 0
                 ? Math.round(10000 / Number(p.initial_margin_fraction))
                 : 1,
@@ -640,19 +769,27 @@ class LighterFeed extends ExchangeWsFeed {
       const orders = msg.orders as Record<string, Record<string, unknown>[]> | undefined;
       if (orders) {
         const allOrders = Object.values(orders).flat();
-        this.state.orders = allOrders
-          .filter(o => String(o.status ?? "") === "open")
-          .map(o => ({
+        // A row without a readable price / size / filled / type is reported, never shown as "0" / "limit".
+        const rows: ExchangeOrder[] = [];
+        for (const o of allOrders.filter(o => String(o.status ?? "") === "open")) {
+          const price = numStr(o.price);
+          const size = numStr(o.remaining_base_amount ?? o.initial_base_amount);
+          const filled = numStr(o.filled_base_amount);
+          if (price === null || size === null || filled === null || typeof o.type !== "string" || o.type === "") {
+            this.recordError("order-row", `order ${String(o.order_id ?? o.order_index ?? "?")} without price / size / filled / type`);
+            continue;
+          }
+          rows.push({
             orderId: String(o.order_id ?? o.order_index ?? ""),
             symbol: String(o.symbol ?? ""),
             side: (o.side === "buy" || o.is_ask === false ? "buy" : "sell") as "buy" | "sell",
-            price: String(o.price ?? "0"),
-            size: String(o.remaining_base_amount ?? o.initial_base_amount ?? ""),
-            filled: String(o.filled_base_amount ?? "0"),
+            price, size, filled,
             status: "open",
-            type: String(o.type ?? "limit"),
+            type: o.type,
             triggerPrice: Number(o.trigger_price) > 0 ? String(o.trigger_price) : null,
-          }));
+          });
+        }
+        this.state.orders = rows;
         this.emitUpdate();
       }
     }

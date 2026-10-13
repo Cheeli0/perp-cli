@@ -11,7 +11,7 @@ import {
 } from "../../shared-api.js";
 import { computeBasisRisk } from "../../arb-utils.js";
 import { removePosition as persistRemovePosition, getPositions as getArbStatePositions, loadArbState } from "../../arb-state.js";
-import { fetchAllBalances, computeRebalancePlan } from "../../rebalance.js";
+import { fetchBalancesWithFailures, computeRebalancePlan } from "../../rebalance.js";
 import { EXCHANGE_TO_CHAIN, getBestQuote } from "../../bridge-engine.js";
 import { computeEnhancedStats, type ArbTradeForStats } from "../../arb-history-stats.js";
 import { listBotSpotVenues, nonQuoteSpotBalances, requireSpotAdapter, spotNetworkOf } from "../../exchanges/spot-factory.js";
@@ -91,14 +91,24 @@ interface SpotPerpPosition {
   perpUnrealizedPnl: number;
   perpLeverage: number;
   perpNotionalUsd: number;
-  direction: "long-spot-short-perp" | "sell-spot-long-perp";
+  /** null = the perp venue's funding rate is unknown (not published / rates unreadable) */
+  direction: "long-spot-short-perp" | "sell-spot-long-perp" | null;
   currentSpread: number | null;
   holdDuration: string | null;
   holdDurationMs: number | null;
   estimatedFundingIncome: number;
+  /**
+   * "actual" = settled payments read from the venue; "partial" = read, but the history may not
+   * reach back to the entry (full page, or Aster's 7-day window — see fundingError); "estimate" =
+   * rate × hold time (history unreadable, see fundingError); "recorded" = the bot's persisted
+   * accumulatedFunding.
+   */
+  fundingSource: "actual" | "partial" | "estimate" | "recorded";
+  fundingError: string | null;
   estimatedFees: number;
   netPnl: number;
-  dailyFundingEstimate: number;
+  /** null = funding rate unknown (never 0) */
+  dailyFundingEstimate: number | null;
 }
 
 interface ArbHistoryTrade {
@@ -139,6 +149,35 @@ export async function listArbVenues(): Promise<string[]> {
  * positions read fails is an error (Rule #2): an unread venue is not "no positions" —
  * a hidden leg would make a live pair look closed.
  */
+/**
+ * Adapters for `arb rebalance`. A venue the user listed explicitly (--exchanges) that cannot
+ * be opened is refused with a PerpError naming venue + cause; from the default list it is
+ * skipped with a stderr warning naming venue + cause (never silently).
+ */
+export async function resolveRebalanceAdapters(
+  names: readonly string[],
+  explicit: boolean,
+  getAdapter: (exchange: string) => Promise<ExchangeAdapter>,
+  warn: (msg: string) => void = (m) => process.stderr.write(`${m}\n`),
+): Promise<Map<string, ExchangeAdapter>> {
+  const out = new Map<string, ExchangeAdapter>();
+  for (const name of names) {
+    try {
+      out.set(name, await getAdapter(name));
+    } catch (e) {
+      const c = classifyError(e, name);
+      if (explicit) {
+        throw new PerpError(c.code as ConstructorParameters<typeof PerpError>[0], `Cannot open ${name}: ${c.message}`, {
+          exchange: name,
+          remediation: `Check ${name} credentials / connectivity (perp account balance -e ${name}), or drop it from --exchanges`,
+        });
+      }
+      warn(`[arb rebalance] ${name} unavailable — skipped: ${c.message}`);
+    }
+  }
+  return out;
+}
+
 export async function readArbVenuePositions(
   venues: readonly string[],
   getAdapter: (exchange: string) => Promise<ExchangeAdapter>,
@@ -169,6 +208,24 @@ function formatDuration(ms: number): string {
   if (hours > 0) return `${hours}h`;
   const minutes = Math.floor(ms / (1000 * 60));
   return `${minutes}m`;
+}
+
+/**
+ * Spot-perp funding view from the perp venue's current rate entry. A missing entry → every
+ * field null ("unknown"): never a 0 rate / 0 daily income / a guessed direction.
+ */
+export function spotPerpFundingView(
+  perpRate: { exchange: string; rate: number; fundingHours: number | null } | undefined,
+  perpNotional: number,
+): { hourlyRate: number | null; annualPct: number | null; direction: "long-spot-short-perp" | "sell-spot-long-perp" | null; dailyFundingEstimate: number | null } {
+  if (perpRate === undefined) return { hourlyRate: null, annualPct: null, direction: null, dailyFundingEstimate: null };
+  const hourlyRate = entryHourly(perpRate);
+  return {
+    hourlyRate,
+    annualPct: hourlyRate * 8760 * 100,
+    direction: hourlyRate >= 0 ? "long-spot-short-perp" : "sell-spot-long-perp",
+    dailyFundingEstimate: Math.abs(hourlyRate) * perpNotional * 24,
+  };
 }
 
 /** hourly rate of a rate entry: the entry's own interval (Aster, per symbol) or the venue basis. */
@@ -406,7 +463,9 @@ export function registerArbManageCommands(
       let rateMap: Map<string, { exchange: string; rate: number; markPrice: number; fundingHours: number | null }[]>;
       try {
         rateMap = await fetchFundingRatesMap();
-      } catch {
+      } catch (e) {
+        // Reported, not silent: every spread / funding rate below shows as unknown (null), never 0.
+        process.stderr.write(`[warn] funding rates unavailable — spreads and daily funding shown as unknown: ${e instanceof Error ? e.message : String(e)}\n`);
         rateMap = new Map();
       }
 
@@ -578,18 +637,20 @@ export function registerArbManageCommands(
             // Get current perp funding rate for this symbol on this exchange
             const rates = rateMap.get(perpSymbol);
             const perpRate = rates?.find(r => r.exchange === shortPos.exchange);
-            const fundingRate = perpRate?.rate ?? 0;
-            const hourlyRate = perpRate && fundingRate ? entryHourly(perpRate) : 0;
-            const annualPct = hourlyRate * 8760 * 100;
-
             const perpNotional = shortPos.size * shortPos.markPrice;
+            // Unknown rate → hourlyRate / annualPct / direction / dailyFundingEstimate are null (never 0).
+            const { hourlyRate, annualPct, direction, dailyFundingEstimate } = spotPerpFundingView(perpRate, perpNotional);
+
             const spotValueUsd = arbSpotAmount * shortPos.markPrice; // approx using perp mark price
 
             // Funding income: fetch actual payments from exchange API
             let actualFundingIncome = 0;
+            let fundingSource: "actual" | "partial" | "estimate" = "actual";
+            let fundingError: string | null = null;
             try {
               const perpAdapter = await getAdapterForExchange(shortPos.exchange);
-              const payments = await perpAdapter.getFundingPayments(200);
+              const FUNDING_PAGE = 200;
+              const payments = await perpAdapter.getFundingPayments(FUNDING_PAGE);
               // Filter from entry time minus 1h buffer (multi-leg entry takes time)
               const entryTime = persisted ? new Date(persisted.entryTime).getTime() - 3600000 : 0;
               for (const p of payments) {
@@ -597,9 +658,20 @@ export function registerArbManageCommands(
                   actualFundingIncome += Number(p.payment);
                 }
               }
-            } catch {
-              // Fallback to estimate if API fails
-              if (holdDurationMs && hourlyRate !== 0) {
+              // The read may not reach back to the entry: a full page, or Aster's 7-day income window.
+              const sevenDaysAgo = Date.now() - 7 * 86_400_000;
+              if (payments.length >= FUNDING_PAGE) {
+                fundingSource = "partial";
+                fundingError = `${FUNDING_PAGE} payments returned (page full) — older funding since entry may be missing`;
+              } else if (shortPos.exchange === "aster" && (!entryTime || entryTime < sevenDaysAgo)) {
+                fundingSource = "partial";
+                fundingError = "Aster funding history covers the last 7 days only — funding before that is not included";
+              }
+            } catch (e) {
+              // History unreadable: an explicit, labelled estimate (fundingSource / fundingError), never a silent one.
+              fundingSource = "estimate";
+              fundingError = e instanceof Error ? e.message : String(e);
+              if (holdDurationMs && hourlyRate !== null && hourlyRate !== 0) {
                 const holdHours = holdDurationMs / (1000 * 60 * 60);
                 actualFundingIncome = Math.abs(hourlyRate) * perpNotional * holdHours;
                 if (hourlyRate < 0) actualFundingIncome = -actualFundingIncome;
@@ -612,9 +684,6 @@ export function registerArbManageCommands(
             const spotFee = getTakerFee(spotEx);
             const perpFee = getTakerFee(shortPos.exchange);
             const entryFees = (spotValueUsd * spotFee) + (perpNotional * perpFee);
-
-            const direction = hourlyRate >= 0 ? "long-spot-short-perp" as const : "sell-spot-long-perp" as const;
-            const dailyFundingEstimate = Math.abs(hourlyRate) * perpNotional * 24;
 
             spotPerpPositions.push({
               symbol: perpSymbol,
@@ -635,10 +704,12 @@ export function registerArbManageCommands(
               perpLeverage: shortPos.leverage,
               perpNotionalUsd: perpNotional,
               direction,
-              currentSpread: annualPct || null,
+              currentSpread: annualPct,
               holdDuration,
               holdDurationMs,
               estimatedFundingIncome,
+              fundingSource,
+              fundingError,
               estimatedFees: entryFees,
               netPnl: (spotValueUsd - shortPos.entryPrice * arbSpotAmount) + shortPos.unrealizedPnl + estimatedFundingIncome - entryFees,
               dailyFundingEstimate,
@@ -664,8 +735,8 @@ export function registerArbManageCommands(
         const holdDurationMs = Date.now() - new Date(persisted.entryTime).getTime();
         const rates = rateMap.get(sym);
         const perpRate = rates?.find(r => r.exchange === persisted.shortExchange);
-        const hourlyRate = perpRate ? entryHourly(perpRate) : 0;
         const perpNotional = shortPos.size * shortPos.markPrice;
+        const fv = spotPerpFundingView(perpRate, perpNotional);
 
         spotPerpPositions.push({
           symbol: sym,
@@ -685,14 +756,16 @@ export function registerArbManageCommands(
           perpUnrealizedPnl: shortPos.unrealizedPnl,
           perpLeverage: shortPos.leverage,
           perpNotionalUsd: perpNotional,
-          direction: hourlyRate >= 0 ? "long-spot-short-perp" : "sell-spot-long-perp",
-          currentSpread: hourlyRate ? Math.abs(hourlyRate) * 8760 * 100 : null,
+          direction: fv.direction,
+          currentSpread: fv.annualPct === null ? null : Math.abs(fv.annualPct),
           holdDuration: formatDuration(holdDurationMs),
           holdDurationMs,
           estimatedFundingIncome: persisted.accumulatedFunding ?? 0,
+          fundingSource: "recorded",
+          fundingError: null,
           estimatedFees: 0,
           netPnl: shortPos.unrealizedPnl + (persisted.accumulatedFunding ?? 0),
-          dailyFundingEstimate: Math.abs(hourlyRate) * perpNotional * 24,
+          dailyFundingEstimate: fv.dailyFundingEstimate,
         });
       }
 
@@ -704,12 +777,14 @@ export function registerArbManageCommands(
       const unconfirmedPairs = arbPairs.filter(p => p.provenance === "inferred");
       arbPairs.splice(0, arbPairs.length, ...arbPairs.filter(p => p.provenance !== "inferred"));
 
+      const fundingUnknownSP = spotPerpPositions.filter(p => p.dailyFundingEstimate === null).map(p => `${p.perpExchange}:${p.symbol}`);
+
       // ── JSON output ──
       if (isJson()) {
         const totalNotionalPP = arbPairs.reduce((s, p) => s + (p.longPosition.notionalUsd + p.shortPosition.notionalUsd) / 2, 0);
         const totalDailyPP = arbPairs.reduce((s, p) => s + p.dailyFundingEstimate, 0);
         const totalNotionalSP = spotPerpPositions.reduce((s, p) => s + p.perpNotionalUsd, 0);
-        const totalDailySP = spotPerpPositions.reduce((s, p) => s + p.dailyFundingEstimate, 0);
+        const totalDailySP = spotPerpPositions.reduce((s, p) => s + (p.dailyFundingEstimate ?? 0), 0);
         const totalNotionalJ = totalNotionalPP + totalNotionalSP;
         const totalDailyJ = totalDailyPP + totalDailySP;
         return printJson(jsonOk({
@@ -729,6 +804,9 @@ export function registerArbManageCommands(
             netPnl: arbPairs.reduce((s, p) => s + p.netPnl, 0) + spotPerpPositions.reduce((s, p) => s + p.netPnl, 0),
             dailyFundingEstimate: totalDailyJ,
             annualizedApr: totalNotionalJ > 0 ? (totalDailyJ * 365 / totalNotionalJ) * 100 : 0,
+            // Spot-perp positions whose funding rate is unknown are excluded from the daily / APR sums.
+            dailyFundingIncomplete: fundingUnknownSP.length > 0,
+            fundingUnknown: fundingUnknownSP,
           },
         }));
       }
@@ -820,12 +898,12 @@ export function registerArbManageCommands(
           console.log(chalk.white.bold("  PnL Breakdown:"));
           console.log(`    Spot PnL:        ${formatPnl(spotPnl)}`);
           console.log(`    Perp PnL:        ${formatPnl(sp.perpUnrealizedPnl)}`);
-          console.log(`    Funding Earned:  ${chalk.yellow(`$${sp.estimatedFundingIncome.toFixed(4)}`)}`);
+          console.log(`    Funding Earned:  ${chalk.yellow(`$${sp.estimatedFundingIncome.toFixed(4)}`)}${sp.fundingSource === "estimate" ? chalk.yellow(` (estimate — funding history unavailable: ${sp.fundingError})`) : sp.fundingSource === "partial" ? chalk.yellow(` (partial: ${sp.fundingError})`) : ""}`);
           console.log(`    Trading Fees:    ${chalk.red(`-$${sp.estimatedFees.toFixed(4)}`)}`);
           console.log(`    ${chalk.white.bold("Total PnL:")}       ${formatPnl(sp.netPnl)}${roi !== 0 ? chalk.gray(` (ROI: ${roi >= 0 ? "+" : ""}${roi.toFixed(2)}%)`) : ""}`);
           console.log("");
           console.log(`    Current Spread:  ${spreadStr}`);
-          console.log(`    Daily Income:    ${chalk.cyan(`$${sp.dailyFundingEstimate.toFixed(4)}/day`)}`);
+          console.log(`    Daily Income:    ${sp.dailyFundingEstimate === null ? chalk.yellow(`unknown (no current ${sp.perpExchange} funding rate)`) : chalk.cyan(`$${sp.dailyFundingEstimate.toFixed(4)}/day`)}`);
           if (annRoi !== 0) console.log(`    Annualized ROI:  ${chalk.cyan(`${annRoi >= 0 ? "+" : ""}${annRoi.toFixed(1)}%`)}`);
         }
         console.log("");
@@ -841,7 +919,7 @@ export function registerArbManageCommands(
       const totalNet = arbPairs.reduce((s, p) => s + p.netPnl, 0)
         + spotPerpPositions.reduce((s, p) => s + p.netPnl, 0);
       const totalDailyFunding = arbPairs.reduce((s, p) => s + p.dailyFundingEstimate, 0)
-        + spotPerpPositions.reduce((s, p) => s + p.dailyFundingEstimate, 0);
+        + spotPerpPositions.reduce((s, p) => s + (p.dailyFundingEstimate ?? 0), 0);
       const totalNotional = arbPairs.reduce((s, p) => s + (p.longPosition.notionalUsd + p.shortPosition.notionalUsd) / 2, 0)
         + spotPerpPositions.reduce((s, p) => s + p.perpNotionalUsd, 0);
       const portfolioApr = totalNotional > 0 ? (totalDailyFunding * 365 / totalNotional) * 100 : 0;
@@ -854,7 +932,7 @@ export function registerArbManageCommands(
       console.log(`    Est. Funding:    ${chalk.yellow(`$${totalFunding.toFixed(4)}`)}`);
       console.log(`    Est. Fees:       ${chalk.red(`-$${totalFees.toFixed(4)}`)}`);
       console.log(`    Net PnL:         ${formatPnl(totalNet)}`);
-      console.log(`    Daily Income:    ${chalk.cyan(`$${totalDailyFunding.toFixed(4)}/day`)}`);
+      console.log(`    Daily Income:    ${chalk.cyan(`$${totalDailyFunding.toFixed(4)}/day`)}${fundingUnknownSP.length > 0 ? chalk.yellow(` (incomplete — funding rate unknown: ${fundingUnknownSP.join(", ")})`) : ""}`);
       if (portfolioApr > 0) {
         console.log(`    Portfolio APR:   ${chalk.cyan(`${portfolioApr.toFixed(1)}%`)}`);
       }
@@ -1519,11 +1597,9 @@ export function registerArbManageCommands(
       const exchangeNames = opts.exchanges.split(",").map(e => e.trim());
       const adapters = new Map<string, ExchangeAdapter>();
 
-      for (const name of exchangeNames) {
-        try {
-          adapters.set(name, await getAdapterForExchange(name));
-        } catch { /* skip unavailable */ }
-      }
+      // Explicit --exchanges → an unavailable venue refuses (PerpError); the default list → skipped with a stderr warning.
+      const explicitExchanges = cmd.getOptionValueSource("exchanges") === "cli";
+      for (const [name, adapter] of await resolveRebalanceAdapters(exchangeNames, explicitExchanges, getAdapterForExchange)) adapters.set(name, adapter);
 
       if (adapters.size === 0) {
         if (isJson()) return printJson(jsonOk({ error: "No exchanges available" }));
@@ -1536,7 +1612,8 @@ export function registerArbManageCommands(
         opts.check = true;
       }
 
-      const snapshots = await fetchAllBalances(adapters);
+      // A venue whose balance read failed is reported (never dropped from the totals silently).
+      const { snapshots, failed: unavailable, notConfigured } = await fetchBalancesWithFailures(adapters);
       const totalEquity = snapshots.reduce((s, e) => s + e.equity, 0);
       const totalAvailable = snapshots.reduce((s, e) => s + e.available, 0);
 
@@ -1559,6 +1636,9 @@ export function registerArbManageCommands(
             })),
             totalEquity,
             totalAvailable,
+            unavailable,
+            notConfigured,
+            partial: unavailable.length > 0,
           }));
         }
 
@@ -1584,7 +1664,17 @@ export function registerArbManageCommands(
         console.log(`  Total Equity:    $${formatUsd(totalEquity)}`);
         console.log(`  Total Available: $${formatUsd(totalAvailable)}`);
         console.log(`  Exchanges:       ${snapshots.length}\n`);
+        for (const f of unavailable) console.log(chalk.yellow(`  ⚠ ${f.exchange} balance unavailable (not in the totals): ${f.error}`));
+        for (const n of notConfigured) console.log(chalk.gray(`  ${n}: not configured (no credentials) — left out`));
+        if (unavailable.length > 0) console.log();
         return;
+      }
+
+      // A plan over fewer venues than requested would move funds on a wrong picture — refuse.
+      if (unavailable.length > 0) {
+        throw new PerpError("EXCHANGE_ERROR", `Rebalance plan refused: balance unavailable on ${unavailable.map(f => f.exchange).join(", ")}`, {
+          remediation: `Retry when every venue answers, or limit the plan to readable venues with --exchanges (errors: ${unavailable.map(f => `${f.exchange}: ${f.error}`).join("; ")})`,
+        });
       }
 
       // Parse target ratios
@@ -1629,9 +1719,11 @@ export function registerArbManageCommands(
       const moveDetails = await Promise.all(moves.map(async (m) => {
         const srcChain = EXCHANGE_TO_CHAIN[m.from] ?? "unknown";
         const dstChain = EXCHANGE_TO_CHAIN[m.to] ?? "unknown";
-        let bridgeFee = 0;
-        let bridgeProvider = "same-chain";
-        let bridgeTime = "instant";
+        // null = no quote could be read (quoteError says why) — never a made-up fee / provider.
+        let bridgeFee: number | null = 0;
+        let bridgeProvider: string | null = "same-chain";
+        let bridgeTime: string | null = "instant";
+        let quoteError: string | null = null;
 
         if (srcChain !== dstChain && srcChain !== "unknown" && dstChain !== "unknown") {
           try {
@@ -1639,10 +1731,11 @@ export function registerArbManageCommands(
             bridgeFee = quote.fee;
             bridgeProvider = quote.provider;
             bridgeTime = `~${Math.ceil(quote.estimatedTime / 60)}min`;
-          } catch {
-            bridgeFee = 0.5; // fallback estimate
-            bridgeProvider = "cctp";
-            bridgeTime = "~3min";
+          } catch (e) {
+            bridgeFee = null;
+            bridgeProvider = null;
+            bridgeTime = null;
+            quoteError = e instanceof Error ? e.message : String(e);
           }
         }
 
@@ -1653,6 +1746,7 @@ export function registerArbManageCommands(
           bridgeFee,
           bridgeProvider,
           bridgeTime,
+          quoteError,
         };
       }));
 
@@ -1694,13 +1788,18 @@ export function registerArbManageCommands(
       for (let i = 0; i < moveDetails.length; i++) {
         const m = moveDetails[i];
         console.log(chalk.white.bold(`  Move ${i + 1}: $${m.amount} ${exAbbr(m.from)} -> ${exAbbr(m.to)}`));
-        console.log(chalk.gray(`    Route: ${m.srcChain} -> ${m.dstChain} via ${m.bridgeProvider}`));
-        console.log(chalk.gray(`    Fee: ~$${m.bridgeFee.toFixed(2)} | Time: ${m.bridgeTime}`));
+        if (m.bridgeFee === null) {
+          console.log(chalk.yellow(`    Route: ${m.srcChain} -> ${m.dstChain} — no bridge quote (${m.quoteError})`));
+        } else {
+          console.log(chalk.gray(`    Route: ${m.srcChain} -> ${m.dstChain} via ${m.bridgeProvider}`));
+          console.log(chalk.gray(`    Fee: ~$${m.bridgeFee.toFixed(2)} | Time: ${m.bridgeTime}`));
+        }
         console.log();
       }
 
-      const totalFees = moveDetails.reduce((s, m) => s + m.bridgeFee, 0);
-      console.log(chalk.gray(`  Total bridge fees: ~$${totalFees.toFixed(2)}`));
+      const totalFees = moveDetails.reduce((s, m) => s + (m.bridgeFee ?? 0), 0);
+      const unquoted = moveDetails.filter(m => m.bridgeFee === null).length;
+      console.log(chalk.gray(`  Total bridge fees: ~$${totalFees.toFixed(2)}`) + (unquoted > 0 ? chalk.yellow(` (excludes ${unquoted} move(s) without a quote)`) : ""));
 
       if (dryRun) {
         console.log(chalk.yellow("\n  [DRY RUN] No transfers executed.\n"));

@@ -118,8 +118,8 @@ function sessionOf(m: ArcusRawMarket): MarketSession | null {
 export function toArcusVenueMarket(m: ArcusRawMarket): VenueMarket {
   const assetClass = arcusAssetClass(m);
   const mark = numOrNull(m.markPrice);
-  if (mark === null) {
-    throw new PerpError("EXCHANGE_ERROR", `Arcus market ${m.marketDisplayName}: missing markPrice`);
+  if (mark === null || !(Number(mark) > 0)) {
+    throw new PerpError("EXCHANGE_ERROR", `Arcus market ${m.marketDisplayName}: missing / non-positive markPrice (${JSON.stringify(m.markPrice)})`);
   }
   return {
     venue: "arcus",
@@ -147,16 +147,25 @@ export function toArcusVenueMarket(m: ArcusRawMarket): VenueMarket {
   };
 }
 
+/**
+ * Markets that are not ONLINE carry placeholder values (live 2026-10-13: the OFFLINE markets
+ * F, BAC, CCL, VT, SGOV, RVI report markPrice "0" and fundingRate "0") — they are left out of
+ * market / funding lists rather than listed at a $0 price and 0 % funding.
+ */
+export function onlineArcusMarkets(raw: ArcusRawMarket[]): ArcusRawMarket[] {
+  return raw.filter(m => m.status === "ONLINE");
+}
+
 async function fetchMarkets(net: Network): Promise<VenueMarket[]> {
   const raw = await fetchArcusRawMarkets(new ArcusClient(net, null));
-  return raw.map(toArcusVenueMarket);
+  return onlineArcusMarkets(raw).map(toArcusVenueMarket);
 }
 
 async function fetchFundingRates(net: Network): Promise<VenueFundingRate[]> {
   const raw = await fetchArcusRawMarkets(new ArcusClient(net, null));
   const out: VenueFundingRate[] = [];
   const missing: string[] = [];
-  for (const m of raw) {
+  for (const m of onlineArcusMarkets(raw)) {
     const rate = numOrNull(m.fundingRate);
     if (rate === null) { missing.push(m.marketDisplayName); continue; }
     const assetClass = arcusAssetClass(m);

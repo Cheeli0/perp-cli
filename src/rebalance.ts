@@ -56,13 +56,36 @@ const EXCHANGE_CHAINS: Record<string, { chain: string }> = Object.fromEntries(
   Object.entries(EXCHANGE_TO_CHAIN).map(([ex, chain]) => [ex, { chain }]),
 );
 
+/** A venue whose balance could not be read (left out of the snapshots). */
+export interface BalanceReadFailure {
+  exchange: string;
+  error: string;
+}
+
 /**
- * Fetch balances from all exchanges in parallel.
+ * Fetch balances from all exchanges in parallel. Venues whose read failed are warned on
+ * stderr and left out; callers that must know which (plan / execute) use fetchBalancesWithFailures.
  */
 export async function fetchAllBalances(
   adapters: Map<string, ExchangeAdapter>,
 ): Promise<ExchangeBalanceSnapshot[]> {
-  const entries = [...adapters.entries()];
+  const { snapshots, failed, notConfigured } = await fetchBalancesWithFailures(adapters);
+  for (const f of failed) process.stderr.write(`[warn] ${f.exchange} balance unavailable (left out): ${f.error}\n`);
+  for (const n of notConfigured) process.stderr.write(`[info] ${n} not configured (no credentials) — left out\n`);
+  return snapshots;
+}
+
+/**
+ * Fetch balances from all exchanges in parallel; a venue whose read failed (error, empty or
+ * non-finite field) is returned in `failed` — never dropped silently, never counted as $0.
+ * A read-only adapter (no credentials: `isReadOnly`) cannot hold funds the CLI trades, so it
+ * is not read and is returned in `notConfigured` — not a failure.
+ */
+export async function fetchBalancesWithFailures(
+  adapters: Map<string, ExchangeAdapter>,
+): Promise<{ snapshots: ExchangeBalanceSnapshot[]; failed: BalanceReadFailure[]; notConfigured: string[] }> {
+  const notConfigured = [...adapters.entries()].filter(([, a]) => isReadOnlyAdapter(a)).map(([n]) => n);
+  const entries = [...adapters.entries()].filter(([, a]) => !isReadOnlyAdapter(a));
   const results = await Promise.allSettled(
     entries.map(async ([name, adapter]) => {
       const bal = await adapter.getBalance();
@@ -107,9 +130,18 @@ export async function fetchAllBalances(
     }),
   );
 
-  return results
-    .filter((r): r is PromiseFulfilledResult<ExchangeBalanceSnapshot> => r.status === "fulfilled")
-    .map((r) => r.value);
+  const snapshots: ExchangeBalanceSnapshot[] = [];
+  const failed: BalanceReadFailure[] = [];
+  results.forEach((r, i) => {
+    if (r.status === "fulfilled") snapshots.push(r.value);
+    else failed.push({ exchange: entries[i][0], error: r.reason instanceof Error ? r.reason.message : String(r.reason) });
+  });
+  return { snapshots, failed, notConfigured };
+}
+
+/** An adapter built without credentials (read-only market data) — `isReadOnly` on the venue adapters. */
+export function isReadOnlyAdapter(a: ExchangeAdapter): boolean {
+  return (a as { isReadOnly?: unknown }).isReadOnly === true;
 }
 
 /**
