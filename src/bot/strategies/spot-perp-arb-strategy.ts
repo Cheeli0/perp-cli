@@ -18,7 +18,7 @@ import { pruneExecutionLog } from "../../execution-log.js";
 import {
   type RateEntry, type RateMap, type FundingScore,
   buildAdapterMap,
-  getPerpSymbol, findRate, matchSymbol, fetchRates,
+  getPerpSymbol, findRate, cappedLeverage, matchSymbol, fetchRates,
   scoreFunding, isPositionGone, botSpotPerpMatches, assertFundingArbLegs, cancelBotSymbols, collectFundingSince } from "./funding-arb-utils.js";
 import type { SpotMarketInfo } from "../../exchanges/spot-interface.js";
 import type { VenueMarket } from "../../exchanges/venue-types.js";
@@ -311,7 +311,7 @@ export class SpotPerpArbStrategy implements Strategy {
       }
       const allowed = allowedByBase.get(pos.symbol.toUpperCase());
       if (allowed === undefined) continue;
-      const candidates = await this.findPerpCandidates(pos.symbol, adapters, ratesByExchange, allowed);
+      const candidates = await this.findPerpCandidates(pos.symbol, adapters, ratesByExchange, allowed, ctx.log);
       const best = candidates[0];
       if (!best || best.exchange === pos.perpExchange) continue;
       const currentInfo = findRate(ratesByExchange, pos.perpExchange, getPerpSymbol(pos.symbol, pos.perpExchange))
@@ -325,12 +325,12 @@ export class SpotPerpArbStrategy implements Strategy {
       if (!oldAdapter || !newAdapter) continue;
       const perpSym = getPerpSymbol(pos.symbol, pos.perpExchange);
       const newMaxLev = findRate(ratesByExchange, best.exchange, getPerpSymbol(pos.symbol, best.exchange))?.maxLeverage
-        ?? findRate(ratesByExchange, best.exchange, pos.symbol)?.maxLeverage ?? 1;
+        ?? findRate(ratesByExchange, best.exchange, pos.symbol)?.maxLeverage;
       const ok = await this.executor.rotateShort({
         symbol: pos.symbol, perpSymbol: perpSym,
         currentExchange: pos.perpExchange, newExchange: best.exchange,
         currentAdapter: oldAdapter, newAdapter,
-        size: pos.size, leverage: Math.min(p.leverage, newMaxLev), log: ctx.log,
+        size: pos.size, leverage: cappedLeverage(p.leverage, [{ exchange: best.exchange, maxLeverage: newMaxLev }], ctx.log), log: ctx.log,
       });
       if (ok.ok) {
         // The spot leg is unchanged: the state entry follows the short to its new venue.
@@ -374,7 +374,7 @@ export class SpotPerpArbStrategy implements Strategy {
           if (openSymbols.has(base)) continue;
           if (Date.now() < (this._failCooldown.get(`${base}:entry`) ?? 0)) continue;
           if (this.quarantined(base, ctx)) continue;
-          const candidates = await this.findPerpCandidates(base, adapters, ratesByExchange, allowed);
+          const candidates = await this.findPerpCandidates(base, adapters, ratesByExchange, allowed, ctx.log);
           for (const cand of candidates) {
             if (cand.score.annualized < p.min_rate || cand.score.consistency < p.min_consistency) continue;
             scoredOpps.push({ symbol: base, spotExchange: spotExName, perpExchange: cand.exchange, annualized: cand.score.annualized, score: cand.score });
@@ -483,15 +483,25 @@ export class SpotPerpArbStrategy implements Strategy {
   }
 
   /** Find all perp exchanges for a symbol, sorted by annualized rate (highest first). */
-  private async findPerpCandidates(symbol: string, adapters: Map<string, ExchangeAdapter>, ratesByExchange: RateMap, allowedPerpVenues: ReadonlySet<string>): Promise<{ exchange: string; rate: number; score: FundingScore }[]> {
+  private async findPerpCandidates(symbol: string, adapters: Map<string, ExchangeAdapter>, ratesByExchange: RateMap, allowedPerpVenues: ReadonlySet<string>, log: (msg: string) => void): Promise<{ exchange: string; rate: number; score: FundingScore }[]> {
     const candidates: { exchange: string; rate: number; score: FundingScore }[] = [];
     for (const [exName, adapter] of adapters) {
       if (!allowedPerpVenues.has(exName)) continue;
       const perpSym = getPerpSymbol(symbol, exName);
       const ri = findRate(ratesByExchange, exName, perpSym) ?? findRate(ratesByExchange, exName, symbol);
       if (!ri || ri.rate <= 0) continue;
-      const score = await this.scoreFundingLocal(adapter, perpSym, exName)
-        ?? await this.scoreFundingLocal(adapter, symbol, exName);
+      // A failed history read is not "too little history": say so, then try the next symbol form;
+      // a venue with no readable form is left out this cycle.
+      let score: FundingScore | null = null;
+      for (const sym of perpSym === symbol ? [perpSym] : [perpSym, symbol]) {
+        try {
+          score = await this.scoreFundingLocal(adapter, sym, exName);
+        } catch (e) {
+          log(`  [SPA] ${sym} on ${exName}: funding history unreadable — not a candidate this cycle: ${e instanceof Error ? e.message : String(e)}`);
+          continue;
+        }
+        if (score) break;
+      }
       if (!score) continue;
       candidates.push({ exchange: exName, rate: ri.rate, score });
     }
@@ -550,8 +560,7 @@ export class SpotPerpArbStrategy implements Strategy {
       const perpSymbol = getPerpSymbol(symbol, perpExchange);
       const rateInfo = findRate(ratesByExchange, perpExchange, perpSymbol)
         ?? findRate(ratesByExchange, perpExchange, symbol);
-      const perpMaxLev = rateInfo?.maxLeverage ?? 1;
-      const leverage = Math.min(p.leverage, perpMaxLev);
+      const leverage = cappedLeverage(p.leverage, [{ exchange: perpExchange, maxLeverage: rateInfo?.maxLeverage }], ctx.log);
 
       // Pre-entry: verify fundingHours (aster lazy bootstrap may not have run yet)
       if (perpExchange === "aster" && rateInfo && "getFundingHours" in perpAdapter) {

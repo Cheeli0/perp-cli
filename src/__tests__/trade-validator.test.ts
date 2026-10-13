@@ -873,3 +873,25 @@ describe("validateTrade — leverage risk limit", () => {
     }
   });
 });
+
+describe("validateTrade — max leverage not published by the venue", () => {
+  const unpublished = () => mockAdapter({
+    getMarkets: vi.fn().mockResolvedValue([{
+      symbol: "BTC-PERP", markPrice: "60000", indexPrice: "60000", fundingRate: "0.0001",
+      volume24h: "1000000", openInterest: "500000", maxLeverage: null,
+      sizeDecimals: null, stepSize: null, fundingHours: null, marginTiers: null,
+    }]),
+  });
+
+  it("no --leverage: margin is estimated at 1x and a warning says so", async () => {
+    const result = await validateTrade(unpublished(), { symbol: "BTC", side: "buy", size: 0.01 });
+    expect(result.warnings.some(w => w.includes("not published") && w.includes("1x"))).toBe(true);
+    expect(result.estimatedCost!.margin).toBeCloseTo(600, 6);
+  });
+
+  it("--leverage 5: used as given, no cap warning and no 'not published' warning", async () => {
+    const result = await validateTrade(unpublished(), { symbol: "BTC", side: "buy", size: 0.01, leverage: 5 });
+    expect(result.warnings.some(w => w.includes("not published") || w.includes("exceeds"))).toBe(false);
+    expect(result.estimatedCost!.margin).toBeCloseTo(120, 6);
+  });
+});

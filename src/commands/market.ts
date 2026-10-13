@@ -32,19 +32,19 @@ export function registerMarketCommands(
       const explicitExchange = program.getOptionValueSource?.("exchange") === "cli";
 
       const HEADERS = ["Symbol", "Mark", "Index", "Funding", "24h Vol", "OI", "Max Lev"];
-      const marketRow = (m: { symbol: string; markPrice: string; indexPrice: string | null; fundingRate: string | null; volume24h: string | null; openInterest: string | null; maxLeverage: number }) => [
+      const marketRow = (m: { symbol: string; markPrice: string; indexPrice: string | null; fundingRate: string | null; volume24h: string | null; openInterest: string | null; maxLeverage: number | null }) => [
         chalk.white.bold(m.symbol),
         `$${formatUsd(m.markPrice)}`,
         usdOrDash(m.indexPrice),
         m.fundingRate != null ? formatPercent(m.fundingRate) : chalk.gray("N/A"),
         usdOrDash(m.volume24h),
         usdOrDash(m.openInterest),
-        String(m.maxLeverage) + "x",
+        m.maxLeverage === null ? chalk.gray("-") : String(m.maxLeverage) + "x",
       ];
 
       // Multi-exchange mode
       if (!explicitExchange && getAdapterForExchange) {
-        const grouped: Record<string, { symbol: string; markPrice: string; indexPrice: string | null; fundingRate: string | null; volume24h: string | null; openInterest: string | null; maxLeverage: number }[]> = {};
+        const grouped: Record<string, { symbol: string; markPrice: string; indexPrice: string | null; fundingRate: string | null; volume24h: string | null; openInterest: string | null; maxLeverage: number | null }[]> = {};
         const errors: Record<string, string> = {};
 
         await Promise.all(EXCHANGES.map(async (ex) => {
@@ -202,7 +202,7 @@ export function registerMarketCommands(
       console.log(`  Funding Rate:   ${m.fundingRate != null ? formatPercent(m.fundingRate) : chalk.gray("N/A")}`);
       console.log(`  24h Volume:     ${usdOrDash(m.volume24h)}`);
       console.log(`  Open Interest:  ${usdOrDash(m.openInterest)}`);
-      console.log(`  Max Leverage:   ${m.maxLeverage}x`);
+      console.log(`  Max Leverage:   ${m.maxLeverage === null ? chalk.gray("-") : `${m.maxLeverage}x`}`);
       console.log();
     });
 

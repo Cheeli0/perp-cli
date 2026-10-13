@@ -777,7 +777,7 @@ export class PacificaAdapter implements ExchangeAdapter {
         }
         setLev.set(s.symbol, s.leverage);
       }
-      let maxLevMap: Map<string, number> | null = null;
+      let maxLevMap: Map<string, number | null> | null = null;
       for (const m of mapped) {
         if (m.leverage > 0) continue;
         const configured = setLev.get(m.symbol);

@@ -2520,26 +2520,6 @@ export class HyperliquidAdapter implements ExchangeAdapter {
     return res;
   }
 
-  /**
-   * Get funding history for a symbol.
-   */
-  async getFundingHistoryRaw(symbol: string, startTime: number, endTime?: number) {
-    const baseUrl = this._testnet
-      ? "https://api.hyperliquid-testnet.xyz"
-      : "https://api.hyperliquid.xyz";
-    const body: Record<string, unknown> = {
-      type: "fundingHistory",
-      coin: symbol.toUpperCase(),
-      startTime,
-    };
-    if (endTime) body.endTime = endTime;
-    const res = await fetch(`${baseUrl}/info`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    return res.json();
-  }
 
   /**
    * Get user trade fills.

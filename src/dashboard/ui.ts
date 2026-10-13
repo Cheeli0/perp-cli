@@ -335,7 +335,7 @@ function renderPanels(exchanges) {
         return \`<tr>\${isHL?\`<td style="color:var(--purple);font-size:11px">\${dex}</td>\`:''}<td>\${sym}</td><td class="side-\${o.side}">\${o.side.toUpperCase()}</td><td>\${o.type}</td><td>$\${fmt(o.price)}</td><td>\${o.size}</td><td>\${o.filled}</td><td>\${o.status}</td></tr>\`;
       }).join('')}</tbody></table>\`:(ordKnown?'<div class="empty-msg">No open orders</div>':'<div class="empty-msg">Open orders '+NA+'</div>')}
       <div class="section-title">Markets (Top 10)</div>
-      \${ex.topMarkets.length?\`<table><thead><tr><th>Symbol</th><th>Mark</th><th>Index</th><th>Funding</th><th>24h Vol</th><th>OI</th><th>Max Lev</th></tr></thead><tbody>\${ex.topMarkets.map(m=>{const fr=Number(m.fundingRate);return\`<tr><td>\${m.symbol}</td><td>$\${fmt(m.markPrice)}</td><td>\${usdOrDash(m.indexPrice)}</td><td class="\${rateClass(fr)}">\${(fr*100).toFixed(4)}%</td><td>\${usdOrDash(m.volume24h,0)}</td><td>\${usdOrDash(m.openInterest,0)}</td><td>\${m.maxLeverage}x</td></tr>\`;}).join('')}</tbody></table>\`:'<div class="empty-msg">No market data</div>'}
+      \${ex.topMarkets.length?\`<table><thead><tr><th>Symbol</th><th>Mark</th><th>Index</th><th>Funding</th><th>24h Vol</th><th>OI</th><th>Max Lev</th></tr></thead><tbody>\${ex.topMarkets.map(m=>{const fr=Number(m.fundingRate);return\`<tr><td>\${m.symbol}</td><td>$\${fmt(m.markPrice)}</td><td>\${usdOrDash(m.indexPrice)}</td><td class="\${rateClass(fr)}">\${(fr*100).toFixed(4)}%</td><td>\${usdOrDash(m.volume24h,0)}</td><td>\${usdOrDash(m.openInterest,0)}</td><td>\${m.maxLeverage==null?'-':m.maxLeverage+'x'}</td></tr>\`;}).join('')}</tbody></table>\`:'<div class="empty-msg">No market data</div>'}
     </div>\`;
   }).join('');
 
