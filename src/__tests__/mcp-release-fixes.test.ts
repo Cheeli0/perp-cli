@@ -365,13 +365,15 @@ describe("4b/6. suggest_command defaults and fund routes", () => {
     const mod = await import("../mcp-server.js");
     const { program } = buildProgram({ defaultExchange: "hyperliquid", version: "test" });
     const funds = program.commands.find((c) => c.name() === "funds")!;
-    // A venue whose subcommand only refuses ("Not available: …", e.g. Ondo withdraw) is not an MCP route.
-    const venueSubs = (n: string) => funds.commands.find((c) => c.name() === n)!.commands
-      .filter((c) => !c.description().startsWith("Not available")).map((c) => c.name());
+    const venueSubs = (n: string) => funds.commands.find((c) => c.name() === n)!.commands.map((c) => c.name());
     const { listVenues } = await import("../exchanges/venue.js");
     const ids = new Set(listVenues().map((v) => v.id as string));
     expect([...mod.MCP_DEPOSIT_VENUES].sort()).toEqual(venueSubs("deposit").filter((n) => ids.has(n)).sort());
-    expect([...mod.MCP_WITHDRAW_VENUES].sort()).toEqual(venueSubs("withdraw").filter((n) => ids.has(n)).sort());
+    // A venue that declares no withdraw asset (Ondo: API cannot withdraw; QFEX: switched off) keeps
+    // a refusing subcommand but is not an MCP route.
+    const { getVenue } = await import("../exchanges/venue.js");
+    const withdrawable = (n: string) => getVenue(n).capabilities?.withdrawAssets !== null;
+    expect([...mod.MCP_WITHDRAW_VENUES].sort()).toEqual(venueSubs("withdraw").filter((n) => ids.has(n) && withdrawable(n)).sort());
   });
 });
 

@@ -8,9 +8,9 @@ export interface MarketSnapshot {
   low24h: number;
   volume24h: number;     // NaN if the venue does not publish 24h volume (same convention as rsi)
   fundingRate: number;
-  volatility24h: number; // (high - low) / price * 100
+  volatility24h: number; // (high - low) / price * 100 (NaN if the 24h candles could not be read)
   rsi: number;           // 14-period RSI from 1h candles (NaN if insufficient data)
-  spreadPct: number;     // best bid-ask spread as percentage of mid price
+  spreadPct: number;     // best bid-ask spread as percentage of mid price (NaN if the orderbook could not be read)
 }
 
 // ── RSI Calculation (Wilder smoothing) ──
@@ -59,9 +59,14 @@ export function calculateRSI(closes: number[], period: number = 14): number {
   return 100 - 100 / (1 + rs);
 }
 
+/**
+ * `log` receives a line for each failed klines / orderbook read; the affected fields are NaN
+ * (every condition comparison on them is false), never a fabricated 0.
+ */
 export async function getMarketSnapshot(
   adapter: ExchangeAdapter,
   symbol: string,
+  log?: (msg: string) => void,
 ): Promise<MarketSnapshot> {
   const markets = await adapter.getMarkets();
   const m = markets.find(mk => symbolMatch(mk.symbol, symbol));
@@ -77,9 +82,10 @@ export async function getMarketSnapshot(
   // Unknown volume → NaN, never 0: a 0 would read as "no liquidity" to volume conditions.
   const volume24h = m.volume24h === null ? NaN : parseFloat(m.volume24h);
 
-  // Try to get kline data for 24h high/low + RSI
-  let high24h = price;
-  let low24h = price;
+  // 24h high/low + RSI from klines. Unknown (failed read / no candles) → NaN: a high=low=price
+  // fallback would read as 0% volatility and satisfy "volatility_below" on a number nobody measured.
+  let high24h = NaN;
+  let low24h = NaN;
   let rsi = NaN;
   try {
     const now = Date.now();
@@ -100,12 +106,12 @@ export async function getMarketSnapshot(
       const closes = klines.map(k => parseFloat(k.close));
       rsi = calculateRSI(closes, 14);
     }
-  } catch {
-    // non-critical
+  } catch (e) {
+    log?.(`  WARNING: ${adapter.name} ${symbol} klines read failed — volatility / RSI unknown this tick: ${e instanceof Error ? e.message : String(e)}`);
   }
 
-  // Calculate bid-ask spread from orderbook
-  let spreadPct = 0;
+  // Bid-ask spread from the orderbook. Unknown (failed read / empty side) → NaN, never 0.
+  let spreadPct = NaN;
   try {
     const ob = await adapter.getOrderbook(symbol);
     if (ob.bids.length > 0 && ob.asks.length > 0) {
@@ -116,11 +122,11 @@ export async function getMarketSnapshot(
         spreadPct = ((bestAsk - bestBid) / midPrice) * 100;
       }
     }
-  } catch {
-    // non-critical
+  } catch (e) {
+    log?.(`  WARNING: ${adapter.name} ${symbol} orderbook read failed — spread unknown this tick: ${e instanceof Error ? e.message : String(e)}`);
   }
 
-  const volatility24h = price > 0 ? ((high24h - low24h) / price) * 100 : 0;
+  const volatility24h = price > 0 ? ((high24h - low24h) / price) * 100 : NaN;
 
   return { price, high24h, low24h, volume24h, fundingRate, volatility24h, rsi, spreadPct };
 }

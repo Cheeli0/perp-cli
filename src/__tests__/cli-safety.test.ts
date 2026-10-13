@@ -383,6 +383,18 @@ describe("root --dex with a non-Hyperliquid -e venue (real root program)", () =>
     expect(stubAdapter.getMarkets).not.toHaveBeenCalled();
   });
 
+  it("--dex with the DEFAULT exchange (no -e typed) names it as the default; public reads (market mid) are refused too", async () => {
+    const { program: p } = buildProgram({ defaultExchange: "pacifica", version: "test" });
+    for (const c of [p, ...allCommands(p)]) { c.exitOverride(); c.configureOutput({ writeErr: () => {}, writeOut: () => {} }); }
+    let err: { structured?: { code?: string }; message?: string } | undefined;
+    try { await p.parseAsync(["node", "perp", "--json", "--dex", "xyz", "market", "mid", "GOLD"]); } catch (e) { err = e as typeof err; }
+    const code = err?.structured?.code ?? (lastJson() as { error?: { code?: string } }).error?.code;
+    const message = err?.message ?? (lastJson() as { error?: { message?: string } }).error?.message;
+    expect(code).toBe("INVALID_PARAMS");
+    expect(message).toContain("the default exchange (pacifica)");
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it("-e hyperliquid --dex xyz is accepted", async () => {
     await run(["--json", "-e", "hyperliquid", "--dex", "xyz", "account", "positions"]);
     expect(stubAdapter.getPositions).toHaveBeenCalled();

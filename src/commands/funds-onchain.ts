@@ -253,11 +253,12 @@ export function registerOnchainFundsCommands(ctx: OnchainFundsContext): void {
 
   const addressBook = funds.command("address-book").description("Not available: the Ondo Perps withdrawal address book is managed in the web app");
 
-  supportsDryRun(addressBook.command("add <venue> <address>"))
-    .description("Not available: Ondo Perps withdrawals and their address book are web-app only (refused, also with --dry-run)")
+  // Optional arguments: a bare `address-book add` gets the same explicit refusal, not a usage error.
+  supportsDryRun(addressBook.command("add [venue] [address]"))
+    .description("Not available: no venue offers a withdrawal address book over the CLI (Ondo Perps: web app only; refused, also with --dry-run)")
     .option("--label <text>", "Ignored")
-    .action(async (venue: string) => {
-      const def = getVenue(venue);
-      throw unsupported(def.displayName, "address-book", "the Ondo Perps API does not allow withdrawals, so the CLI keeps no withdrawal address book", "Manage withdrawals and the address book in the Ondo Perps web app");
+    // Venue-neutral: no venue has a CLI address book, so the arguments are not even resolved.
+    .action(async () => {
+      throw unsupported("perp-cli", "address-book", "perp-cli has no withdrawal address book for any venue (Ondo Perps withdrawals are web-app only)", "Manage withdrawals and address books in the venue's web app");
     });
 }

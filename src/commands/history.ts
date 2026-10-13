@@ -430,25 +430,34 @@ function registerAnalyticsSubcommands(
 
         const allTrades: TradeEntry[] = [];
         const allFunding: FundingEntry[] = [];
+        // A venue whose adapter / trades / funding read failed is listed here and left out of the
+        // totals (partial: true) — never counted as 0.
+        const errors: Record<string, string> = {};
+        const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
         // Fetch trades + funding in parallel from all exchanges
         await Promise.allSettled(
           exchanges.map(async (ex) => {
+            let adapter: ExchangeAdapter;
             try {
-              const adapter = await getAdapterForExchange(ex);
-              const [trades, funding] = await Promise.all([
-                adapter.getTradeHistory(limit),
-                adapter.getFundingPayments(limit),
-              ]);
-              for (const t of trades) {
+              adapter = await getAdapterForExchange(ex);
+            } catch (e) {
+              errors[`${ex}.adapter`] = errText(e);
+              return;
+            }
+            const [trades, funding] = await Promise.allSettled([adapter.getTradeHistory(limit), adapter.getFundingPayments(limit)]);
+            if (trades.status === "fulfilled") {
+              for (const t of trades.value) {
                 if (sinceMs && t.time < sinceMs) continue;
                 allTrades.push({ exchange: ex, symbol: t.symbol, side: t.side, price: Number(t.price), size: Number(t.size), fee: Number(t.fee), time: t.time });
               }
-              for (const f of funding) {
+            } else errors[`${ex}.trades`] = errText(trades.reason);
+            if (funding.status === "fulfilled") {
+              for (const f of funding.value) {
                 if (sinceMs && f.time < sinceMs) continue;
                 allFunding.push({ exchange: ex, symbol: f.symbol, payment: Number(f.payment), time: f.time });
               }
-            } catch { /* skip unavailable exchanges */ }
+            } else errors[`${ex}.funding`] = errText(funding.reason);
           }),
         );
 
@@ -508,6 +517,8 @@ function registerAnalyticsSubcommands(
             [...byExchange.entries()].map(([ex, d]) => [ex, { ...d, netPnl: d.funding - d.fees }]),
           ),
           daily,
+          errors,
+          partial: Object.keys(errors).length > 0,
         };
 
         if (isJson()) return printJson(jsonOk(result));
@@ -519,6 +530,7 @@ function registerAnalyticsSubcommands(
         console.log(`  Trading Fees:    ${chalk.red(`-$${formatUsd(totalFees)}`)}`);
         console.log(`  Funding Income:  ${formatPnl(totalFunding)}`);
         console.log(`  Net P&L:         ${formatPnl(netPnl)}`);
+        for (const [k, msg] of Object.entries(errors)) console.log(chalk.yellow(`  ⚠ ${k} unavailable (left out of the totals): ${msg}`));
 
         if (byExchange.size > 0) {
           console.log(chalk.white.bold("\n  By Exchange:"));
@@ -568,26 +580,39 @@ function registerAnalyticsSubcommands(
 
         // Fetch funding payments and current positions in parallel
         const positionNotionals = new Map<string, number>();
+        // A venue whose adapter / funding / positions read failed is listed here; its funding is
+        // left out of the totals (partial: true) — never counted as 0.
+        const errors: Record<string, string> = {};
+        const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
         await Promise.allSettled(
           exchanges.map(async (ex) => {
+            let adapter: ExchangeAdapter;
             try {
-              const adapter = await getAdapterForExchange(ex);
-              const [payments, positions] = await Promise.all([
-                adapter.getFundingPayments(parseInt(opts.limit)),
-                adapter.getPositions(),
-              ]);
-              for (const p of payments) {
+              adapter = await getAdapterForExchange(ex);
+            } catch (e) {
+              errors[`${ex}.adapter`] = errText(e);
+              return;
+            }
+            const [payments, positions] = await Promise.allSettled([
+              adapter.getFundingPayments(parseInt(opts.limit)),
+              adapter.getPositions(),
+            ]);
+            if (payments.status === "fulfilled") {
+              for (const p of payments.value) {
                 if (sinceMs && p.time < sinceMs) continue;
                 if (opts.symbol && !p.symbol.toUpperCase().includes(opts.symbol.toUpperCase())) continue;
                 allFunding.push({ exchange: ex, symbol: p.symbol, payment: Number(p.payment), time: p.time });
               }
-              for (const p of positions) {
+            } else errors[`${ex}.funding`] = errText(payments.reason);
+            // Positions only feed the annualized rate (null when the notional is unknown).
+            if (positions.status === "fulfilled") {
+              for (const p of positions.value) {
                 if (Number(p.size) > 0) {
                   positionNotionals.set(`${ex}:${p.symbol}`, Math.abs(Number(p.size) * Number(p.markPrice)));
                 }
               }
-            } catch { /* skip unavailable exchanges */ }
+            } else errors[`${ex}.positions`] = errText(positions.reason);
           }),
         );
 
@@ -649,15 +674,18 @@ function registerAnalyticsSubcommands(
         const arbRows = arbPositions
           .map(pos => {
             const af = arbFunding.get(pos.symbol);
-            if (!af || (af.longFunding === 0 && af.shortFunding === 0)) return null;
+            // A leg on a venue whose funding read failed is unknown (null), not 0.
+            const longFunding = af && !(`${pos.longExchange}.adapter` in errors || `${pos.longExchange}.funding` in errors) ? af.longFunding : null;
+            const shortFunding = af && !(`${pos.shortExchange}.adapter` in errors || `${pos.shortExchange}.funding` in errors) ? af.shortFunding : null;
+            if (!af || (longFunding === 0 && shortFunding === 0)) return null;
             return {
               symbol: pos.symbol,
               mode: pos.mode ?? "perp-perp",
               longExchange: pos.longExchange,
               shortExchange: pos.shortExchange,
-              netFunding: af.longFunding + af.shortFunding,
-              longFunding: af.longFunding,
-              shortFunding: af.shortFunding,
+              netFunding: longFunding !== null && shortFunding !== null ? longFunding + shortFunding : null,
+              longFunding,
+              shortFunding,
               daysSinceEntry: Math.max(1, Math.round((Date.now() - new Date(pos.entryTime).getTime()) / 86400000)),
             };
           })
@@ -674,6 +702,8 @@ function registerAnalyticsSubcommands(
           byExchange: Object.fromEntries(byExchange),
           arbPositions: arbRows,
           ...(opts.daily ? { daily } : {}),
+          errors,
+          partial: Object.keys(errors).length > 0,
         };
 
         if (isJson()) return printJson(jsonOk(result));
@@ -683,6 +713,7 @@ function registerAnalyticsSubcommands(
         console.log(`  Total Payments:  ${allFunding.length}`);
         console.log(`  Net Funding:     ${formatPnl(totalFunding)}`);
         console.log(`  Period:          ~${Math.round(periodDays)} days`);
+        for (const [k, msg] of Object.entries(errors)) console.log(chalk.yellow(`  ⚠ ${k} unavailable (left out of the totals): ${msg}`));
 
         if (exSymRows.length > 0) {
           console.log(chalk.white.bold("\n  By Exchange × Symbol:"));
@@ -702,7 +733,7 @@ function registerAnalyticsSubcommands(
             chalk.white.bold(a.symbol),
             `${a.longExchange} → ${a.shortExchange}`,
             a.mode,
-            formatPnl(a.netFunding),
+            a.netFunding !== null ? formatPnl(a.netFunding) : chalk.yellow("unavailable"),
             `${a.daysSinceEntry}d`,
           ]);
           console.log(makeTable(["Symbol", "Long → Short", "Mode", "Net Funding", "Held"], rows));
@@ -751,6 +782,7 @@ function registerAnalyticsSubcommands(
         // A venue whose read failed is reported here and left out of the totals — never counted as 0.
         const errors: Record<string, string> = {};
         const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
+        let venuesRead = 0;
 
         await Promise.allSettled(
           exchanges.map(async (ex) => {
@@ -765,6 +797,7 @@ function registerAnalyticsSubcommands(
               const balance = await adapter.getBalance();
               totalEquity += Number(balance.equity);
               totalUPnl += Number(balance.unrealizedPnl);
+              venuesRead++;
             } catch (e) {
               errors[`${ex}.balance`] = errText(e);
               return;
@@ -808,6 +841,10 @@ function registerAnalyticsSubcommands(
               : "0",
           },
           errors,
+          // partial: some venue read failed — portfolio / costs cover only the venues that answered.
+          partial: Object.keys(errors).length > 0,
+          venuesRead,
+          venuesRequested: exchanges.length,
         };
 
         if (isJson()) return printJson(jsonOk(report));
@@ -863,26 +900,49 @@ function registerAnalyticsSubcommands(
         // Fetch funding + current positions from all relevant exchanges
         const fundingByExSym = new Map<string, number>();
         const currentPrices = new Map<string, number>();
+        // A venue whose adapter / funding / positions read failed is keyed here: rows touching it
+        // report null for the unknown part (funding / pricePnl), never 0 or the entry price.
+        const errors: Record<string, string> = {};
+        const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
+        const fundingFailed = new Set<string>();
 
         await Promise.allSettled(
           [...exchangeSet].map(async (ex) => {
+            let adapter: ExchangeAdapter;
             try {
-              const adapter = await getAdapterForExchange(ex);
-              const [funding, livePositions] = await Promise.all([
-                adapter.getFundingPayments(limit),
-                adapter.getPositions(),
-              ]);
-              for (const f of funding) {
+              adapter = await getAdapterForExchange(ex);
+            } catch (e) {
+              errors[`${ex}.adapter`] = errText(e);
+              fundingFailed.add(ex);
+              return;
+            }
+            const [funding, livePositions] = await Promise.allSettled([
+              adapter.getFundingPayments(limit),
+              adapter.getPositions(),
+            ]);
+            if (funding.status === "fulfilled") {
+              for (const f of funding.value) {
                 if (sinceMs && f.time < sinceMs) continue;
                 const key = `${ex}:${f.symbol}`;
                 fundingByExSym.set(key, (fundingByExSym.get(key) ?? 0) + Number(f.payment));
               }
-              for (const p of livePositions) {
+            } else {
+              errors[`${ex}.funding`] = errText(funding.reason);
+              fundingFailed.add(ex);
+            }
+            if (livePositions.status === "fulfilled") {
+              for (const p of livePositions.value) {
                 currentPrices.set(`${ex}:${p.symbol}`, Number(p.markPrice));
               }
-            } catch { /* skip */ }
+            } else errors[`${ex}.positions`] = errText(livePositions.reason);
           }),
         );
+
+        // Funding of a venue that answered: the sum of its payments (none = 0). A failed venue: unknown (null).
+        const fundingOf = (ex: string, sym: string): number | null =>
+          fundingFailed.has(ex) ? null : fundingByExSym.get(`${ex}:${sym}`) ?? 0;
+        // Current mark from the live position; none (failed read / no live leg) = unknown (null), never the entry price.
+        const priceOf = (ex: string, sym: string): number | null => currentPrices.get(`${ex}:${sym}`) ?? null;
 
         // Entries without a verified entry price (a bot leg the venue reported no fill price for)
         // have no price PnL: listed apart, never priced at a guess.
@@ -892,23 +952,23 @@ function registerAnalyticsSubcommands(
         // Build comparison data
         const rows = priced.map(pos => {
           const daysHeld = Math.max(1, Math.round((Date.now() - new Date(pos.entryTime).getTime()) / 86400000));
-          const longFunding = fundingByExSym.get(`${pos.longExchange}:${pos.symbol}`) ?? 0;
-          const shortFunding = fundingByExSym.get(`${pos.shortExchange}:${pos.symbol}`) ?? 0;
-          const netFunding = longFunding + shortFunding;
+          const longFunding = fundingOf(pos.longExchange, pos.symbol);
+          const shortFunding = fundingOf(pos.shortExchange, pos.symbol);
+          const netFunding = longFunding !== null && shortFunding !== null ? longFunding + shortFunding : null;
 
-          // Estimate unrealized PnL from price movement
-          const longPrice = currentPrices.get(`${pos.longExchange}:${pos.symbol}`) ?? pos.entryLongPrice;
-          const shortPrice = currentPrices.get(`${pos.shortExchange}:${pos.symbol}`) ?? pos.entryShortPrice;
-          const longPnl = (longPrice - pos.entryLongPrice) * pos.longSize;
-          const shortPnl = (pos.entryShortPrice - shortPrice) * pos.shortSize;
-          const pricePnl = longPnl + shortPnl;
-          const totalPnl = pricePnl + netFunding;
+          // Estimate unrealized PnL from price movement (null when either leg's mark is unknown)
+          const longPrice = priceOf(pos.longExchange, pos.symbol);
+          const shortPrice = priceOf(pos.shortExchange, pos.symbol);
+          const pricePnl = longPrice !== null && shortPrice !== null
+            ? (longPrice - pos.entryLongPrice) * pos.longSize + (pos.entryShortPrice - shortPrice) * pos.shortSize
+            : null;
+          const totalPnl = pricePnl !== null && netFunding !== null ? pricePnl + netFunding : null;
 
           // Notional for ROI calculation
           const notional = pos.entryLongPrice * pos.longSize + pos.entryShortPrice * pos.shortSize;
-          const roi = notional > 0 ? (totalPnl / notional) * 100 : 0;
-          const fundingRoi = notional > 0 ? (netFunding / notional) * 100 : 0;
-          const annualizedRoi = daysHeld > 0 ? (fundingRoi / daysHeld) * 365 : 0;
+          const roi = totalPnl !== null ? (notional > 0 ? (totalPnl / notional) * 100 : 0) : null;
+          const fundingRoi = netFunding !== null ? (notional > 0 ? (netFunding / notional) * 100 : 0) : null;
+          const annualizedRoi = fundingRoi !== null ? (daysHeld > 0 ? (fundingRoi / daysHeld) * 365 : 0) : null;
 
           return {
             symbol: pos.symbol,
@@ -927,15 +987,20 @@ function registerAnalyticsSubcommands(
           };
         });
 
-        // Sort by total PnL descending
-        rows.sort((a, b) => b.totalPnl - a.totalPnl);
+        // Sort by total PnL descending (unknown totals last)
+        rows.sort((a, b) => (a.totalPnl === null ? 1 : b.totalPnl === null ? -1 : b.totalPnl - a.totalPnl));
 
+        // Totals skip the unknown (null) values; partial flags that they do not cover every row.
+        const sumKnown = (vals: (number | null)[]) => vals.reduce<number>((s, v) => s + (v ?? 0), 0);
+        const complete = rows.filter(r => r.totalPnl !== null);
         const totals = {
-          funding: rows.reduce((s, r) => s + r.funding, 0),
-          pricePnl: rows.reduce((s, r) => s + r.pricePnl, 0),
-          totalPnl: rows.reduce((s, r) => s + r.totalPnl, 0),
-          notional: rows.reduce((s, r) => s + r.notional, 0),
+          funding: sumKnown(rows.map(r => r.funding)),
+          pricePnl: sumKnown(rows.map(r => r.pricePnl)),
+          totalPnl: sumKnown(complete.map(r => r.totalPnl)),
+          // ROI base: only the rows whose total PnL is known.
+          notional: complete.reduce((s, r) => s + r.notional, 0),
         };
+        const partial = Object.keys(errors).length > 0 || rows.some(r => r.funding === null || r.pricePnl === null);
 
         const result = {
           period: opts.period ?? "all",
@@ -946,6 +1011,8 @@ function registerAnalyticsSubcommands(
             ...totals,
             roi: totals.notional > 0 ? (totals.totalPnl / totals.notional) * 100 : 0,
           },
+          errors,
+          partial,
         };
 
         if (isJson()) return printJson(jsonOk(result));
@@ -958,11 +1025,11 @@ function registerAnalyticsSubcommands(
           `${r.longExchange} → ${r.shortExchange}`,
           r.mode,
           `${r.daysHeld}d`,
-          formatPnl(r.funding),
-          formatPnl(r.pricePnl),
-          formatPnl(r.totalPnl),
-          `${r.roi >= 0 ? "+" : ""}${r.roi.toFixed(2)}%`,
-          `${r.annualizedRoi >= 0 ? "+" : ""}${r.annualizedRoi.toFixed(1)}%`,
+          r.funding !== null ? formatPnl(r.funding) : chalk.yellow("unavailable"),
+          r.pricePnl !== null ? formatPnl(r.pricePnl) : chalk.yellow("unavailable"),
+          r.totalPnl !== null ? formatPnl(r.totalPnl) : chalk.yellow("unavailable"),
+          r.roi !== null ? `${r.roi >= 0 ? "+" : ""}${r.roi.toFixed(2)}%` : chalk.yellow("unavailable"),
+          r.annualizedRoi !== null ? `${r.annualizedRoi >= 0 ? "+" : ""}${r.annualizedRoi.toFixed(1)}%` : chalk.yellow("unavailable"),
         ]);
         console.log(makeTable(
           ["Symbol", "Long → Short", "Mode", "Held", "Funding", "Price PnL", "Total PnL", "ROI", "Ann.ROI"],
@@ -977,6 +1044,8 @@ function registerAnalyticsSubcommands(
         if (totals.notional > 0) {
           console.log(`    Total ROI:        ${result.totals.roi >= 0 ? "+" : ""}${result.totals.roi.toFixed(2)}%`);
         }
+        if (partial) console.log(chalk.yellow("    ⚠ Partial: totals leave out the unavailable values above"));
+        for (const [k, msg] of Object.entries(errors)) console.log(chalk.yellow(`    ⚠ ${k} unavailable: ${msg}`));
         console.log();
       });
     });

@@ -29,10 +29,11 @@ export function computeMatchedSize(
     opts?.shortSizeDecimals ?? getSizeDecimals(shortExchange),
   );
 
-  // If lotSize is provided, round to nearest multiple of lotSize (floor)
+  // If lotSize is provided, round to nearest multiple of lotSize (floor). The 1e-9 guard keeps a
+  // float quotient like 0.3 / 0.1 = 2.9999999999999996 from dropping a whole lot (as fillSizeString does).
   let roundedSize: number;
   if (opts?.lotSize && opts.lotSize > 0) {
-    roundedSize = Math.floor(rawSize / opts.lotSize) * opts.lotSize;
+    roundedSize = Math.floor(rawSize / opts.lotSize + 1e-9) * opts.lotSize;
   } else {
     // Round DOWN to the least precise exchange's decimals
     const factor = Math.pow(10, szDecimals);
@@ -50,7 +51,7 @@ export function computeMatchedSize(
     // Try rounding UP instead
     let roundedUp: number;
     if (opts?.lotSize && opts.lotSize > 0) {
-      roundedUp = Math.ceil(rawSize / opts.lotSize) * opts.lotSize;
+      roundedUp = Math.ceil(rawSize / opts.lotSize - 1e-9) * opts.lotSize;
     } else {
       const factor = Math.pow(10, szDecimals);
       roundedUp = Math.ceil(rawSize * factor) / factor;
@@ -61,17 +62,38 @@ export function computeMatchedSize(
     // (b), so a ceil that still fell short of minNotional was returned and then
     // rejected by the venue — SSOT Rule #2: fail honestly with null instead.
     if (notionalUp >= minNotional && notionalUp <= sizeUsd * 1.2) {
-      return { size: formatSize(roundedUp, szDecimals, opts?.lotSize), notional: notionalUp };
+      return sized(roundedUp, price, szDecimals, opts?.lotSize);
     }
     return null; // Can't meet minimum within tolerance
   }
 
-  return { size: formatSize(roundedSize, szDecimals, opts?.lotSize), notional };
+  return sized(roundedSize, price, szDecimals, opts?.lotSize);
+}
+
+/**
+ * The size string sent to both venues and the notional OF THAT STRING (never of the unformatted
+ * float). With a lot, the lot's own decimals are used — formatting a 0.0001-lot size with the
+ * venue default (e.g. 2) used to round 0.0157 UP to "0.02" or a 0.004 size to "0.00". A size that
+ * formats to zero is not viable (null), never a zero-size order.
+ */
+function sized(size: number, price: number, szDecimals: number, lotSize?: number): { size: string; notional: number } | null {
+  const str = formatSize(size, szDecimals, lotSize);
+  const n = Number(str);
+  if (!(n > 0)) return null;
+  return { size: str, notional: n * price };
 }
 
 function formatSize(size: number, szDecimals: number, lotSize?: number): string {
-  if (lotSize && lotSize >= 1) return String(Math.round(size));
+  if (lotSize && lotSize > 0) return size.toFixed(decimalsOfLot(lotSize)); // whole lots (≥1) → 0 decimals; 2.5 → 1
   return size.toFixed(szDecimals);
+}
+
+/** Decimal places of a lot size (0.0001 → 4, 0.5 → 1, 1e-7 → 7). */
+function decimalsOfLot(lot: number): number {
+  const s = lot.toString();
+  const exp = /e-(\d+)$/.exec(s);
+  if (exp) return Number(exp[1]) + (s.split("e")[0].split(".")[1]?.length ?? 0);
+  return s.includes(".") ? s.split(".")[1].length : 0;
 }
 
 /** Size decimal precision by exchange (conservative fallbacks — prefer explicit decimals via opts) */

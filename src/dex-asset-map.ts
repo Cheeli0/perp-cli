@@ -101,17 +101,46 @@ async function hlInfoPost(body: Record<string, unknown>): Promise<unknown> {
 }
 
 /**
- * Fetch all assets from all Hyperliquid dexes (native + deployed).
+ * Result of one all-dex read. `failedDexes` maps each dex whose metaAndAssetCtxs read
+ * failed (timeout / 429 / …) to its error: that dex's assets are UNKNOWN, not absent —
+ * a consumer must never treat a pair on a failed dex as gone.
  */
-export async function fetchAllDexAssets(): Promise<DexAsset[]> {
-  const { withCache, TTL_MARKET } = await import("./cache.js");
-  // Network in the key: a mainnet snapshot must never answer a testnet run (L7).
-  return withCache(`pub:hl:${sharedApiNetwork()}:allDexAssets`, TTL_MARKET, () => _fetchAllDexAssetsLive());
+export interface DexAssetsResult {
+  assets: DexAsset[];
+  failedDexes: Record<string, string>;
 }
 
-async function _fetchAllDexAssetsLive(): Promise<DexAsset[]> {
+/**
+ * Fetch all assets from all Hyperliquid dexes (native + deployed), with the dexes whose
+ * read failed. Only a complete read (no failed dex) is cached.
+ */
+export async function fetchAllDexAssetsDetailed(): Promise<DexAssetsResult> {
+  const { getCached, setCached, TTL_MARKET } = await import("./cache.js");
+  // Network in the key: a mainnet snapshot must never answer a testnet run (L7).
+  const key = `pub:hl:${sharedApiNetwork()}:allDexAssets`;
+  const cached = getCached<DexAsset[]>(key);
+  if (cached !== null) return { assets: cached, failedDexes: {} };
+  const res = await _fetchAllDexAssetsLive();
+  if (Object.keys(res.failedDexes).length === 0) setCached(key, res.assets, TTL_MARKET);
+  return res;
+}
+
+/**
+ * Fetch all assets from all Hyperliquid dexes (display use). A dex whose read failed is
+ * reported on stderr (its assets are missing from the result). Trading paths use
+ * fetchAllDexAssetsDetailed() so a failed dex is never mistaken for an absent pair.
+ */
+export async function fetchAllDexAssets(): Promise<DexAsset[]> {
+  const { assets, failedDexes } = await fetchAllDexAssetsDetailed();
+  for (const [dex, err] of Object.entries(failedDexes)) {
+    process.stderr.write(`[perp] HIP-3 dex ${dex} unavailable: ${err} — its assets are missing from this read\n`);
+  }
+  return assets;
+}
+
+async function _fetchAllDexAssetsLive(): Promise<DexAssetsResult> {
   const allMetas = await hlInfoPost({ type: "allPerpMetas" }) as Record<string, unknown>[];
-  if (!Array.isArray(allMetas)) return [];
+  if (!Array.isArray(allMetas)) throw new Error("HL API error: allPerpMetas returned a non-array response");
 
   // Collect dex names (index 0 = native "hl", rest = deployed dexes)
   const dexNames: string[] = [];
@@ -127,6 +156,7 @@ async function _fetchAllDexAssetsLive(): Promise<DexAsset[]> {
   // Fetch metaAndAssetCtxs for each dex in batches of 3 to avoid 429 rate limits
   const BATCH_SIZE = 3;
   const allAssets: DexAsset[] = [];
+  const failedDexes: Record<string, string> = {};
 
   const tasks = dexNames.map((dex, i) => ({ dex, i })).filter(t => t.dex !== "");
 
@@ -141,8 +171,11 @@ async function _fetchAllDexAssetsLive(): Promise<DexAsset[]> {
           { universe: { name: string; maxLeverage: number; szDecimals: number; isDelisted?: boolean }[] },
           { markPx: string; funding: string; openInterest: string; dayNtlVlm: string }[],
         ];
-        const universe = data[0]?.universe ?? [];
-        const ctxs = data[1] ?? [];
+        if (!Array.isArray(data) || !Array.isArray(data[0]?.universe) || !Array.isArray(data[1])) {
+          throw new Error("metaAndAssetCtxs returned an unexpected shape");
+        }
+        const universe = data[0].universe;
+        const ctxs = data[1];
         return universe
           .map((asset, j): DexAsset | null => {
             if (asset.isDelisted) return null;
@@ -162,14 +195,16 @@ async function _fetchAllDexAssetsLive(): Promise<DexAsset[]> {
             };
           })
           .filter((a): a is DexAsset => a !== null && a.markPrice > 0);
-      } catch {
+      } catch (e) {
+        // Explicit, not empty: the dex's assets are unknown this read.
+        failedDexes[dex] = e instanceof Error ? e.message : String(e);
         return [];
       }
     }));
     allAssets.push(...results.flat());
   }
 
-  return allAssets;
+  return { assets: allAssets, failedDexes };
 }
 
 /**
@@ -258,14 +293,14 @@ export function findDexArbPairs(
 }
 
 /**
- * Fetch and return arb opportunities across all HIP-3 dexes.
- * Single convenience function for CLI commands.
+ * Fetch and return arb opportunities across all HIP-3 dexes, plus the dexes whose read
+ * failed (pairs on those dexes are unknown this scan — not gone).
  */
 export async function scanDexArb(opts?: {
   minAnnualSpread?: number;
   maxPriceGapPct?: number;
   includeNative?: boolean;
-}): Promise<DexArbPair[]> {
-  const assets = await fetchAllDexAssets();
-  return findDexArbPairs(assets, opts);
+}): Promise<{ pairs: DexArbPair[]; failedDexes: Record<string, string> }> {
+  const { assets, failedDexes } = await fetchAllDexAssetsDetailed();
+  return { pairs: findDexArbPairs(assets, opts), failedDexes };
 }

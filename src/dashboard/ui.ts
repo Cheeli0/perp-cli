@@ -240,6 +240,11 @@ function pnlClass(v) { return Number(v)>=0?'pnl-pos':'pnl-neg'; }
 function pnlSign(v) { const n=Number(v)||0; return n>=0?'+$'+fmt(Math.abs(n)):'-$'+fmt(Math.abs(n)); }
 function rateClass(v) { const n=Number(v)||0; return n>0?'rate-positive':n<0?'rate-negative':'rate-neutral'; }
 function spreadClass(v) { return v>=50?'spread-high':v>=20?'spread-mid':'spread-low'; }
+// null = the venue value could not be read / is unknown → shown as such, never as $0.
+const NA = '<span style="color:var(--yellow,#e5c07b)">unavailable</span>';
+function usdOrNA(v, d=2) { return v==null ? NA : '$'+fmt(v,d); }
+function pnlOrNA(v) { return v==null ? NA : pnlSign(v); }
+function escHtml(v) { return String(v).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]); }
 
 // ── Portfolio Rendering ──
 function renderTotals(t) {
@@ -251,12 +256,13 @@ function renderTotals(t) {
     {label:'Unrealized PnL',value:pnlSign(t.unrealizedPnl),cls:pnlCls},
     {label:'Positions',value:t.positionCount,cls:''},
     {label:'Open Orders',value:t.orderCount,cls:''},
-  ].map(c=>\`<div class="total-card"><div class="label">\${c.label}</div><div class="value \${c.cls}">\${c.value}</div></div>\`).join('');
+  ].map(c=>\`<div class="total-card"><div class="label">\${c.label}\${t.partial?' (partial)':''}</div><div class="value \${c.cls}">\${c.value}</div></div>\`).join('')
+  + (t.partial ? \`<div class="total-card" style="grid-column:1/-1"><div class="label">\${NA} — left out of the totals</div><div style="font-size:12px">\${escHtml((t.unavailable||[]).join(', '))}</div></div>\` : '');
 }
 
 function renderTabs(exchanges) {
   if (!activeExchange && exchanges.length) activeExchange = exchanges[0].name;
-  $('#tabs').innerHTML = exchanges.map(ex=>\`<div class="tab \${ex.name===activeExchange?'active':''}" data-ex="\${ex.name}">\${ex.name}</div>\`).join('');
+  $('#tabs').innerHTML = exchanges.map(ex=>\`<div class="tab \${ex.name===activeExchange?'active':''}" data-ex="\${ex.name}">\${ex.name}\${(ex.feed&&ex.feed.stale)||ex.error?' ⚠':''}</div>\`).join('');
   $$('.tab').forEach(tab => { tab.onclick=()=>{ activeExchange=tab.dataset.ex; render(); }; });
 }
 
@@ -272,16 +278,18 @@ function renderPanels(exchanges) {
 
     // For HL: detect unique dexes from positions/orders
     let dexes = [];
-    let filteredPositions = ex.positions;
-    let filteredOrders = ex.orders;
+    // null = list could not be read (shown as unavailable, never as "no positions")
+    const posKnown = ex.positions != null, ordKnown = ex.orders != null;
+    let filteredPositions = ex.positions || [];
+    let filteredOrders = ex.orders || [];
     if (isHL) {
       const dexSet = new Set();
-      ex.positions.forEach(p => dexSet.add(getDex(p.symbol)));
-      ex.orders.forEach(o => dexSet.add(getDex(o.symbol)));
+      filteredPositions.forEach(p => dexSet.add(getDex(p.symbol)));
+      filteredOrders.forEach(o => dexSet.add(getDex(o.symbol)));
       dexes = ['all', ...Array.from(dexSet).sort()];
       if (activeDexFilters.size > 0) {
-        filteredPositions = ex.positions.filter(p => activeDexFilters.has(getDex(p.symbol)));
-        filteredOrders = ex.orders.filter(o => activeDexFilters.has(getDex(o.symbol)));
+        filteredPositions = filteredPositions.filter(p => activeDexFilters.has(getDex(p.symbol)));
+        filteredOrders = filteredOrders.filter(o => activeDexFilters.has(getDex(o.symbol)));
       }
     }
 
@@ -294,32 +302,38 @@ function renderPanels(exchanges) {
     const dexBreakdown = (field) => {
       if (!dexBal || dexBal.length < 1) return '';
       return '<div style="font-size:10px;color:var(--muted);margin-top:2px">' +
-        dexBal.map(d => d.name + ': $' + fmt(Number(d.balance[field]))).join(' · ') + '</div>';
+        dexBal.map(d => d.name + ': ' + (d.balance ? usdOrNA(d.balance[field]) : NA)).join(' · ') + '</div>';
     };
 
+    const bal = ex.balance || {};
+    const stale = ex.feed && ex.feed.stale;
+    const banner = (stale || ex.error)
+      ? \`<div class="empty-msg" style="color:var(--yellow,#e5c07b)">⚠ \${stale ? 'STALE data' : 'Partial data'}\${ex.feed && ex.feed.lastOkAt ? ' (last update ' + new Date(ex.feed.lastOkAt).toLocaleTimeString() + ')' : ''}\${ex.error ? ': ' + escHtml(ex.error) : ''}</div>\`
+      : '';
     return \`<div class="exchange-panel \${isActive?'active':''}" id="panel-\${ex.name}">
+      \${banner}
       <div class="balance-bar">
-        <div class="balance-item"><div class="label">Equity</div><div class="val">$\${fmt(ex.balance.equity)}</div>\${dexBreakdown('equity')}</div>
-        <div class="balance-item"><div class="label">Available</div><div class="val">$\${fmt(ex.balance.available)}</div>\${dexBreakdown('available')}</div>
-        <div class="balance-item"><div class="label">Margin Used</div><div class="val">$\${fmt(ex.balance.marginUsed)}</div>\${dexBreakdown('marginUsed')}</div>
-        <div class="balance-item"><div class="label">Unrealized PnL</div><div class="val \${pnlClass(ex.balance.unrealizedPnl)}">\${pnlSign(ex.balance.unrealizedPnl)}</div>\${dexBreakdown('unrealizedPnl')}</div>
+        <div class="balance-item"><div class="label">Equity</div><div class="val">\${usdOrNA(bal.equity)}</div>\${dexBreakdown('equity')}</div>
+        <div class="balance-item"><div class="label">Available</div><div class="val">\${usdOrNA(bal.available)}</div>\${dexBreakdown('available')}</div>
+        <div class="balance-item"><div class="label">Margin Used</div><div class="val">\${usdOrNA(bal.marginUsed)}</div>\${dexBreakdown('marginUsed')}</div>
+        <div class="balance-item"><div class="label">Unrealized PnL</div><div class="val \${pnlClass(bal.unrealizedPnl)}">\${pnlOrNA(bal.unrealizedPnl)}</div>\${dexBreakdown('unrealizedPnl')}</div>
       </div>
-      <div class="section-title">Positions (\${filteredPositions.length}\${isHL && activeDexFilters.size>0 ? '/'+ex.positions.length : ''})</div>
+      <div class="section-title">Positions (\${posKnown ? filteredPositions.length : '?'}\${isHL && posKnown && activeDexFilters.size>0 ? '/'+ex.positions.length : ''})</div>
       \${dexFilterHtml}
       \${filteredPositions.length?\`<table><thead><tr>\${isHL?'<th>DEX</th>':''}<th>Symbol</th><th>Side</th><th>Size</th><th>Entry</th><th>Mark</th><th>Liq</th><th>Value</th><th>PnL</th><th>ROE%</th><th>Lev</th></tr></thead><tbody>\${filteredPositions.map(p=>{
         const dex = getDex(p.symbol);
         const sym = p.symbol.includes(':') ? p.symbol.split(':').slice(1).join(':') : p.symbol;
-        const notional = Math.abs(Number(p.size)) * Number(p.markPrice);
-        const margin = p.leverage > 0 ? notional / p.leverage : notional;
-        const roe = margin > 0 ? (Number(p.unrealizedPnl) / margin * 100) : 0;
-        return \`<tr>\${isHL?\`<td style="color:var(--purple);font-size:11px">\${dex}</td>\`:''}<td>\${sym}</td><td class="side-\${p.side}">\${p.side.toUpperCase()}</td><td>\${p.size}</td><td>$\${fmt(p.entryPrice)}</td><td>$\${fmt(p.markPrice)}</td><td>\${(p.liquidationPrice==null||p.liquidationPrice==='N/A')?'-':'$'+fmt(p.liquidationPrice)}</td><td style="color:var(--muted)">$\${fmt(notional)}</td><td class="\${pnlClass(p.unrealizedPnl)}">\${pnlSign(p.unrealizedPnl)}</td><td class="\${pnlClass(p.unrealizedPnl)}">\${roe>=0?'+':''}\${fmt(roe,1)}%</td><td>\${p.leverage}x</td></tr>\`;
-      }).join('')}</tbody></table>\`:'<div class="empty-msg">No open positions</div>'}
-      <div class="section-title">Open Orders (\${filteredOrders.length})</div>
+        const notional = p.markPrice == null ? null : Math.abs(Number(p.size)) * Number(p.markPrice);
+        const margin = notional == null ? null : p.leverage > 0 ? notional / p.leverage : notional;
+        const roe = margin != null && margin > 0 && p.unrealizedPnl != null ? (Number(p.unrealizedPnl) / margin * 100) : null;
+        return \`<tr>\${isHL?\`<td style="color:var(--purple);font-size:11px">\${dex}</td>\`:''}<td>\${sym}</td><td class="side-\${p.side}">\${p.side.toUpperCase()}</td><td>\${p.size}</td><td>\${usdOrNA(p.entryPrice)}</td><td>\${usdOrNA(p.markPrice)}</td><td>\${(p.liquidationPrice==null||p.liquidationPrice==='N/A')?'-':'$'+fmt(p.liquidationPrice)}</td><td style="color:var(--muted)">\${usdOrNA(notional)}</td><td class="\${pnlClass(p.unrealizedPnl)}">\${pnlOrNA(p.unrealizedPnl)}</td><td class="\${pnlClass(p.unrealizedPnl)}">\${roe==null?NA:(roe>=0?'+':'')+fmt(roe,1)+'%'}</td><td>\${p.leverage}x</td></tr>\`;
+      }).join('')}</tbody></table>\`:(posKnown?'<div class="empty-msg">No open positions</div>':'<div class="empty-msg">Positions '+NA+'</div>')}
+      <div class="section-title">Open Orders (\${ordKnown ? filteredOrders.length : '?'})</div>
       \${filteredOrders.length?\`<table><thead><tr>\${isHL?'<th>DEX</th>':''}<th>Symbol</th><th>Side</th><th>Type</th><th>Price</th><th>Size</th><th>Filled</th><th>Status</th></tr></thead><tbody>\${filteredOrders.map(o=>{
         const dex = getDex(o.symbol);
         const sym = o.symbol.includes(':') ? o.symbol.split(':').slice(1).join(':') : o.symbol;
         return \`<tr>\${isHL?\`<td style="color:var(--purple);font-size:11px">\${dex}</td>\`:''}<td>\${sym}</td><td class="side-\${o.side}">\${o.side.toUpperCase()}</td><td>\${o.type}</td><td>$\${fmt(o.price)}</td><td>\${o.size}</td><td>\${o.filled}</td><td>\${o.status}</td></tr>\`;
-      }).join('')}</tbody></table>\`:'<div class="empty-msg">No open orders</div>'}
+      }).join('')}</tbody></table>\`:(ordKnown?'<div class="empty-msg">No open orders</div>':'<div class="empty-msg">Open orders '+NA+'</div>')}
       <div class="section-title">Markets (Top 10)</div>
       \${ex.topMarkets.length?\`<table><thead><tr><th>Symbol</th><th>Mark</th><th>Index</th><th>Funding</th><th>24h Vol</th><th>OI</th><th>Max Lev</th></tr></thead><tbody>\${ex.topMarkets.map(m=>{const fr=Number(m.fundingRate);return\`<tr><td>\${m.symbol}</td><td>$\${fmt(m.markPrice)}</td><td>\${usdOrDash(m.indexPrice)}</td><td class="\${rateClass(fr)}">\${(fr*100).toFixed(4)}%</td><td>\${usdOrDash(m.volume24h,0)}</td><td>\${usdOrDash(m.openInterest,0)}</td><td>\${m.maxLeverage}x</td></tr>\`;}).join('')}</tbody></table>\`:'<div class="empty-msg">No market data</div>'}
     </div>\`;
@@ -511,12 +525,17 @@ function detectEvents(snap) {
   for (const ex of snap.exchanges) {
     const prev = prevSnapshot.exchanges.find(e => e.name === ex.name);
     if (!prev) continue;
-    const prevSyms = new Set(prev.positions.map(p => p.symbol));
-    const currSyms = new Set(ex.positions.map(p => p.symbol));
-    for (const p of ex.positions) { if (!prevSyms.has(p.symbol)) addEvent('position_opened', ex.name, {symbol:p.symbol,side:p.side,size:p.size}); }
-    for (const p of prev.positions) { if (!currSyms.has(p.symbol)) addEvent('position_closed', ex.name, {symbol:p.symbol,side:p.side}); }
-    const eqDelta = Math.abs(Number(ex.balance.equity) - Number(prev.balance.equity));
-    if (eqDelta > 0.01) addEvent('balance_update', ex.name, {equity:ex.balance.equity,delta:eqDelta.toFixed(2)});
+    // An unread (null) side is not a change — no opened/closed events from a failed read.
+    if (prev.positions && ex.positions) {
+      const prevSyms = new Set(prev.positions.map(p => p.symbol));
+      const currSyms = new Set(ex.positions.map(p => p.symbol));
+      for (const p of ex.positions) { if (!prevSyms.has(p.symbol)) addEvent('position_opened', ex.name, {symbol:p.symbol,side:p.side,size:p.size}); }
+      for (const p of prev.positions) { if (!currSyms.has(p.symbol)) addEvent('position_closed', ex.name, {symbol:p.symbol,side:p.side}); }
+    }
+    if (prev.balance && ex.balance) {
+      const eqDelta = Math.abs(Number(ex.balance.equity) - Number(prev.balance.equity));
+      if (eqDelta > 0.01) addEvent('balance_update', ex.name, {equity:ex.balance.equity,delta:eqDelta.toFixed(2)});
+    }
   }
   prevSnapshot = snap;
 }

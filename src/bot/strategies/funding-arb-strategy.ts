@@ -18,7 +18,7 @@ import {
   findRate,
   getPriceEstimate,
   fetchRates,
-  botSpotPerpMatches, assertFundingArbLegs, cancelBotSymbols } from "./funding-arb-utils.js";
+  botSpotPerpMatches, assertFundingArbLegs, cancelBotSymbols, collectFundingSince } from "./funding-arb-utils.js";
 import type { VenueMarket } from "../../exchanges/venue-types.js";
 import { fillSizeString, sizeDecimalsOf, spotLotStepOf, spotMarketFill } from "../../exchanges/spot-result.js";
 import { floorToStep, lotStepOf } from "../../exchanges/precision.js";
@@ -110,6 +110,9 @@ export class FundingArbStrategy implements Strategy {
     ctx.state.set("arbOpenPositions", [] as ArbOpenPosition[]);
     ctx.state.set("arbPositions", 0);
     ctx.state.set("fundingIncome", 0);
+    // Payments up to this instant are covered by the startup recovery (last 24 h); the periodic
+    // check books only payments newer than it (collectFundingSince high-water mark).
+    ctx.state.set("fundingStartTime", Date.now());
     ctx.state.set("fundingLastCheck", Date.now());
     ctx.state.set("fundingHistory", [] as { time: number; amount: number; exchange: string; symbol: string }[]);
     ctx.log(`  [ARB] Funding arb ready | spread >= ${params.min_spread}% | close < ${params.close_spread}% | size $${params.size_usd}`);
@@ -141,13 +144,16 @@ export class FundingArbStrategy implements Strategy {
         try {
           const payments = await a.getFundingPayments(200);
           const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
-          const recent = payments.filter(p => p.time > oneDayAgo);
+          const startedAt = ctx.state.get("fundingStartTime") as number;
+          const recent = payments.filter(p => p.time > oneDayAgo && p.time <= startedAt);
           const sum = recent.reduce((s, p) => s + parseFloat(p.payment), 0);
           if (Math.abs(sum) > 0.001) {
             historicalFunding += sum;
             ctx.log(`  [FUND] ${name}: $${sum.toFixed(4)} historical funding`);
           }
-        } catch { /* not all adapters support this */ }
+        } catch (e) {
+          ctx.log(`  [FUND] ${name}: funding history unavailable — historical funding excludes it: ${e instanceof Error ? e.message : String(e)}`);
+        }
       }
       if (Math.abs(historicalFunding) > 0.001) {
         ctx.state.set("fundingIncome", historicalFunding);
@@ -423,23 +429,14 @@ export class FundingArbStrategy implements Strategy {
     const lastCheck = ctx.state.get("fundingLastCheck") as number;
     if (Date.now() - lastCheck > 5 * 60 * 1000) {
       try {
-        let totalFunding = 0;
-        for (const [name, a] of adapters) {
-          try {
-            const payments = await a.getFundingPayments(50);
-            const startTime = ctx.state.get("fundingLastCheck") as number;
-            const recent = payments.filter(p => p.time > startTime - 5 * 60 * 1000);
-            const sum = recent.reduce((s, p) => s + parseFloat(p.payment), 0);
-            totalFunding += sum;
-            if (Math.abs(sum) > 0.001) {
-              ctx.log(`  [FUND] ${name}: $${sum.toFixed(4)} funding received`);
-            }
-          } catch { /* not all adapters support this */ }
-        }
-        const prev = ctx.state.get("fundingIncome") as number;
-        ctx.state.set("fundingIncome", prev + totalFunding);
+        const since = (ctx.state.get("fundingLastCheckByVenue") as Record<string, number> | undefined) ?? {};
+        const { total } = await collectFundingSince(adapters, since, ctx.state.get("fundingStartTime") as number, ctx.log);
+        ctx.state.set("fundingLastCheckByVenue", since);
+        ctx.state.set("fundingIncome", (ctx.state.get("fundingIncome") as number) + total);
         ctx.state.set("fundingLastCheck", Date.now());
-      } catch { /* non-critical */ }
+      } catch (e) {
+        ctx.log(`  [FUND] funding check failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
     }
 
     // ── Update strategy state for TUI display ──

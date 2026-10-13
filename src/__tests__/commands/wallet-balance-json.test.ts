@@ -33,10 +33,18 @@ vi.mock("../../commands/init.js", async (orig) => {
     validateKey: async (chain: string) => ({ valid: true, address: chain === "solana" ? SOL : EVM }),
   };
 });
+let owsActive: string | undefined;
 vi.mock("../../settings.js", async (orig) => {
   const real = await orig<typeof import("../../settings.js")>();
-  return { ...real, loadSettings: () => ({ ...real.loadSettings(), owsActiveWallet: undefined }) };
+  return { ...real, loadSettings: () => ({ ...real.loadSettings(), owsActiveWallet: owsActive }) };
 });
+let owsLoadFails = false;
+vi.mock("../../signer/ows-loader.js", () => ({
+  loadOws: () => {
+    if (owsLoadFails) throw new Error("vault missing");
+    return { getWallet: (name: string) => ({ name, accounts: [{ chainId: "eip155:1", address: EVM }, { chainId: "solana:mainnet", address: SOL }, { chainId: "cosmos:x", address: "c1" }] }) };
+  },
+}));
 
 const { registerWalletCommands } = await import("../../commands/wallet.js");
 const { EXCHANGE_ENV_MAP } = await import("../../commands/init.js");
@@ -51,6 +59,8 @@ function program(): Command {
 
 let out: string[];
 beforeEach(() => {
+  owsActive = undefined;
+  owsLoadFails = false;
   vi.clearAllMocks();
   out = [];
   vi.spyOn(console, "log").mockImplementation((...a) => { out.push(a.map(String).join(" ")); });
@@ -79,5 +89,42 @@ describe("wallet balance --json (.env path)", () => {
     expect(doc.data.find(e => e.chain === "solana")).toMatchObject({ address: SOL, stableUsd: 3, errors: [] });
     expect(evmRead).toHaveBeenCalledTimes(1);
     expect(solRead).toHaveBeenCalledTimes(1);
+  });
+});
+
+const parseOne = () => {
+  const docs = out.filter(l => l.trim() !== "");
+  expect(docs).toHaveLength(1);
+  return JSON.parse(docs[0]) as { ok: boolean; data: Array<Record<string, unknown>> };
+};
+
+describe("wallet balance --json (OWS and named-wallet paths)", () => {
+  it("active OWS wallet: one document, EVM + Solana accounts (other chains skipped), same entry shape", async () => {
+    owsActive = "main";
+    await program().parseAsync(["node", "perp", "wallet", "balance"]);
+    const doc = parseOne();
+    expect(doc.data.map(e => [e.wallet, e.chain, e.address])).toEqual([["main", "evm", EVM], ["main", "solana", SOL]]);
+    expect(doc.data[0]).toMatchObject({ stableUsd: 12.5, errors: ["bsc USDT: rpc timeout"] });
+  });
+
+  it("OWS vault fails to load → falls back to the .env path (still one document)", async () => {
+    owsActive = "main";
+    owsLoadFails = true;
+    await program().parseAsync(["node", "perp", "wallet", "balance"]);
+    expect(parseOne().data.map(e => e.chain).sort()).toEqual(["evm", "solana"]);
+  });
+
+  it("a balance-read failure on the OWS path propagates (no silent fall back to .env)", async () => {
+    owsActive = "main";
+    evmRead.mockRejectedValueOnce(new Error("ethers import failed"));
+    await expect(program().parseAsync(["node", "perp", "wallet", "balance"])).rejects.toThrow("ethers import failed");
+    expect(out.filter(l => l.trim() !== "")).toHaveLength(0);
+  });
+
+  it("named OWS wallet: one document with a single entry", async () => {
+    await program().parseAsync(["node", "perp", "wallet", "balance", "main"]);
+    const doc = parseOne();
+    expect(doc.data).toHaveLength(1);
+    expect(doc.data[0]).toMatchObject({ wallet: "main", chain: "evm", address: EVM, stableUsd: 12.5 });
   });
 });

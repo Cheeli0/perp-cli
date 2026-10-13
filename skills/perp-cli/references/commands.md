@@ -37,6 +37,7 @@ perp --json -e <EX> account margin <SYMBOL>    # position margin info
 perp --json -e <EX> account pnl                # realized + unrealized + funding
 perp --json -e <EX> account twap-orders        # active TWAP orders
 perp --json portfolio                          # cross-exchange unified view
+# funding24h is null (with fundingError) when a venue's funding history is unreadable; totals.fundingIncomplete = true then
 perp --json portfolio --arb                    # full dashboard with arb top 5
 ```
 
@@ -255,7 +256,7 @@ perp --json arb scan --gaps                                 # cross-exchange pri
 perp --json arb scan --hip3                                 # HIP-3 cross-dex spreads
 perp --json arb scan --history [SYMBOL]                     # historical funding
 perp --json arb scan --compare <SYMBOL>                     # compare a symbol across exchanges
-perp --json arb scan --positions                            # position funding impact
+perp --json arb scan --positions                            # position funding impact; actual24h null + fundingHistoryErrors when a venue's history is unreadable
 perp --json arb scan --live --interval 60                   # continuous monitoring
 perp --json arb scan --top 10 --hold-days 7 --bridge-cost 0 --size 100  # cost-aware filtering
 perp --json arb scan --rates --include-unverified           # also show QFEX (unverified funding; display only, never ranked)
@@ -281,6 +282,7 @@ perp --json arb close <SYM> --state-only --yes              # drop a stale state
 
 # Status / history / config / rebalance
 perp --json arb status                                      # open arb positions + PnL + funding; check unconfirmedPairs, staleStateEntries
+# spot-perp entries: fundingSource actual | partial | estimate | recorded (+ fundingError) — only "actual" is complete settled funding
 perp --json arb status --period 7 --symbol BTC              # filter funding lookback / symbol
 perp --json arb history                                     # alias: arb log
 perp --json arb history --period 30                         # past arb trade performance
@@ -424,9 +426,9 @@ perp --json history list                       # execution audit trail
 perp --json history positions                  # position lifetime tracking
 perp --json history prune                      # purge old entries
 perp --json history summary                    # trading performance summary (replaces former 'stats')
-perp --json history pnl                        # P&L breakdown by exchange
+perp --json history pnl                        # P&L breakdown by exchange; errors + partial name venues whose reads failed (left out, not 0)
 perp --json history funding                    # funding payment aggregation
-perp --json history report                     # full performance report (summary + pnl + funding)
+perp --json history report                     # full performance report (summary + pnl + funding); errors + partial + venuesRead
 perp --json history compare                    # compare strategies / accounts
 perp --json history snapshot                   # equity snapshot
 perp --json history track                      # PnL tracking helper

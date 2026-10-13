@@ -75,7 +75,9 @@ interface ExchangeEntry {
   spot: SpotHolding[];
   positions: PositionEntry[];
   openOrders: number;
-  funding24h: number;
+  /** Funding paid / received in the last 24 h; null = the venue's funding history could not be read. */
+  funding24h: number | null;
+  fundingError: string | null;
   totalAccountValueUsd: number;
   error: string | null;
 }
@@ -86,7 +88,10 @@ interface Totals {
   accountValueUsd: number;
   marginUsed: number;
   marginPct: number;
+  /** Sum over the venues whose funding was read (see fundingIncomplete). */
   funding24h: number;
+  /** true = at least one venue's funding24h is null and is left out of the sum. */
+  fundingIncomplete: boolean;
 }
 
 interface RiskBlock {
@@ -113,6 +118,8 @@ interface ServeBlock {
   url: string;
   port: number;
   exchanges: string[];
+  /** Venue (or hl:<dex>) adapters that could not be initialized and are NOT monitored. */
+  errors: Record<string, string>;
 }
 
 interface PortfolioEnvelopeData {
@@ -337,7 +344,10 @@ async function fetchExchangeEntry(
       adapter.getBalance(),
       adapter.getPositions(),
       adapter.getOpenOrders(),
-      adapter.getFundingPayments(200).catch(() => [] as { time: number; symbol: string; payment: string }[]),
+      adapter.getFundingPayments(200).then(
+        (rows) => ({ rows, error: null as string | null }),
+        (e: unknown) => ({ rows: null, error: e instanceof Error ? e.message : String(e) }),
+      ),
     ]);
 
     // Spot balances for every venue with def.spot (§12). Failures are surfaced on
@@ -362,8 +372,10 @@ async function fetchExchangeEntry(
     }
 
     const cutoff24h = Date.now() - 24 * 60 * 60 * 1000;
-    const recent = fundingPayments.filter(f => f.time >= cutoff24h);
-    const funding24h = recent.reduce((sum, f) => sum + Number(f.payment), 0);
+    if (fundingPayments.error !== null) warn(`${def.displayName} funding history unavailable (funding24h null): ${fundingPayments.error}`);
+    const funding24h = fundingPayments.rows === null
+      ? null
+      : fundingPayments.rows.filter(f => f.time >= cutoff24h).reduce((sum, f) => sum + Number(f.payment), 0);
 
     // Shared balances (Pacifica USDC, HL unified USDC) are already in perp equity (§12.4 #8).
     const nonUsdcSpotValue = spot.filter(b => !b.shared).reduce((s, b) => s + b.valueUsd, 0);
@@ -391,6 +403,7 @@ async function fetchExchangeEntry(
       })),
       openOrders: orders.length,
       funding24h,
+      fundingError: fundingPayments.error,
       totalAccountValueUsd: Number(bal.equity) + nonUsdcSpotValue,
       error: null,
     };
@@ -403,7 +416,9 @@ async function fetchExchangeEntry(
       spot: [],
       positions: [],
       openOrders: 0,
-      funding24h: 0,
+      funding24h: null,
+      // The whole venue was unreadable: funding is unknown for the same reason.
+      fundingError: err instanceof Error ? err.message : String(err),
       totalAccountValueUsd: 0,
       error: err instanceof Error ? err.message : String(err),
     };
@@ -415,6 +430,7 @@ function buildTotals(entries: ExchangeEntry[]): { totals: Totals; risk: RiskBloc
   let spotValueUsd = 0;
   let marginUsed = 0;
   let funding24h = 0;
+  let fundingIncomplete = false;
   let accountValueUsd = 0;
 
   for (const e of entries) {
@@ -422,7 +438,8 @@ function buildTotals(entries: ExchangeEntry[]): { totals: Totals; risk: RiskBloc
       equity += Number(e.perp.equity);
       marginUsed += Number(e.perp.marginUsed);
     }
-    funding24h += e.funding24h;
+    if (e.funding24h === null) fundingIncomplete = true;
+    else funding24h += e.funding24h;
 
     // Non-USDC spot value (for unified accounts USDC is already in equity)
     const exSpot = e.isUnified
@@ -440,7 +457,7 @@ function buildTotals(entries: ExchangeEntry[]): { totals: Totals; risk: RiskBloc
   const level: RiskBlock["level"] = marginPct < 30 ? "LOW" : marginPct < 60 ? "MEDIUM" : "HIGH";
 
   return {
-    totals: { equity, spotValueUsd, accountValueUsd, marginUsed, marginPct, funding24h },
+    totals: { equity, spotValueUsd, accountValueUsd, marginUsed, marginPct, funding24h, fundingIncomplete },
     risk: { level, marginPct },
   };
 }
@@ -738,7 +755,11 @@ async function runWatch(
 
 const KNOWN_HIP3_DEXES = ["xyz", "flx", "hyna", "km", "cash", "vntl"];
 
-async function checkDexPositions(address: string, dex: string): Promise<number> {
+/**
+ * Open-position count on a HIP-3 dex; null = the read failed (unknown — NOT "no positions").
+ * The failure is warned on stderr; callers must treat null as "may hold positions".
+ */
+export async function checkDexPositions(address: string, dex: string): Promise<number | null> {
   try {
     // Selected network (review L7): follows -n via setSharedApiNetwork (live binding).
     const res = await fetch(HYPERLIQUID_API_URL, {
@@ -746,14 +767,18 @@ async function checkDexPositions(address: string, dex: string): Promise<number> 
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ type: "clearinghouseState", user: address, dex }),
     });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const state = await res.json() as Record<string, unknown>;
-    const positions = (state?.assetPositions ?? []) as Record<string, unknown>[];
-    return positions.filter(p => {
+    if (!state || !Array.isArray(state.assetPositions)) throw new Error("clearinghouseState without assetPositions");
+    return (state.assetPositions as Record<string, unknown>[]).filter(p => {
       const pos = (p.position ?? p) as Record<string, unknown>;
-      return Number(pos.szi ?? 0) !== 0;
+      const szi = Number(pos.szi);
+      if (!Number.isFinite(szi)) throw new Error(`position without a numeric szi (${String(pos.coin)})`);
+      return szi !== 0;
     }).length;
-  } catch {
-    return 0;
+  } catch (e) {
+    process.stderr.write(`[warn] hl:${dex} positions unknown (HIP-3 dex read failed; included in the dashboard): ${e instanceof Error ? e.message : String(e)}\n`);
+    return null;
   }
 }
 
@@ -768,14 +793,21 @@ async function autoDetectHip3Dexes(
       count: await checkDexPositions(address, dex),
     })),
   );
-  const activeDexes = checks.filter(c => c.count > 0);
+  // Unknown (null) counts are included: a failed read must not hide a dex that may hold positions.
+  const activeDexes = checks.filter(c => c.count === null || c.count > 0);
   const results: DashboardExchange[] = [];
   for (const { dex, count } of activeDexes) {
     try {
       const adapter = await getHLAdapterForDex(dex);
       results.push({ name: `hl:${dex}`, adapter });
-      if (verbose) console.log(chalk.green(`  ✓ hl:${dex} (HIP-3, ${count} position${count > 1 ? "s" : ""})`));
-    } catch { /* skip */ }
+      if (verbose) {
+        console.log(count === null
+          ? chalk.yellow(`  ⚠ hl:${dex} (HIP-3, positions unknown — read failed)`)
+          : chalk.green(`  ✓ hl:${dex} (HIP-3, ${count} position${count > 1 ? "s" : ""})`));
+      }
+    } catch (e) {
+      process.stderr.write(`[warn] hl:${dex} left out of the dashboard (adapter unavailable${count === null ? ", positions unknown" : `, ${count} position(s)`}): ${e instanceof Error ? e.message : String(e)}\n`);
+    }
   }
   return results;
 }
@@ -790,18 +822,24 @@ async function runServe(
 
   if (isJsonMode) {
     const exchanges: DashboardExchange[] = [];
+    // A venue whose adapter failed is not monitored — reported in serve.errors + stderr, not dropped silently.
+    const errors: Record<string, string> = {};
+    const noteError = (name: string, e: unknown) => {
+      errors[name] = e instanceof Error ? e.message : String(e);
+      process.stderr.write(`[warn] ${name} not monitored (adapter unavailable): ${errors[name]}\n`);
+    };
     for (const name of resolved.exchangeList) {
       try {
         const adapter = await getAdapterForExchange(name);
         exchanges.push({ name, adapter });
-      } catch { /* skip */ }
+      } catch (e) { noteError(name, e); }
     }
     if (getHLAdapterForDex) {
       for (const dex of resolved.dexList) {
         try {
           const adapter = await getHLAdapterForDex(dex);
           exchanges.push({ name: `hl:${dex}`, adapter });
-        } catch { /* skip */ }
+        } catch (e) { noteError(`hl:${dex}`, e); }
       }
       if (resolved.autoDex && !resolved.dexList.length && resolved.exchangeList.includes("hyperliquid")) {
         const hlEx = exchanges.find(e => e.name === "hyperliquid");
@@ -822,12 +860,13 @@ async function runServe(
       scope: resolved.scope,
       mode: "serve",
       exchanges: [],
-      totals: { equity: 0, spotValueUsd: 0, accountValueUsd: 0, marginUsed: 0, marginPct: 0, funding24h: 0 },
+      totals: { equity: 0, spotValueUsd: 0, accountValueUsd: 0, marginUsed: 0, marginPct: 0, funding24h: 0, fundingIncomplete: false },
       risk: { level: "LOW", marginPct: 0 },
       serve: {
         url: `http://localhost:${dashboard.port}`,
         port: dashboard.port,
         exchanges: exchanges.map(e => e.name),
+        errors,
       },
     };
     printJson(jsonOk(data));
@@ -978,7 +1017,7 @@ export function registerPortfolioCommand(
             scope: resolved.scope,
             mode: "health",
             exchanges: [],
-            totals: { equity: 0, spotValueUsd: 0, accountValueUsd: 0, marginUsed: 0, marginPct: 0, funding24h: 0 },
+            totals: { equity: 0, spotValueUsd: 0, accountValueUsd: 0, marginUsed: 0, marginPct: 0, funding24h: 0, fundingIncomplete: false },
             risk: { level: "LOW", marginPct: 0 },
             health,
           };

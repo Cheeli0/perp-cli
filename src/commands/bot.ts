@@ -196,17 +196,10 @@ export function registerStrategyCommands(
       minSpread: string; closeSpread: string; size: string;
       maxPositions: string; exchanges: string; interval: string;
       maxDrawdown: string; background?: boolean; headless?: boolean; jobId?: string;
-    }) => {
-      const exchangeNames = opts.exchanges.split(",").map(e => e.trim());
-      const adapters = new Map<string, ExchangeAdapter>();
-
-      for (const name of exchangeNames) {
-        try {
-          adapters.set(name, await getAdapterFor(name));
-        } catch {
-          // skip unavailable
-        }
-      }
+    }, cmd: Command) => {
+      const adapters = await loadBotVenueAdapters(opts.exchanges.split(",").map(e => e.trim()), cmd.getOptionValueSource("exchanges") === "cli", getAdapterFor);
+      // The strategy scans only the venues that loaded.
+      const exchangeNames = [...adapters.keys()];
 
       if (adapters.size < 2) {
         console.error(chalk.red("\n  Need at least 2 exchanges for arbitrage.\n"));
@@ -245,7 +238,8 @@ export function registerStrategyCommands(
           `strategy`, `quick-arb`,
           `--min-spread`, opts.minSpread, `--close-spread`, opts.closeSpread,
           `--size`, opts.size, `--max-positions`, opts.maxPositions,
-          `--exchanges`, opts.exchanges, `--interval`, opts.interval,
+          // The venues the parent loaded (a skipped default venue is not re-tried as "explicit").
+          `--exchanges`, exchangeNames.join(","), `--interval`, opts.interval,
           `--max-drawdown`, opts.maxDrawdown,
         ];
         const job = startJob({
@@ -285,17 +279,10 @@ export function registerStrategyCommands(
       exchanges: string; minRate: string; closeRate: string; size: string;
       maxPositions: string; leverage: string; interval: string;
       maxDrawdown: string; background?: boolean; headless?: boolean; jobId?: string;
-    }) => {
-      const exchangeNames = opts.exchanges.split(",").map(e => e.trim());
-      const adapters = new Map<string, ExchangeAdapter>();
-
-      for (const name of exchangeNames) {
-        try {
-          adapters.set(name, await getAdapterFor(name));
-        } catch {
-          // skip unavailable
-        }
-      }
+    }, cmd: Command) => {
+      const adapters = await loadBotVenueAdapters(opts.exchanges.split(",").map(e => e.trim()), cmd.getOptionValueSource("exchanges") === "cli", getAdapterFor);
+      // The strategy trades only the venues that loaded.
+      const exchangeNames = [...adapters.keys()];
 
       if (adapters.size < 1) {
         console.error(chalk.red("\n  Need at least 1 exchange for delta-neutral.\n"));
@@ -335,7 +322,7 @@ export function registerStrategyCommands(
           `strategy`, `delta-neutral`,
           `--min-rate`, opts.minRate, `--close-rate`, opts.closeRate,
           `--size`, opts.size, `--max-positions`, opts.maxPositions,
-          `--leverage`, opts.leverage, `--exchanges`, opts.exchanges,
+          `--leverage`, opts.leverage, `--exchanges`, exchangeNames.join(","),
           `--interval`, opts.interval, `--max-drawdown`, opts.maxDrawdown,
         ];
         const job = startJob({
@@ -413,15 +400,9 @@ export function registerStrategyCommands(
         const built = preset.buildConfig("multi", sym);
         const config = opts.size !== undefined ? withPresetSize(built, opts.size) : built;
         const arbStrategy = config.strategy as import("../bot/config.js").FundingArbStrategyParams;
-        const adapters = new Map<string, ExchangeAdapter>();
-
-        for (const exName of arbStrategy.exchanges) {
-          try {
-            adapters.set(exName, await getAdapterFor(exName));
-          } catch {
-            // skip unavailable
-          }
-        }
+        // The preset's venue list is a default (not user-passed): a failing venue is skipped with a warning.
+        const adapters = await loadBotVenueAdapters(arbStrategy.exchanges, false, getAdapterFor);
+        arbStrategy.exchanges = [...adapters.keys()];
 
         if (adapters.size < 2) {
           console.error(chalk.red("\n  Need at least 2 exchanges for arbitrage.\n"));
@@ -830,6 +811,48 @@ export function registerStrategyCommands(
   registerStrategyPlanCommands(bot, getAdapter, isJson);
 }
 
+/**
+ * Adapters for a multi-venue bot. An explicitly passed list (--exchanges on the command line)
+ * must load in full: a venue that fails refuses the start with a PerpError naming it. A default
+ * list skips a failing venue with a stderr warning naming it and the cause.
+ */
+export async function loadBotVenueAdapters(
+  names: string[],
+  explicit: boolean,
+  getAdapterFor: (exchange: string) => Promise<ExchangeAdapter>,
+): Promise<Map<string, ExchangeAdapter>> {
+  const adapters = new Map<string, ExchangeAdapter>();
+  for (const name of names) {
+    try {
+      const a = await getAdapterFor(name);
+      // A venue without credentials gets a read-only adapter: it can neither trade nor report
+      // the bot's balances, so it is "not configured" — refused when listed explicitly.
+      if ((a as { isReadOnly?: unknown }).isReadOnly === true) {
+        if (explicit) {
+          throw new PerpError("NO_SIGNER_AVAILABLE", `--exchanges venue ${name} has no credentials configured`, {
+            exchange: name, remediation: `Set it up (perp setup) or remove it from --exchanges`,
+          });
+        }
+        process.stderr.write(`[info] ${name} not configured (no credentials) — the bot runs without it\n`);
+        continue;
+      }
+      adapters.set(name, a);
+    } catch (e) {
+      if (e instanceof PerpError && e.structured.code === "NO_SIGNER_AVAILABLE" && explicit) throw e;
+      const cause = e instanceof Error ? e.message : String(e);
+      if (explicit) {
+        throw new PerpError(e instanceof PerpError ? e.structured.code : "EXCHANGE_ERROR",
+          `--exchanges venue ${name} could not be initialised: ${cause}`, {
+            exchange: name,
+            remediation: `Fix ${name}'s setup (credentials / network: perp -e ${name} portfolio), or remove it from --exchanges`,
+          });
+      }
+      process.stderr.write(`[warn] ${name} unavailable (${cause}) — the bot runs without it\n`);
+    }
+  }
+  return adapters;
+}
+
 function makeLog(): (msg: string) => void {
   return (msg: string) => {
     const ts = new Date().toLocaleTimeString();
@@ -1003,18 +1026,10 @@ function registerRunSubcommands(
       rebalanceThreshold: string;
       maxDrawdown?: string;
       jobId?: string;
-    }) => {
+    }, cmd: Command) => {
       const exchangeNames = opts.exchanges.split(",").map((e) => e.trim());
-      const adapters = new Map<string, ExchangeAdapter>();
-
-      for (const name of exchangeNames) {
-        try {
-          const a = await getAdapterFor(name);
-          adapters.set(name, a);
-        } catch {
-          if (!isJson()) console.log(chalk.yellow(`  Skipping ${name} (no credentials)`));
-        }
-      }
+      // An explicitly listed venue that fails to load refuses the start; a default one is skipped with a warning.
+      const adapters = await loadBotVenueAdapters(exchangeNames, cmd.getOptionValueSource("exchanges") === "cli", getAdapterFor);
 
       if (adapters.size < 2) {
         console.error(chalk.red("Need at least 2 exchanges for arbitrage. Set credentials for 2+ exchanges."));

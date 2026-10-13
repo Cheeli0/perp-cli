@@ -28,23 +28,39 @@ const EXCHANGE_CHAIN_MAP: Record<string, string> = {
   hyperliquid: "hyperliquid",
 };
 
+/** A venue whose margin could not be read: UNKNOWN (never healthy) — callers block new entries on it. */
+export interface ChainMarginUnknown {
+  exchange: string;
+  error: string;
+}
+
+export interface ChainMarginCheck {
+  statuses: ChainMarginStatus[];
+  /** Venues whose balance read failed / returned non-numeric values (margin unknown). */
+  unknown: ChainMarginUnknown[];
+}
+
 /**
  * Check margin status across all configured exchanges.
  *
  * @param adapters - Map of exchange name to adapter
  * @param minMarginPct - Warn when free margin / equity falls below this (default: 30%)
- * @returns Per-exchange margin status array
+ * @returns Per-exchange margin status, plus every venue whose margin is unknown (a failed
+ *          read is reported there — never dropped, so it can still block entries)
  */
 export async function checkChainMargins(
   adapters: Map<string, ExchangeAdapter>,
   minMarginPct: number = 30,
-): Promise<ChainMarginStatus[]> {
+): Promise<ChainMarginCheck> {
   const entries = [...adapters.entries()];
   const results = await Promise.allSettled(
-    entries.map(async ([name, adapter]) => {
+    entries.map(async ([name, adapter]): Promise<ChainMarginStatus> => {
       const bal = await adapter.getBalance();
       const equity = Number(bal.equity);
       const usedMargin = Number(bal.marginUsed);
+      if (!Number.isFinite(equity) || !Number.isFinite(usedMargin)) {
+        throw new Error(`balance returned non-numeric equity/marginUsed (${String(bal.equity)}/${String(bal.marginUsed)})`);
+      }
       const freeMargin = equity - usedMargin;
 
       // marginRatio = (freeMargin / equity) * 100
@@ -63,9 +79,13 @@ export async function checkChainMargins(
     }),
   );
 
-  return results
-    .filter((r): r is PromiseFulfilledResult<ChainMarginStatus> => r.status === "fulfilled")
-    .map((r) => r.value);
+  const statuses: ChainMarginStatus[] = [];
+  const unknown: ChainMarginUnknown[] = [];
+  results.forEach((r, i) => {
+    if (r.status === "fulfilled") statuses.push(r.value);
+    else unknown.push({ exchange: entries[i][0], error: r.reason instanceof Error ? r.reason.message : String(r.reason) });
+  });
+  return { statuses, unknown };
 }
 
 /**
@@ -80,6 +100,32 @@ export function isCriticalMargin(status: ChainMarginStatus): boolean {
  */
 export function shouldBlockEntries(status: ChainMarginStatus, minMarginPct: number = 30): boolean {
   return status.marginRatio < minMarginPct;
+}
+
+/** Why new entries on a venue are blocked this cycle (closing / reducing stays allowed). */
+export interface MarginEntryBlock {
+  exchange: string;
+  level: "critical" | "low" | "unknown";
+  /** null when the margin is unknown */
+  marginPct: number | null;
+  /** Threshold breached; null when unknown */
+  threshold: number | null;
+  /** Read error when unknown */
+  error?: string;
+}
+
+/**
+ * Entry blocks from a margin check: critical (<15%), low (< minMarginPct), and UNKNOWN
+ * (failed read — never treated as healthy, so new entries are blocked on it too).
+ */
+export function marginEntryBlocks(check: ChainMarginCheck, minMarginPct: number = 30): MarginEntryBlock[] {
+  const out: MarginEntryBlock[] = [];
+  for (const ms of check.statuses) {
+    if (isCriticalMargin(ms)) out.push({ exchange: ms.exchange, level: "critical", marginPct: ms.marginRatio, threshold: 15 });
+    else if (shouldBlockEntries(ms, minMarginPct)) out.push({ exchange: ms.exchange, level: "low", marginPct: ms.marginRatio, threshold: minMarginPct });
+  }
+  for (const u of check.unknown) out.push({ exchange: u.exchange, level: "unknown", marginPct: null, threshold: null, error: u.error });
+  return out;
 }
 
 // ── Dynamic Auto-Sizing ──

@@ -5,8 +5,16 @@ import { Box, Text, useApp, useInput } from "ink";
 
 export interface ExchangeBalance {
   exchange: string;
-  equity: string;
-  available: string;
+  /** null = the balance read failed (`error` says why) — shown "unavailable", never $0. */
+  equity: string | null;
+  available: string | null;
+  error?: string;
+}
+
+/** A venue whose display read (positions / spot balances) failed this tick. */
+export interface VenueReadError {
+  exchange: string;
+  error: string;
 }
 
 export interface BotTuiState {
@@ -35,6 +43,10 @@ export interface BotTuiState {
   strategyState: Record<string, unknown>;
   tick: number;
   exchangeBalances?: ExchangeBalance[];
+  /** Venues whose positions could not be read: their positions are unknown, not empty. */
+  positionErrors?: VenueReadError[];
+  /** Open orders read failure (null = read): the orders are unknown, not empty. */
+  openOrdersError?: string | null;
 }
 
 export interface Position {
@@ -147,7 +159,12 @@ export function BotDashboard({ initialState, onQuit, onPause, subscribe }: Dashb
   const drawdown = state.equity !== null && state.peakEquity !== null ? state.peakEquity - state.equity : null;
   const drawdownPct = drawdown !== null && state.peakEquity !== null && state.peakEquity > 0 ? (drawdown / state.peakEquity) * 100 : 0;
   const usd = (v: number | null) => v === null ? "unknown" : `$${v.toFixed(2)}`;
-  const totalEquity = state.exchangeBalances !== undefined ? state.exchangeBalances.reduce((s, e) => s + parseFloat(e.equity), 0) : state.equity;
+  // Any unavailable venue balance → the total is unknown (never summed as if that venue were $0).
+  const totalEquity = state.exchangeBalances !== undefined
+    ? (state.exchangeBalances.some((e) => e.equity === null) ? null : state.exchangeBalances.reduce((s, e) => s + parseFloat(e.equity as string), 0))
+    : state.equity;
+  const positionErrors = state.positionErrors ?? [];
+  const openOrdersError = state.openOrdersError ?? null;
   const bidOrders = state.openOrders.filter((o) => o.side.toLowerCase() === "buy");
   const askOrders = state.openOrders.filter((o) => o.side.toLowerCase() === "sell");
   const hasMultiExchange = (state.exchangeBalances?.length ?? 0) > 1;
@@ -194,7 +211,7 @@ export function BotDashboard({ initialState, onQuit, onPause, subscribe }: Dashb
             Price: <Text bold color="white">${state.price.toFixed(2)}</Text>
           </Text>
           <Text color="gray">
-            Vol24h: <Text color="white">{state.volatility24h.toFixed(1)}%</Text>
+            Vol24h: <Text color="white">{Number.isFinite(state.volatility24h) ? `${state.volatility24h.toFixed(1)}%` : "unknown"}</Text>
           </Text>
           <Text color="gray">
             FR: <Text color={state.fundingRate >= 0 ? "green" : "red"}>
@@ -248,8 +265,14 @@ export function BotDashboard({ initialState, onQuit, onPause, subscribe }: Dashb
           {state.exchangeBalances.map((eb, i) => (
             <Box key={i} flexDirection="row">
               <Text color="white">{pad(eb.exchange, 16)}</Text>
-              <Text color="white">{pad(`$${parseFloat(eb.equity).toFixed(2)}`, 14)}</Text>
-              <Text color="gray">${parseFloat(eb.available).toFixed(2)}</Text>
+              {eb.equity === null ? (
+                <Text color="red">unavailable{eb.error ? ` (${eb.error})` : ""}</Text>
+              ) : (
+                <>
+                  <Text color="white">{pad(`$${parseFloat(eb.equity).toFixed(2)}`, 14)}</Text>
+                  <Text color="gray">{eb.available === null ? "unavailable" : `$${parseFloat(eb.available).toFixed(2)}`}</Text>
+                </>
+              )}
             </Box>
           ))}
         </Box>
@@ -258,8 +281,11 @@ export function BotDashboard({ initialState, onQuit, onPause, subscribe }: Dashb
       {/* ── Positions ── */}
       <Box marginTop={1} flexDirection="column">
         <Text color="cyan" bold>Positions</Text>
+        {positionErrors.map((pe, i) => (
+          <Text key={`err-${i}`} color="red">  {pe.exchange}: unavailable ({pe.error})</Text>
+        ))}
         {state.positions.length === 0 ? (
-          <Text color="gray">  No open positions</Text>
+          positionErrors.length === 0 && <Text color="gray">  No open positions</Text>
         ) : (
           <Box flexDirection="column">
             <Box flexDirection="row">
@@ -290,6 +316,11 @@ export function BotDashboard({ initialState, onQuit, onPause, subscribe }: Dashb
       </Box>
 
       {/* ── Open Orders (bid | ask) ── */}
+      {openOrdersError !== null ? (
+        <Box marginTop={1}>
+          <Text color="red">Open orders unavailable ({openOrdersError})</Text>
+        </Box>
+      ) : (
       <Box marginTop={1} flexDirection="row" justifyContent="space-between">
         <Box flexDirection="column" width="50%">
           <Text color="green" bold>Bids ({bidOrders.length})</Text>
@@ -316,6 +347,7 @@ export function BotDashboard({ initialState, onQuit, onPause, subscribe }: Dashb
           )}
         </Box>
       </Box>
+      )}
 
       {/* ── Strategy State ── */}
       <Box marginTop={1} flexDirection="column">

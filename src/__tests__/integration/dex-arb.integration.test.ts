@@ -140,7 +140,7 @@ describe("findDexArbPairs — live data", () => {
 
 describe("scanDexArb — live full scan", () => {
   it("returns sorted arb opportunities", async () => {
-    const pairs = await scanDexArb({ minAnnualSpread: 5 });
+    const { pairs } = await scanDexArb({ minAnnualSpread: 5 });
 
     expect(pairs.length).toBeGreaterThan(0);
 
@@ -167,8 +167,8 @@ describe("scanDexArb — live full scan", () => {
   }, 30000);
 
   it("no-native mode excludes HL base assets", async () => {
-    const withNative = await scanDexArb({ minAnnualSpread: 0, includeNative: true });
-    const withoutNative = await scanDexArb({ minAnnualSpread: 0, includeNative: false });
+    const { pairs: withNative } = await scanDexArb({ minAnnualSpread: 0, includeNative: true });
+    const { pairs: withoutNative } = await scanDexArb({ minAnnualSpread: 0, includeNative: false });
 
     // Without native, should have fewer pairs (no hl↔dex pairs)
     const nativePairs = withNative.filter(p => p.long.dex === "hl" || p.short.dex === "hl");

@@ -1,4 +1,5 @@
 import { Command } from "commander";
+import { QFEX_WITHDRAW_ENABLED } from "../exchanges/venues/qfex.js";
 import { unsupported } from "../exchanges/trading-v2.js";
 import chalk from "chalk";
 import { printJson, jsonOk, withJsonErrors } from "../utils.js";
@@ -121,7 +122,7 @@ export function registerSettingsCommands(
           const fee = "feeBps" in e ? `${e.feeBps} bps` : "fee share (you pay the normal fee)";
           console.log(`    ${v.padEnd(14)} ${id}  ${fee}${BUILDER_FEE_CAPABILITIES[v as keyof typeof BUILDER_FEE_CAPABILITIES]?.feeKind === "max" ? " (max)" : ""}`);
         }
-        console.log(chalk.white.bold("\n  Withdraw gate (qfex: API-key withdrawals; hyperliquid: withdraw / transfer to a non-owner address; off unless set):"));
+        console.log(chalk.white.bold(`\n  Withdraw gate (qfex: API-key withdrawals${QFEX_WITHDRAW_ENABLED ? "" : " — currently disabled in perp-cli"}; hyperliquid: withdraw / transfer to a non-owner address; off unless set):`));
         const gates = Object.entries(s.withdraw) as [WithdrawGateVenue, WithdrawGate][];
         if (gates.length === 0) console.log(chalk.gray(`    (none — gated withdrawals on ${WITHDRAW_GATE_VENUES.join(", ")} are refused; Hyperliquid to the owner's own address is always allowed)`));
         for (const [v, g] of gates) console.log(`    ${v.padEnd(14)} max ${g.maxPerTx}/tx, ${g.maxPerDay}/day → ${g.allowlist.join(", ")}`);

@@ -6,12 +6,16 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 const failing = new Set<string>();
 const rpcUrls: string[] = [];
+const providerArgs: Array<{ timeout: number; chainId: number; opts: Record<string, unknown> }> = [];
 const raw: Record<string, bigint> = {};
 
 vi.mock("ethers", async (orig) => {
   const real = await orig<typeof import("ethers")>();
   class JsonRpcProvider {
-    constructor(readonly url: string) { rpcUrls.push(url); }
+    constructor(readonly req: { url: string; timeout: number }, readonly chainId: number, readonly opts: Record<string, unknown>) {
+      rpcUrls.push(req.url);
+      providerArgs.push({ timeout: req.timeout, chainId, opts });
+    }
     async getBalance() { return 10n ** 15n; } // 0.001 native
   }
   class Contract {
@@ -38,7 +42,7 @@ vi.mock("@solana/web3.js", async (orig) => {
   return { ...real, Connection };
 });
 
-const { evmOnchainBalances, mainnetEvmChains, solanaOnchainBalances, stableTotal } = await import("../onchain-balances.js");
+const { evmOnchainBalances, mainnetEvmChains, solanaOnchainBalances, stableTotal, ONCHAIN_READ_TIMEOUT_MS } = await import("../onchain-balances.js");
 const SOL_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const SOL_USDT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 
@@ -49,6 +53,7 @@ const BSC_USDT = "0x55d398326f99059fF775485246999027B3197955";
 beforeEach(() => {
   for (const k of Object.keys(solTokenAccounts)) delete solTokenAccounts[k];
   rpcUrls.length = 0;
+  providerArgs.length = 0;
   failing.clear();
   for (const k of Object.keys(raw)) delete raw[k];
   vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ ETH: "2500", BNB: "700", SOL: "100" }))));
@@ -96,6 +101,26 @@ describe("evmOnchainBalances", () => {
   it("every chain goes through the (mocked) provider — no real RPC in unit tests", async () => {
     await evmOnchainBalances(ADDR, false);
     expect(rpcUrls).toHaveLength(5);
+  });
+
+  it("every RPC has the 10 s timeout, a pinned chain id (staticNetwork) and no JSON-RPC batching", async () => {
+    await evmOnchainBalances(ADDR, false);
+    expect(providerArgs.map(p => p.chainId)).toEqual([42161, 1, 8453, 56, 4663]);
+    for (const p of providerArgs) {
+      expect(p.timeout).toBe(ONCHAIN_READ_TIMEOUT_MS);
+      expect(p.opts).toMatchObject({ staticNetwork: true, batchMaxCount: 1 });
+    }
+    expect(ONCHAIN_READ_TIMEOUT_MS).toBe(10_000);
+  });
+
+  it("the price request carries an abort signal (timeout)", async () => {
+    const f = vi.fn(async (_u: unknown, init?: RequestInit) => {
+      expect(init?.signal).toBeInstanceOf(AbortSignal);
+      return new Response(JSON.stringify({ ETH: "2500" }));
+    });
+    vi.stubGlobal("fetch", f);
+    await evmOnchainBalances(ADDR, false, ["arbitrum"]);
+    expect(f).toHaveBeenCalledTimes(1);
   });
 
   it("`only` limits the chains; testnet reads Arbitrum Sepolia only", async () => {

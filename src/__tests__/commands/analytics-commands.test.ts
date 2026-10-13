@@ -286,3 +286,144 @@ describe("analytics compare", () => {
     expect(res.data.positions).toEqual([]);
   });
 });
+
+describe("analytics report — failed venue reads are reported, never counted as 0", () => {
+  function programWith(getAdapter: (ex: string) => Promise<ExchangeAdapter>) {
+    program = new Command();
+    addRootSafetyOptions(program);
+    program.option("--json", "JSON output");
+    registerHistoryCommands(program, () => program.opts().json ?? false, getAdapter);
+  }
+
+  it("all venues answer → partial false, errors empty", async () => {
+    const res = await run(["analytics", "report"]);
+    expect(res.data).toMatchObject({ partial: false, errors: {}, venuesRead: 3, venuesRequested: 3 });
+  });
+
+  it("adapter / trades / funding failures are keyed per venue; totals cover only the venues that answered", async () => {
+    programWith(async (ex) => {
+      if (ex === "lighter") throw new Error("no credentials");
+      const a = mockAdapter(ex);
+      if (ex === "pacifica") (a.getTradeHistory as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("HTTP 500"));
+      return a;
+    });
+    const res = await run(["analytics", "report"]);
+    expect(res.ok).toBe(true);
+    expect(res.data.partial).toBe(true);
+    expect(res.data.venuesRead).toBe(2);
+    expect(res.data.errors).toEqual({ "lighter.adapter": "no credentials", "pacifica.trades": "HTTP 500" });
+    expect(res.data.portfolio.totalEquity).toBe(20000);
+    expect(res.data.costs.totalFees).toBeCloseTo(2.63, 6); // hyperliquid only
+  });
+});
+
+describe("analytics pnl — failed venue reads are reported, never counted as 0", () => {
+  it("adapter / funding failures land in errors with partial true; totals cover the rest", async () => {
+    program = new Command();
+    addRootSafetyOptions(program);
+    program.option("--json", "JSON output");
+    registerHistoryCommands(program, () => program.opts().json ?? false, async (ex) => {
+      if (ex === "lighter") throw new Error("no credentials");
+      const a = mockAdapter(ex);
+      if (ex === "pacifica") (a.getFundingPayments as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("HTTP 503"));
+      return a;
+    });
+    const res = await run(["analytics", "pnl"]);
+    expect(res.ok).toBe(true);
+    expect(res.data.partial).toBe(true);
+    expect(res.data.errors).toEqual({ "lighter.adapter": "no credentials", "pacifica.funding": "HTTP 503" });
+    expect(res.data.totalFunding).toBeCloseTo(15.5, 6); // hyperliquid only (5.20 + 4.80 + 5.50)
+    expect(res.data.totalTrades).toBe(4);               // hyperliquid + pacifica trades
+  });
+
+  it("all venues answer → partial false", async () => {
+    const res = await run(["analytics", "pnl"]);
+    expect(res.data).toMatchObject({ partial: false, errors: {} });
+  });
+});
+
+describe("analytics funding — failed venue reads are reported, never counted as 0", () => {
+  it("adapter / funding / positions failures are keyed per venue; totals cover the rest; partial true", async () => {
+    program = new Command();
+    addRootSafetyOptions(program);
+    program.option("--json", "JSON output");
+    registerHistoryCommands(program, () => program.opts().json ?? false, async (ex) => {
+      if (ex === "lighter") throw new Error("no credentials");
+      const a = mockAdapter(ex);
+      if (ex === "pacifica") (a.getFundingPayments as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("HTTP 503"));
+      if (ex === "hyperliquid") (a.getPositions as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("timeout"));
+      return a;
+    });
+    const res = await run(["analytics", "funding"]);
+    expect(res.ok).toBe(true);
+    expect(res.data.partial).toBe(true);
+    expect(res.data.errors).toEqual({
+      "lighter.adapter": "no credentials",
+      "pacifica.funding": "HTTP 503",
+      "hyperliquid.positions": "timeout",
+    });
+    expect(res.data.totalFunding).toBeCloseTo(15.5, 6); // hyperliquid only
+    // ETH arb is hyperliquid → lighter: the lighter leg is unknown → netFunding null, not hl-only.
+    const eth = res.data.arbPositions.find((a: { symbol: string }) => a.symbol === "ETH");
+    expect(eth).toMatchObject({ longFunding: 15.5, shortFunding: null, netFunding: null });
+  });
+
+  it("all venues answer → partial false, errors empty", async () => {
+    const res = await run(["analytics", "funding"]);
+    expect(res.data).toMatchObject({ partial: false, errors: {} });
+  });
+});
+
+describe("analytics compare — a failed venue's funding / price is null, never 0 / the entry price", () => {
+  it("rows touching a failed venue report null; totals skip them and flag partial", async () => {
+    program = new Command();
+    addRootSafetyOptions(program);
+    program.option("--json", "JSON output");
+    registerHistoryCommands(program, () => program.opts().json ?? false, async (ex) => {
+      const a = mockAdapter(ex);
+      // BTC live positions on lighter + pacifica so the BTC row is fully priced.
+      (a.getPositions as ReturnType<typeof vi.fn>).mockResolvedValue([
+        { symbol: "ETH", side: "long", size: "1.0", entryPrice: "3500", markPrice: "3520", liquidationPrice: null, unrealizedPnl: "20", leverage: 2 },
+        { symbol: "BTC", side: "long", size: "0.1", entryPrice: "95000", markPrice: "96000", liquidationPrice: null, unrealizedPnl: "100", leverage: 2 },
+      ]);
+      // hyperliquid (ETH long leg) funding fails; lighter's positions read is fine.
+      if (ex === "hyperliquid") (a.getFundingPayments as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("HTTP 500"));
+      return a;
+    });
+    const res = await run(["analytics", "compare"]);
+    expect(res.ok).toBe(true);
+    expect(res.data.partial).toBe(true);
+    expect(res.data.errors).toEqual({ "hyperliquid.funding": "HTTP 500" });
+    const eth = res.data.positions.find((p: { symbol: string }) => p.symbol === "ETH");
+    expect(eth.funding).toBeNull();
+    expect(eth.totalPnl).toBeNull();
+    expect(eth.roi).toBeNull();
+    expect(eth.pricePnl).toBeCloseTo(20 - 10, 6); // prices were read: (3520-3500)*1 + (3510-3520)*1
+    const btc = res.data.positions.find((p: { symbol: string }) => p.symbol === "BTC");
+    expect(btc.funding).toBe(0); // venues answered, no BTC payments
+    expect(btc.pricePnl).toBeCloseTo((96000 - 95000) * 0.1 + (95100 - 96000) * 0.1, 6);
+    // Totals: funding / totalPnl cover BTC only (ETH unknown is skipped, not counted as 0 + entry price).
+    expect(res.data.totals.totalPnl).toBeCloseTo(btc.totalPnl, 6);
+    expect(res.data.totals.notional).toBeCloseTo(95000 * 0.1 + 95100 * 0.1, 6);
+  });
+
+  it("a whole venue failing (adapter) → its legs' price PnL null, not priced at the entry", async () => {
+    program = new Command();
+    addRootSafetyOptions(program);
+    program.option("--json", "JSON output");
+    registerHistoryCommands(program, () => program.opts().json ?? false, async (ex) => {
+      if (ex === "lighter") throw new Error("no credentials");
+      return mockAdapter(ex);
+    });
+    const res = await run(["analytics", "compare"]);
+    expect(res.data.errors).toEqual({ "lighter.adapter": "no credentials" });
+    for (const p of res.data.positions) {
+      expect(p.funding).toBeNull();
+      expect(p.pricePnl).toBeNull();
+      expect(p.totalPnl).toBeNull();
+    }
+    expect(res.data.partial).toBe(true);
+    expect(res.data.totals.totalPnl).toBe(0);
+    expect(res.data.totals.notional).toBe(0);
+  });
+});

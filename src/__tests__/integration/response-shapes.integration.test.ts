@@ -282,7 +282,7 @@ describe("Response Shape Validation (Hyperliquid Mainnet)", () => {
 
   describe("6. scanDexArb full pipeline", () => {
     it("returns sorted array with valid pairs", async () => {
-      const pairs = await scanDexArb({ minAnnualSpread: 5 });
+      const { pairs } = await scanDexArb({ minAnnualSpread: 5 });
 
       expect(Array.isArray(pairs)).toBe(true);
 

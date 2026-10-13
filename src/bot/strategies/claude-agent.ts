@@ -110,8 +110,8 @@ function buildMarketMessage(snapshot: EnrichedSnapshot, symbol: string): string 
     `Symbol: ${symbol}`,
     `Price: ${snapshot.price.toFixed(4)}`,
     `Funding Rate: ${(snapshot.fundingRate * 100).toFixed(4)}%`,
-    `24h Volatility: ${snapshot.volatility24h.toFixed(2)}%`,
-    `24h Volume: ${snapshot.volume24h.toFixed(2)}`,
+    `24h Volatility: ${Number.isFinite(snapshot.volatility24h) ? `${snapshot.volatility24h.toFixed(2)}%` : "unknown"}`,
+    `24h Volume: ${Number.isFinite(snapshot.volume24h) ? snapshot.volume24h.toFixed(2) : "unknown"}`,
     `Open Interest: ${snapshot.openInterest}`,
   ];
 

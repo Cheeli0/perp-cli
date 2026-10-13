@@ -2,6 +2,9 @@ import type { Strategy, StrategyContext, StrategyAction, EnrichedSnapshot } from
 import type { GridStrategyParams } from "../config.js";
 import { registerStrategy } from "../strategy-registry.js";
 
+/** Consecutive failed open-order reads after which every tick logs a loud warning. */
+export const GRID_READ_FAILURE_WARN = 5;
+
 /** A grid level tracks its expected price and side */
 interface GridLevel {
   price: number;
@@ -118,13 +121,14 @@ export class GridStrategy implements Strategy {
 
       // For each filled level, place the opposite (counter) order
       const newLevels: GridLevel[] = [...matchedLevels];
+      const counterOrders: StrategyAction[] = [];
       for (const filled of unmatchedLevels) {
         const wasBuy = filled.side === "buy";
         const newSide: "buy" | "sell" = wasBuy ? "sell" : "buy";
         const newPrice = wasBuy ? filled.price + step : filled.price - step;
 
         if (newPrice >= gridLower && newPrice <= gridUpper) {
-          actions.push({
+          counterOrders.push({
             type: "place_order",
             side: newSide,
             price: newPrice.toFixed(2),
@@ -136,7 +140,21 @@ export class GridStrategy implements Strategy {
       }
 
       ctx.state.set("gridLevels", newLevels);
-    } catch { /* retry next loop */ }
+      actions.push(...counterOrders);
+      const prevFailures = (ctx.state.get("gridReadFailures") as number | undefined) ?? 0;
+      if (prevFailures > 0) ctx.log(`  [GRID] Open orders readable again after ${prevFailures} failed read(s)`);
+      ctx.state.set("gridReadFailures", 0);
+    } catch (e) {
+      // No fill detection / counter orders on an unread book (never on stale data); retried next tick.
+      const failures = ((ctx.state.get("gridReadFailures") as number | undefined) ?? 0) + 1;
+      ctx.state.set("gridReadFailures", failures);
+      const reason = e instanceof Error ? e.message : String(e);
+      if (failures >= GRID_READ_FAILURE_WARN) {
+        ctx.log(`  [GRID] WARNING: open orders unreadable for ${failures} consecutive ticks (${reason}) — the grid is NOT placing counter orders; check: perp -e ${ctx.adapter.name} account orders`);
+      } else {
+        ctx.log(`  [GRID] Open orders read failed (${failures}/${GRID_READ_FAILURE_WARN}): ${reason} — fill detection skipped this tick`);
+      }
+    }
 
     // Auto-rebalance if price exits range
     if (params.rebalance) {

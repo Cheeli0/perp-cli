@@ -375,7 +375,7 @@ export async function runBot(
 
       try {
         // Get market data (enriched for strategy use)
-        const { snapshot, unknown: dataUnknown } = await getEnrichedSnapshot(adapter, config.symbol);
+        const { snapshot, unknown: dataUnknown } = await getEnrichedSnapshot(adapter, config.symbol, (m) => effectiveLog(m));
         if (snapshot.price > 0) lastPrice = snapshot.price;
         // A strategy that reads the orderbook / klines never runs on fake (empty) data.
         const skipForData = needsMarketData && dataUnknown !== null;
@@ -540,8 +540,9 @@ export async function runBot(
         }
 
         // ── Fetch balances + emit state update for TUI / JSON ──
-        const [positions, openOrders, exchangeBalances] = await Promise.all([
-          extraAdapters ? fetchAllPositions(adapter, config.symbol, extraAdapters) : fetchPositions(adapter, config.symbol, adapter.name),
+        // Display data: a failed venue read is carried as an error (rendered "unavailable"), never as empty.
+        const [{ positions, errors: positionErrors }, { orders: openOrders, error: openOrdersError }, exchangeBalances] = await Promise.all([
+          extraAdapters ? fetchAllPositions(adapter, config.symbol, extraAdapters) : fetchPositions(adapter, config.symbol, adapter.name).then(r => ({ positions: r.positions, errors: r.error === null ? [] : [{ exchange: adapter.name, error: r.error }] })),
           fetchOpenOrders(adapter, config.symbol),
           fetchExchangeBalances(adapter, extraAdapters),
         ]);
@@ -587,7 +588,7 @@ export async function runBot(
         }
 
         if (mode === "tui" || mode === "json") {
-          const tuiState = buildTuiState(state, config, snapshot, positions, openOrders, strategyCtx, exchangeBalances);
+          const tuiState = buildTuiState(state, config, snapshot, positions, openOrders, strategyCtx, exchangeBalances, { positionErrors, openOrdersError });
 
           if (mode === "tui") {
             tuiEmitter.emitState(tuiState);
@@ -920,6 +921,7 @@ export { filledOf };
 async function getEnrichedSnapshot(
   adapter: ExchangeAdapter,
   symbol: string,
+  log: BotLog,
 ): Promise<{ snapshot: EnrichedSnapshot; unknown: string | null }> {
   // Multi-symbol strategies use "ALL" — skip market-specific data
   if (symbol.toUpperCase() === "ALL") {
@@ -932,7 +934,7 @@ async function getEnrichedSnapshot(
       unknown: null,
     };
   }
-  const base = await getMarketSnapshot(adapter, symbol);
+  const base = await getMarketSnapshot(adapter, symbol, log);
   const failed: string[] = [];
   const why = (what: string) => (e: unknown) => { failed.push(`${what} read failed: ${e instanceof Error ? e.message : String(e)}`); return null; };
   const [orderbook, klines] = await Promise.all([
@@ -949,13 +951,13 @@ async function getEnrichedSnapshot(
 
 function logStatus(log: BotLog, state: BotState, snapshot: MarketSnapshot, phase: string) {
   const runtime = formatDuration(Math.floor((Date.now() - state.startTime) / 1000));
-  const vol = snapshot.volatility24h.toFixed(1);
+  const vol = Number.isFinite(snapshot.volatility24h) ? `${snapshot.volatility24h.toFixed(1)}%` : "unknown";
   const fr = (snapshot.fundingRate * 100).toFixed(4);
   const eq = usdOrUnknown(state.equity);
   const dd = state.equity !== null && state.peakEquity !== null ? `$${(state.peakEquity - state.equity).toFixed(2)}` : "unknown";
 
   log(chalk.gray(
-    `  [${phase}] $${snapshot.price.toFixed(2)} | vol: ${vol}% | fr: ${fr}% | ` +
+    `  [${phase}] $${snapshot.price.toFixed(2)} | vol: ${vol} | fr: ${fr}% | ` +
     `eq: ${eq} | dd: ${dd} | fills: ${state.fills} | ${runtime}`
   ));
 }
@@ -984,11 +986,12 @@ function sleep(ms: number): Promise<void> {
 
 // ── TUI helpers ──
 
-async function fetchPositions(adapter: ExchangeAdapter, symbol: string, exchangeName?: string): Promise<import("./tui/index.js").Position[]> {
+/** TUI positions of one venue; a failed read → `error` set (shown "unavailable"), never an empty list. */
+export async function fetchPositions(adapter: ExchangeAdapter, symbol: string, exchangeName?: string): Promise<{ positions: import("./tui/index.js").Position[]; error: string | null }> {
   try {
     const positions = await adapter.getPositions();
     const isAll = symbol.toUpperCase() === "ALL";
-    return positions
+    return { positions: positions
       .filter(p => (isAll || p.symbol.toUpperCase() === symbol.toUpperCase() || p.symbol.toUpperCase() === symbol.toUpperCase() + "-PERP") && parseFloat(p.size) !== 0)
       .map(p => ({
         symbol: p.symbol,
@@ -998,13 +1001,14 @@ async function fetchPositions(adapter: ExchangeAdapter, symbol: string, exchange
         markPrice: p.markPrice,
         unrealizedPnl: p.unrealizedPnl,
         exchange: exchangeName ?? adapter.name,
-      }));
-  } catch {
-    return [];
+      })), error: null };
+  } catch (e) {
+    return { positions: [], error: `positions read failed: ${e instanceof Error ? e.message : String(e)}` };
   }
 }
 
-async function fetchExchangeBalances(
+/** A venue whose balance read failed is listed with `error` set and null amounts, never left out. */
+export async function fetchExchangeBalances(
   primaryAdapter: ExchangeAdapter,
   extraAdapters?: Map<string, ExchangeAdapter>,
 ): Promise<import("./tui/index.js").ExchangeBalance[]> {
@@ -1019,7 +1023,9 @@ async function fetchExchangeBalances(
     try {
       const bal = await a.getBalance();
       results.push({ exchange: name, equity: bal.equity, available: bal.available });
-    } catch { /* skip */ }
+    } catch (e) {
+      results.push({ exchange: name, equity: null, available: null, error: e instanceof Error ? e.message : String(e) });
+    }
   }));
   return results;
 }
@@ -1028,7 +1034,7 @@ const _spotPriceWarned = new Set<string>();
 
 async function fetchSpotPositions(
   adapter: ExchangeAdapter,
-): Promise<import("./tui/index.js").Position[]> {
+): Promise<{ positions: import("./tui/index.js").Position[]; error: string | null }> {
   // Bot scope (§12.4 #3): only separate/runtime spot venues with transfer.
   const { getBotSpotAdapter, isSpotQuoteAsset, spotMarketsForValuation, spotNetworkOf, spotTokenBase } = await import("../exchanges/spot-factory.js");
   const { getVenue } = await import("../exchanges/venue.js");
@@ -1037,14 +1043,13 @@ async function fetchSpotPositions(
   let net: import("../exchanges/venue-types.js").Network;
   try {
     const spot = await getBotSpotAdapter(adapter.name, adapter);
-    if (spot === null) return [];
+    if (spot === null) return { positions: [], error: null };
     net = spotNetworkOf(spot);
     raw = await spot.getSpotBalances();
     markets = await spotMarketsForValuation(getVenue(adapter.name), spot, raw, net);
   } catch (e) {
-    // Display-only path: surface the failure instead of hiding it, keep the TUI alive.
-    process.stderr.write(`[warn] ${adapter.name} spot positions unavailable: ${e instanceof Error ? e.message : String(e)}\n`);
-    return [];
+    // Display-only path: surfaced as "unavailable" in the TUI / JSON state, the TUI stays alive.
+    return { positions: [], error: `spot positions read failed: ${e instanceof Error ? e.message : String(e)}` };
   }
   const def = getVenue(adapter.name);
   const priceMap = new Map(markets.map(m => [m.baseToken.toUpperCase(), m.markPrice]));
@@ -1074,14 +1079,14 @@ async function fetchSpotPositions(
       exchange: adapter.name,
     });
   }
-  return out;
+  return { positions: out, error: null };
 }
 
 async function fetchAllPositions(
   primaryAdapter: ExchangeAdapter,
   symbol: string,
   extraAdapters?: Map<string, ExchangeAdapter>,
-): Promise<import("./tui/index.js").Position[]> {
+): Promise<{ positions: import("./tui/index.js").Position[]; errors: import("./tui/BotDashboard.js").VenueReadError[] }> {
   const adapters: [string, ExchangeAdapter][] = [[primaryAdapter.name, primaryAdapter]];
   if (extraAdapters) {
     for (const [name, a] of extraAdapters) {
@@ -1089,20 +1094,23 @@ async function fetchAllPositions(
     }
   }
   const all: import("./tui/index.js").Position[][] = [];
+  const errors: import("./tui/BotDashboard.js").VenueReadError[] = [];
   await Promise.all(adapters.map(async ([name, a]) => {
     const [perpPos, spotPos] = await Promise.all([
       fetchPositions(a, symbol, name),
       fetchSpotPositions(a),
     ]);
-    all.push([...perpPos, ...spotPos]);
+    all.push([...perpPos.positions, ...spotPos.positions]);
+    for (const err of [perpPos.error, spotPos.error]) if (err !== null) errors.push({ exchange: name, error: err });
   }));
-  return all.flat();
+  return { positions: all.flat(), errors };
 }
 
-async function fetchOpenOrders(adapter: ExchangeAdapter, symbol: string): Promise<import("./tui/index.js").OpenOrder[]> {
+/** TUI open orders; a failed read → `error` set (shown "unavailable"), never an empty list. */
+export async function fetchOpenOrders(adapter: ExchangeAdapter, symbol: string): Promise<{ orders: import("./tui/index.js").OpenOrder[]; error: string | null }> {
   try {
     const orders = await adapter.getOpenOrders();
-    return orders
+    return { orders: orders
       .filter(o => o.symbol.toUpperCase() === symbol.toUpperCase() || o.symbol.toUpperCase() === symbol.toUpperCase() + "-PERP")
       .map(o => ({
         orderId: o.orderId,
@@ -1110,9 +1118,9 @@ async function fetchOpenOrders(adapter: ExchangeAdapter, symbol: string): Promis
         price: o.price,
         size: o.size,
         type: o.type,
-      }));
-  } catch {
-    return [];
+      })), error: null };
+  } catch (e) {
+    return { orders: [], error: `open orders read failed: ${e instanceof Error ? e.message : String(e)}` };
   }
 }
 
@@ -1124,6 +1132,7 @@ function buildTuiState(
   openOrders: import("./tui/index.js").OpenOrder[],
   strategyCtx: StrategyContext,
   exchangeBalances?: import("./tui/index.js").ExchangeBalance[],
+  readErrors?: { positionErrors: import("./tui/BotDashboard.js").VenueReadError[]; openOrdersError: string | null },
 ): BotTuiState {
   // Extract serializable strategy state from the Map
   const strategyState: Record<string, unknown> = {};
@@ -1160,5 +1169,7 @@ function buildTuiState(
     strategyState,
     tick: strategyCtx.tick,
     exchangeBalances,
+    positionErrors: readErrors?.positionErrors ?? [],
+    openOrdersError: readErrors?.openOrdersError ?? null,
   };
 }

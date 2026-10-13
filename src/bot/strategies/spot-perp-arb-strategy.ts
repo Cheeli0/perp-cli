@@ -19,7 +19,7 @@ import {
   type RateEntry, type RateMap, type FundingScore,
   buildAdapterMap,
   getPerpSymbol, findRate, matchSymbol, fetchRates,
-  scoreFunding, isPositionGone, botSpotPerpMatches, assertFundingArbLegs, cancelBotSymbols } from "./funding-arb-utils.js";
+  scoreFunding, isPositionGone, botSpotPerpMatches, assertFundingArbLegs, cancelBotSymbols, collectFundingSince } from "./funding-arb-utils.js";
 import type { SpotMarketInfo } from "../../exchanges/spot-interface.js";
 import type { VenueMarket } from "../../exchanges/venue-types.js";
 import { SpotPerpExecutor } from "./spot-perp-executor.js";
@@ -114,6 +114,9 @@ export class SpotPerpArbStrategy implements Strategy {
     ctx.state.set("spaPositions", [] as SpotPerpPosition[]);
     ctx.state.set("arbPositions", 0);
     ctx.state.set("fundingIncome", 0);
+    // Payments up to this instant are covered by the startup recovery (last 24 h); the periodic
+    // check books only payments newer than it (collectFundingSince high-water mark).
+    ctx.state.set("fundingStartTime", Date.now());
     ctx.state.set("fundingLastCheck", Date.now());
     ctx.log(`  [SPA] Ready | rate >= ${p.min_rate}% | close < ${p.close_rate}% | size $${p.size_usd}`);
     ctx.log(`  [SPA] Consistency >= ${(p.min_consistency * 100).toFixed(0)}% | history ${p.history_periods} periods | rotation ${p.rotation_threshold}%`);
@@ -133,9 +136,12 @@ export class SpotPerpArbStrategy implements Strategy {
         try {
           const payments = await a.getFundingPayments(200);
           const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
-          const sum = payments.filter(fp => fp.time > oneDayAgo).reduce((s, fp) => s + parseFloat(fp.payment), 0);
+          const startedAt = ctx.state.get("fundingStartTime") as number;
+          const sum = payments.filter(fp => fp.time > oneDayAgo && fp.time <= startedAt).reduce((s, fp) => s + parseFloat(fp.payment), 0);
           if (Math.abs(sum) > 0.001) { historicalFunding += sum; ctx.log(`  [FUND] ${name}: $${sum.toFixed(4)} historical`); }
-        } catch { /* not supported */ }
+        } catch (e) {
+          ctx.log(`  [FUND] ${name}: funding history unavailable — historical funding excludes it: ${e instanceof Error ? e.message : String(e)}`);
+        }
       }
       if (Math.abs(historicalFunding) > 0.001) ctx.state.set("fundingIncome", historicalFunding);
     } catch (err) {
@@ -201,19 +207,14 @@ export class SpotPerpArbStrategy implements Strategy {
     const lastCheck = ctx.state.get("fundingLastCheck") as number;
     if (Date.now() - lastCheck > 5 * 60 * 1000) {
       try {
-        let total = 0;
-        for (const [name, a] of adapters) {
-          try {
-            const payments = await a.getFundingPayments(50);
-            const start = ctx.state.get("fundingLastCheck") as number;
-            const sum = payments.filter(fp => fp.time > start - 5 * 60 * 1000).reduce((s, fp) => s + parseFloat(fp.payment), 0);
-            total += sum;
-            if (Math.abs(sum) > 0.001) ctx.log(`  [FUND] ${name}: $${sum.toFixed(4)}`);
-          } catch { /* skip */ }
-        }
+        const since = (ctx.state.get("fundingLastCheckByVenue") as Record<string, number> | undefined) ?? {};
+        const { total } = await collectFundingSince(adapters, since, ctx.state.get("fundingStartTime") as number, ctx.log);
+        ctx.state.set("fundingLastCheckByVenue", since);
         ctx.state.set("fundingIncome", (ctx.state.get("fundingIncome") as number) + total);
         ctx.state.set("fundingLastCheck", Date.now());
-      } catch { /* non-critical */ }
+      } catch (e) {
+        ctx.log(`  [FUND] funding check failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
     }
 
     for (const pos of positions) {
@@ -227,7 +228,10 @@ export class SpotPerpArbStrategy implements Strategy {
         const recent = relevant.slice(0, p.history_periods);
         if (recent.length > 0) pos.fundingHistory = recent.map(fp => ({ time: fp.time, amount: parseFloat(fp.payment) }));
         pos.lastFundingCheck = Date.now();
-      } catch { /* non-critical */ }
+      } catch (e) {
+        // lastFundingCheck is not advanced: retried next tick.
+        ctx.log(`  [FUND] ${pos.symbol} ${pos.perpExchange}: funding history unavailable: ${e instanceof Error ? e.message : String(e)}`);
+      }
     }
 
     const display = positions.map(pos => {
@@ -570,11 +574,17 @@ export class SpotPerpArbStrategy implements Strategy {
       const maxTotalPositionUsd = riskConfig?.max_position_usd ?? Infinity;
       const positions = ctx.state.get("spaPositions") as SpotPerpPosition[];
       let currentTotalUsd = 0;
-      for (const pos of positions) {
+      // No cap (Infinity): exposure does not gate the entry.
+      for (const pos of Number.isFinite(maxTotalPositionUsd) ? positions : []) {
         const ri = findRate(ratesByExchange, pos.perpExchange, getPerpSymbol(pos.symbol, pos.perpExchange))
           ?? findRate(ratesByExchange, pos.perpExchange, pos.symbol);
-        const price = ri?.price ?? 0;
-        currentTotalUsd += price * parseFloat(pos.size);
+        // Unknown price of a held position → exposure unknown: no new entry this cycle (a $0
+        // valuation would understate exposure and let the max_position_usd cap be bypassed).
+        if (ri === undefined || !(ri.price > 0)) {
+          ctx.log(`  [SPA] Skip ${symbol}: ${pos.symbol} ${pos.perpExchange} price unknown this cycle — total exposure unknown, no new entries`);
+          return false;
+        }
+        currentTotalUsd += ri.price * parseFloat(pos.size);
       }
       const remainingBudget = maxTotalPositionUsd - currentTotalUsd;
       if (remainingBudget < 10) {

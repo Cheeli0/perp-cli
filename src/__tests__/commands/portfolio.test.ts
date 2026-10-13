@@ -784,3 +784,34 @@ describe("Test 12: stdin overrides CLI --exchanges flag", () => {
     expect(exchanges[0].name).toBe("hyperliquid");
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 13: unreadable funding history → funding24h null + fundingError, not 0
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("Test 13: funding history read failure is reported, never counted as 0", () => {
+  it("that venue's funding24h is null with fundingError; totals sum the rest and flag fundingIncomplete", async () => {
+    const now = Date.now();
+    const factory = vi.fn().mockImplementation(async (exchange: string) => ({
+      getBalance: vi.fn().mockResolvedValue(makeBalance()),
+      getPositions: vi.fn().mockResolvedValue([]),
+      getOpenOrders: vi.fn().mockResolvedValue([]),
+      getFundingPayments: exchange === "hyperliquid"
+        ? vi.fn().mockRejectedValue(new Error("HTTP 429"))
+        : vi.fn().mockResolvedValue([{ time: now - 1000, symbol: "ETH", payment: "0.5" }]),
+      address: "0xAddr",
+    }));
+    const prog = makeProgram(factory as never);
+    const { captured, restore } = captureOutput();
+    try {
+      await prog.parseAsync(["node", "perp", "--json", "portfolio", "--exchanges", "hyperliquid,pacifica"]);
+    } finally {
+      restore();
+    }
+    const data = parseEnvelope(captured.stdoutLines).data as Record<string, unknown>;
+    const exchanges = data.exchanges as Array<Record<string, unknown>>;
+    expect(exchanges.find(e => e.name === "hyperliquid")).toMatchObject({ connected: true, funding24h: null, fundingError: "HTTP 429" });
+    expect(exchanges.find(e => e.name === "pacifica")).toMatchObject({ funding24h: 0.5, fundingError: null });
+    expect(data.totals).toMatchObject({ funding24h: 0.5, fundingIncomplete: true });
+  });
+});

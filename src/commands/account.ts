@@ -325,7 +325,7 @@ export function registerAccountCommands(
 
   account
     .command("history")
-    .description("Order history")
+    .description("Order history (Aster: last 7 days, symbols with a position, open order or fill in that window)")
     .action(async () => {
       const adapter = await getAdapter();
       const orders = await adapter.getOrderHistory(30);
@@ -395,7 +395,7 @@ export function registerAccountCommands(
 
   account
     .command("trades")
-    .description("Trade history (fills)")
+    .description("Trade history (fills) (Aster: last 7 days, symbols with a position, open order or fill in that window)")
     .action(async () => {
       const adapter = await getAdapter();
       const trades = await adapter.getTradeHistory(30);

@@ -75,12 +75,12 @@ describe("computeMatchedSize — lotSize option (integer-quantum coins)", () => 
     expect(result!.notional).toBe(900);
   });
 
-  it("floors to nearest lotSize multiple when lotSize < 1 and formats with szDecimals", () => {
+  it("floors to nearest lotSize multiple when lotSize < 1 and formats with the lot's decimals", () => {
     // rawSize = 100/1000 = 0.1, lotSize=0.001 → floor(0.1/0.001)*0.001 = 0.1
-    // formatSize: lotSize < 1 → 0.1.toFixed(2) = "0.10" (szDecimals=min(2,2)=2)
+    // formatSize: lotSize < 1 → the lot's 3 decimals = "0.100" (the venue default would round)
     const result = computeMatchedSize(100, 1000, "hyperliquid", "lighter", { lotSize: 0.001 });
     expect(result).not.toBeNull();
-    expect(result!.size).toBe("0.10");
+    expect(result!.size).toBe("0.100");
     expect(result!.notional).toBeCloseTo(100, 4);
   });
 
@@ -224,5 +224,25 @@ describe("arb exec minimum = the venues' published minimum, not a fixed $10", ()
     };
     expect(await venueOrderMinimums(adapter as never, "sol", "mainnet")).toEqual({ minSize: null, minNotional: "5" });
     await expect(venueOrderMinimums(adapter as never, "DOGE", "mainnet")).rejects.toMatchObject({ structured: { code: "SYMBOL_NOT_FOUND" } });
+  });
+});
+
+describe("computeMatchedSize — lot precision regressions (reported from the HypurrQuant port, v0.14.1)", () => {
+  it("A: an exact multiple of the lot is not floored away by float error (0.3 / 0.1)", () => {
+    expect(computeMatchedSize(30, 100, "hyperliquid", "lighter", { lotSize: 0.1 })).toEqual({ size: "0.3", notional: 30 });
+  });
+
+  it("B: a sub-1 lot formats with the lot's decimals — never rounded UP past the request; notional matches the string", () => {
+    expect(computeMatchedSize(15.7, 1000, "hyperliquid", "lighter", { lotSize: 0.0001 })).toEqual({ size: "0.0157", notional: 15.7 });
+  });
+
+  it("C: a size below the venue-default decimals is never returned as 0.00", () => {
+    const r = computeMatchedSize(400, 100000, "hyperliquid", "lighter", { lotSize: 0.0001 });
+    expect(r).toEqual({ size: "0.0040", notional: 400 });
+  });
+
+  it("D: with the venues' published decimals a small BTC leg sizes (default HL 2 decimals → null)", () => {
+    expect(computeMatchedSize(500, 83000, "hyperliquid", "lighter")).toBeNull();
+    expect(computeMatchedSize(500, 83000, "hyperliquid", "lighter", { longSizeDecimals: 5, shortSizeDecimals: 5 })).toEqual({ size: "0.00602", notional: 0.00602 * 83000 });
   });
 });

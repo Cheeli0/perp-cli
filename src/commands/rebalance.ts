@@ -3,8 +3,9 @@ import { isDryRun, supportsDryRun } from "../cli-flags.js";
 import chalk from "chalk";
 import { formatUsd, makeTable, printJson, jsonOk } from "../utils.js";
 import type { ExchangeAdapter } from "../exchanges/index.js";
+import { PerpError } from "../errors.js";
 import {
-  fetchAllBalances,
+  fetchBalancesWithFailures,
   computeRebalancePlan,
   describeBridgeRoute,
   estimateMoveTime,
@@ -50,9 +51,13 @@ export function registerFundsRebalanceCommands(
       }
 
       if (!isJson()) console.log(chalk.cyan("\n  Fetching balances across exchanges...\n"));
-      const snapshots = await fetchAllBalances(adapters);
+      const { snapshots, failed, notConfigured } = await fetchBalancesWithFailures(adapters);
+      // A venue whose balance read failed is unavailable — listed, never shown as $0 or dropped.
+      unavailable.push(...failed);
+      const partial = unavailable.length > 0;
 
-      if (isJson()) return printJson(jsonOk({ snapshots, unavailable }));
+      if (isJson()) return printJson(jsonOk({ snapshots, unavailable, partial, notConfigured }));
+      for (const n of notConfigured) console.log(chalk.gray(`  ${n}: not configured (no credentials) — left out`));
 
       const totalEquity = snapshots.reduce((s, e) => s + e.equity, 0);
       const totalAvailable = snapshots.reduce((s, e) => s + e.available, 0);
@@ -76,7 +81,8 @@ export function registerFundsRebalanceCommands(
       console.log(chalk.cyan.bold("  Totals"));
       console.log(`  Total Equity:    $${formatUsd(totalEquity)}`);
       console.log(`  Total Available: $${formatUsd(totalAvailable)}`);
-      console.log(`  Exchanges:       ${snapshots.length}\n`);
+      console.log(`  Exchanges:       ${snapshots.length}${partial ? ` of ${exchangeNames.length} (partial)` : ""}\n`);
+      printUnavailable(unavailable);
     });
 
   // ── rebalance plan ──
@@ -107,13 +113,22 @@ export function registerFundsRebalanceCommands(
       }
 
       if (!isJson()) console.log(chalk.cyan("\n  Computing rebalance plan...\n"));
-      const snapshots = await fetchAllBalances(adapters);
+      const { snapshots, failed, notConfigured } = await fetchBalancesWithFailures(adapters);
+      unavailable.push(...failed);
+      // partial: the plan covers only the venues that were read — `execute` refuses to run it.
+      const partial = unavailable.length > 0;
       const plan = computeRebalancePlan(snapshots, {
         minMove: parseFloat(opts.minMove),
         reserve: parseFloat(opts.reserve),
       });
 
-      if (isJson()) return printJson(jsonOk({ ...plan, unavailable }));
+      if (isJson()) return printJson(jsonOk({ ...plan, unavailable, partial, notConfigured }));
+      for (const n of notConfigured) console.log(chalk.gray(`  ${n}: not configured (no credentials) — left out of the plan`));
+
+      if (partial) {
+        console.log(chalk.yellow(`  ⚠ Partial plan: computed over ${snapshots.length} of ${exchangeNames.length} exchanges.`));
+        printUnavailable(unavailable);
+      }
 
       // Show current state
       const rows = plan.snapshots.map((s) => {
@@ -168,21 +183,37 @@ export function registerFundsRebalanceCommands(
       if (opts.autoBridge && !dryRun) assertBridgeNetwork(getNetwork());
       const exchangeNames = opts.exchanges.split(",").map((e) => e.trim());
       const adapters = new Map<string, ExchangeAdapter>();
+      const unavailable: Array<{ exchange: string; error: string }> = [];
 
       for (const name of exchangeNames) {
         try {
           adapters.set(name, await getAdapterForExchange(name));
-        } catch {
-          // skip
+        } catch (e) {
+          unavailable.push({ exchange: name, error: e instanceof Error ? e.message : String(e) });
         }
       }
 
-      if (adapters.size < 2) {
+      if (adapters.size < 2 && unavailable.length === 0) {
         console.error(chalk.red("\n  Need at least 2 exchanges.\n"));
         return;
       }
 
-      const snapshots = await fetchAllBalances(adapters);
+      const { snapshots, failed, notConfigured } = await fetchBalancesWithFailures(adapters);
+      unavailable.push(...failed);
+      // A venue without credentials holds nothing the CLI can move: left out (noted), not a failure.
+      if (!isJson()) for (const n of notConfigured) console.log(chalk.gray(`  ${n}: not configured (no credentials) — left out`));
+      // Moving funds on a plan computed over fewer venues than requested would mis-size every
+      // move: abort unless every requested venue was read.
+      if (unavailable.length > 0) {
+        throw new PerpError(
+          "EXCHANGE_ERROR",
+          `Rebalance aborted: balances of ${unavailable.map(u => u.exchange).join(", ")} could not be read (${unavailable.map(u => `${u.exchange}: ${u.error}`).join("; ")})`,
+          {
+            unavailable,
+            remediation: `Retry when every venue answers, or exclude the unavailable venue(s) explicitly with --exchanges ${exchangeNames.filter(n => !unavailable.some(u => u.exchange === n)).join(",") || "<list>"}`,
+          },
+        );
+      }
       const plan = computeRebalancePlan(snapshots, {
         minMove: parseFloat(opts.minMove),
         reserve: parseFloat(opts.reserve),
@@ -276,6 +307,11 @@ export function registerFundsRebalanceCommands(
       if (isJson()) return printJson(jsonOk({ status: dryRun ? "simulated" : "executed", dryRun, sent: !dryRun, moves: moveResults }));
       console.log(chalk.cyan("  Rebalance initiated. Monitor progress with 'perp funds rebalance check'.\n"));
     });
+}
+
+function printUnavailable(unavailable: Array<{ exchange: string; error: string }>): void {
+  for (const u of unavailable) console.log(chalk.yellow(`  ⚠ ${u.exchange} unavailable (left out): ${u.error}`));
+  if (unavailable.length > 0) console.log();
 }
 
 /**

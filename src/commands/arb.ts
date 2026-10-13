@@ -57,32 +57,30 @@ async function fetchHyperliquidRates(): Promise<FundingRate[]> {
 async function fetchAsterRates(): Promise<FundingRate[]> {
   // SSOT rule #2: do NOT silently coerce missing markPrice / lastFundingRate
   // to 0 — that would corrupt comparisons against other DEXs. Skip symbols
-  // whose Aster row is malformed instead. The outer try/catch is intentional:
-  // if the entire endpoint fails, the arb command can still compare the
-  // remaining DEXs (graceful degradation is an explicit caller-facing
-  // behavior, not a silent data substitution).
-  try {
-    const premiums = await fetch("https://fapi.asterdex.com/fapi/v1/premiumIndex").then(r => r.json()) as Array<Record<string, unknown>>;
-    const out: FundingRate[] = [];
-    for (const p of premiums ?? []) {
-      const rawSym = String(p.symbol ?? "");
-      if (!rawSym.endsWith("USDT")) continue;
-      const fundingRate = Number(p.lastFundingRate);
-      const markPrice = Number(p.markPrice);
-      if (!Number.isFinite(fundingRate) || !Number.isFinite(markPrice) || markPrice <= 0) {
-        continue;
-      }
-      out.push({
-        exchange: "aster",
-        symbol: rawSym.replace(/USDT$/, ""),
-        fundingRate,
-        markPrice,
-      });
+  // whose Aster row is malformed instead. An endpoint failure PROPAGATES: the
+  // caller (handleBasisScan) runs every DEX under Promise.allSettled and reports
+  // the rejection on stderr — Aster is never silently absent from the scan.
+  const res = await fetch("https://fapi.asterdex.com/fapi/v1/premiumIndex");
+  if (!res.ok) throw new Error(`Aster premiumIndex HTTP ${res.status}`);
+  const premiums = await res.json() as unknown;
+  if (!Array.isArray(premiums)) throw new Error("Aster premiumIndex returned a non-array response");
+  const out: FundingRate[] = [];
+  for (const p of premiums as Array<Record<string, unknown>>) {
+    const rawSym = String(p.symbol ?? "");
+    if (!rawSym.endsWith("USDT")) continue;
+    const fundingRate = Number(p.lastFundingRate);
+    const markPrice = Number(p.markPrice);
+    if (!Number.isFinite(fundingRate) || !Number.isFinite(markPrice) || markPrice <= 0) {
+      continue;
     }
-    return out;
-  } catch {
-    return [];
+    out.push({
+      exchange: "aster",
+      symbol: rawSym.replace(/USDT$/, ""),
+      fundingRate,
+      markPrice,
+    });
   }
+  return out;
 }
 
 async function fetchLighterRates(): Promise<FundingRate[]> {
@@ -498,7 +496,9 @@ export async function handleBasisScan(isJson: () => boolean, opts: { minBasis: s
 
 export async function handleDexScan(isJson: () => boolean, opts: { minSpread: string; maxGap: string; includeNative: boolean; top: string }): Promise<void> {
   if (!isJson()) console.log(chalk.cyan("  Scanning HIP-3 deployed dex funding spreads...\n"));
-  const pairs = await scanDexArb({ minAnnualSpread: parseFloat(opts.minSpread), maxPriceGapPct: parseFloat(opts.maxGap), includeNative: opts.includeNative });
+  const { pairs, failedDexes } = await scanDexArb({ minAnnualSpread: parseFloat(opts.minSpread), maxPriceGapPct: parseFloat(opts.maxGap), includeNative: opts.includeNative });
+  // A dex whose read failed is reported (stderr, both modes — JSON stdout keeps its shape); its pairs are unknown, not absent.
+  for (const [dex, msg] of Object.entries(failedDexes)) process.stderr.write(`[dex-scan] HIP-3 dex ${dex} unavailable: ${msg} — its pairs are missing from this scan\n`);
   const topN = parseInt(opts.top); const shown = pairs.slice(0, topN);
   if (isJson()) return printJson(jsonOk(shown.map(p => ({
     underlying: p.underlying, longDex: p.long.dex, longSymbol: p.long.raw, longFunding: p.long.fundingRate,
@@ -564,27 +564,29 @@ export async function handleFundingPositions(
   await withJsonErrors(isJson(), async () => {
     const targetExchanges = opts.exchanges ? opts.exchanges.split(",").map(s => s.trim().toLowerCase()) : [...ALL_EXCHANGES];
     if (!isJson()) console.log(chalk.cyan("  Fetching positions and funding rates...\n"));
-    interface PF { exchange: string; symbol: string; side: "long"|"short"; size: string; entryPrice: string; markPrice: string; unrealizedPnl: string; leverage: number; notionalUsd: number; fundingRate: number; hourlyRate: number; annualPct: number; hourlyPayment: number; dailyPayment: number; actualReceived24h: number; actualPaid24h: number; actualNet24h: number; }
+    interface PF { exchange: string; symbol: string; side: "long"|"short"; size: string; entryPrice: string; markPrice: string; unrealizedPnl: string; leverage: number; notionalUsd: number; fundingRate: number; hourlyRate: number; annualPct: number; hourlyPayment: number; dailyPayment: number; actualReceived24h: number | null; actualPaid24h: number | null; actualNet24h: number | null; }
     const results: PF[] = []; const exchangeErrors: Record<string, string> = {}; const fundingUnknown: string[] = [];
+    /* venue → why its funding history could not be read; its positions get actual* = null (never 0) */ const fundingHistoryErrors: Record<string, string> = {};
     await Promise.all(targetExchanges.map(async (exchange) => {
       try {
         const adapter = await getAdapterForExchange(exchange);
-        const [positions, markets, fp] = await Promise.all([adapter.getPositions(), adapter.getMarkets(), adapter.getFundingPayments(100).catch(() => [] as { time: number; symbol: string; payment: string }[])]);
+        const [positions, markets, fp] = await Promise.all([adapter.getPositions(), adapter.getMarkets(), adapter.getFundingPayments(100).then((rows) => rows, (e: unknown) => { fundingHistoryErrors[exchange] = e instanceof Error ? e.message : String(e); return null; })]);
         if (positions.length === 0) return;
         /* rate null = the venue reports no funding rate for the market (never read as 0) */ const fm = new Map<string, { rate: number | null; markPrice: number; fundingHours: number | null }>(); for (const m of markets) { const sym = m.symbol.toUpperCase().replace(/-PERP$/, ""); const rate = m.fundingRate === null || !Number.isFinite(Number(m.fundingRate)) ? null : Number(m.fundingRate); fm.set(sym, { rate, markPrice: Number(m.markPrice) || 0, fundingHours: m.fundingHours }); }
-        const dayAgo = Date.now() - 86400000; const af = new Map<string, { received: number; paid: number }>(); for (const f of fp) { if (f.time < dayAgo) continue; const sym = f.symbol.toUpperCase().replace(/-PERP$/, ""); const amt = Number(f.payment) || 0; if (!af.has(sym)) af.set(sym, { received: 0, paid: 0 }); const e = af.get(sym)!; if (amt > 0) e.received += amt; else e.paid += Math.abs(amt); }
-        for (const pos of positions) { const sym = pos.symbol.toUpperCase().replace(/-PERP$/, ""); const fd = fm.get(sym); if (fd === undefined || fd.rate === null) { fundingUnknown.push(`${exchange}:${sym}`); continue; } const fr = fd.rate; const mk = Number(pos.markPrice) || fd?.markPrice || 0; const sz = Math.abs(Number(pos.size)); const nu = sz * mk; const fh = fd ? fd.fundingHours : null; /* market basis first (§10.1) */ const hr = fh !== null ? fr / fh : toHourlyRate(fr, exchange); const ap = annualizeHourlyRate(hr); const hp = estimateHourlyFundingFromHourly(hr, nu, pos.side); const a = af.get(sym); results.push({ exchange, symbol: sym, side: pos.side, size: pos.size, entryPrice: pos.entryPrice, markPrice: pos.markPrice, unrealizedPnl: pos.unrealizedPnl, leverage: pos.leverage, notionalUsd: nu, fundingRate: fr, hourlyRate: hr, annualPct: ap, hourlyPayment: hp, dailyPayment: hp * 24, actualReceived24h: a?.received ?? 0, actualPaid24h: a?.paid ?? 0, actualNet24h: (a?.received ?? 0) - (a?.paid ?? 0) }); }
+        const dayAgo = Date.now() - 86400000; const af = new Map<string, { received: number; paid: number }>(); for (const f of fp ?? []) { if (f.time < dayAgo) continue; const sym = f.symbol.toUpperCase().replace(/-PERP$/, ""); const amt = Number(f.payment); if (!Number.isFinite(amt)) { fundingHistoryErrors[exchange] = `non-numeric funding payment ${JSON.stringify(f.payment)}`; continue; } if (!af.has(sym)) af.set(sym, { received: 0, paid: 0 }); const e = af.get(sym)!; if (amt > 0) e.received += amt; else e.paid += Math.abs(amt); }
+        /* a venue whose history was unreadable or had an unparsable row: actual* = null (never a partial sum shown as complete) */ const histBad = fp === null || fundingHistoryErrors[exchange] !== undefined; for (const pos of positions) { const sym = pos.symbol.toUpperCase().replace(/-PERP$/, ""); const fd = fm.get(sym); if (fd === undefined || fd.rate === null) { fundingUnknown.push(`${exchange}:${sym}`); continue; } const fr = fd.rate; const posMark = Number(pos.markPrice); const mk = Number.isFinite(posMark) && posMark > 0 ? posMark : fd.markPrice; if (!(mk > 0)) { fundingUnknown.push(`${exchange}:${sym} (no mark price)`); continue; } const sz = Math.abs(Number(pos.size)); const nu = sz * mk; const fh = fd ? fd.fundingHours : null; /* market basis first (§10.1) */ const hr = fh !== null ? fr / fh : toHourlyRate(fr, exchange); const ap = annualizeHourlyRate(hr); const hp = estimateHourlyFundingFromHourly(hr, nu, pos.side); const a = af.get(sym); results.push({ exchange, symbol: sym, side: pos.side, size: pos.size, entryPrice: pos.entryPrice, markPrice: pos.markPrice, unrealizedPnl: pos.unrealizedPnl, leverage: pos.leverage, notionalUsd: nu, fundingRate: fr, hourlyRate: hr, annualPct: ap, hourlyPayment: hp, dailyPayment: hp * 24, actualReceived24h: histBad ? null : a?.received ?? 0, actualPaid24h: histBad ? null : a?.paid ?? 0, actualNet24h: histBad ? null : (a?.received ?? 0) - (a?.paid ?? 0) }); }
       } catch (err) { exchangeErrors[exchange] = err instanceof Error ? err.message : String(err); }
     }));
     if (results.length === 0) { if (isJson()) return printJson(jsonOk({ positions: [], totals: { predicted: { hourly: 0, daily: 0 }, actual24h: { net: 0 }, notionalUsd: 0 }, fundingUnknown, errors: exchangeErrors })); console.log(chalk.gray(fundingUnknown.length > 0 ? `  No positions with a published funding rate (funding unknown: ${fundingUnknown.join(", ")}).\n` : "  No open positions.\n")); return; }
     results.sort((a, b) => Math.abs(b.dailyPayment) - Math.abs(a.dailyPayment));
-    const tH = results.reduce((s, r) => s + r.hourlyPayment, 0); const tD = results.reduce((s, r) => s + r.dailyPayment, 0); const tN = results.reduce((s, r) => s + r.notionalUsd, 0); const tA = results.reduce((s, r) => s + r.actualNet24h, 0);
-    if (isJson()) return printJson(jsonOk({ positions: results.map(r => ({ exchange: r.exchange, symbol: r.symbol, side: r.side, size: r.size, notionalUsd: +r.notionalUsd.toFixed(2), fundingRate: r.fundingRate, annualPct: +r.annualPct.toFixed(2), predicted: { hourly: +r.hourlyPayment.toFixed(6), daily: +r.dailyPayment.toFixed(4) }, actual24h: { received: +r.actualReceived24h.toFixed(6), paid: +r.actualPaid24h.toFixed(6), net: +r.actualNet24h.toFixed(6) }, unrealizedPnl: r.unrealizedPnl })), totals: { predicted: { hourly: +tH.toFixed(6), daily: +tD.toFixed(4) }, actual24h: { net: +tA.toFixed(6) }, notionalUsd: +tN.toFixed(2) }, fundingUnknown, errors: Object.keys(exchangeErrors).length > 0 ? exchangeErrors : undefined }));
+    const tH = results.reduce((s, r) => s + r.hourlyPayment, 0); const tD = results.reduce((s, r) => s + r.dailyPayment, 0); const tN = results.reduce((s, r) => s + r.notionalUsd, 0); const tA = results.reduce((s, r) => s + (r.actualNet24h ?? 0), 0); const actualIncomplete = results.some(r => r.actualNet24h === null);
+    if (isJson()) return printJson(jsonOk({ positions: results.map(r => ({ exchange: r.exchange, symbol: r.symbol, side: r.side, size: r.size, notionalUsd: +r.notionalUsd.toFixed(2), fundingRate: r.fundingRate, annualPct: +r.annualPct.toFixed(2), predicted: { hourly: +r.hourlyPayment.toFixed(6), daily: +r.dailyPayment.toFixed(4) }, actual24h: r.actualNet24h === null ? null : { received: +(r.actualReceived24h ?? 0).toFixed(6), paid: +(r.actualPaid24h ?? 0).toFixed(6), net: +r.actualNet24h.toFixed(6) }, unrealizedPnl: r.unrealizedPnl })), totals: { predicted: { hourly: +tH.toFixed(6), daily: +tD.toFixed(4) }, actual24h: { net: +tA.toFixed(6), incomplete: actualIncomplete }, notionalUsd: +tN.toFixed(2) }, fundingUnknown, fundingHistoryErrors, errors: Object.keys(exchangeErrors).length > 0 ? exchangeErrors : undefined }));
     const exAbbr = venueAbbr;
     console.log(chalk.cyan.bold("  Position Funding Impact\n"));
-    const rows = results.map(r => { const sc = r.side === "long" ? chalk.green : chalk.red; const rc = r.fundingRate > 0 ? chalk.red : r.fundingRate < 0 ? chalk.green : chalk.white; const as = r.actualNet24h !== 0 ? (r.actualNet24h > 0 ? chalk.green : chalk.red)(`${r.actualNet24h > 0 ? "+" : ""}$${r.actualNet24h.toFixed(4)}`) : chalk.gray("-"); return [chalk.white.bold(exAbbr(r.exchange)), chalk.white.bold(r.symbol), sc(r.side.toUpperCase()), `$${formatUsd(r.notionalUsd)}`, rc(formatPercent(r.fundingRate)), rc(`${r.annualPct.toFixed(1)}%`), as, formatPnl(r.unrealizedPnl)]; });
+    const rows = results.map(r => { const sc = r.side === "long" ? chalk.green : chalk.red; const rc = r.fundingRate > 0 ? chalk.red : r.fundingRate < 0 ? chalk.green : chalk.white; const as = r.actualNet24h === null ? chalk.yellow("unavailable") : r.actualNet24h !== 0 ? (r.actualNet24h > 0 ? chalk.green : chalk.red)(`${r.actualNet24h > 0 ? "+" : ""}$${r.actualNet24h.toFixed(4)}`) : chalk.gray("-"); return [chalk.white.bold(exAbbr(r.exchange)), chalk.white.bold(r.symbol), sc(r.side.toUpperCase()), `$${formatUsd(r.notionalUsd)}`, rc(formatPercent(r.fundingRate)), rc(`${r.annualPct.toFixed(1)}%`), as, formatPnl(r.unrealizedPnl)]; });
     console.log(makeTable(["Ex", "Symbol", "Side", "Notional", "Rate(now)", "Annual(now)", "Actual 24h", "uPnL"], rows));
     console.log(`\n  Total: $${formatUsd(tN)} | Actual 24h: ${tA >= 0 ? "+" : ""}$${tA.toFixed(4)} | Predicted: ${tD >= 0 ? "-" : "+"}$${Math.abs(tD).toFixed(4)}/d\n`);
     if (fundingUnknown.length > 0) console.log(chalk.yellow(`  Funding rate not published (excluded, not counted as 0): ${fundingUnknown.join(", ")}\n`));
+    for (const [ex, msg] of Object.entries(fundingHistoryErrors)) console.log(chalk.yellow(`  ${ex} funding history unavailable (Actual 24h excluded, not 0): ${msg}`));
   });
 }
