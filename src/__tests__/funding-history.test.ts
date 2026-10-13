@@ -49,6 +49,7 @@ function makeRate(overrides: Partial<ExchangeFundingRate> = {}): ExchangeFunding
     nextFundingTime: null,
     historicalAvg: null,
     fundingVerified: true,
+    apiStatus: "official",
     ...overrides,
   };
 }

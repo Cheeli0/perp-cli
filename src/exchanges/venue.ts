@@ -166,11 +166,35 @@ export type VenueRole = "marketData" | "account" | "trading";
 
 export type SymbolIdentity = "baseTicker" | "explicit";
 
+/**
+ * How perp-cli reaches the venue. "official" = a documented public API. "unofficial" = an
+ * undocumented API (e.g. the one the venue's own web app uses) that may change or be blocked
+ * without notice; every user-facing surface (JSON `venueApi` / `apiStatus`, human footnotes,
+ * MCP output, the landing screen, the skill docs) labels data read through it.
+ */
+export type VenueApiStatus =
+  | { kind: "official" }
+  | { kind: "unofficial"; note: string; docs: string | null };
+
+export const OFFICIAL_API: VenueApiStatus = { kind: "official" };
+
+/** "official" | "unofficial" — the per-row label for mixed-venue tables and JSON. */
+export function apiStatusOf(venue: VenueId): VenueApiStatus["kind"] {
+  return getVenue(venue).apiStatus.kind;
+}
+
+/** Human footnote for an unofficial-API venue; null for an official one. */
+export function unofficialApiNote(def: VenueDefinition): string | null {
+  return def.apiStatus.kind === "unofficial"
+    ? `${def.displayName}: UNOFFICIAL API — ${def.apiStatus.note}`
+    : null;
+}
+
 export interface VenueDefinition {
   id: VenueId;
   aliases: readonly string[];
   displayName: string;
-  family: "pacifica" | "hyperliquid" | "lighter" | "aster" | "ondo" | "arcus" | "qfex";
+  family: "pacifica" | "hyperliquid" | "lighter" | "aster" | "ondo" | "arcus" | "qfex" | "risex" | "txflow";
   masterKeyKind: MasterKeyKind;
   agentKeyKind: AgentKeyKind;
   secretStorage: SecretStorage;
@@ -209,6 +233,8 @@ export interface VenueDefinition {
    * settings.builder.<venue> and the approval is confirmed.
    */
   builderFee: BuilderFeeCapability | null;
+  /** Official documented API, or an unofficial one that is labelled everywhere (VenueApiStatus). */
+  apiStatus: VenueApiStatus;
 }
 
 // ── Registry ──
@@ -269,7 +295,31 @@ export function networkConfig(def: VenueDefinition, net: Network): VenueNetworkC
   return cfg;
 }
 
+/**
+ * The uniform refusal for any account / trading / funds / agent / builder / bot action on a venue
+ * whose roles do not include `role` (a market-data-only venue such as TxFlow). Raised before any
+ * credential is resolved or any request is sent.
+ */
+export function roleUnsupported(def: VenueDefinition, feature: string, role: VenueRole = "trading"): PerpError {
+  const reason = def.apiStatus.kind === "unofficial"
+    ? `${def.displayName} is integrated through an unofficial read-only API (market data only)`
+    : `${def.displayName} is available for market data only (no ${role} role)`;
+  const remediation = def.apiStatus.kind === "unofficial"
+    ? `Trade on the ${def.displayName} website; perp-cli shows ${def.displayName} market data only (perp -e ${def.id} market list|info|funding|book|trades|kline)`
+    : `Use the market-data commands for ${def.id} (perp -e ${def.id} market list|funding)`;
+  return new PerpError("CAPABILITY_UNSUPPORTED", `${def.id} does not support ${feature} — ${reason}`, {
+    venue: def.id, feature, reason, remediation,
+  });
+}
+
+/** Throws roleUnsupported() unless the venue has `role`. */
+export function requireRole(def: VenueDefinition, role: VenueRole, feature: string): void {
+  if (!def.roles.includes(role)) throw roleUnsupported(def, feature, role);
+}
+
 export function requireCapabilities(def: VenueDefinition): VenueCapabilities {
+  // A venue without the trading role is a definite capability refusal, not "not implemented yet".
+  if (!def.roles.includes("trading")) throw roleUnsupported(def, "trading");
   if (!def.capabilities) {
     throw new PerpError("NOT_IMPLEMENTED", `${def.displayName} does not support trading via API`, {
       remediation: `${def.id} is available for market data only (funding/market commands)`,

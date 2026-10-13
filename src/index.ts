@@ -125,11 +125,11 @@ if (rawArgs.length === 0 || (!hasSubcommand && !rawArgs.includes("-h") && !rawAr
         const landingVenues: string[] = [];
         for (const ex of LANDING_EXCHANGES) {
           const def = getVenue(ex);
-          if (def.create === null || await hasCredentials(def.id, NO_CLI_CREDENTIAL_OPTS)) landingVenues.push(ex);
+          if (!def.roles.includes("account") || await hasCredentials(def.id, NO_CLI_CREDENTIAL_OPTS)) landingVenues.push(ex);
         }
         const statusResults = await Promise.allSettled(landingVenues.map(async (ex): Promise<LandingExchangeStatus> => {
-          if (getVenue(ex).create === null) {
-            return { exchange: ex, marketDataOnly: true, ok: false, equity: 0, positions: 0 };
+          if (!getVenue(ex).roles.includes("account")) {
+            return { exchange: ex, marketDataOnly: true, unofficialApi: getVenue(ex).apiStatus.kind === "unofficial", ok: false, equity: 0, positions: 0 };
           }
           try {
             const adapter = await withTimeout(getAdapterForExchange(ex), 5000);

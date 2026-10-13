@@ -197,5 +197,6 @@ export const asterVenue: VenueDefinition = {
   // (INVALID_PARAMS) at order time; this is only the outer venue-wide bound.
   maxSlippageBps: 5000,
   builderFee: BUILDER_FEE_CAPABILITIES["aster"],
+  apiStatus: { kind: "official" },
   create: async ctx => (await import("./create-helpers.js")).createAster(ctx),
 };

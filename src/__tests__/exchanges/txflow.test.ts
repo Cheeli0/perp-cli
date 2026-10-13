@@ -1,0 +1,278 @@
+/**
+ * TxFlow (market data only, UNOFFICIAL API): exact unit conversions, the id → symbol join,
+ * error mapping of the undocumented endpoint, the one-shot WS snapshot, the "unofficial" label,
+ * and the write-refusal table (every write path refuses with CAPABILITY_UNSUPPORTED and makes
+ * zero network calls).
+ */
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import "../../exchanges/venues/index.js";
+import { PerpError } from "../../errors.js";
+import { getVenue, requireCapabilities, resolveVenueId } from "../../exchanges/venue.js";
+import { fetchAllAssetCtxsOnce, TxflowClient, type WsFactory, type WsLike } from "../../exchanges/txflow/client.js";
+import {
+  fetchTxflowFundingRates, fetchTxflowMarkets, joinSnapshot, percentToFraction, stepFromSzDecimals, toTxflowMarketMeta,
+  type TxflowMarketMeta,
+} from "../../exchanges/txflow/public.js";
+import { TxflowPublicAdapter } from "../../exchanges/txflow/adapter.js";
+import { buildProgram } from "../../cli-program.js";
+
+const META = {
+  universe: [
+    { name: "BTC-USDC", baseCurrency: "BTC", quoteCurrency: "USDC", szDecimals: 4, maxLeverage: 75, index: 1, priceTick: "0.1", haltTrading: false, delisted: false, tagIds: [1] },
+    { name: "DOGE-USDC", baseCurrency: "DOGE", quoteCurrency: "USDC", szDecimals: -1, maxLeverage: 20, index: 10, priceTick: "0.00001", haltTrading: false, delisted: false, tagIds: [7] },
+    { name: "XAU-USDC", baseCurrency: "XAU", quoteCurrency: "USDC", szDecimals: 3, maxLeverage: 20, index: 120, priceTick: "0.1", haltTrading: true, delisted: false, tagIds: [5] },
+    { name: "OLD-USDC", baseCurrency: "OLD", quoteCurrency: "USDC", szDecimals: 0, maxLeverage: 3, index: 99, priceTick: "0.01", haltTrading: false, delisted: true, tagIds: [1] },
+  ],
+};
+const ctx = (funding: string, markPx: string, extra: Record<string, unknown> = {}) => ({
+  funding, markPx, oraclePx: markPx, openInterest: "12.5", nextFundingTime: 1_791_907_200_000, prevFundingTime: 1_791_903_600_000, ...extra,
+});
+const CTXS = [
+  { coin: "10", ctx: ctx("-0.00310218", "0.2424") },
+  { coin: "1", ctx: ctx("0.00125000", "83263.0") },
+  { coin: "120", ctx: ctx("0.00125000", "2400.5", { prevFundingTime: 1_791_900_000_000 }) },
+  { coin: "777", ctx: ctx("0.00125000", "1") },
+];
+
+function fakeWs(frames: unknown[] | null, opts: { error?: boolean } = {}): { factory: WsFactory; sent: string[]; closed: () => boolean } {
+  const sent: string[] = [];
+  let closed = false;
+  const factory: WsFactory = () => {
+    const handlers: Record<string, (x?: unknown) => void> = {};
+    const ws: WsLike = {
+      on: ((ev: string, cb: (x?: unknown) => void) => { handlers[ev] = cb; return ws; }) as WsLike["on"],
+      send: (d: string) => {
+        sent.push(d);
+        if (frames !== null) setTimeout(() => { for (const f of frames) handlers.message?.(JSON.stringify(f)); }, 1);
+      },
+      close: () => { closed = true; },
+    };
+    setTimeout(() => (opts.error ? handlers.error?.(new Error("boom")) : handlers.open?.()), 1);
+    return ws;
+  };
+  return { factory, sent, closed: () => closed };
+}
+
+function jsonResponse(status: number, body: unknown): Response {
+  return new Response(typeof body === "string" ? body : JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}
+
+let fetchMock: ReturnType<typeof vi.fn>;
+beforeEach(() => {
+  fetchMock = vi.fn(async (url: string) => { throw new Error(`unexpected network call: ${url}`); });
+  vi.stubGlobal("fetch", fetchMock);
+});
+afterEach(() => {
+  vi.restoreAllMocks();
+  process.exitCode = 0;
+});
+
+describe("TxFlow venue definition", () => {
+  it("is market-data only, unofficial, unverified funding, alias txf", () => {
+    const def = getVenue("txflow");
+    expect(def.roles).toEqual(["marketData"]);
+    expect(def.capabilities).toBeNull();
+    expect(def.fundingVerified).toBe(false);
+    expect(def.apiStatus.kind).toBe("unofficial");
+    expect(resolveVenueId("txf")).toBe("txflow");
+    expect(def.networks.testnet).toBeNull();
+  });
+
+  it("requireCapabilities refuses with CAPABILITY_UNSUPPORTED (role-based), not NOT_IMPLEMENTED", () => {
+    try {
+      requireCapabilities(getVenue("txflow"));
+      throw new Error("no throw");
+    } catch (e) {
+      expect((e as PerpError).structured.code).toBe("CAPABILITY_UNSUPPORTED");
+      expect((e as PerpError).structured.details).toMatchObject({ venue: "txflow", feature: "trading" });
+      expect((e as PerpError).message).toMatch(/unofficial read-only API/);
+    }
+  });
+});
+
+describe("exact conversions", () => {
+  it("stepFromSzDecimals handles negative szDecimals", () => {
+    expect(stepFromSzDecimals(4)).toBe("0.0001");
+    expect(stepFromSzDecimals(1)).toBe("0.1");
+    expect(stepFromSzDecimals(0)).toBe("1");
+    expect(stepFromSzDecimals(-1)).toBe("10");
+    expect(stepFromSzDecimals(-5)).toBe("100000");
+  });
+
+  it("percentToFraction is an exact two-place shift", () => {
+    expect(percentToFraction("0.00125")).toBe("0.0000125");
+    expect(percentToFraction("0.00125000")).toBe("0.0000125");
+    expect(percentToFraction("-0.00310218")).toBe("-0.0000310218");
+    expect(percentToFraction("1.5")).toBe("0.015");
+    expect(percentToFraction("100")).toBe("1");
+    expect(percentToFraction("0")).toBe("0");
+    expect(percentToFraction("-0.000")).toBe("0");
+    expect(() => percentToFraction("1e-5")).toThrow(PerpError);
+  });
+
+  it("perpMeta rows: delisted dropped, halt → not tradable, TradFi classified explicitly", () => {
+    const rows = META.universe.map(toTxflowMarketMeta);
+    expect(rows[3]).toBeNull();
+    expect(rows[1]).toMatchObject({ symbol: "DOGE", stepSize: "10", assetClass: "crypto", canonical: "DOGE" });
+    expect(rows[2]).toMatchObject({ symbol: "XAU", assetClass: "commodity", canonical: "GOLD", halted: true });
+    expect(() => toTxflowMarketMeta({ ...META.universe[0], index: "1" })).toThrow(/shape changed/);
+  });
+});
+
+describe("snapshot join (by coin id, never by position)", () => {
+  it("joins by id and drops an unknown coin id with a warning", () => {
+    const dir = META.universe.map(toTxflowMarketMeta).filter((m): m is TxflowMarketMeta => m !== null);
+    const warn = vi.fn();
+    const joined = joinSnapshot(dir, CTXS, warn);
+    expect(joined.get(1)?.markPx).toBe("83263.0");
+    expect(joined.get(10)?.fundingPct).toBe("-0.00310218");
+    expect(joined.has(777)).toBe(false);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("unknown coin id(s): 777"));
+  });
+});
+
+describe("TxflowClient error mapping", () => {
+  const client = () => new TxflowClient("https://api.txflow.test", { capacity: 100, refillPerSec: 100, weights: null });
+
+  it("HTTP 200 with {message} is EXCHANGE_ERROR", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, { message: "Orderbook for coin '99999' not found" }));
+    await expect(client().info({ type: "l2Book", coin: "99999" })).rejects.toMatchObject({ structured: { code: "EXCHANGE_ERROR" } });
+  });
+
+  it("HTTP 403 (allowlist) is EXCHANGE_ERROR with the unofficial remediation, no fallback", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(403, { message: "This action is not allowed." }));
+    const e = await client().info({ type: "meta" }).catch((x: unknown) => x as PerpError) as PerpError;
+    expect(e.structured.code).toBe("EXCHANGE_ERROR");
+    expect(e.structured.remediation).toMatch(/unofficial API refused "meta"/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("a network failure is EXCHANGE_UNREACHABLE; a non-JSON body is shape drift", async () => {
+    fetchMock.mockRejectedValueOnce(new TypeError("fetch failed"));
+    await expect(client().info({ type: "perpMeta" })).rejects.toMatchObject({ structured: { code: "EXCHANGE_UNREACHABLE" } });
+    fetchMock.mockResolvedValueOnce(new Response("<html>", { status: 200 }));
+    await expect(client().info({ type: "perpMeta" })).rejects.toMatchObject({ structured: { code: "EXCHANGE_ERROR" } });
+  });
+});
+
+describe("one-shot WS snapshot", () => {
+  it("subscribes to allAssetCtxs, ignores other frames, resolves the first snapshot and closes", async () => {
+    const ws = fakeWs([{ channel: "subscriptionResponse", data: {} }, { channel: "allAssetCtxs", data: { ctxs: CTXS } }]);
+    const out = await fetchAllAssetCtxsOnce("wss://x", ws.factory, 1_000);
+    expect(out).toHaveLength(4);
+    expect(JSON.parse(ws.sent[0])).toEqual({ method: "subscribe", type: "allAssetCtxs", subscription: { type: "allAssetCtxs" } });
+    expect(ws.closed()).toBe(true);
+  });
+
+  it("no snapshot within the timeout → EXCHANGE_UNREACHABLE", async () => {
+    const ws = fakeWs([]);
+    await expect(fetchAllAssetCtxsOnce("wss://x", ws.factory, 30)).rejects.toMatchObject({ structured: { code: "EXCHANGE_UNREACHABLE" } });
+  });
+
+  it("socket error → EXCHANGE_UNREACHABLE; malformed frame → EXCHANGE_ERROR", async () => {
+    await expect(fetchAllAssetCtxsOnce("wss://x", fakeWs(null, { error: true }).factory, 1_000)).rejects.toMatchObject({ structured: { code: "EXCHANGE_UNREACHABLE" } });
+    await expect(fetchAllAssetCtxsOnce("wss://x", fakeWs([{ channel: "allAssetCtxs", data: {} }]).factory, 1_000)).rejects.toMatchObject({ structured: { code: "EXCHANGE_ERROR" } });
+  });
+});
+
+describe("markets and funding (fixture)", () => {
+  const deps = () => ({ wsFactory: fakeWs([{ channel: "allAssetCtxs", data: { ctxs: CTXS } }]).factory, warn: vi.fn() });
+
+  it("markets: DOGE step 10, halted XAU not tradable, missing snapshot rows dropped", async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, META));
+    const markets = await fetchTxflowMarkets("mainnet", deps());
+    const by = Object.fromEntries(markets.map(m => [m.symbol, m]));
+    expect(by.DOGE).toMatchObject({ stepSize: "10", venueSymbol: "10", fundingRate: "-0.0000310218" });
+    expect(by.BTC).toMatchObject({ fundingRate: "0.0000125", tickSize: "0.1", stepSize: "0.0001", maxLeverage: 75, tradable: true });
+    // next − prev funding ≠ 1h → that market's funding is unknown (null), never assumed hourly.
+    expect(by.XAU).toMatchObject({ fundingRate: null, tradable: false });
+  });
+
+  it("funding rows: percent per hour → fraction per hour, basis 1h, unknown-interval rows omitted", async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, META));
+    const rates = await fetchTxflowFundingRates("mainnet", deps());
+    expect(rates.map(r => [r.symbol, r.rate])).toEqual([["BTC", "0.0000125"], ["DOGE", "-0.0000310218"]]);
+    expect(rates[0]).toMatchObject({ basis: { kind: "perHours", hours: 1 }, nextFundingTime: 1_791_907_200_000 });
+  });
+
+  it("testnet → NOT_IMPLEMENTED (no testnet)", async () => {
+    await expect(fetchTxflowMarkets("testnet", deps())).rejects.toMatchObject({ structured: { code: "NOT_IMPLEMENTED" } });
+  });
+});
+
+describe("public-only adapter", () => {
+  it("every account / trading method refuses with CAPABILITY_UNSUPPORTED and sends nothing", async () => {
+    const a = new TxflowPublicAdapter(getVenue("txflow"), "mainnet");
+    const calls: Array<() => Promise<unknown>> = [
+      () => a.getBalance(), () => a.getPositions(), () => a.getOpenOrders(), () => a.getOrderHistory(), () => a.getTradeHistory(),
+      () => a.getFundingPayments(), () => a.marketOrder(), () => a.limitOrder(), () => a.editOrder(), () => a.cancelOrder(),
+      () => a.cancelAllOrders(), () => a.setLeverage(), () => a.stopOrder(), () => a.getFundingHistory(),
+    ];
+    for (const c of calls) await expect(c()).rejects.toMatchObject({ structured: { code: "CAPABILITY_UNSUPPORTED" } });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("market rows carry venueApi: unofficial and fundingVerified: false", async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, META));
+    const a = new TxflowPublicAdapter(getVenue("txflow"), "mainnet");
+    vi.spyOn(a, "getVenueMarkets").mockResolvedValue(await fetchTxflowMarkets("mainnet", { wsFactory: fakeWs([{ channel: "allAssetCtxs", data: { ctxs: CTXS } }]).factory, warn: vi.fn() }));
+    const rows = await a.getMarkets();
+    expect(rows.every(r => r.venueApi === "unofficial" && r.fundingVerified === false)).toBe(true);
+  });
+});
+
+describe("write-refusal table: -e txflow writes refuse before any I/O", () => {
+  type Env = { ok: boolean; error?: { code: string; message: string; details?: Record<string, unknown> } };
+  const run = async (args: string[]): Promise<{ env: Env; docs: number }> => {
+    const out: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((m) => { out.push(String(m)); });
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    vi.spyOn(process.stdout, "write").mockImplementation((m) => { out.push(String(m)); return true; });
+    vi.spyOn(process, "exit").mockImplementation(((code?: number) => { throw Object.assign(new Error("__exit__"), { exitCode: code }); }) as never);
+    const { program } = buildProgram({ defaultExchange: "hyperliquid", version: "test" });
+    let thrown: PerpError | null = null;
+    try {
+      await program.parseAsync(["node", "perp", "--json", ...args]);
+    } catch (e) {
+      if (e instanceof PerpError) thrown = e;
+      else if ((e as Error).message !== "__exit__") throw e;
+    } finally {
+      vi.restoreAllMocks();
+      vi.stubGlobal("fetch", fetchMock);
+    }
+    if (thrown !== null) return { env: { ok: false, error: thrown.structured as never }, docs: out.join("").trim() === "" ? 1 : 2 };
+    // Exactly one JSON document on stdout (pretty-printed or not).
+    return { env: JSON.parse(out.join("").trim()) as Env, docs: 1 };
+  };
+
+  const CASES: string[][] = [
+    ["-e", "txflow", "trade", "market", "BTC", "buy", "0.001"],
+    ["-e", "txflow", "trade", "buy", "BTC", "0.001"],
+    ["-e", "txflow", "trade", "limit", "BTC", "buy", "50000", "0.001"],
+    ["-e", "txflow", "trade", "cancel", "BTC", "123"],
+    ["-e", "txflow", "trade", "cancel-all"],
+    ["-e", "txflow", "trade", "leverage", "BTC", "5"],
+    ["-e", "txflow", "trade", "close", "BTC"],
+    ["-e", "txflow", "portfolio"],
+    ["-e", "txflow", "account", "trades"],
+    ["-e", "txflow", "account", "positions"],
+    ["-e", "txflow", "account", "orders"],
+    ["funds", "deposit", "txflow", "10"],
+    ["funds", "withdraw", "txflow", "10"],
+    ["--dry-run", "funds", "withdraw", "txflow", "10"],
+    ["wallet", "agent", "approve", "txflow"],
+    ["wallet", "agent", "import", "txflow"],
+    ["wallet", "builder", "approve", "txflow"],
+  ];
+
+  for (const args of CASES) {
+    it(`perp ${args.join(" ")} → CAPABILITY_UNSUPPORTED, one JSON document, zero fetch`, async () => {
+      const { env, docs } = await run(args);
+      expect(env.ok).toBe(false);
+      expect(env.error!.code).toBe("CAPABILITY_UNSUPPORTED");
+      expect(docs).toBe(1);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+  }
+});

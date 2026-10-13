@@ -51,12 +51,21 @@ export const EXPLICIT_CANONICAL: Readonly<Record<string, string>> = {
   "hl:xyz|SILVER": "SILVER",
   "qfex|GOLD": "GOLD",
   "qfex|SILVER": "SILVER",
+  "risex|XAU": "GOLD",
+  "risex|XAG": "SILVER",
+  "txflow|XAU": "GOLD",
+  "txflow|XAG": "SILVER",
   // Crude oil (WTI)
   "ondo|WTI": "CRUDE_OIL_WTI",
   "hl:xyz|CL": "CRUDE_OIL_WTI",
   "hl:flx|OIL": "CRUDE_OIL_WTI",
   // QFEX CL blends expiring futures; roll-week gaps are caught by the cross-venue price filter.
   "qfex|CL": "CRUDE_OIL_WTI",
+  "risex|CL": "CRUDE_OIL_WTI",
+  // Brent crude
+  "risex|BZ": "CRUDE_OIL_BRENT",
+  "txflow|BZ": "CRUDE_OIL_BRENT",
+  "txflow|CL": "CRUDE_OIL_WTI",
   // US equity indices
   "ondo|US500": "SPX",
   "ondo|US100": "NDX",

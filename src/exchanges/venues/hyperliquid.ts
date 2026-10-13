@@ -131,5 +131,6 @@ export const hyperliquidVenue: VenueDefinition = {
   },
   maxSlippageBps: 5000,
   builderFee: BUILDER_FEE_CAPABILITIES["hyperliquid"],
+  apiStatus: { kind: "official" },
   create: async ctx => (await import("./create-helpers.js")).createHyperliquid(ctx),
 };

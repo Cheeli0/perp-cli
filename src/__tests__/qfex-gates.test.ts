@@ -99,8 +99,8 @@ describe("funding exclusion (venue flag fundingVerified)", () => {
     return { def, fetchFundingRates };
   };
 
-  it("qfex is the only venue with unverified funding", () => {
-    expect(listVenues().filter(v => !v.fundingVerified).map(v => v.id)).toEqual(["qfex"]);
+  it("qfex and txflow (unofficial API) are the only venues with unverified funding", () => {
+    expect(listVenues().filter(v => !v.fundingVerified).map(v => v.id)).toEqual(["qfex", "txflow"]);
   });
 
   it("fetchVenuesRates drops an unverified venue (not even fetched) unless includeUnverified", async () => {

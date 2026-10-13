@@ -178,7 +178,33 @@ export interface QfexAgentMeta {
   source: "imported";
 }
 
-export type AnyAgentMeta = AgentMeta | OndoAgentMeta | ArcusAgentMeta | QfexAgentMeta;
+/**
+ * RISEx session signer (EVM key). Registered by the master with RegisterSigner (+ the signer's
+ * VerifySigner) and then restricted ON-CHAIN to the trading permission (DisablePermission for every
+ * other permission, signed by the signer and sent by the master). The private key lives only in OWS wallet `agentWalletName`
+ * (SSOT Rule #3).
+ */
+export interface RisexAgentMeta {
+  kind: "risex";
+  agentName: string;
+  agentWalletName: string;
+  /** Signer (session key) address. */
+  signerAddress: `0x${string}`;
+  /** The RISEx account (master wallet address) the signer trades for. */
+  accountAddress: `0x${string}`;
+  /** ISO timestamp of the on-chain expiration signed in RegisterSigner. */
+  expiresAt: string;
+  /**
+   * On-chain permission state proven after registration (Authorization.hasPermission):
+   * trading-only = only the router permission enabled. Never written from a guess.
+   */
+  permissions: { tradingOnly: boolean; disabled: number[]; verifiedAt: string };
+  network: "mainnet" | "testnet";
+  approvedAt: string;
+  source: "approved";
+}
+
+export type AnyAgentMeta = AgentMeta | OndoAgentMeta | ArcusAgentMeta | QfexAgentMeta | RisexAgentMeta;
 
 export interface AgentsByExchange {
   aster?: Record<string, AgentMeta>;
@@ -189,6 +215,7 @@ export interface AgentsByExchange {
   ondo?: Record<string, OndoAgentMeta>;
   arcus?: Record<string, ArcusAgentMeta>;
   qfex?: Record<string, QfexAgentMeta>;
+  risex?: Record<string, RisexAgentMeta>;
 }
 
 export interface Settings {

@@ -26,7 +26,7 @@ import { z } from "zod";
 import type { ExchangeAdapter } from "./exchanges/interface.js";
 import { hasCredentials, listConfiguredAccountVenues, resolveCredentials, NO_CLI_CREDENTIAL_OPTS } from "./config.js";
 import { HyperliquidAdapter } from "./exchanges/hyperliquid.js";
-import { getVenue, listVenues, listVenuesWithRole, networkConfig, READ_ONLY_CREDENTIALS, requireCapabilities, type VenueDefinition } from "./exchanges/venue.js";
+import { getVenue, listVenues, listVenuesWithRole, networkConfig, READ_ONLY_CREDENTIALS, requireCapabilities, roleUnsupported, type VenueDefinition } from "./exchanges/venue.js";
 import "./exchanges/venues/index.js";
 import type { OrderRequest, VenueId } from "./exchanges/venue-types.js";
 import { newVenueClientOrderId, placeAndConfirm, validateLegacyTif, validateOrderRequest, type PlacedOrder } from "./exchanges/trading-v2.js";
@@ -83,6 +83,8 @@ async function getOrCreateAdapter(exchange: string): Promise<ExchangeAdapter> {
   const def = getVenue(exchange);
   const cached = adapters.get(def.id);
   if (cached) return cached;
+  // Market-data-only venue (TxFlow: unofficial read-only API): every account / trading tool refuses here.
+  if (!def.roles.includes("account")) throw roleUnsupported(def, "account");
   const create = requireCreate(def);
   if (!(await hasCredentials(def.id, NO_CLI_CREDENTIAL_OPTS))) {
     throw new PerpError("NO_SIGNER_AVAILABLE", `No credentials configured for ${def.id}`, {
@@ -129,9 +131,19 @@ async function tryGetAdapter(exchange: string): Promise<ExchangeAdapter | null> 
   }
 }
 
-/** Fetch markets using the venue's public data path (no key needed). */
+/** Fetch markets using the venue's public data path (no key needed). Unofficial-API rows carry venueApi. */
 async function fetchMarketsPublic(exchange: string) {
-  return getVenue(exchange).publicData.fetchMarkets(MCP_NETWORK);
+  const def = getVenue(exchange);
+  const rows = await def.publicData.fetchMarkets(MCP_NETWORK);
+  return def.apiStatus.kind === "unofficial" ? rows.map(r => ({ ...r, venueApi: "unofficial" as const, fundingVerified: def.fundingVerified })) : rows;
+}
+
+/** meta fields every market-data tool adds for its venue: apiStatus, and the note for an unofficial API. */
+function apiMeta(exchange: string): Record<string, unknown> {
+  const def = getVenue(exchange);
+  return def.apiStatus.kind === "unofficial"
+    ? { apiStatus: "unofficial", apiNote: `${def.displayName}: UNOFFICIAL API — ${def.apiStatus.note}`, fundingVerified: def.fundingVerified }
+    : { apiStatus: "official" };
 }
 
 type BookLevels = { bids: [string, string][]; asks: [string, string][] };
@@ -259,10 +271,10 @@ server.tool(
       const adapter = await tryGetAdapter(exchange);
       if (adapter) {
         const markets = await adapter.getMarkets();
-        return { content: [{ type: "text", text: ok(markets, { exchange, count: markets.length }) }] };
+        return { content: [{ type: "text", text: ok(markets, { exchange, count: markets.length, ...apiMeta(exchange) }) }] };
       }
       const markets = await fetchMarketsPublic(exchange);
-      return { content: [{ type: "text", text: ok(markets, { exchange, count: markets.length, source: "public" }) }] };
+      return { content: [{ type: "text", text: ok(markets, { exchange, count: markets.length, source: "public", ...apiMeta(exchange) }) }] };
     } catch (e) {
       return { content: [{ type: "text", text: errOf(e, { exchange }) }], isError: true };
     }
@@ -282,10 +294,10 @@ server.tool(
       const adapter = await tryGetAdapter(exchange);
       if (adapter) {
         const book = await adapter.getOrderbook(symbol);
-        return { content: [{ type: "text", text: ok(book, { exchange, symbol }) }] };
+        return { content: [{ type: "text", text: ok(book, { exchange, symbol, ...apiMeta(exchange) }) }] };
       }
       const book = await fetchOrderbookPublic(exchange, symbol);
-      return { content: [{ type: "text", text: ok(book, { exchange, symbol, source: "public" }) }] };
+      return { content: [{ type: "text", text: ok(book, { exchange, symbol, source: "public", ...apiMeta(exchange) }) }] };
     } catch (e) {
       return { content: [{ type: "text", text: errOf(e, { exchange, symbol }) }], isError: true };
     }
@@ -350,7 +362,8 @@ server.tool(
       });
 
       const data = Array.from(priceMap.entries()).map(([symbol, prices]) => ({ symbol, prices }));
-      return { content: [{ type: "text", text: ok(data, { count: data.length, errors }) }] };
+      const unofficial = listVenuesWithRole("marketData").filter(v => v.apiStatus.kind === "unofficial").map(v => v.id);
+      return { content: [{ type: "text", text: ok(data, { count: data.length, errors, unofficialApiVenues: unofficial }) }] };
     } catch (e) {
       return { content: [{ type: "text", text: errOf(e) }], isError: true };
     }
@@ -1419,7 +1432,8 @@ server.tool(
         // QFEX: public GET /refdata for one instrument on the server's network.
         qfex: () => restPing(`${networkConfig(getVenue("qfex"), MCP_NETWORK).restUrl}/refdata?ticker=AAPL-USD`),
       };
-      const venues = listVenues();
+      // A venue without an environment on the server's network (TxFlow has no testnet) is not probed.
+      const venues = listVenues().filter(v => v.networks[MCP_NETWORK] !== null);
       const probes = await Promise.all(venues.map(v => {
         const ping = pings[v.id];
         return ping !== undefined
@@ -1428,7 +1442,7 @@ server.tool(
       }));
 
       const result: Record<string, unknown> = {};
-      venues.forEach((v, i) => { result[v.id] = { ...probes[i], statusText: probes[i].ok ? "healthy" : "unreachable" }; });
+      venues.forEach((v, i) => { result[v.id] = { ...probes[i], statusText: probes[i].ok ? "healthy" : "unreachable", apiStatus: v.apiStatus.kind }; });
       result.covered = venues.map(v => v.id);
       result.allHealthy = probes.every(p => p.ok);
 

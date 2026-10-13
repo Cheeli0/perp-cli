@@ -7,13 +7,13 @@ import { printJson, jsonOk } from "../utils.js";
 import { PerpError, classifyError } from "../errors.js";
 import chalk from "chalk";
 import bs58 from "bs58";
-import { loadSettings, type AgentMeta, type OndoAgentMeta, type ArcusAgentMeta, type QfexAgentMeta } from "../settings.js";
+import { loadSettings, type AgentMeta, type OndoAgentMeta, type ArcusAgentMeta, type QfexAgentMeta, type RisexAgentMeta } from "../settings.js";
 import {
   getAgent, setAgent, deleteAgent, listAgents, acquireLock, releaseLock,
   getVenueAgent, getVenueAgentForNetwork, setVenueAgent, deleteVenueAgent, listVenueAgents,
   agentNetworkOf, recordedAgentNetworkOf, assertAgentNetwork, getAgentForNetwork, agentSourceOf,
 } from "../agent-wallet/store.js";
-import { getVenue, networkConfig, resolveVenueId } from "../exchanges/venue.js";
+import { getVenue, networkConfig, resolveVenueId, roleUnsupported } from "../exchanges/venue.js";
 import { listConfiguredAccountVenues } from "../config.js";
 import "../exchanges/venues/index.js";
 import type { Network, VenueId } from "../exchanges/venue-types.js";
@@ -541,6 +541,25 @@ export function confirmImportAccount(explicitAccountId: string | null, json: boo
   };
 }
 
+/** RISEx: session-key status on the venue and the on-chain permission bitmap (read-only). */
+async function verifyRisex(network: Network, opts: VerifyOpts): Promise<VerifyResult> {
+  const meta = opts.agentName !== undefined ? getVenueAgent("risex", opts.agentName) : getVenueAgentForNetwork("risex", network);
+  if (!meta) {
+    throw new PerpError("AGENT_NOT_REGISTERED", `No RISEx signer registered for ${network}`, { remediation: `perp${network === "testnet" ? " -n testnet" : ""} wallet agent approve risex --master <ows-wallet>` });
+  }
+  const { verifyRisexAgent } = await import("../exchanges/risex/agent.js");
+  const v = await verifyRisexAgent(meta);
+  const warnings: string[] = [];
+  if (!v.active) warnings.push(`RISEx signer ${meta.signerAddress} status is ${String(v.status)} (1 = Active)`);
+  if (!v.tradingOnly) warnings.push(`RISEx signer ${meta.signerAddress} is NOT trading-only on-chain (${JSON.stringify(v.permissions)}) — revoke it`);
+  if (v.expired) warnings.push(`RISEx signer ${meta.signerAddress} expired at ${meta.expiresAt}`);
+  return {
+    registered: v.active, count: 1,
+    items: [{ agentName: meta.agentName, signer: meta.signerAddress, account: meta.accountAddress, network: meta.network, status: v.status, permissions: v.permissions, tradingOnly: v.tradingOnly, expiresAt: meta.expiresAt }],
+    warnings: warnings.length > 0 ? warnings : undefined,
+  };
+}
+
 /** Dispatch a verify to the venue-specific implementation. */
 async function verifyVenue(ex: VenueId, network: Network, opts: VerifyOpts): Promise<VerifyResult> {
   if (ex === "aster") return verifyAster(opts);
@@ -550,8 +569,9 @@ async function verifyVenue(ex: VenueId, network: Network, opts: VerifyOpts): Pro
   if (ex === "ondo") return verifyOndo(network, opts);
   if (ex === "arcus") return verifyArcus(network, opts);
   if (ex === "qfex") return verifyQfex(network, opts);
+  if (ex === "risex") return verifyRisex(network, opts);
   throw new PerpError("NOT_IMPLEMENTED", `${ex} has no agents to verify`, {
-    remediation: "perp wallet agent verify <aster|hyperliquid|pacifica|lighter|lighter-rh|ondo|arcus|qfex> [agentName]",
+    remediation: "perp wallet agent verify <aster|hyperliquid|pacifica|lighter|lighter-rh|ondo|arcus|qfex|risex> [agentName]",
   });
 }
 
@@ -579,6 +599,8 @@ export function agentApproveUnsupportedReason(venue: VenueId, network: Network, 
 
 /** Throws the uniform CAPABILITY_UNSUPPORTED error when agentApproveUnsupportedReason() is non-null. */
 export function assertAgentApproveSupported(venue: VenueId, network: Network, op: AgentOp): void {
+  const def = getVenue(venue);
+  if (!def.roles.includes("trading")) throw roleUnsupported(def, `agent ${op}`);
   if (venue === "qfex") {
     // Programmatic key creation needs a website session (SIWE + MFA) — not a CLI path.
     throw unsupported("qfex", "agentApprove", "API keys are created (and revoked) on the QFEX website, behind 2FA",
@@ -614,6 +636,8 @@ export function defaultAgentName(venue: VenueId, network: Network): string {
     case "ondo": return `perp-cli-ondo${suffix}`;
     case "arcus": return `perp-cli-arcus${suffix}`;
     case "qfex": return `perp-cli-qfex${suffix}`;
+    case "risex": return `perp-cli-risex${suffix}`;
+    case "txflow": return `perp-cli-txflow${suffix}`;
   }
 }
 
@@ -656,7 +680,7 @@ function assertAgentNameFree(venue: VenueId, agentName: string, network: Network
 }
 
 /** Ondo / Arcus: refuse (even with --rotate) to replace a record registered on another network. */
-function assertVenueAgentNameFree(venue: "ondo" | "arcus", agentName: string, network: Network): void {
+function assertVenueAgentNameFree(venue: "ondo" | "arcus" | "risex", agentName: string, network: Network): void {
   const existing = getVenueAgent(venue, agentName);
   if (existing !== null && existing.network !== network) {
     throw new PerpError("INVALID_PARAMS", `${venue} agent "${agentName}" is already registered on ${existing.network}`, {
@@ -699,6 +723,7 @@ export interface ApproveAgentParams {
 export type ApproveAgentOutcome =
   | { venue: "ondo"; meta: OndoAgentMeta }
   | { venue: "arcus"; meta: ArcusAgentMeta }
+  | { venue: "risex"; meta: RisexAgentMeta }
   | { venue: LighterVenueId; agentName: string; expiresAt: string; result: LtApproveFlowResult }
   | { venue: "pacifica"; agentName: string; expiresAt: string; result: PacApproveFlowResult }
   | { venue: "hyperliquid"; agentName: string; expiresAt: string; result: HlApproveFlowResult }
@@ -778,6 +803,43 @@ export async function approveVenueAgent(p: ApproveAgentParams): Promise<ApproveA
       return { venue: "arcus", meta };
     } finally {
       releaseLock("arcus");
+    }
+  }
+
+  // RISEx: master-signed RegisterSigner, then an on-chain restriction to trading-only.
+  if (p.venue === "risex") {
+    const masterName = requireMaster(p.master);
+    assertVenueAgentNameFree("risex", agentName, p.network);
+    if (p.canWithdraw || p.canSpot) {
+      throw new PerpError("INVALID_PARAMS", "RISEx signers registered by perp-cli are always restricted to trading only (no fund movement, no spot)", {
+        remediation: "Drop --can-withdraw / --can-spot",
+      });
+    }
+    const expiresAt = parseExpiresInParam(p.expiresIn);
+    const { approveRisexAgent, revokeRisexAgent, risexAgentWalletName } = await import("../exchanges/risex/agent.js");
+    acquireLock("risex");
+    try {
+      const existing = getVenueAgent("risex", agentName);
+      if (existing !== null) {
+        if (!p.rotate) {
+          throw new PerpError("INVALID_PARAMS", `RISEx signer "${agentName}" already exists`, {
+            remediation: `Replace it (revoke the old signer, register a fresh one): perp${p.network === "testnet" ? " -n testnet" : ""} wallet agent approve risex --rotate — or choose another --agent-name`,
+          });
+        }
+        // Rotate: venue-confirmed revoke of the old signer, then drop its key, then approve.
+        await revokeRisexAgent({ meta: existing, masterOwsWallet: masterName, passphrase: p.passphrase });
+        try { loadOws().deleteWallet(existing.agentWalletName); } catch { /* already gone */ }
+        deleteVenueAgent("risex", agentName);
+      } else if (p.rotate && loadOws().listWallets().some((w: { name: string }) => w.name === risexAgentWalletName(masterName, p.network))) {
+        throw new PerpError("INVALID_PARAMS", `OWS wallet "${risexAgentWalletName(masterName, p.network)}" exists but no RISEx signer record uses it`, {
+          remediation: `If no RISEx signer uses its key, delete it (ows wallet delete ${risexAgentWalletName(masterName, p.network)}) and re-run the approve`,
+        });
+      }
+      const meta = await approveRisexAgent({ agentName, masterOwsWallet: masterName, passphrase: p.passphrase, network: p.network, expiresAt });
+      setVenueAgent("risex", meta);
+      return { venue: "risex", meta };
+    } finally {
+      releaseLock("risex");
     }
   }
 
@@ -889,7 +951,7 @@ export function qfexWithdrawKeyWarning(meta: Pick<QfexAgentMeta, "agentName" | "
 /** Venues `wallet agent rotate` (and `approve --rotate`) can rotate. */
 type RotatableVenue = "aster" | "hyperliquid" | "pacifica" | LighterVenueId;
 
-type RotatedAgentOutcome = Exclude<ApproveAgentOutcome, { venue: "ondo" | "arcus" }>;
+type RotatedAgentOutcome = Exclude<ApproveAgentOutcome, { venue: "ondo" | "arcus" | "risex" }>;
 
 export interface RotateAgentParams {
   exchange: RotatableVenue;
@@ -1131,6 +1193,16 @@ export function printApproveOutcome(outcome: ApproveAgentOutcome): void {
       console.log(`  Valid Until:   ${chalk.cyan(outcome.meta.validUntil)}`);
       console.log();
       return;
+    case "risex":
+      console.log(chalk.green.bold("\n  RISEx signer registered and restricted to trading-only!\n"));
+      console.log(`  Name:        ${chalk.cyan(outcome.meta.agentName)}`);
+      console.log(`  Signer:      ${chalk.cyan(outcome.meta.signerAddress)}`);
+      console.log(`  Account:     ${chalk.cyan(outcome.meta.accountAddress)}`);
+      console.log(`  Expires:     ${chalk.cyan(outcome.meta.expiresAt)}`);
+      console.log(`  Permissions: ${chalk.cyan("trading only")} ${chalk.gray(`(on-chain; disabled ${outcome.meta.permissions.disabled.join(", ")}; verified ${outcome.meta.permissions.verifiedAt})`)}`);
+      console.log(chalk.gray("  Deposits / withdrawals: RISEx app only (perp-cli never moves RISEx funds)."));
+      console.log();
+      return;
     case "lighter":
     case "lighter-rh":
       console.log(chalk.green.bold(`\n  ${getVenue(outcome.venue).displayName} Agent approved successfully!\n`));
@@ -1187,7 +1259,7 @@ export function registerWalletAgentCommands(
   // ── agent approve <exchange> ── register an agent wallet ──────────────────
   agent
     .command("approve <exchange>")
-    .description("Register an agent wallet / API key for an exchange (aster, hyperliquid, pacifica, lighter, lighter-rh, ondo, arcus)")
+    .description("Register an agent wallet / API key for an exchange (aster, hyperliquid, pacifica, lighter, lighter-rh, ondo, arcus, risex — risex: a trading-only session signer, restricted on-chain)")
     .option("--master <name>", "Master OWS wallet name")
     .option("--agent-name <name>", "Agent name (default: perp-cli-aster)")
     .option("--expires-in <duration>", "Expiry: 30d, 90d, 180d, 1y, or ISO-8601 datetime (default: 90d)")
@@ -1249,7 +1321,8 @@ export function registerWalletAgentCommands(
 
         let master = opts.master ?? null;
         let agentName = opts.agentName ?? null;
-        let expiresIn = opts.expiresIn ?? "90d";
+        // RISEx signers default to 30 days (owner decision; the venue maximum is not documented).
+        let expiresIn = opts.expiresIn ?? (venue === "risex" ? "30d" : "90d");
         let canPerp = opts.canPerp ?? true;
         let canSpot = opts.canSpot ?? false;
         let canWithdraw = opts.canWithdraw ?? false;
@@ -1398,6 +1471,9 @@ Examples:
         }
         const network = networkOf(command);
         const venue = resolveVenueId(exchange);
+        // TxFlow (market data only) / RISEx (perp-cli-registered, restricted signers only): refused before any stdin read.
+        const { assertImportSupported } = await import("./agent-import.js");
+        assertImportSupported(venue, network);
         const int = (flag: string, raw: string | undefined): number | null => {
           if (raw === undefined) return null;
           const n = Number(raw);
@@ -1479,14 +1555,14 @@ Examples:
       const venueFilter = exchange === undefined ? null : resolveVenueId(exchange);
       for (const { exchange: ex, meta } of listVenueAgents()) {
         if (venueFilter !== null && venueFilter !== ex) continue;
-        const expiresAt = meta.kind === "arcus" ? meta.validUntil : null;
+        const expiresAt = meta.kind === "arcus" ? meta.validUntil : meta.kind === "risex" ? meta.expiresAt : null;
         const status: "active" | "expired" = expiresAt !== null && expiresAt !== "" && new Date(expiresAt).getTime() < now ? "expired" : "active";
         rows.push({
           name: meta.agentName,
           exchange: ex,
           network: meta.network,
           source: agentSourceOf(ex, meta),
-          evmAddress: meta.kind === "arcus" ? meta.ownerAddress : "",
+          evmAddress: meta.kind === "arcus" ? meta.ownerAddress : meta.kind === "risex" ? meta.signerAddress : "",
           // Ondo keys carry no expiry; shown as "—".
           expiresAt: expiresAt ?? "",
           status,
@@ -1564,7 +1640,7 @@ Examples:
         network = networkOf(command);
         // An imported key is only ever removed locally, so it needs no venue support for revoke
         // (e.g. an imported Aster testnet key).
-        const rec = exchange === "ondo" || exchange === "arcus" || exchange === "qfex" ? getVenueAgent(exchange, agentName) : getAgent(exchange, agentName);
+        const rec = exchange === "ondo" || exchange === "arcus" || exchange === "qfex" || exchange === "risex" ? getVenueAgent(exchange, agentName) : getAgent(exchange, agentName);
         // QFEX keys only exist as imports: a missing record is "already removed", never an approve-capability error.
         if (exchange !== "qfex" && (rec === null || agentSourceOf(exchange, rec) !== "imported")) assertAgentApproveSupported(exchange, network, "revoke");
       } catch (e) {
@@ -1605,6 +1681,39 @@ Examples:
           const note = "The key is still valid on QFEX — revoke it in QFEX Developer Settings (website) to invalidate it.";
           if (useJson) printJson(jsonOk({ revoked: true, local: true, keystoreRemoved, note }));
           else console.log(chalk.green(`Agent "${agentName}" on qfex removed locally.`) + chalk.yellow(`\n  ${note}`));
+          return;
+        }
+        // ── RISEx: RevokeSigner signed by the master wallet (gasless REST); then the key is deleted ──
+        if (exchange === "risex") {
+          const risexMeta = getVenueAgent("risex", agentName);
+          if (!risexMeta) {
+            if (useJson) printJson({ ok: true, data: { alreadyRevoked: true } });
+            else console.log(`Agent "${agentName}" on risex not found locally — already revoked.`);
+            return;
+          }
+          if (risexMeta.network !== network) {
+            throw new PerpError("AGENT_NOT_REGISTERED", `RISEx signer "${agentName}" is registered on ${risexMeta.network}, not ${network}`, {
+              remediation: risexMeta.network === "mainnet" ? "Run without -n testnet to revoke it" : "Run with -n testnet to revoke it",
+            });
+          }
+          let txHash: string | null = null;
+          if (!localOnly) {
+            const masterName = opts.master ?? loadSettings().owsActiveWallet;
+            if (!masterName) {
+              throw new PerpError("INVALID_PARAMS", "Master wallet name is required to revoke a RISEx signer", {
+                remediation: "Use --master <name>, or --force to clear local state only (then revoke it in the RISEx app)",
+              });
+            }
+            const passphrase = await resolvePassphrase({ flag: passphraseFlag });
+            const { revokeRisexAgent } = await import("../exchanges/risex/agent.js");
+            txHash = (await revokeRisexAgent({ meta: risexMeta, masterOwsWallet: masterName, passphrase })).txHash;
+          }
+          try { loadOws().deleteWallet(risexMeta.agentWalletName); } catch { /* already gone */ }
+          deleteVenueAgent("risex", agentName);
+          if (useJson) printJson(jsonOk({ revoked: !localOnly, local: localOnly, txHash }));
+          else console.log(localOnly
+            ? chalk.yellow(`Agent "${agentName}" on risex removed locally only — revoke signer ${risexMeta.signerAddress} in the RISEx app.`)
+            : chalk.green(`Agent "${agentName}" on risex revoked successfully.`));
           return;
         }
         // ── Arcus: EIP-712 RevokeApiKey signed by the master wallet ──
