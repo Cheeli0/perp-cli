@@ -20,7 +20,8 @@ import type { ExchangeAdapter, ExchangeBalance, ExchangePosition } from "../exch
 import { makeTable, formatUsd, formatPnl, printJson, jsonOk, jsonError, withJsonErrors } from "../utils.js";
 import { isDexCapable } from "../exchanges/capabilities.js";
 import type { DashboardExchange } from "../dashboard/index.js";
-import { getVenue, listVenuesWithRole } from "../exchanges/venue.js";
+import { getVenue, listVenuesWithRole, tryResolveVenueId } from "../exchanges/venue.js";
+import { PerpError } from "../errors.js";
 import "../exchanges/venues/index.js";
 import { listConfiguredAccountVenues } from "../config.js";
 import { HYPERLIQUID_API_URL } from "../api/public/urls.js";
@@ -205,12 +206,13 @@ function parseList(input: string | undefined): string[] {
 
 function validateExchanges(list: string[]): string[] {
   const valid = accountVenueIds();
-  const lower = list.map(s => s.toLowerCase());
-  const unknown = lower.filter(e => !valid.includes(e));
+  // Aliases (hl, pac, lt, lrh, ast, …) resolve through the venue registry, like every other command.
+  const ids = list.map(s => tryResolveVenueId(s) ?? s.toLowerCase());
+  const unknown = ids.filter(e => !valid.includes(e));
   if (unknown.length > 0) {
-    throw new Error(`Unknown exchange: ${unknown.join(", ")}. Valid: ${valid.join(", ")}`);
+    throw new PerpError("INVALID_PARAMS", `Unknown exchange: ${unknown.join(", ")}`, { remediation: `Use one of: ${valid.join(", ")} (or an alias such as hl, pac, lt, lrh, ast)` });
   }
-  return lower;
+  return ids;
 }
 
 /** Resolve global -e flag from program (only counts when the user typed it). */

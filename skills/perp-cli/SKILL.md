@@ -2,7 +2,7 @@
 name: perp-cli
 description: "Multi-DEX perpetual futures trading via the perp-cli command-line tool. Use when user asks to: trade perps, check funding rates, scan/execute arbitrage (perp-perp or spot-perp), run delta-neutral strategies, bridge USDC across chains, manage positions/orders/leverage, deposit/withdraw, hedge spot+perp, trade HIP-3 DEXes, or mentions perp-cli, hypurrquant, Pacifica, Hyperliquid, Lighter, Aster, Lighter RH, Ondo Perps, Arcus, HyperEVM, funding arb, or U-tokens (UBTC/UETH/USOL). Covers Pacifica (Solana), Hyperliquid (HyperEVM), Lighter (Ethereum), Aster (BNB Chain), Lighter RH and Arcus (Robinhood chain) and Ondo Perps (off-chain)."
 license: MIT
-allowed-tools: "Bash(perp:*), Bash(npx perp-cli:*), Bash(npx -y perp-cli:*)"
+allowed-tools: "Bash(perp:*), Bash(npx -y perp-cli:*), Bash(bash scripts/preflight.sh:*), Bash(bash scripts/arb-monitor.sh:*), Bash(bash scripts/funding-analysis.sh:*), Bash(bash scripts/spot-perp-scan.sh:*), Bash(bash scripts/validate-arb.sh:*)"
 compatibility: "Requires Node.js 20 or newer and the perp-cli npm package (global install or npx). Network access required for exchange APIs and bridge providers. Mutating commands need a wallet key imported into the OWS vault via 'perp wallet set EXCHANGE' (key on stdin or hidden prompt — never argv). Skill is portable across Claude Code, Claude.ai, Cursor, Codex, and Gemini CLI — no platform-specific features."
 metadata:
   author: hypurrquant
@@ -33,28 +33,29 @@ Also bundled under `scripts/`: `preflight.sh`, `arb-monitor.sh`, `funding-analys
 
 ### Critical rules
 
-1. **Always pass `--json`.** Without it, output is human-formatted and hard to parse.
-2. **Always run `--dry-run` first** for any mutating trade (open / close / bridge / withdraw). Show the result, get user confirmation, then execute without `--dry-run`.
-3. **Always use `--fields`** when you only need specific data — saves tokens.
-4. **Avoid bare `perp setup` / `perp init` / `perp wallet setup`** — they prompt and will hang an agent. Use `printf '%s' "$KEY" | OWS_PASSPHRASE=<pp> perp --json wallet set <exchange>` for key registration (key on stdin; a key on argv is rejected), or `perp --json setup --non-interactive --wallet <ows-wallet> --venues <list> [--default-venue <v>] [--slippage-bps <n>] [--slippage <venue>=<bps>]` (new wallet: `--wallet-name <name> --passphrase <pp>`; agent registration only with `--approve-agents --yes`, after user confirmation) (and `OWS_PASSPHRASE=<pp> perp wallet setup --name <n> --max-tx-usd <usd> --max-daily-usd <usd>`) when the wizard is required.
-5. **NEVER trade without explicit user confirmation.** A dry-run is not consent.
-6. **NEVER read `~/.perp/.env` or other key files.** The CLI reads them — you should not.
-7. **NEVER manually add `-PERP` suffix** to symbols. Use bare names (`BTC`, `SOL`, `ICP`); the CLI resolves exchange-specific naming.
+1. **Always pass `--json`.** Without it, output is human-formatted and hard to parse. `ok:false` also exits 1.
+2. **Always pass `-e <venue>`** on venue-scoped commands. The default is `settings.defaultExchange`, else `pacifica` — never rely on it.
+3. **Always run `--dry-run` first** for any mutating command that supports it (`--help` says "supports --dry-run"). Show the result, get user confirmation, then execute without `--dry-run`. Commands without dry-run support refuse `--dry-run` with `INVALID_PARAMS` (see "Safety rules").
+4. **Always use `--fields`** when you only need specific data — saves tokens.
+5. **Avoid bare `perp setup` / `perp init` / `perp wallet setup`** — they prompt and will hang an agent. Use `printf '%s' "$KEY" | OWS_PASSPHRASE=<pp> perp --json wallet set <exchange>` for key registration (key on stdin; a key on argv or `-k` is rejected), or `perp --json setup --non-interactive --wallet <ows-wallet> --venues <list> [--default-venue <v>] [--slippage-bps <n>] [--slippage <venue>=<bps>]` (new wallet: `--wallet-name <name>` with the passphrase in `OWS_PASSPHRASE`; agent registration only with `--approve-agents --yes`, after user confirmation) (and `OWS_PASSPHRASE=<pp> perp wallet setup --name <n> --max-tx-usd <usd> --max-daily-usd <usd>`) when the wizard is required. The passphrase goes in `OWS_PASSPHRASE` or stdin — the root `--passphrase` flag is deprecated (visible in `ps`).
+6. **NEVER trade without explicit user confirmation.** A dry-run is not consent.
+7. **NEVER read `~/.perp/.env` or other key files.** The CLI reads them — you should not.
+8. **NEVER manually add `-PERP` suffix** to symbols. Use bare names (`BTC`, `SOL`, `ICP`); the CLI resolves exchange-specific naming.
+9. **NEVER resubmit after `ORDER_PENDING`** (or any unknown outcome). See "Safety rules".
 
 ### Step 1: Verify install + version
 
 ```bash
-perp --version 2>/dev/null  # must be >= 0.14.0
-npm install -g perp-cli@latest 2>/dev/null || npx -y perp-cli@latest --json --version
+perp --version 2>/dev/null || npx -y perp-cli@latest --version   # must be >= 0.14.0
 ```
 
-If `perp` is not on PATH, prefix every command with `npx -y perp-cli@latest`.
+If it is missing or older, ask the user before installing/upgrading (`npm install -g perp-cli@latest`) — never install on your own. If `perp` is not on PATH, prefix every command with `npx -y perp-cli@latest`.
 
 ### Step 2: Verify wallet + balance
 
 ```bash
 perp --json wallet show               # confirms configured exchanges
-perp --json portfolio -e <ex>         # per-exchange USDC available (account balance was renamed to portfolio in v0.12)
+perp --json portfolio -e <venue-id>   # per-exchange USDC available; full id (hyperliquid, not hl) — portfolio rejects aliases
 ```
 
 If any required exchange is missing, register it (user supplies the key):
@@ -95,7 +96,7 @@ Imported keys trade; `funds deposit|withdraw|transfer|bridge`, `wallet manage re
 - Funding rates on QFEX are unverified: excluded everywhere unless `perp --json arb scan --rates --include-unverified` (display only).
 - Withdrawals need `settings.withdraw.qfex` (allowlist + limits), which only the user can set in an interactive terminal — an agent cannot set or change it. `perp --json --dry-run funds withdraw qfex <amt> --to <addr>` shows the gate verdict.
 
-Venue rules for these: `trade limit` on `ondo` / `arcus` has **no default `--tif`** (pass one: ondo GTC|IOC|ALO, arcus GTT|IOC|FOK|ALO); market orders on every venue are bounded by `--slippage-bps <n>` → `settings.slippageBps.<venue>` → `settings.defaultSlippageBps` (shipped default 50). Ondo (US, PA) and Arcus (US, CA, GB) print a one-time restricted-region notice on stderr when used with credentials (warn only, never blocks).
+Venue rules for these: `trade limit` defaults to `--tif GTC` on every venue (arcus maps it to GTT; ondo offers GTC|IOC|ALO; FOK is never emulated → `CAPABILITY_UNSUPPORTED` where not offered); market orders on every venue are bounded by `--slippage-bps <n>` → `settings.slippageBps.<venue>` → `settings.defaultSlippageBps` (shipped default 50). Ondo (US, PA) and Arcus (US, CA, GB) print a one-time restricted-region notice on stderr when used with credentials (warn only, never blocks).
 
 ### Step 3: Discover (read-only)
 
@@ -133,6 +134,8 @@ perp --json --dry-run -e <ex> trade buy <SYM> <SIZE> --smart
 ```
 
 > `trade check` does NOT read exchange-set leverage. Always pass `--leverage` explicitly.
+>
+> `--smart` (IOC at best bid/ask ± 1 tick) exists only on pacifica / hyperliquid / lighter / aster, and is refused (`CAPABILITY_UNSUPPORTED`) together with `--tp`/`--sl` or `--client-id`/`--auto-id`.
 
 Show the dry-run output to the user. Wait for confirmation.
 
@@ -141,10 +144,12 @@ Show the dry-run output to the user. Wait for confirmation.
 After explicit user confirmation:
 
 ```bash
-# Perp-perp arb (auto-matches both legs)
-perp --json arb exec <SYM> <longEx> <shortEx> <USD> --smart --reconcile
+# Perp-perp arb: legs are SEQUENTIAL — long first, then the short sized to the verified long fill;
+# reconcile is always on (the long is trimmed reduce-only to the short's verified fill).
+# An unconfirmed leg quarantines the symbol (see "Safety rules").
+perp --json arb exec <SYM> <longEx> <shortEx> <USD> --smart
 
-# Spot+perp arb (spot has 0 funding cost; spot exchanges: hl, lt)
+# Spot+perp arb (spot has 0 funding cost; spot:<venue> = hl, lt, lrh, aster, ondo)
 perp --json arb exec <SYM> spot:hl hl <USD>
 perp --json arb exec <SYM> spot:lt pac <USD>
 
@@ -176,6 +181,8 @@ perp --json arb close <SYM>                                     # perp-perp arb
 perp --json arb close <SYM> --pair <longEx>:<shortEx>           # disambiguate
 perp --json arb close <SYM> --spot-exch hl --perp-exch hl       # spot+perp
 perp --json arb close <SYM> --smart                             # IOC limits
+perp --json arb close <SYM> --force                             # quarantined symbol — only after the user checked positions
+perp --json arb close <SYM> --state-only --yes                  # drop a stale state entry (arb status staleStateEntries); sends no order
 
 # Single trade
 perp --json -e <ex> trade close <SYM>                           # close one symbol
@@ -193,21 +200,28 @@ perp --json funds deposit hyperliquid 100
 perp --json funds deposit pacifica 100
 perp --json funds deposit lighter ethereum 100              # L1 direct
 perp --json funds deposit lighter cctp arbitrum 100         # via CCTP
-perp --json funds withdraw hyperliquid 100
-perp --json funds transfer 100 <ADDRESS>                    # HL internal (instant)
+perp --json funds withdraw hyperliquid 100 [--chain arbitrum|ethereum|base]   # CCTP to your own wallet
+perp --json funds transfer 100 <ADDRESS>                    # HL internal (instant) — allowlisted destinations only
 
 # Cross-chain bridge (auto-cheapest cctp/relay/debridge)
 perp --json funds bridge quote --from solana --to arbitrum --amount 100
 perp --json funds bridge send  --from solana --to arbitrum --amount 100
 perp --json funds bridge status <orderId>                   # poll until success
 
-# Inter-exchange rebalance (orchestrated withdraw → bridge → deposit)
+# Inter-exchange rebalance
 perp --json funds rebalance check
 perp --json funds rebalance plan
-perp --json funds rebalance execute --auto-bridge
+perp --json --dry-run funds rebalance execute --auto-bridge   # status "simulated" (moves[].status "dry_run"), or "balanced" (nothing to move)
+perp --json funds rebalance execute --auto-bridge             # withdraw → bridge ONLY; no deposit
 ```
 
 Always run `funds bridge quote` before `funds bridge send` so the user sees fees + ETA.
+
+- `funds rebalance execute` returns `ok:true` even when a move failed: check EVERY `moves[].status` (`withdrawn`, `bridged`, `same_chain`, `needs_bridge`, `withdraw_failed`, `bridge_failed`). It never deposits — after the bridge arrives, deposit manually (`funds deposit <venue> <amt>`).
+- `funds transfer <amt> <addr>` (HL) and `funds withdraw hyperliquid --to <other address>` require the destination on the `settings withdraw.hyperliquid` allowlist (`POLICY_DENIED` otherwise). Only the user can set it, in an interactive terminal (`--json` / piped → `POLICY_DENIED`). NEVER try to set or change `withdraw.<venue>` yourself.
+- HL withdraw goes over CCTP (native USDC); on Arbitrum a 0.2 USDC forwarding fee is deducted (an amount ≤ the fee → `SIZE_TOO_SMALL`).
+- Bridges: exactly `--amount` leaves the wallet (fees come out of it); a deBridge `nativeFee` is shown separately and is paid in the source chain's native token. Solana-origin deBridge is refused (`NO_BRIDGE_ROUTE`) → `--provider cctp`. `--fast` = fast CCTP finality (higher fee).
+- `funds bridge exchange --from <ex> --to <ex>` bridges the master wallet's OWN USDC between the venues' chains (pacifica → solana, lighter → arbitrum); it does NOT withdraw from / deposit into Pacifica or Lighter. Exception hyperliquid: `--from hyperliquid` spends HyperCore spot USDC, `--to hyperliquid` credits HyperCore perps. HyperCore → Solana is refused (`NO_BRIDGE_ROUTE`).
 
 Relay swaps between assets (`--from-asset` / `--to-asset`, chains `robinhood`, `arbitrum`, `bsc`, `base`, destination `solana`): run `perp --json --dry-run funds bridge send ...` first — it prints the locally verified quote (amount in, expected out, protocol-guaranteed minimum, fees, ETA) and the min-out verdict without loading a key. Stable → native (e.g. USDG → SOL / ETH) needs `--min-out`. The recipient is always the master wallet's own address; an `ORDER_PENDING` result carries the Relay request id — never bridge again before checking it.
 
@@ -215,7 +229,8 @@ Relay swaps between assets (`--from-asset` / `--to-asset`, chains `robinhood`, `
 
 ```bash
 perp strategy list-strategies                                 # 20 registered
-perp strategy run <strategy> [symbol]                         # run any strategy
+perp strategy run <strategy> [symbol]                         # run any strategy (multi-venue: --exchanges must include the -e venue)
+perp --json --dry-run strategy run <strategy> [symbol]        # simulate: actions logged, never sent
 perp strategy apex [symbol]                                   # APEX orchestrator
 perp strategy reflect                                         # performance analysis
 perp --json strategy plan validate <FILE>                     # validate scripted plan
@@ -227,11 +242,14 @@ perp --json strategy plan execute <FILE> --dry-run            # dry-run scripted
 Background daemon (tmux):
 
 ```bash
+perp --json --dry-run arb auto --min-spread 30 --size 100     # simulate first (--background inherits --dry-run)
 perp --json arb auto --min-spread 30 --size 100 --background
 perp --json background list
 perp --json background logs <id> -f
-perp --json background stop <id>
+perp --json background stop <id> [--timeout 90]   # graceful: SIGINT, job cancels its orders, waits, reports what is left on the venue
 ```
+
+`strategy funding-arb` is monitor-only unless `--auto-execute`. Bots: `equity` is `null` when a balance read fails — arb strategies then skip new entries and the bot stops after 10 consecutive unknown ticks; `ordersPlaced` counts orders sent, `fills` only venue-reported fills — a resting order is placed, not filled.
 
 Background jobs inherit the parent's `-n`, `--dry-run`, `-e`, `--ows`, `-w`, `--no-agent`, `--dex`, and never receive key material (argv/env): they resolve credentials from the OWS vault / agent keystores / `~/.perp/.env` themselves. `--background` with `-k`, `--passphrase`, `--ows-key` or a shell-exported key / `OWS_PASSPHRASE` → `INVALID_PARAMS` — register an agent (`perp wallet agent approve <venue>`), which signs without the master passphrase.
 
@@ -239,7 +257,7 @@ Background jobs inherit the parent's `-n`, `--dry-run`, `-e`, `--ows`, `-w`, `--
 
 - Single position notional < **80%** of that exchange's available balance.
 - Leverage 1–3x for arb; never above 5x for arb positions.
-- `arb exec` auto-matches both legs to the same size; pass `--reconcile` to trim mismatches.
+- `arb exec` sizes the short to the verified long fill and always reconciles; still check `arb status` (`unconfirmedPairs`, `staleStateEntries`) afterwards.
 - ALWAYS follow `longExch`/`shortExch` from `arb scan` — NEVER reverse direction.
 - NEVER enter if `netSpread <= 0` or `netSpread < estimated round-trip slippage`.
 - Capital that's mid-bridge is "at risk" and unhedged — factor it in.
@@ -298,16 +316,13 @@ perp --json funds bridge status <orderId>             # poll until completed
 perp --json funds deposit hyperliquid 500
 ```
 
-Or use the orchestrated path:
-
-```bash
-perp --json funds rebalance plan
-perp --json funds rebalance execute --auto-bridge
-```
+`funds rebalance execute --auto-bridge` only withdraws and bridges — check every `moves[].status`, then deposit by hand (`funds deposit hyperliquid <amt>`) after the bridge arrives.
 
 ### Example 5: "Run a delta-neutral funding bot in background"
 
 ```bash
+perp --json --dry-run arb auto --min-spread 30 --close-spread 5 --size 100 --max-positions 5
+# → show the simulation, ask confirmation
 perp --json arb auto --min-spread 30 --close-spread 5 --size 100 --max-positions 5 --background
 perp --json background list
 perp --json background logs <id> -f
@@ -317,17 +332,40 @@ perp --json background stop <id>
 
 ## Troubleshooting
 
-Every response is `{ "ok": true, "data": ... }` or `{ "ok": false, "error": { "code": "...", "retryable": true|false } }`. Always check `ok` first.
+Every response is `{ "ok": true, "data": ... }` or `{ "ok": false, "error": { "code": "...", "retryable": true|false, "remediation"?: "..." } }`; `ok:false` exits 1. Always check `ok` first and follow `error.remediation`. `retryable: true` → wait and retry ONCE, and only for read-only commands — a write is never blindly retried.
 
 | Error code | Meaning | Action |
 |---|---|---|
-| `RATE_LIMITED` | Exchange throttled the request | Wait 5s, retry up to 3 times. For Lighter, space calls 3s+ apart. |
-| `EXCHANGE_UNREACHABLE` | API down or network issue | Wait 10s, retry. After 3 failures, skip that exchange and continue. |
-| `INSUFFICIENT_BALANCE` | Not enough USDC on that exchange | Reduce size or `funds bridge`/`funds rebalance` first. |
-| `SYMBOL_NOT_FOUND` | Symbol not listed on this exchange | Run `market list` to verify. Don't add `-PERP` suffix manually. |
-| `SIZE_TOO_SMALL` | Below exchange minimum (HL is $10 notional) | Compute `size × price` before submitting; raise size. |
-| `DUPLICATE_ORDER` | Same `--client-id` already submitted | Already executed — check `account positions` instead of retrying. |
-| `INVALID_SIGNATURE` (Lighter) | API key drift / not approved | `perp wallet agent approve lighter --master <wallet>` to regenerate. |
+| `ORDER_PENDING` | A write was sent, outcome unknown | NEVER resubmit. See "Safety rules". |
+| `ORDER_PARTIAL` | Part of a multi-leg / close succeeded | Don't retry; check positions per venue, close residuals by hand (may be quarantined). |
+| `ORDER_REJECTED` / `ACTION_REJECTED` | Definitely not placed / not executed | Fix the cause from `error.message`; a new attempt is a new decision (ask the user). |
+| `RISK_VIOLATION` | Local risk limit breached, or symbol quarantined | Report to the user. `--force` only with explicit user consent, and never bypasses quarantine. |
+| `CAPABILITY_UNSUPPORTED` | Venue/feature combination not offered | Do NOT work around it (no emulation via other orders/venues); tell the user. |
+| `INVALID_TICK` | Limit/trigger price off the venue grid (HL: ≤ 5 significant figures) | Refused, never rounded — re-price on the grid and confirm with the user. |
+| `INVALID_PARAMS` | Bad argument (incl. strict sizes: `1,000` / `1e3` / `10abc` refused; `--dry-run` on a command without dry-run) | Fix the argument. |
+| `CLI_ERROR` | Command parse error (unknown command / missing option) | Check `<cmd> --help`. |
+| `NO_SIGNER_AVAILABLE` | No key that may sign this (e.g. imported agent key for a master-only action) | User does it on the website, or `perp wallet import`s the master. |
+| `AGENT_NOT_REGISTERED` / `AGENT_EXPIRED` | Agent key missing, on the other network, or expired | Follow `remediation`: master on this computer → `perp wallet agent approve <venue> [--rotate]` (master-signed: user consent); imported key → new key on the website, `wallet agent import <venue> --replace`. |
+| `POLICY_DENIED` | Local withdraw gate / OWS policy refused | Never change `withdraw.<venue>` — only the user can, in a terminal. |
+| `PASSPHRASE_REQUIRED` | Vault passphrase needed | Ask the user to provide `OWS_PASSPHRASE` (or stdin); never put it on argv. |
+| `LOCK_HELD` | Another perp process holds a state lock | Wait ~5s and retry once; check `background list`. |
+| `NO_BRIDGE_ROUTE` | No supported bridge route (e.g. deBridge from Solana, HyperCore → Solana) | Use the route in `remediation` (e.g. `--provider cctp`). |
+| `RATE_LIMITED` / `EXCHANGE_UNREACHABLE` | Throttled / API down (reads) | Wait 5–10s, retry once; then skip that venue. |
+| `INSUFFICIENT_BALANCE` | Not enough collateral on that venue | Reduce size or move funds first (user-confirmed). |
+| `SYMBOL_NOT_FOUND` | Not listed on this venue | `market list`. Don't add `-PERP`. |
+| `SIZE_TOO_SMALL` | Below venue minimum (HL TWAP: $100 total) | Compute `size × price`; raise size. |
+
+`--client-id` (`trade market/buy/sell/limit`): an id already recorded in `~/.perp/client-ids.jsonl` (and not marked failed) returns `ok:true` with `data.duplicate: true` and sends nothing — local tracking only, not a venue check (it is NOT a `DUPLICATE_ORDER` error). Formats: Pacifica a full UUID, Hyperliquid `0x` + 32 hex; QFEX refuses `--client-id` (use `--auto-id`); `--smart` + client id → `CAPABILITY_UNSUPPORTED`.
+
+## Safety rules
+
+- **Unknown outcome (`ORDER_PENDING`) on ANY write** — orders, cancels, edits, leverage, withdraw / deposit / bridge / transfer: do NOT resubmit. Check `perp --json -e <ex> trade status c:<id> --symbol <S>` (the id in `remediation`), `account orders` / `account positions` / `portfolio`, and the tx hash / request id in `error.details` (`funds bridge status <id>` for bridges). Report to the user.
+- **Quarantine**: an unknown or unhedged outcome (arb, bots, `trade close`, `trade multi`) quarantines the symbol — global per symbol, scoped by network. It blocks opening orders, `arb exec`, `arb auto` and bots (`RISK_VIOLATION`); reduce-only orders pass. List: `perp --json strategy quarantine`. Clear only after the USER has verified the positions on the venues: `perp --json strategy quarantine-clear <SYM>`. `arb close` on a quarantined symbol needs `--force`.
+- **Risk gate**: `trade market / buy / sell / limit / split / market --split / scale-in / twap / multi / stop --no-reduce-only` check `~/.perp/risk.json` (`perp risk limits ...`); reduce-only is exempt. `--force` bypasses the limits (never quarantine) — only with explicit user consent.
+- **Stops** (`trade stop`, `tpsl`) are reduce-only by default; `--no-reduce-only` is refused on ondo and qfex. `trade tpsl <SYM> long|short` = the OPEN position's side; legs are sized to the live position.
+- **Dry-run is default-deny**: commands that cannot simulate refuse `--dry-run` with `INVALID_PARAMS` (e.g. `trade twap`, `trade multi`, `trade cancel-stop`, `trade cancel-twap`, `strategy start / preset / grid / dca / quick-* / funding-arb`, `wallet agent approve`, `wallet rotate`). Simulate bots with `perp --json --dry-run strategy run <strategy>` / `perp --json --dry-run arb auto`.
+- **A dry-run is not a full venue check**: it validates arguments, the risk gate and quarantine, but some venue rules are enforced only on the live send — e.g. an off-grid limit price (`INVALID_TICK`) or `--no-reduce-only` on ondo / qfex (`CAPABILITY_UNSUPPORTED`). Those refusals happen before anything is sent.
+- **`wallet rotate`** creates a new wallet and transfers assets, with no dry-run — only on the user's explicit request.
 
 ### Common mistakes
 
@@ -360,7 +398,7 @@ Builder fees are extra fees on the USER's perp orders, paid to a third-party bui
 perp --json wallet builder status [venue]                 # support, config, approval, attaches?
 perp --json --dry-run wallet builder approve <venue>      # plan only — show it to the user
 perp --json wallet builder approve <venue> --yes          # only after explicit user consent (master-signed)
-perp --json --no-builder trade market BTC buy 0.1         # one run without the fee
+perp --json --no-builder -e <ex> trade market BTC buy 0.1   # one run without the fee
 ```
 
 qfex: `builder.qfex <uuid>` is a fee share (no extra fee, no approval; mainnet only). Unsupported: lighter, lighter-rh, arcus (`CAPABILITY_UNSUPPORTED`). An order whose approval is missing or unknown is sent without the fee (`execution.notes`); `execution.builderFee` records what was attached.

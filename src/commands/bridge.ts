@@ -131,7 +131,7 @@ async function relaySend(opts: RelaySendOpts, cmd: Command, isJson: () => boolea
   relayAsset(dst, toAsset);
   if (origin.vm !== "evm") {
     throw new PerpError("NO_BRIDGE_ROUTE", `Relay: bridging FROM ${origin.label} is not implemented (only EVM-origin deposits are verified and signed)`, {
-      remediation: "Bridge from an EVM chain, or use --provider cctp / debridge for a Solana-origin USDC bridge",
+      remediation: "Bridge from an EVM chain, or use --provider cctp for a Solana-origin USDC bridge (deBridge from Solana is refused too)",
     });
   }
 

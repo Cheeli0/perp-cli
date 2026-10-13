@@ -77,6 +77,76 @@ function checkInvocation(root: Command, invocation: string): string | null {
   return null;
 }
 
+/**
+ * Placeholder names that stand for a differently-named commander argument (same meaning).
+ * Key: placeholder text inside <>; value: the commander argument name it denotes.
+ */
+const PLACEHOLDER_ALIASES: Record<string, string> = {
+  "buy|sell": "side",
+  "long|short": "positionSide",
+  n: "leverage",
+};
+
+/**
+ * Walk `perp …` to its leaf command, then pair each positional token with the commander argument
+ * at the same position. A `<placeholder>` must name that argument (a literal value or a template
+ * substitution `<x>` is not checked). Returns the mismatches.
+ */
+function argOrderMismatches(root: Command, invocation: string): string[] {
+  const tokens = invocation.replace(/^.*?\bperp\s+/, "").match(/'[^']*'|"[^"]*"|\S+/g) ?? [];
+  let cmd = root;
+  const positionals: string[] = [];
+  let inArgs = false;
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t === "|" || t === "&&" || t === "#" || t === "or" || t.endsWith(",")) break;
+    if (t.startsWith("-")) {
+      const found = findOption(cmd, t);
+      if (found && (found.opt.required || found.opt.optional) && !t.includes("=")) i++;
+      continue;
+    }
+    if (!inArgs) {
+      const sub = /^[<['"]/.test(t) ? undefined : cmd.commands.find((c) => c.name() === t || c.aliases().includes(t));
+      if (sub) { cmd = sub; continue; }
+      inArgs = true;
+    }
+    positionals.push(t);
+  }
+  const declared = cmd.registeredArguments;
+  if (declared.length === 0) return [];
+  const out: string[] = [];
+  positionals.forEach((t, k) => {
+    const m = /^<([^>]+)>$/.exec(t);
+    if (!m || m[1] === "x") return;
+    const arg = declared[Math.min(k, declared.length - 1)];
+    if (k >= declared.length && !arg.variadic) { out.push(`${invocation}: extra positional ${t}`); return; }
+    const raw = m[1].replace(/\.\.\.$/, "");
+    const name = PLACEHOLDER_ALIASES[raw] ?? raw;
+    // `trade cancel <symbolOrOrderId> [orderId]`: the two-argument form passes the symbol first.
+    if (name !== arg.name() && !(arg.name() === "symbolOrOrderId" && name === "symbol")) out.push(`${invocation}: position ${k} is <${arg.name()}> but the template says ${t}`);
+  });
+  return out;
+}
+
+describe("MCP command templates follow the real argument order", () => {
+  const { program } = buildProgram({ defaultExchange: "hyperliquid", version: "test" });
+
+  it("trade stop is <symbol> <side> <size> <stopPrice> in the real command", () => {
+    const trade = program.commands.find((c) => c.name() === "trade")!;
+    const stop = trade.commands.find((c) => c.name() === "stop")!;
+    expect(stop.registeredArguments.map((a) => a.name())).toEqual(["symbol", "side", "size", "stopPrice"]);
+  });
+
+  it("every <placeholder> in an MCP command template sits at its commander argument's position", () => {
+    const bad = mcpCommandStrings().flatMap((s) => argOrderMismatches(program, s));
+    expect(bad).toEqual([]);
+  });
+
+  it("the checker catches a swapped template (sanity)", () => {
+    expect(argOrderMismatches(program, "perp -e x --json trade stop <x> <side> <stopPrice> <size>")).toHaveLength(2);
+  });
+});
+
 describe("MCP command references resolve in buildProgram()", () => {
   const { program } = buildProgram({ defaultExchange: "hyperliquid", version: "test" });
   const strings = mcpCommandStrings();

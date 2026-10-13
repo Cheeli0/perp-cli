@@ -26,7 +26,6 @@ import { z } from "zod";
 import type { ExchangeAdapter } from "./exchanges/interface.js";
 import { hasCredentials, listConfiguredAccountVenues, resolveCredentials, NO_CLI_CREDENTIAL_OPTS } from "./config.js";
 import { HyperliquidAdapter } from "./exchanges/hyperliquid.js";
-import { AsterAdapter } from "./exchanges/aster.js";
 import { getVenue, listVenues, listVenuesWithRole, networkConfig, READ_ONLY_CREDENTIALS, requireCapabilities, type VenueDefinition } from "./exchanges/venue.js";
 import "./exchanges/venues/index.js";
 import type { OrderRequest, VenueId } from "./exchanges/venue-types.js";
@@ -49,6 +48,7 @@ import { orderResultJson, symbolMatch } from "./utils.js";
 import { logMcpExecution, mcpPreTradeGate, mcpReduceOnlyGate, resolveMcpNetwork } from "./mcp-trade-guard.js";
 import { setSharedApiNetwork } from "./api/public/urls.js";
 import { logClientId } from "./client-id-tracker.js";
+import { loadSettings } from "./settings.js";
 
 /**
  * The one network this server serves: PERP_NETWORK, validated like `-n` (an invalid value
@@ -134,57 +134,68 @@ async function fetchMarketsPublic(exchange: string) {
   return getVenue(exchange).publicData.fetchMarkets(MCP_NETWORK);
 }
 
-/** Fetch orderbook using public API (no key needed) */
-async function fetchOrderbookPublic(exchange: string, symbol: string): Promise<{ bids: [string, string][]; asks: [string, string][] }> {
-  const ex = getVenue(exchange).id;
-  if (ex === "hyperliquid") {
+type BookLevels = { bids: [string, string][]; asks: [string, string][] };
+
+/** One book level from a venue payload; a level without a string price / size is a payload error (never "0"). */
+function bookLevel(venue: string, symbol: string, price: unknown, size: unknown): [string, string] {
+  if (typeof price !== "string" || typeof size !== "string") {
+    throw new PerpError("EXCHANGE_ERROR", `${venue} orderbook ${symbol}: level without price / size`, { exchange: venue });
+  }
+  return [price, size];
+}
+
+/**
+ * Fetch an orderbook without credentials. Hyperliquid (native perps) and the Lighter family are
+ * read straight from their public REST endpoints and validated (HTTP status, payload shape, unknown
+ * symbol); every other venue goes through its read-only adapter (no key material), the same path
+ * `perp market book` takes without credentials. A venue without an account/trading API throws
+ * NOT_IMPLEMENTED (requireCreate).
+ */
+async function fetchOrderbookPublic(exchange: string, symbol: string): Promise<BookLevels> {
+  const def = getVenue(exchange);
+  const sym = symbol.toUpperCase();
+  if (def.id === "hyperliquid") {
     const { HYPERLIQUID_API_URL } = await import("./api/public/urls.js");
     const res = await fetch(HYPERLIQUID_API_URL, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ type: "l2Book", coin: symbol.toUpperCase() }),
+      body: JSON.stringify({ type: "l2Book", coin: sym }),
     });
-    const data = await res.json() as { levels: [{ px: string; sz: string }[], { px: string; sz: string }[]] };
-    return {
-      bids: (data.levels?.[0] ?? []).map(l => [l.px, l.sz] as [string, string]),
-      asks: (data.levels?.[1] ?? []).map(l => [l.px, l.sz] as [string, string]),
-    };
-  } else if (getVenue(ex).family === "lighter") {
-    const def = getVenue(ex);
-    const sym = symbol.toUpperCase();
+    if (!res.ok) throw new PerpError("EXCHANGE_ERROR", `${def.displayName} l2Book ${sym}: HTTP ${res.status}`, { exchange: def.id });
+    const data = await res.json() as { levels?: unknown } | null;
+    if (data === null) {
+      throw new PerpError("SYMBOL_NOT_FOUND", `${def.displayName} has no native perp ${sym}`, {
+        exchange: def.id,
+        remediation: `List markets with get_markets (exchange: ${def.id}); HIP-3 dex markets are read with the CLI: perp -e hyperliquid --dex <name> market book ${sym}`,
+      });
+    }
+    const levels = data.levels;
+    if (!Array.isArray(levels) || levels.length !== 2 || !Array.isArray(levels[0]) || !Array.isArray(levels[1])) {
+      throw new PerpError("EXCHANGE_ERROR", `${def.displayName} l2Book ${sym}: unexpected payload (no [bids, asks] levels)`, { exchange: def.id });
+    }
+    const side = (ls: unknown[]) => ls.map(l => bookLevel(def.id, sym, (l as { px?: unknown }).px, (l as { sz?: unknown }).sz));
+    return { bids: side(levels[0]), asks: side(levels[1]) };
+  }
+  if (def.family === "lighter") {
     const market = (await def.publicData.fetchMarkets(MCP_NETWORK)).find(m => m.symbol.toUpperCase() === sym);
     if (!market) {
-      throw new PerpError("SYMBOL_NOT_FOUND", `${def.displayName} has no market ${sym}`, { remediation: `List markets with get_markets (exchange: ${def.id})` });
+      throw new PerpError("SYMBOL_NOT_FOUND", `${def.displayName} has no market ${sym}`, { exchange: def.id, remediation: `List markets with get_markets (exchange: ${def.id})` });
     }
     const res = await fetch(`${networkConfig(def, MCP_NETWORK).restUrl}/api/v1/orderBookOrders?market_id=${market.venueSymbol}&limit=20`);
-    if (!res.ok) throw new PerpError("EXCHANGE_ERROR", `${def.displayName} orderBookOrders HTTP ${res.status}`);
-    const data = await res.json() as { bids?: { price: string; remaining_base_amount?: string; size?: string }[]; asks?: { price: string; remaining_base_amount?: string; size?: string }[] };
-    return {
-      bids: (data.bids ?? []).map(l => [l.price, l.remaining_base_amount ?? l.size ?? "0"] as [string, string]),
-      asks: (data.asks ?? []).map(l => [l.price, l.remaining_base_amount ?? l.size ?? "0"] as [string, string]),
-    };
-  } else if (ex === "pacifica") {
-    const { PACIFICA_API_URL } = await import("./api/public/urls.js");
-    const baseUrl = PACIFICA_API_URL.replace("/info/prices", "");
-    const res = await fetch(`${baseUrl}/info/l2Book?symbol=${symbol.toUpperCase()}`);
-    const data = await res.json() as { l?: [{ p: string; a: string }[], { p: string; a: string }[]] };
-    return {
-      bids: (data.l?.[0] ?? []).map(e => [e.p, e.a] as [string, string]),
-      asks: (data.l?.[1] ?? []).map(e => [e.p, e.a] as [string, string]),
-    };
-  } else if (ex === "qfex") {
-    // GET /md/orderbook/{symbol} is public: a read-only adapter needs no key.
-    const def = getVenue(ex);
-    const qfex = await requireCreate(def)({ network: MCP_NETWORK, credentials: READ_ONLY_CREDENTIALS, noAgent: true, hlDex: null, readOnly: true, noBuilder: true });
-    return qfex.getOrderbook(symbol);
-  } else if (ex === "aster") {
-    // AsterAdapter.getOrderbook() uses /fapi/v1/depth (public).
-    const ast = new AsterAdapter(undefined, MCP_NETWORK === "testnet");
-    await ast.init();
-    return ast.getOrderbook(symbol);
+    if (!res.ok) throw new PerpError("EXCHANGE_ERROR", `${def.displayName} orderBookOrders ${sym}: HTTP ${res.status}`, { exchange: def.id });
+    const data = await res.json() as { bids?: unknown; asks?: unknown };
+    if (!Array.isArray(data.bids) || !Array.isArray(data.asks)) {
+      throw new PerpError("EXCHANGE_ERROR", `${def.displayName} orderBookOrders ${sym}: unexpected payload (no bids / asks arrays)`, { exchange: def.id });
+    }
+    type LighterLevel = { price?: unknown; remaining_base_amount?: unknown; size?: unknown };
+    const side = (ls: unknown[]) => ls.map(l => {
+      const lv = l as LighterLevel;
+      return bookLevel(def.id, sym, lv.price, lv.remaining_base_amount !== undefined ? lv.remaining_base_amount : lv.size);
+    });
+    return { bids: side(data.bids), asks: side(data.asks) };
   }
-  throw new PerpError("NOT_IMPLEMENTED", `No public orderbook path for ${exchange}`, {
-    remediation: `Register credentials for ${exchange} (perp wallet agent approve ${exchange}) to read its orderbook through the adapter`,
-  });
+  // Read-only adapter: no key material, public endpoints only.
+  const ro = await requireCreate(def)({ network: MCP_NETWORK, credentials: READ_ONLY_CREDENTIALS, noAgent: true, hlDex: null, readOnly: true, noBuilder: true });
+  return ro.getOrderbook(sym);
 }
 
 // ── JSON envelope helpers ──
@@ -193,16 +204,12 @@ function ok(data: unknown, meta?: Record<string, unknown>) {
   return JSON.stringify({ ok: true, data, meta: { ...meta, network: MCP_NETWORK } }, null, 2);
 }
 
-function err(error: string, meta?: Record<string, unknown>) {
-  return JSON.stringify({ ok: false, error, meta: { ...meta, network: MCP_NETWORK } }, null, 2);
-}
-
 /**
  * Error envelope from a thrown value: the STRUCTURED error (classifyError — a PerpError keeps its
  * code / remediation / details verbatim), never just the message. An ORDER_PENDING order must
  * reach the agent as code + "Do NOT resubmit" remediation, or it would retry and double-trade.
  */
-function errOf(e: unknown, meta?: Record<string, unknown>) {
+function errOf(e: unknown, meta?: Record<string, unknown>, top?: Record<string, unknown>) {
   const s = classifyError(e, typeof meta?.exchange === "string" ? meta.exchange : undefined);
   return JSON.stringify({
     ok: false,
@@ -211,9 +218,22 @@ function errOf(e: unknown, meta?: Record<string, unknown>) {
     retryable: s.retryable,
     ...(s.remediation !== undefined ? { remediation: s.remediation } : {}),
     ...(s.details !== undefined ? { details: s.details } : {}),
+    // Tool-specific top-level facts an agent must not miss (e.g. trade_execute executed:false / pending:true).
+    ...top,
     meta: { ...meta, network: MCP_NETWORK },
   }, null, 2);
 }
+
+/** Hyperliquid scope of every MCP tool: the server builds adapters with no HIP-3 dex (hlDex null). */
+const HL_SCOPE_NOTE = "Hyperliquid: native perps only (HIP-3 dexes via the CLI --dex).";
+
+/**
+ * Venues with a `perp funds deposit <venue>` command. lighter takes a route (ethereum | cctp <chain>);
+ * qfex takes no amount (it shows the deposit address). Tested against the real command tree.
+ */
+export const MCP_DEPOSIT_VENUES: readonly string[] = ["pacifica", "hyperliquid", "lighter", "lighter-rh", "aster", "ondo", "qfex"];
+/** Venues with a `perp funds withdraw <venue>` command. Tested against the real command tree. */
+export const MCP_WITHDRAW_VENUES: readonly string[] = ["pacifica", "hyperliquid", "lighter", "aster", "ondo", "arcus", "qfex"];
 
 // ── MCP Server ──
 
@@ -231,7 +251,7 @@ const server = new McpServer(
 
 server.tool(
   "get_markets",
-  "Get all available perpetual futures markets on an exchange, including price, funding rate, volume, and max leverage. Works without API keys.",
+  `Get all available perpetual futures markets on an exchange, including price, funding rate, volume, and max leverage. Works without API keys (public market data). ${HL_SCOPE_NOTE}`,
   { exchange: z.string().describe(`Exchange name: ${listVenues().map(v => v.id).join(", ")} (aliases accepted)`) },
   async ({ exchange }) => {
     try {
@@ -251,7 +271,7 @@ server.tool(
 
 server.tool(
   "get_orderbook",
-  "Get the order book (bids and asks) for a symbol on an exchange. Works without API keys.",
+  `Get the order book (bids and asks) for a symbol on an exchange. Works without API keys on every venue with an account API (configured credentials → the account adapter; none → the public endpoint / read-only adapter); market-data-only venues have no orderbook path. ${HL_SCOPE_NOTE}`,
   {
     exchange: z.string().describe(`Exchange name: ${listVenues().map(v => v.id).join(", ")} (aliases accepted)`),
     symbol: z.string().describe("Trading pair symbol, e.g. BTC, ETH, SOL"),
@@ -418,20 +438,20 @@ server.tool(
       const { HyperliquidOutcomeAdapter } = await import("./exchanges/hyperliquid-outcome.js");
       const adapter = await getOrCreateAdapter("hyperliquid");
       if (!(adapter instanceof HyperliquidAdapter)) {
-        return { content: [{ type: "text", text: err("Outcome positions are Hyperliquid-only", { exchange: "hyperliquid" }) }], isError: true };
+        throw new PerpError("CAPABILITY_UNSUPPORTED", "Outcome positions are Hyperliquid-only", { exchange: "hyperliquid" });
       }
       const out = new HyperliquidOutcomeAdapter(adapter);
       const positions = await out.getPositions();
       return { content: [{ type: "text", text: ok(positions, { count: positions.length }) }] };
     } catch (e) {
-      return { content: [{ type: "text", text: errOf(e) }], isError: true };
+      return { content: [{ type: "text", text: errOf(e, { exchange: "hyperliquid" }) }], isError: true };
     }
   },
 );
 
 server.tool(
   "get_balance",
-  "Get account balance (equity, available margin, margin used, unrealized PnL) on an exchange",
+  `Get account balance (equity, available margin, margin used, unrealized PnL) on an exchange. ${HL_SCOPE_NOTE}`,
   { exchange: z.string().describe(`Exchange name: ${listVenues().map(v => v.id).join(", ")} (aliases accepted)`) },
   async ({ exchange }) => {
     try {
@@ -446,7 +466,7 @@ server.tool(
 
 server.tool(
   "get_positions",
-  "Get all open positions on an exchange, including size, entry price, PnL, leverage",
+  `Get all open positions on an exchange, including size, entry price, PnL, leverage. ${HL_SCOPE_NOTE}`,
   { exchange: z.string().describe(`Exchange name: ${listVenues().map(v => v.id).join(", ")} (aliases accepted)`) },
   async ({ exchange }) => {
     try {
@@ -461,7 +481,7 @@ server.tool(
 
 server.tool(
   "get_open_orders",
-  "Get all open/pending orders on an exchange",
+  `Get all open/pending orders on an exchange. ${HL_SCOPE_NOTE}`,
   { exchange: z.string().describe(`Exchange name: ${listVenues().map(v => v.id).join(", ")} (aliases accepted)`) },
   async ({ exchange }) => {
     try {
@@ -578,11 +598,12 @@ server.tool(
   "Given a natural language trading goal, suggest the exact perp CLI commands to run. Does NOT execute anything — only returns commands for the user to review and run manually",
   {
     goal: z.string().describe("Natural language goal, e.g. 'buy 0.1 BTC on pacifica', 'close all positions', 'check funding arb opportunities'"),
-    exchange: z.string().optional().describe(`Preferred exchange (default: pacifica). Options: ${listVenuesWithRole("trading").map(v => v.id).join(", ")}`),
+    exchange: z.string().optional().describe(`Preferred exchange (default: settings.defaultExchange, else pacifica — the CLI's -e default). Options: ${listVenuesWithRole("trading").map(v => v.id).join(", ")}`),
   },
   async ({ goal, exchange }) => {
     try {
-      const ex = exchange ?? "pacifica";
+      // Same default as the CLI's -e (src/index.ts): settings.defaultExchange, else pacifica. Aliases resolve; unknown names throw.
+      const ex = getVenue(exchange ?? (loadSettings().defaultExchange || "pacifica")).id;
       const g = goal.toLowerCase();
       const steps: { step: number; command: string; description: string; dangerous?: boolean }[] = [];
 
@@ -668,7 +689,7 @@ server.tool(
         const symbol = extractSymbol(g) || "<symbol>";
         steps.push(
           { step: 1, command: `perp -e ${ex} --json account positions`, description: "Check current position" },
-          { step: 2, command: `perp -e ${ex} --json trade stop ${symbol} <side> <stopPrice> <size>`, description: "Place stop order", dangerous: true },
+          { step: 2, command: `perp -e ${ex} --json trade stop ${symbol} <side> <size> <stopPrice>`, description: "Place stop order", dangerous: true },
         );
       } else if (g.includes("split") || g.includes("depth") || (g.includes("large") && (g.includes("order") || g.includes("buy") || g.includes("sell")))) {
         const symbol = extractSymbol(g) || "<symbol>";
@@ -698,7 +719,7 @@ server.tool(
       } else if (g.includes("edit") || g.includes("modify order")) {
         steps.push(
           { step: 1, command: `perp -e ${ex} --json account orders`, description: "List open orders to find order ID" },
-          { step: 2, command: `perp -e ${ex} --json trade edit <symbol> <orderId> <newPrice> <newSize>`, description: "Modify the order", dangerous: true },
+          { step: 2, command: `perp -e ${ex} --json trade edit <symbol> <orderId> <price> <size>`, description: "Modify the order", dangerous: true },
         );
       } else if (g.includes("arb") || g.includes("arbitrage")) {
         steps.push(
@@ -763,7 +784,7 @@ server.tool(
       } else if (g.includes("setup") || g.includes("init") || g.includes("configure") || g.includes("connect") || g.includes("set key") || g.includes("set wallet") || g.includes("private key")) {
         steps.push(
           { step: 1, command: "perp --json wallet show", description: "Check if any wallets are already configured" },
-          { step: 2, command: "printf '%s' \"$KEY\" | OWS_PASSPHRASE=<pp> perp --json wallet set <exchange>", description: "Import the exchange key (stdin — never argv) into the OWS vault and make it the active wallet (exchange: pacifica, hyperliquid, lighter, aster, or aliases: hl, pac, lt, ast)" },
+          { step: 2, command: "printf '%s' \"$KEY\" | OWS_PASSPHRASE=<pp> perp --json wallet set <exchange>", description: "Import the master key (stdin — never argv) into the OWS vault and make it the active wallet. wallet set takes pacifica, hyperliquid, lighter, aster (aliases: hl, pac, lt, ast); Lighter RH / Ondo / Arcus register with perp wallet agent approve <lighter-rh|ondo|arcus>, QFEX with perp wallet agent import qfex" },
           { step: 3, command: "printf '%s' \"$KEY\" | OWS_PASSPHRASE=<pp> perp --json wallet set <exchange> --default", description: "Import key + make it the default exchange" },
           { step: 4, command: "perp --json wallet show", description: "Verify wallet is configured (shows public address)" },
         );
@@ -837,18 +858,38 @@ server.tool(
         );
       } else if (g.includes("deposit")) {
         const amount = extractNumber(g) || "<amount>";
-        steps.push(
-          { step: 1, command: "perp --json wallet balance", description: "Check wallet balance" },
-          { step: 2, command: `perp --json funds deposit ${ex} ${amount}`, description: `Deposit $${amount} to ${ex}`, dangerous: true },
-          { step: 3, command: `perp -e ${ex} --json portfolio`, description: "Verify deposit arrived" },
-        );
+        steps.push({ step: 1, command: "perp --json wallet balance", description: "Check wallet balance" });
+        if (ex === "lighter") {
+          // Lighter deposits pick a route: ethereum (L1 bridge) or cctp <chain> (USDC via CCTP).
+          steps.push(
+            { step: 2, command: `perp --json funds deposit lighter ethereum ${amount}`, description: `Deposit $${amount} to lighter from Ethereum L1 (or: perp --json funds deposit lighter cctp <chain> ${amount})`, dangerous: true },
+            { step: 3, command: `perp -e ${ex} --json portfolio`, description: "Verify deposit arrived" },
+          );
+        } else if (ex === "qfex") {
+          // QFEX: perp-cli shows the deposit address; the user sends USDC on Arbitrum One from their own wallet.
+          steps.push(
+            { step: 2, command: "perp --json funds deposit qfex", description: "Show the QFEX USDC (Arbitrum One) deposit address — perp-cli sends nothing; transfer from your own wallet" },
+            { step: 3, command: `perp -e ${ex} --json portfolio`, description: "Verify deposit arrived" },
+          );
+        } else if (MCP_DEPOSIT_VENUES.includes(ex)) {
+          steps.push(
+            { step: 2, command: `perp --json funds deposit ${ex} ${amount}`, description: `Deposit $${amount} to ${ex}`, dangerous: true },
+            { step: 3, command: `perp -e ${ex} --json portfolio`, description: "Verify deposit arrived" },
+          );
+        } else {
+          steps.push({ step: 2, command: "perp --json funds info", description: `${ex} has no CLI deposit route (deposit on the venue website); CLI deposit venues: ${MCP_DEPOSIT_VENUES.join(", ")}` });
+        }
       } else if (g.includes("withdraw")) {
         const amount = extractNumber(g) || "<amount>";
-        steps.push(
-          { step: 1, command: `perp -e ${ex} --json portfolio`, description: "Check available balance" },
-          { step: 2, command: `perp --json funds withdraw ${ex} ${amount}`, description: `Withdraw $${amount} from ${ex}`, dangerous: true },
-          { step: 3, command: "perp --json wallet balance", description: "Verify withdrawal received" },
-        );
+        steps.push({ step: 1, command: `perp -e ${ex} --json portfolio`, description: "Check available balance" });
+        if (MCP_WITHDRAW_VENUES.includes(ex)) {
+          steps.push(
+            { step: 2, command: `perp --json funds withdraw ${ex} ${amount}`, description: `Withdraw $${amount} from ${ex}`, dangerous: true },
+            { step: 3, command: "perp --json wallet balance", description: "Verify withdrawal received" },
+          );
+        } else {
+          steps.push({ step: 2, command: "perp --json funds info", description: `${ex} has no CLI withdraw route (withdraw on the venue website); CLI withdraw venues: ${MCP_WITHDRAW_VENUES.join(", ")}` });
+        }
       } else if (g.includes("leverage")) {
         const symbol = extractSymbol(g) || "<symbol>";
         const lev = extractNumber(g) || "<leverage>";
@@ -1009,10 +1050,10 @@ server.tool(
           parameters: [
             { name: "symbol", value: args[2], description: "Trading pair" },
             { name: "side", value: args[3], description: "buy or sell" },
-            { name: "stopPrice", value: args[4], description: "Trigger price" },
-            { name: "size", value: args[5], description: "Order size" },
+            { name: "size", value: args[4], description: "Order size" },
+            { name: "stopPrice", value: args[5], description: "Trigger price" },
           ],
-          risks: ["Stop orders become market orders when triggered — slippage possible", "Stop may not fill in fast markets"],
+          risks: ["Stop orders become market orders when triggered — slippage possible", "Stop may not fill in fast markets", "Reduce-only by default (--no-reduce-only to open a position)"],
           category: "write",
           relatedCommands: ["perp account positions", "perp trade tpsl"],
         };
@@ -1347,46 +1388,49 @@ server.tool(
 
 server.tool(
   "health_check",
-  "Ping venue REST endpoints and return connectivity status and latency",
+  "Ping every registered venue on the server's network and return connectivity status and latency. Pacifica / Hyperliquid / Lighter / Aster / QFEX: REST ping (status = HTTP status, 0 = no response); every other venue: its public market-data read (status null). A failure carries its error message.",
   {},
   async () => {
     try {
-      // Aster has no shared-api ping helper; ping /fapi/v1/time directly.
-      const pingAster = async (): Promise<{ ok: boolean; latencyMs: number; status: number }> => {
+      type Probe = { ok: boolean; latencyMs: number; status: number | null; error: string | null; probe: "ping" | "markets" };
+      const timed = async (probe: Probe["probe"], fn: () => Promise<{ ok: boolean; status: number | null }>): Promise<Probe> => {
         const start = Date.now();
         try {
-          const res = await fetch(`${networkConfig(getVenue("aster"), MCP_NETWORK).restUrl}/fapi/v1/time`);
-          return { ok: res.ok, latencyMs: Date.now() - start, status: res.status };
-        } catch {
-          return { ok: false, latencyMs: Date.now() - start, status: 0 };
+          const r = await fn();
+          return { ok: r.ok, latencyMs: Date.now() - start, status: r.status, error: r.ok ? null : `HTTP ${r.status}`, probe };
+        } catch (e) {
+          return { ok: false, latencyMs: Date.now() - start, status: probe === "ping" ? 0 : null, error: extractErrorMessage(e), probe };
         }
       };
-      // QFEX: public GET /refdata for one instrument on the server's network.
-      const pingQfex = async (): Promise<{ ok: boolean; latencyMs: number; status: number }> => {
-        const start = Date.now();
-        try {
-          const res = await fetch(`${networkConfig(getVenue("qfex"), MCP_NETWORK).restUrl}/refdata?ticker=AAPL-USD`);
-          return { ok: res.ok, latencyMs: Date.now() - start, status: res.status };
-        } catch {
-          return { ok: false, latencyMs: Date.now() - start, status: 0 };
-        }
+      const restPing = (url: string) => timed("ping", async () => {
+        const res = await fetch(url);
+        return { ok: res.ok, status: res.status };
+      });
+      // Shared-api helpers report a transport failure as status 0 (no message).
+      const helperPing = (fn: () => Promise<{ ok: boolean; latencyMs: number; status: number }>) => async (): Promise<Probe> => {
+        const r = await fn();
+        return { ...r, error: r.ok ? null : r.status === 0 ? "no response" : `HTTP ${r.status}`, probe: "ping" };
       };
-      const [pacifica, hyperliquid, lighter, aster, qfex] = await Promise.all([
-        pingPacifica(),
-        pingHyperliquid(),
-        pingLighter(),
-        pingAster(),
-        pingQfex(),
-      ]);
+      const pings: Record<string, () => Promise<Probe>> = {
+        pacifica: helperPing(pingPacifica),
+        hyperliquid: helperPing(pingHyperliquid),
+        lighter: helperPing(pingLighter),
+        aster: () => restPing(`${networkConfig(getVenue("aster"), MCP_NETWORK).restUrl}/fapi/v1/time`),
+        // QFEX: public GET /refdata for one instrument on the server's network.
+        qfex: () => restPing(`${networkConfig(getVenue("qfex"), MCP_NETWORK).restUrl}/refdata?ticker=AAPL-USD`),
+      };
+      const venues = listVenues();
+      const probes = await Promise.all(venues.map(v => {
+        const ping = pings[v.id];
+        return ping !== undefined
+          ? ping()
+          : timed("markets", async () => { await v.publicData.fetchMarkets(MCP_NETWORK); return { ok: true, status: null }; });
+      }));
 
-      const result = {
-        pacifica: { ...pacifica, statusText: pacifica.ok ? "healthy" : "unreachable" },
-        hyperliquid: { ...hyperliquid, statusText: hyperliquid.ok ? "healthy" : "unreachable" },
-        lighter: { ...lighter, statusText: lighter.ok ? "healthy" : "unreachable" },
-        aster: { ...aster, statusText: aster.ok ? "healthy" : "unreachable" },
-        qfex: { ...qfex, statusText: qfex.ok ? "healthy" : "unreachable" },
-        allHealthy: pacifica.ok && hyperliquid.ok && lighter.ok && aster.ok && qfex.ok,
-      };
+      const result: Record<string, unknown> = {};
+      venues.forEach((v, i) => { result[v.id] = { ...probes[i], statusText: probes[i].ok ? "healthy" : "unreachable" }; });
+      result.covered = venues.map(v => v.id);
+      result.allHealthy = probes.every(p => p.ok);
 
       return { content: [{ type: "text", text: ok(result) }] };
     } catch (e) {
@@ -1414,6 +1458,7 @@ server.resource(
         { flag: "--json", description: "Output as JSON for structured parsing" },
         { flag: "-n, --network <net>", description: "Network: mainnet or testnet (validated; a typo is a usage error)", default: "mainnet" },
         { flag: "--dry-run", description: "Print the order/plan without sending anything (result has sent:false). Default-deny: commands that cannot honor it reject --dry-run instead of running live" },
+        { flag: "--dex <name>", description: "HIP-3 deployed dex name, Hyperliquid only (the MCP tools read/trade native Hyperliquid perps only). Example: perp -e hyperliquid --dex <name> market list" },
       ],
       commands: {
         market: {
@@ -1479,7 +1524,7 @@ server.resource(
           subcommands: {
             scan: { usage: "perp arb scan --min <pct>", description: "Find arb opportunities (use --rates, --gaps, --hip3, --positions, --basis, --compare, --history, --live)" },
             auto: { usage: "perp arb auto --min-spread <pct>", description: "Auto-execute funding arb" },
-            exec: { usage: "perp arb exec <symbol> <longEx> <shortEx> <size>", description: "Execute arb trade on two exchanges" },
+            exec: { usage: "perp arb exec <symbol> <longExch> <shortExch> <sizeUsd>", description: "Execute arb trade on two exchanges (sizeUsd = USD notional per leg)" },
             status: { usage: "perp arb status", description: "Current arb positions" },
             close: { usage: "perp arb close <symbol>", description: "Close arb position" },
             "history|log": { usage: "perp arb history", description: "Arb execution history" },
@@ -1576,8 +1621,10 @@ server.resource(
           usage: "perp funds <deposit|withdraw|transfer|bridge|rebalance|info> ...",
           description: "Fund movement — deposit, withdraw, transfer, cross-chain bridge, inter-exchange rebalance",
           subcommands: {
-            "deposit <exchange> <amount>": "Deposit USDC to exchange (pacifica, hyperliquid, lighter)",
-            "withdraw <exchange> <amount>": "Withdraw USDC from exchange (pacifica, hyperliquid, lighter)",
+            [`deposit <${MCP_DEPOSIT_VENUES.filter(v => v !== "lighter" && v !== "qfex").join("|")}> <amount>`]: "Deposit USDC to an exchange account",
+            "deposit qfex": "Show the QFEX USDC (Arbitrum One) deposit address — perp-cli sends nothing",
+            "deposit lighter <ethereum|cctp> ...": "Deposit to Lighter: perp funds deposit lighter ethereum <amount> (L1 bridge) | perp funds deposit lighter cctp <chain> <amount> (CCTP)",
+            [`withdraw <${MCP_WITHDRAW_VENUES.join("|")}> <amount>`]: "Withdraw USDC from an exchange account",
             "transfer <amount> <address>": "HL internal transfer (instant)",
             "bridge chains": "List supported chains and USDC addresses",
             "bridge quote --from <chain> --to <chain> --amount <n>": "Get bridge quotes from all providers",
@@ -1588,6 +1635,19 @@ server.resource(
             "rebalance plan": "Calculate optimal rebalancing moves",
             "rebalance execute [--auto-bridge]": "Execute rebalancing (withdraw → bridge → deposit)",
             info: "Show all deposit/withdraw/bridge/rebalance routes & limits",
+          },
+        },
+        outcome: {
+          description: "Hyperliquid Outcome markets (HIP-4) — binary/range contracts",
+          subcommands: {
+            list: { usage: "perp outcome list", description: "Active outcome markets" },
+            book: { usage: "perp outcome book <outcome> <side>", description: "Orderbook for one outcome side" },
+            view: { usage: "perp outcome view <outcome>", description: "Both sides' books + underlying mark gap + expiry" },
+            positions: { usage: "perp outcome positions", description: "Open outcome positions" },
+            orders: { usage: "perp outcome orders", description: "Open outcome orders" },
+            buy: { usage: "perp outcome buy <outcome> <side> [usd]", description: "Buy a side (USD notional, or --size <shares>; --limit <px>; supports --dry-run)" },
+            sell: { usage: "perp outcome sell <outcome> <side> [usd]", description: "Sell a side (USD notional, --size <shares> or --all; supports --dry-run)" },
+            cancel: { usage: "perp outcome cancel <outcome> <side> <oid>", description: "Cancel an open outcome order" },
           },
         },
         portfolio: { usage: "perp portfolio", description: "Cross-exchange portfolio summary" },
@@ -1618,9 +1678,34 @@ server.resource(
 // Trade execution tools (dry-run + confirm safety model)
 // ============================================================
 
+/**
+ * The OrderRequest trade_execute sends (and trade_preview checks): limit orders need a price and
+ * a TIF the venue accepts; a market order carries the resolved slippage bound. Throws
+ * INVALID_PARAMS / CAPABILITY_UNSUPPORTED before anything is read or sent.
+ */
+function mcpOrderRequest(adapter: ExchangeAdapter, p: {
+  symbol: string; side: "buy" | "sell"; size: string; orderType: "market" | "limit";
+  price: string | undefined; tif: string | undefined; reduceOnly: boolean; slippageBps: number | undefined;
+}): OrderRequest {
+  const def = getVenue(adapter.name);
+  const caps = requireCapabilities(def);
+  const isLimit = p.orderType === "limit";
+  if (isLimit && !p.price) throw new PerpError("INVALID_PARAMS", "Price is required for limit orders");
+  return {
+    symbol: p.symbol, side: p.side, type: p.orderType, size: p.size,
+    price: isLimit ? p.price as string : null,
+    triggerPrice: null, triggerSource: null,
+    tif: isLimit ? validateLegacyTif(def, caps, p.tif ?? "GTC") : null,
+    reduceOnly: p.reduceOnly,
+    clientOrderId: caps.clientOrderId && caps.orderAck === "async" ? newVenueClientOrderId(def) : null,
+    slippage: isLimit ? null : resolveAdapterSlippage(adapter, p.slippageBps ?? null),
+    tpsl: null,
+  };
+}
+
 server.tool(
   "trade_preview",
-  "Preview a trade WITHOUT executing. Returns estimated fill price, fees, margin impact, and risk checks. ALWAYS call this before trade_execute and show the result to the user for confirmation.",
+  `Preview a trade WITHOUT executing. Runs trade_execute's pre-send checks read-only (size parse, order validation incl. TIF, quarantine, local risk limits — never forced) and reports any refusal as valid:false with its code + remediation; also returns the estimated fill price from the book, notional, margin impact, the builder fee the order would carry, and the existing position. Venue trading fees are NOT estimated. ALWAYS call this before trade_execute and show the result to the user for confirmation. ${HL_SCOPE_NOTE}`,
   {
     exchange: z.string().describe(`Exchange: ${listVenues().filter(v => v.create !== null).map(v => v.id).join(", ")} (aliases accepted)`),
     symbol: z.string().describe("Trading symbol (e.g., BTC, ETH, SOL)"),
@@ -1628,65 +1713,106 @@ server.tool(
     size: z.string().describe("Order size (base currency units, e.g., '0.1' for 0.1 BTC)"),
     orderType: z.enum(["market", "limit"]).default("market").describe("Order type"),
     price: z.string().optional().describe("Limit price (required for limit orders)"),
+    tif: z.string().optional().describe("Limit orders: GTC (default) | IOC | FOK | ALO (post-only); venue aliases GTT / GTX / TOB accepted — checked like trade_execute"),
+    reduceOnly: z.boolean().default(false).describe("Reduce-only order (close position only) — checked like trade_execute (quarantine applies only to non-reduce-only orders)"),
   },
-  async ({ exchange, symbol, side, size, orderType, price }) => {
+  async ({ exchange, symbol, side, size, orderType, price, tif, reduceOnly }) => {
     try {
       const adapter = await getOrCreateAdapter(exchange);
+      const sym = symbol.toUpperCase();
+      const isLimit = orderType === "limit";
+
+      // trade_execute's pre-send checks, read-only. Each refusal keeps its code + remediation.
+      const refusals: { check: "size" | "order" | "gate"; code: string; message: string; remediation: string | null }[] = [];
+      const refuse = (check: "size" | "order" | "gate", e: unknown): void => {
+        const s = classifyError(e, adapter.name);
+        refusals.push({ check, code: s.code, message: s.message, remediation: s.remediation ?? null });
+      };
+      let parsedSize: string | null = null;
+      try {
+        parsedSize = parsePositiveDecimal(size, "size");
+      } catch (e) {
+        refuse("size", e);
+      }
+      if (parsedSize !== null) {
+        try {
+          const req = mcpOrderRequest(adapter, { symbol: sym, side, size: parsedSize, orderType, price, tif, reduceOnly, slippageBps: undefined });
+          const def = getVenue(adapter.name);
+          validateOrderRequest(def, requireCapabilities(def), req);
+        } catch (e) {
+          refuse("order", e);
+        }
+        try {
+          await mcpPreTradeGate(adapter, { symbol: sym, size: Number(parsedSize), price: isLimit && price ? Number(price) : null, reduceOnly },
+            (m) => process.stderr.write(`${m}\n`));
+        } catch (e) {
+          refuse("gate", e);
+        }
+      }
+
       const [balance, positions, orderbook] = await Promise.all([
         adapter.getBalance(),
         adapter.getPositions(),
-        adapter.getOrderbook(symbol),
+        adapter.getOrderbook(sym),
       ]);
 
       // Estimate fill price from orderbook
       const bestBid = orderbook.bids[0]?.[0];
       const bestAsk = orderbook.asks[0]?.[0];
-      const estPrice = orderType === "limit" && price
+      const estPrice = isLimit && price
         ? price
         : side === "buy" ? bestAsk : bestBid;
 
-      const notional = estPrice ? Number(estPrice) * Number(size) : 0;
+      // Unknown (unparseable size / empty book side) = null, never 0.
+      const notional = estPrice && parsedSize !== null ? Number(estPrice) * Number(parsedSize) : null;
       const existingPos = positions.find(p => symbolMatch(p.symbol, symbol));
 
-      // Run validation
       // SSOT rule #2: validation failure must surface as a structured invalid
-      // result, NOT be swallowed into a fake `{ valid: true }`. The previous
-      // shape silently green-lit trades when the underlying balance/orderbook
-      // fetches errored out.
+      // result, NOT be swallowed into a fake `{ valid: true }`.
       let validation;
       // For a preview the user has not yet committed leverage, so 1x is the
       // documented default exposed in the preview shape (no silent fallback —
       // the caller can override via existingPos.leverage when re-entering an
       // open position).
       const previewLeverage = existingPos?.leverage ?? 1;
-      try {
-        validation = await validateTrade(adapter, { symbol, side, size: Number(size), leverage: previewLeverage });
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        validation = {
-          valid: false,
-          checks: [{
-            check: "symbol_valid",
-            passed: false,
-            message: `Validation could not run: ${msg}`,
-          }],
-          warnings: [],
-        };
+      if (parsedSize === null) {
+        validation = { valid: false, checks: [{ check: "size", passed: false, message: refusals[0].message }], warnings: [] };
+      } else {
+        try {
+          validation = await validateTrade(adapter, {
+            symbol: sym, side, size: Number(parsedSize), leverage: previewLeverage, type: orderType, reduceOnly,
+            ...(isLimit && price ? { price: Number(price) } : {}),
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          validation = {
+            valid: false,
+            checks: [{
+              check: "symbol_valid",
+              passed: false,
+              message: `Validation could not run: ${msg}`,
+            }],
+            warnings: [],
+          };
+        }
       }
 
-      const builderPlan = await builderPlanFor(adapter, symbol);
+      const builderPlan = await builderPlanFor(adapter, sym);
       const preview = {
-        order: { exchange, symbol, side, size, orderType, price: price ?? estPrice },
+        // false when trade_execute would refuse this order (see refusals) or the trade checks fail.
+        valid: refusals.length === 0 && validation.valid,
+        refusals,
+        order: { exchange, symbol, side, size, orderType, price: price ?? estPrice ?? null, tif: tif ?? null, reduceOnly },
         estimate: {
-          fillPrice: estPrice ?? "unknown",
-          notionalUsd: notional.toFixed(2),
-          spread: bestBid && bestAsk ? ((Number(bestAsk) - Number(bestBid)) / Number(bestBid) * 100).toFixed(4) + "%" : "unknown",
+          fillPrice: estPrice ?? null,
+          notionalUsd: notional !== null ? notional.toFixed(2) : null,
+          spread: bestBid && bestAsk ? ((Number(bestAsk) - Number(bestBid)) / Number(bestBid) * 100).toFixed(4) + "%" : null,
         },
         account: {
           equity: balance.equity,
           available: balance.available,
           marginUsed: balance.marginUsed,
-          marginAfter: (Number(balance.marginUsed) + notional / (existingPos?.leverage ?? 1)).toFixed(2),
+          marginAfter: notional !== null ? (Number(balance.marginUsed) + notional / previewLeverage).toFixed(2) : null,
         },
         existingPosition: existingPos ? {
           side: existingPos.side,
@@ -1703,7 +1829,7 @@ server.tool(
 
       return { content: [{ type: "text", text: ok(preview, { exchange, type: "preview" }) }] };
     } catch (e) {
-      return { content: [{ type: "text", text: errOf(e) }], isError: true };
+      return { content: [{ type: "text", text: errOf(e, { exchange, symbol }) }], isError: true };
     }
   },
 );
@@ -1729,7 +1855,7 @@ async function placeViaV2(adapter: ExchangeAdapter, req: OrderRequest, what: str
 
 server.tool(
   "trade_execute",
-  "Execute a REAL trade on the server's network (meta.network; PERP_NETWORK, default mainnet). IMPORTANT: Always call trade_preview first and get explicit user confirmation before calling this tool. Refused with RISK_VIOLATION when the order breaches the local risk limits (perp risk set; there is no override over MCP) or when the symbol is quarantined (only reduce-only orders pass). Every order is written to the execution log. Supports market and limit orders. Returns the uniform OrderResult (status, finality, filledSize, execution: slippage / protection price / TIF sent) with the raw venue response under `legacy`.",
+  `Execute a REAL trade on the server's network (meta.network; PERP_NETWORK, default mainnet). IMPORTANT: Always call trade_preview first and get explicit user confirmation before calling this tool. Refused with RISK_VIOLATION when the order breaches the local risk limits (perp risk set; there is no override over MCP) or when the symbol is quarantined (only reduce-only orders pass). Every order is written to the execution log. Supports market and limit orders. Returns the uniform OrderResult (status, finality, filledSize, execution: slippage / protection price / TIF sent) with the raw venue response under \`legacy\`, plus top-level filledSize / requestedSize / partial. Outcomes: an unknown outcome (transport failure after send, or a non-final venue ack) → ok:false, code ORDER_PENDING, executed:false, pending:true and a "do NOT resubmit" remediation — the symbol is quarantined for opening orders until a human clears it; a final rejection / cancel with nothing filled → ORDER_REJECTED, executed:false; a cancel after a partial fill → executed:true, partial:true with the real filledSize. ${HL_SCOPE_NOTE}`,
   {
     exchange: z.string().describe(`Exchange: ${listVenues().filter(v => v.create !== null).map(v => v.id).join(", ")} (aliases accepted)`),
     symbol: z.string().describe("Trading symbol (e.g., BTC, ETH, SOL)"),
@@ -1749,19 +1875,8 @@ server.tool(
       const def = getVenue(adapter.name);
       const caps = requireCapabilities(def);
       const sym = symbol.toUpperCase();
-
-      if (orderType === "limit" && !price) throw new PerpError("INVALID_PARAMS", "Price is required for limit orders");
       const isLimit = orderType === "limit";
-      const req: OrderRequest = {
-        symbol: sym, side, type: orderType, size,
-        price: isLimit ? price as string : null,
-        triggerPrice: null, triggerSource: null,
-        tif: isLimit ? validateLegacyTif(def, caps, tif ?? "GTC") : null,
-        reduceOnly,
-        clientOrderId: caps.clientOrderId && caps.orderAck === "async" ? newVenueClientOrderId(def) : null,
-        slippage: isLimit ? null : resolveAdapterSlippage(adapter, slippageBps ?? null),
-        tpsl: null,
-      };
+      const req = mcpOrderRequest(adapter, { symbol: sym, side, size, orderType, price, tif, reduceOnly, slippageBps });
       // Same pre-send path as `perp trade`: request validation, quarantine (non-reduce-only),
       // local risk limits (no force over MCP), then client-id + execution log around the send.
       validateOrderRequest(def, caps, req);
@@ -1775,20 +1890,66 @@ server.tool(
         logClientId({ clientOrderId: cid, exchange: adapter.name, symbol: sym, side, size, ...(isLimit ? { price: price as string } : {}), type: orderType_, status: "pending", createdAt: nowIso(), updatedAt: nowIso() });
       }
       const logMeta = { reduceOnly, ...(cid !== null ? { clientOrderId: cid } : {}) };
+      const priceLog = isLimit ? { price: price as string } : {};
+      const errMeta = { exchange, symbol, type: "execution" };
+      const qLog = (m: string) => process.stderr.write(`${m}\n`);
+      const clearCmd = `${MCP_NETWORK === "testnet" ? "perp -n testnet" : "perp"} strategy quarantine-clear ${sym}`;
+      // An unknown outcome on an opening order quarantines the symbol: the gate then refuses a
+      // resubmit of the same order (only reduce-only orders pass) until a human clears it.
+      const quarantineUnknown = (why: string): void => {
+        if (reduceOnly) return;
+        quarantineSymbol("mcp-execute", sym, `trade_execute ${orderType} ${side} ${size} ${sym} on ${adapter.name}: ${why}`,
+          `Check ${sym} on ${adapter.name} (get_open_orders / get_positions), resolve the order by hand, then: ${clearCmd}`, qLog);
+      };
       let result: PlacedOrder;
       try {
         result = await placeViaV2(adapter, req, `${orderType} ${side} ${size} ${sym}`,
           `Do NOT resubmit — the order may have been placed. Call get_positions / get_open_orders for ${symbol} on ${exchange} first`);
       } catch (placeErr) {
         const unknown = isOutcomeUnknown(placeErr);
-        logMcpExecution(MCP_NETWORK, { type: logType, exchange: adapter.name, symbol: sym, side, size, ...(isLimit ? { price: price as string } : {}), status: unknown ? "unverified" : "failed", error: extractErrorMessage(placeErr), meta: logMeta });
+        logMcpExecution(MCP_NETWORK, { type: logType, exchange: adapter.name, symbol: sym, side, size, ...priceLog, status: unknown ? "unverified" : "failed", error: extractErrorMessage(placeErr), meta: logMeta });
         // An unknown outcome stays "pending" in the client-id log (it may have been placed).
         if (cid !== null && !unknown) {
           logClientId({ clientOrderId: cid, exchange: adapter.name, symbol: sym, side, size, type: orderType_, status: "failed", createdAt: nowIso(), updatedAt: nowIso() });
         }
-        throw placeErr;
+        if (unknown) quarantineUnknown(`outcome unknown (${extractErrorMessage(placeErr)})`);
+        return { content: [{ type: "text", text: errOf(placeErr, errMeta, unknown ? { executed: false, pending: true } : { executed: false }) }], isError: true };
       }
-      logMcpExecution(MCP_NETWORK, { type: logType, exchange: adapter.name, symbol: sym, side, size, ...(isLimit ? { price: price as string } : {}), status: "success", meta: logMeta });
+
+      // Settle what the venue reported (mirrors the CLI scale path, src/commands/trade.ts placeScaleLevels):
+      //  - not final → outcome unknown: ORDER_PENDING, never "success";
+      //  - final rejected / cancelled with nothing filled → ORDER_REJECTED;
+      //  - final cancelled with an unreported fill → the fill is unknown: ORDER_PENDING;
+      //  - final rejected / cancelled with a fill → executed, reported as the partial fill it is.
+      const filled = result.filledSize === null ? null : Number(result.filledSize);
+      const terminal = result.status === "rejected" || result.status === "cancelled";
+      const fillUnknown = result.finality === "final" && result.status === "cancelled" && filled === null;
+      if (result.finality !== "final" || fillUnknown) {
+        const why = fillUnknown
+          ? `the venue cancelled the order without reporting its fill`
+          : `the venue acknowledged the order without a final status (${result.status})`;
+        logMcpExecution(MCP_NETWORK, { type: logType, exchange: adapter.name, symbol: sym, side, size, ...priceLog, status: "unverified", error: why, meta: logMeta });
+        quarantineUnknown(why);
+        const pe = new PerpError("ORDER_PENDING", `${adapter.name} ${orderType} ${side} ${size} ${sym}: outcome unknown — ${why}`, {
+          exchange: adapter.name,
+          remediation: result.remediation ?? `Do NOT resubmit — the order may have filled. Call get_open_orders / get_positions for ${symbol} on ${exchange} first`,
+        });
+        return { content: [{ type: "text", text: errOf(pe, errMeta, { executed: false, pending: true, result: orderResultJson(result) }) }], isError: true };
+      }
+      if (terminal && (filled === null || filled === 0)) {
+        const why = `the venue ${result.status} the order${result.orderId !== null ? ` ${result.orderId}` : ""}`;
+        logMcpExecution(MCP_NETWORK, { type: logType, exchange: adapter.name, symbol: sym, side, size, ...priceLog, status: "failed", error: why, meta: logMeta });
+        if (cid !== null) {
+          logClientId({ clientOrderId: cid, exchange: adapter.name, symbol: sym, side, size, type: orderType_, status: "failed", createdAt: nowIso(), updatedAt: nowIso() });
+        }
+        const pe = new PerpError("ORDER_REJECTED", `${adapter.name} ${orderType} ${side} ${size} ${sym}: ${why}; nothing filled`, { exchange: adapter.name });
+        return { content: [{ type: "text", text: errOf(pe, errMeta, { executed: false, result: orderResultJson(result) }) }], isError: true };
+      }
+      const partial = terminal; // a terminal status with a fill > 0 — the rest was cancelled / rejected
+      logMcpExecution(MCP_NETWORK, {
+        type: logType, exchange: adapter.name, symbol: sym, side, size: partial ? result.filledSize as string : size, ...priceLog, status: "success",
+        meta: { ...logMeta, ...(partial ? { partial: true, requested: size, venueStatus: result.status } : {}) },
+      });
       if (cid !== null) {
         logClientId({ clientOrderId: cid, exchange: adapter.name, symbol: sym, side, size, type: orderType_, status: "submitted", createdAt: nowIso(), updatedAt: nowIso() });
       }
@@ -1797,14 +1958,17 @@ server.tool(
       // (an agent would retry and double-trade). Report currentPosition: null + warning instead.
       // Exact symbol match; "-PERP" suffix-insensitive; uncached read.
       let currentPosition: Awaited<ReturnType<ExchangeAdapter["getPositions"]>>[number] | null;
-      let warning: string | null = null;
+      let warning: string | null = partial
+        ? `Partially filled: ${result.filledSize} of ${size} ${sym}; the rest was ${result.status} by the venue. Do NOT resubmit the full size`
+        : null;
       try {
         invalidateCache("acct");
         const positions = await adapter.getPositions();
         currentPosition = positions.find(p => symbolMatch(p.symbol, symbol)) ?? null;
       } catch (readErr) {
         currentPosition = null;
-        warning = `Order placed, but the post-order position read failed: ${extractErrorMessage(readErr)}. Do NOT resubmit — call get_positions for ${symbol} on ${exchange}`;
+        const readWarning = `Order placed, but the post-order position read failed: ${extractErrorMessage(readErr)}. Do NOT resubmit — call get_positions for ${symbol} on ${exchange}`;
+        warning = warning === null ? readWarning : `${warning}. ${readWarning}`;
       }
 
       return {
@@ -1812,6 +1976,10 @@ server.tool(
           type: "text",
           text: ok({
             executed: true,
+            partial,
+            // null = the venue did not report the fill (never "0" as a stand-in).
+            filledSize: result.filledSize,
+            requestedSize: size,
             order: { exchange, symbol, side, size, orderType, price, tif: req.tif },
             result: orderResultJson(result),
             currentPosition,
@@ -1820,14 +1988,14 @@ server.tool(
         }],
       };
     } catch (e) {
-      return { content: [{ type: "text", text: errOf(e) }], isError: true };
+      return { content: [{ type: "text", text: errOf(e, { exchange, symbol, type: "execution" }) }], isError: true };
     }
   },
 );
 
 server.tool(
   "trade_close",
-  "Close an existing position. IMPORTANT: Call trade_preview first with the opposite side to show impact, then get user confirmation. Verified close: `closedSize` is the measured / venue-final fill (one residual market close is attempted); a residual still open → ORDER_PARTIAL error (symbol quarantined). Includes the uniform OrderResult of the reduce-only market order.",
+  `Close an existing position. IMPORTANT: Call trade_preview first with the opposite side to show impact, then get user confirmation. Verified close: \`closedSize\` is the measured / venue-final fill (one residual market close is attempted); a residual still open → ORDER_PARTIAL error (symbol quarantined). Includes the uniform OrderResult of the reduce-only market order. ${HL_SCOPE_NOTE}`,
   {
     exchange: z.string().describe(`Exchange: ${listVenues().filter(v => v.create !== null).map(v => v.id).join(", ")} (aliases accepted)`),
     symbol: z.string().describe("Symbol to close (e.g., BTC, ETH)"),
@@ -1844,7 +2012,7 @@ server.tool(
       const positions = await adapter.getPositions();
       const pos = positions.find(p => symbolMatch(p.symbol, symbol));
       if (!pos || Number(pos.size) === 0) {
-        return { content: [{ type: "text", text: err(`No open position for ${symbol} on ${exchange}`) }], isError: true };
+        throw new PerpError("POSITION_NOT_FOUND", `No open position for ${symbol} on ${exchange}`, { exchange: adapter.name, remediation: `List open positions with get_positions (exchange: ${exchange})` });
       }
 
       const closeSide = pos.side === "long" ? "sell" : "buy";
@@ -1910,7 +2078,7 @@ server.tool(
         }],
       };
     } catch (e) {
-      return { content: [{ type: "text", text: errOf(e) }], isError: true };
+      return { content: [{ type: "text", text: errOf(e, { exchange, symbol, type: "close" }) }], isError: true };
     }
   },
 );
@@ -1939,23 +2107,24 @@ server.tool(
       const allFunding: FundingEntry[] = [];
       const posNotionals = new Map<string, number>();
 
-      await Promise.allSettled(exchanges.map(async (ex) => {
-        try {
-          const adapter = await getOrCreateAdapter(ex);
-          const [payments, positions] = await Promise.all([
-            adapter.getFundingPayments(200),
-            adapter.getPositions(),
-          ]);
-          for (const p of payments) {
-            if (sinceMs && p.time < sinceMs) continue;
-            if (symFilter && !p.symbol.toUpperCase().includes(symFilter.toUpperCase())) continue;
-            allFunding.push({ exchange: ex, symbol: p.symbol, payment: Number(p.payment), time: p.time });
-          }
-          for (const p of positions) {
-            if (Number(p.size) > 0) posNotionals.set(`${ex}:${p.symbol}`, Math.abs(Number(p.size) * Number(p.markPrice)));
-          }
-        } catch { /* skip */ }
+      // Per-venue failures are reported in meta.errors (never silently dropped from the totals).
+      const errors: Record<string, string> = {};
+      const settled = await Promise.allSettled(exchanges.map(async (ex) => {
+        const adapter = await getOrCreateAdapter(ex);
+        const [payments, positions] = await Promise.all([
+          adapter.getFundingPayments(200),
+          adapter.getPositions(),
+        ]);
+        for (const p of payments) {
+          if (sinceMs && p.time < sinceMs) continue;
+          if (symFilter && !p.symbol.toUpperCase().includes(symFilter.toUpperCase())) continue;
+          allFunding.push({ exchange: ex, symbol: p.symbol, payment: Number(p.payment), time: p.time });
+        }
+        for (const p of positions) {
+          if (Number(p.size) > 0) posNotionals.set(`${ex}:${p.symbol}`, Math.abs(Number(p.size) * Number(p.markPrice)));
+        }
       }));
+      settled.forEach((r, i) => { if (r.status === "rejected") errors[exchanges[i]] = extractErrorMessage(r.reason); });
 
       allFunding.sort((a, b) => a.time - b.time);
 
@@ -1992,7 +2161,7 @@ server.tool(
         arbPositions,
       };
 
-      return { content: [{ type: "text", text: ok(data) }] };
+      return { content: [{ type: "text", text: ok(data, { errors }) }] };
     } catch (e) {
       return { content: [{ type: "text", text: errOf(e) }], isError: true };
     }
@@ -2017,27 +2186,28 @@ server.tool(
       const byExchange = new Map<string, { trades: number; volume: number; fees: number; funding: number }>();
       const dailyMap = new Map<string, { fees: number; funding: number }>();
 
-      await Promise.allSettled(exchanges.map(async (ex) => {
-        try {
-          const adapter = await getOrCreateAdapter(ex);
-          const [trades, funding] = await Promise.all([adapter.getTradeHistory(200), adapter.getFundingPayments(200)]);
-          const exData = byExchange.get(ex) ?? { trades: 0, volume: 0, fees: 0, funding: 0 };
-          for (const t of trades) {
-            if (sinceMs && t.time < sinceMs) continue;
-            const notional = Number(t.price) * Number(t.size);
-            exData.trades++; exData.volume += notional; exData.fees += Number(t.fee);
-            const day = new Date(t.time).toISOString().slice(0, 10);
-            const d = dailyMap.get(day) ?? { fees: 0, funding: 0 }; d.fees += Number(t.fee); dailyMap.set(day, d);
-          }
-          for (const f of funding) {
-            if (sinceMs && f.time < sinceMs) continue;
-            exData.funding += Number(f.payment);
-            const day = new Date(f.time).toISOString().slice(0, 10);
-            const d = dailyMap.get(day) ?? { fees: 0, funding: 0 }; d.funding += Number(f.payment); dailyMap.set(day, d);
-          }
-          byExchange.set(ex, exData);
-        } catch { /* skip */ }
+      // Per-venue failures are reported in meta.errors (never silently dropped from the totals).
+      const errors: Record<string, string> = {};
+      const settled = await Promise.allSettled(exchanges.map(async (ex) => {
+        const adapter = await getOrCreateAdapter(ex);
+        const [trades, funding] = await Promise.all([adapter.getTradeHistory(200), adapter.getFundingPayments(200)]);
+        const exData = byExchange.get(ex) ?? { trades: 0, volume: 0, fees: 0, funding: 0 };
+        for (const t of trades) {
+          if (sinceMs && t.time < sinceMs) continue;
+          const notional = Number(t.price) * Number(t.size);
+          exData.trades++; exData.volume += notional; exData.fees += Number(t.fee);
+          const day = new Date(t.time).toISOString().slice(0, 10);
+          const d = dailyMap.get(day) ?? { fees: 0, funding: 0 }; d.fees += Number(t.fee); dailyMap.set(day, d);
+        }
+        for (const f of funding) {
+          if (sinceMs && f.time < sinceMs) continue;
+          exData.funding += Number(f.payment);
+          const day = new Date(f.time).toISOString().slice(0, 10);
+          const d = dailyMap.get(day) ?? { fees: 0, funding: 0 }; d.funding += Number(f.payment); dailyMap.set(day, d);
+        }
+        byExchange.set(ex, exData);
       }));
+      settled.forEach((r, i) => { if (r.status === "rejected") errors[exchanges[i]] = extractErrorMessage(r.reason); });
 
       let totalFees = 0, totalFunding = 0, totalVolume = 0, totalTrades = 0;
       for (const d of byExchange.values()) { totalFees += d.fees; totalFunding += d.funding; totalVolume += d.volume; totalTrades += d.trades; }
@@ -2048,7 +2218,7 @@ server.tool(
         daily: [...dailyMap.entries()].sort().map(([date, d]) => ({ date, fees: d.fees, funding: d.funding, net: d.funding - d.fees })),
       };
 
-      return { content: [{ type: "text", text: ok(data) }] };
+      return { content: [{ type: "text", text: ok(data, { errors }) }] };
     } catch (e) {
       return { content: [{ type: "text", text: errOf(e) }], isError: true };
     }
@@ -2079,39 +2249,50 @@ server.tool(
 
       const fundingByExSym = new Map<string, number>();
       const currentPrices = new Map<string, number>();
-
-      await Promise.allSettled([...exchangeSet].map(async (ex) => {
-        try {
-          const adapter = await getOrCreateAdapter(ex);
-          const [funding, livePos] = await Promise.all([adapter.getFundingPayments(200), adapter.getPositions()]);
-          for (const f of funding) {
-            if (sinceMs && f.time < sinceMs) continue;
-            const key = `${ex}:${f.symbol}`;
-            fundingByExSym.set(key, (fundingByExSym.get(key) ?? 0) + Number(f.payment));
-          }
-          for (const p of livePos) currentPrices.set(`${ex}:${p.symbol}`, Number(p.markPrice));
-        } catch { /* skip */ }
+      // A venue whose reads failed has unknown funding / prices: its rows report null, the reason is in meta.errors.
+      const errors: Record<string, string> = {};
+      const venues = [...exchangeSet];
+      const settled = await Promise.allSettled(venues.map(async (ex) => {
+        const adapter = await getOrCreateAdapter(ex);
+        const [funding, livePos] = await Promise.all([adapter.getFundingPayments(200), adapter.getPositions()]);
+        for (const f of funding) {
+          if (sinceMs && f.time < sinceMs) continue;
+          const key = `${ex}:${f.symbol}`;
+          fundingByExSym.set(key, (fundingByExSym.get(key) ?? 0) + Number(f.payment));
+        }
+        for (const p of livePos) currentPrices.set(`${ex}:${p.symbol}`, Number(p.markPrice));
       }));
+      settled.forEach((r, i) => { if (r.status === "rejected") errors[venues[i]] = extractErrorMessage(r.reason); });
 
       // Entries without a verified entry price have no price PnL: listed apart, never priced at a guess.
       const priced = positions.filter((p): p is typeof p & { entryLongPrice: number; entryShortPrice: number } => p.entryLongPrice !== null && p.entryShortPrice !== null);
       const unpricedPositions = positions.filter(p => p.entryLongPrice === null || p.entryShortPrice === null).map(p => p.symbol);
+      // Funding of a venue that answered: the sum of its payments (none = 0). A failed venue: unknown (null).
+      const fundingOf = (ex: string, sym: string): number | null => (ex in errors ? null : fundingByExSym.get(`${ex}:${sym}`) ?? 0);
+      // Current mark price from the live position; none (failed read / no live leg) = unknown (null), never the entry price.
+      const priceOf = (ex: string, sym: string): number | null => currentPrices.get(`${ex}:${sym}`) ?? null;
       const rows = priced.map(pos => {
         const daysHeld = Math.max(1, Math.round((Date.now() - new Date(pos.entryTime).getTime()) / 86400000));
-        const funding = (fundingByExSym.get(`${pos.longExchange}:${pos.symbol}`) ?? 0) + (fundingByExSym.get(`${pos.shortExchange}:${pos.symbol}`) ?? 0);
-        const longPrice = currentPrices.get(`${pos.longExchange}:${pos.symbol}`) ?? pos.entryLongPrice;
-        const shortPrice = currentPrices.get(`${pos.shortExchange}:${pos.symbol}`) ?? pos.entryShortPrice;
-        const pricePnl = (longPrice - pos.entryLongPrice) * pos.longSize + (pos.entryShortPrice - shortPrice) * pos.shortSize;
-        const totalPnl = pricePnl + funding;
+        const lf = fundingOf(pos.longExchange, pos.symbol);
+        const sf = fundingOf(pos.shortExchange, pos.symbol);
+        const funding = lf !== null && sf !== null ? lf + sf : null;
+        const longPrice = priceOf(pos.longExchange, pos.symbol);
+        const shortPrice = priceOf(pos.shortExchange, pos.symbol);
+        const pricePnl = longPrice !== null && shortPrice !== null
+          ? (longPrice - pos.entryLongPrice) * pos.longSize + (pos.entryShortPrice - shortPrice) * pos.shortSize
+          : null;
+        const totalPnl = pricePnl !== null && funding !== null ? pricePnl + funding : null;
         const notional = pos.entryLongPrice * pos.longSize + pos.entryShortPrice * pos.shortSize;
-        const roi = notional > 0 ? (totalPnl / notional) * 100 : 0;
-        const fundingRoi = notional > 0 ? (funding / notional) * 100 : 0;
-        return { symbol: pos.symbol, mode: pos.mode ?? "perp-perp", longExchange: pos.longExchange, shortExchange: pos.shortExchange, daysHeld, funding, pricePnl, totalPnl, roi, annualizedRoi: daysHeld > 0 ? (fundingRoi / daysHeld) * 365 : 0 };
-      }).sort((a, b) => b.totalPnl - a.totalPnl);
+        const roi = totalPnl !== null && notional > 0 ? (totalPnl / notional) * 100 : null;
+        const fundingRoi = funding !== null && notional > 0 ? (funding / notional) * 100 : null;
+        return { symbol: pos.symbol, mode: pos.mode ?? "perp-perp", longExchange: pos.longExchange, shortExchange: pos.shortExchange, daysHeld, funding, pricePnl, totalPnl, roi, annualizedRoi: fundingRoi !== null ? (fundingRoi / daysHeld) * 365 : null };
+      }).sort((a, b) => (a.totalPnl === null ? 1 : b.totalPnl === null ? -1 : b.totalPnl - a.totalPnl));
 
-      const totals = { funding: rows.reduce((s, r) => s + r.funding, 0), pricePnl: rows.reduce((s, r) => s + r.pricePnl, 0), totalPnl: rows.reduce((s, r) => s + r.totalPnl, 0) };
+      // A total over rows with an unknown value is itself unknown (null).
+      const sumOrNull = (vals: (number | null)[]): number | null => (vals.some(v => v === null) ? null : (vals as number[]).reduce((s, v) => s + v, 0));
+      const totals = { funding: sumOrNull(rows.map(r => r.funding)), pricePnl: sumOrNull(rows.map(r => r.pricePnl)), totalPnl: sumOrNull(rows.map(r => r.totalPnl)) };
 
-      return { content: [{ type: "text", text: ok({ period, positionCount: rows.length, positions: rows, unpricedPositions, totals }) }] };
+      return { content: [{ type: "text", text: ok({ period, positionCount: rows.length, positions: rows, unpricedPositions, totals }, { errors }) }] };
     } catch (e) {
       return { content: [{ type: "text", text: errOf(e) }], isError: true };
     }
@@ -2128,16 +2309,18 @@ server.resource(
   { mimeType: "application/json", description: "Live cross-exchange prices for all perpetual futures markets" },
   async () => {
     const prices: Record<string, Record<string, string>> = {};
-    await Promise.allSettled(listVenuesWithRole("marketData").map(v => v.id).map(async (ex) => {
-      try {
-        const markets = await fetchMarketsPublic(ex);
-        for (const m of markets) {
-          if (!prices[m.symbol]) prices[m.symbol] = {};
-          prices[m.symbol][ex] = m.markPrice;
-        }
-      } catch { /* skip */ }
+    const venues = listVenuesWithRole("marketData").map(v => v.id);
+    // Per-venue failures are reported in meta.errors (like get_prices), never silently skipped.
+    const errors: Record<string, string> = {};
+    const settled = await Promise.allSettled(venues.map(async (ex) => {
+      const markets = await fetchMarketsPublic(ex);
+      for (const m of markets) {
+        if (!prices[m.symbol]) prices[m.symbol] = {};
+        prices[m.symbol][ex] = m.markPrice;
+      }
     }));
-    return { contents: [{ uri: "market://prices", text: JSON.stringify({ ok: true, data: prices, meta: { timestamp: new Date().toISOString(), network: MCP_NETWORK } }, null, 2), mimeType: "application/json" }] };
+    settled.forEach((r, i) => { if (r.status === "rejected") errors[venues[i]] = extractErrorMessage(r.reason); });
+    return { contents: [{ uri: "market://prices", text: JSON.stringify({ ok: true, data: prices, meta: { timestamp: new Date().toISOString(), network: MCP_NETWORK, errors } }, null, 2), mimeType: "application/json" }] };
   },
 );
 
@@ -2150,7 +2333,7 @@ server.resource(
       const rates = await fetchAllFundingRates();
       return { contents: [{ uri: "market://funding-rates", text: JSON.stringify({ ok: true, data: rates, meta: { timestamp: new Date().toISOString(), network: MCP_NETWORK } }, null, 2), mimeType: "application/json" }] };
     } catch (e) {
-      return { contents: [{ uri: "market://funding-rates", text: JSON.stringify({ ok: false, error: String(e), meta: { network: MCP_NETWORK } }), mimeType: "application/json" }] };
+      return { contents: [{ uri: "market://funding-rates", text: errOf(e), mimeType: "application/json" }] };
     }
   },
 );
@@ -2184,12 +2367,14 @@ server.prompt(
 
 3. **Preview Before Executing**
    - ALWAYS use \`trade_preview\` before any trade
-   - Show the user: estimated price, fees, margin impact
+   - Show the user: estimated price, notional, margin impact, builder fee, and any refusal (valid:false + code / remediation)
+   - Venue trading fees are not estimated by the preview
    - Wait for explicit user confirmation
 
 4. **Execute with Confirmation**
    - Only call \`trade_execute\` after user says "yes" or "confirm"
    - Never execute trades without showing the preview first
+   - ORDER_PENDING (pending:true) means the outcome is unknown: do NOT resubmit — check \`get_open_orders\` / \`get_positions\` (the symbol is quarantined for opening orders until a human clears it)
 
 5. **Monitor After Execution**
    - Use \`get_positions\` to verify the trade went through
@@ -2201,11 +2386,10 @@ server.prompt(
 - If the user asks to "buy" or "sell", preview first, then ask for confirmation
 - Warn about high-leverage trades or large position sizes
 
-## Supported Exchanges
-- **pacifica** (Solana) — SOL-based perpetual futures
-- **hyperliquid** (HyperEVM) — Low-fee perpetuals with HIP-3 DEXes
-- **lighter** (Ethereum) — Ethereum-based perpetual futures
-- **aster** (BNB Chain) — BNB Chain perpetual futures`,
+## Supported Exchanges (server network: ${MCP_NETWORK})
+${listVenues().map(v => `- **${v.id}** (${v.displayName}) — ${v.roles.join(", ")}`).join("\n")}
+
+${HL_SCOPE_NOTE}`,
       },
     }],
   }),
