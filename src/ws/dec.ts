@@ -39,3 +39,19 @@ export function shiftDecimal(s: string, places: number): string | undefined {
   const out = frac === "" ? int : `${int}.${frac}`;
   return /^0(\.0*)?$/.test(out) ? "0" : sign + out;
 }
+
+/**
+ * Exact value × integer × 10^shift on decimal strings (BigInt, no float). Lighter trade fees:
+ * usd_amount × fee × 1e-6. Undefined for a non-decimal input or a non-integer multiplier.
+ */
+export function mulDecimalInt(s: string, n: number, shift: number): string | undefined {
+  if (!Number.isInteger(n)) return undefined;
+  const m = DECIMAL_RE.exec(s);
+  if (m === null || m[4] !== undefined || (m[2] === "" && (m[3] === undefined || m[3] === ""))) return undefined;
+  const frac = m[3] === undefined ? "" : m[3];
+  const digits = `${m[2]}${frac}`.replace(/^0+(?=\d)/, "");
+  const product = BigInt(digits === "" ? "0" : digits) * BigInt(n) * (m[1] === "-" ? -1n : 1n);
+  const neg = product < 0n;
+  const abs = (neg ? -product : product).toString();
+  return shiftDecimal(`${neg ? "-" : ""}${abs}`, shift - frac.length);
+}

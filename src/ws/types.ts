@@ -41,6 +41,7 @@ export interface CloseReason {
   remediation: string | null;
 }
 
+/** @experimental 0.14.x (stable from 0.15.0) */
 export type ConnectionState =
   | { status: "idle" }
   | { status: "connecting"; attempt: number }
@@ -61,6 +62,7 @@ export type Canonicalize = (
 export type Source = "ws" | "snapshot" | `rest:${string}` | "venue-definition";
 export type RateKind = "lastSettled" | "accruing" | "predicted";
 
+/** @experimental 0.14.x (stable from 0.15.0) */
 export interface MarketDirectoryEntry {
   venue: VenueId;
   dex: string | null;
@@ -93,6 +95,7 @@ export interface FundingState {
   marketClosed: boolean | null;
 }
 
+/** @experimental 0.14.x (stable from 0.15.0) */
 export interface MarketUpdate {
   type: "market";
   schema: 1;
@@ -117,6 +120,7 @@ export interface MarketUpdate {
   asOf: Partial<Record<MarketField, number>>;
 }
 
+/** @experimental 0.14.x (stable from 0.15.0) */
 export interface BboUpdate {
   type: "bbo"; schema: 1; venue: VenueId; dex: string | null; symbol: string;
   bid: Dec | null; bidSize: Dec | null; ask: Dec | null; askSize: Dec | null; venueTs: number | null; recvTs: number;
@@ -172,11 +176,14 @@ export interface OrderRow {
 export interface FillRow {
   /** Venue fill key (HL tid, Pacifica h:i, Lighter trade_id, Arcus tradeId). With `side` and `orderId` it is the dedupe key. */
   fillId: string;
+  /** The client order id of the filled order when the fill frame carries it (see the capability notes per venue). */
+  clientId: string | null;
   symbol: string;
   dex: string | null;
   side: "buy" | "sell" | null;
   price: Dec | null;
   size: Dec | null;
+  /** Fee amount in `feeToken` (negative = rebate). */
   fee: Dec | null;
   feeToken: string | null;
   closedPnl: Dec | null;
@@ -185,6 +192,7 @@ export interface FillRow {
   time: number | null;
 }
 
+/** @experimental 0.14.x (stable from 0.15.0) */
 export type UserUpdate =
   | {
     type: "account"; schema: 1; venue: VenueId;
@@ -210,10 +218,12 @@ export type UserUpdate =
    */
   | { type: "fills"; schema: 1; venue: VenueId; snapshot: true; fills: FillRow[]; source: Source; recvTs: number };
 
+/** @experimental 0.14.x (stable from 0.15.0) */
 export type UserRef =
   | { venue: "hyperliquid"; address: `0x${string}` }
   | { venue: "pacifica"; account: string }
   | { venue: "lighter" | "lighter-rh"; accountIndex: number }
+  /** KNOWN GAP in 0.14.4: Aster user channels are not implemented (CAPABILITY_UNSUPPORTED); 0.14.5. */
   | { venue: "aster"; user: `0x${string}`; signer: `0x${string}` }
   /** subaccount null = the venue default account (0). */
   | { venue: "arcus"; address: `0x${string}`; subaccount: number | null }
@@ -227,7 +237,10 @@ export interface TypedData {
   message: Record<string, unknown>;
 }
 
-/** Async credentials; the library never holds keys (only short-lived tokens it is handed). */
+/**
+ * Async credentials; the library never holds keys (only short-lived tokens it is handed).
+ * @experimental 0.14.x (stable from 0.15.0)
+ */
 export interface CredentialProvider {
   user(): Promise<UserRef>;
   /** Ondo login, QFEX auth (secret stays with the provider). Lowercase hex. */
@@ -238,6 +251,7 @@ export interface CredentialProvider {
   authToken?(req: { purpose: string; maxTtlSec: number }): Promise<{ token: string; expiresAt: number }>;
 }
 
+/** @experimental 0.14.x (stable from 0.15.0) */
 export type StreamControl =
   | { type: "state"; venue: VenueId; state: ConnectionState }
   | {
@@ -262,6 +276,7 @@ export interface StreamLog {
 
 // ── Capability matrix (static, §6) ──
 
+/** @experimental 0.14.x (stable from 0.15.0) */
 export interface VenueWsCapabilities {
   /** true = works from a browser page (Origin/CORS checked, Phase 0); "in-page-secrets" = needs allowInPageSecrets. */
   browser: boolean | "in-page-secrets";
@@ -280,6 +295,7 @@ export type MarketTarget =
   | { kind: "user"; channels: UserChannel[] }
   | { kind: "market"; symbol: string; channels: Array<"market" | "bbo" | "book" | "trades"> };
 
+/** @experimental 0.14.x (stable from 0.15.0) */
 export interface VenueStreamOptions {
   network?: Network;
   /** hyperliquid: HIP-3 dexes to include. Default [] = native only. */
@@ -308,6 +324,7 @@ export interface VenueStreamOptions {
   clock?: () => number;
 }
 
+/** @experimental 0.14.x (stable from 0.15.0) */
 export interface Subscription<E> extends AsyncIterable<E | StreamControl> {
   /** Unbuffered callback. Returns an unsubscribe-from-callback function. */
   on(cb: (e: E | StreamControl) => void): () => void;
@@ -427,6 +444,7 @@ export interface LabelledRefresh {
   run(ctx: CodecContext, dir: CodecDirectory): Promise<string[]>;
 }
 
+/** @experimental 0.14.x (stable from 0.15.0) */
 export interface VenueCodec {
   readonly venue: VenueId;
   readonly capabilities: VenueWsCapabilities;

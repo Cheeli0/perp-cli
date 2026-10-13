@@ -40,6 +40,9 @@ export const pacifica: VenueCodec = {
       openInterest: "Base units",
       user: "By account (Solana address), no auth. account_order_updates / account_trades send no snapshot → gap refetch-required for orders (at subscribe and after a reconnect) and fills (after a reconnect)",
       bbo: "bbo{symbol} ≤ 20 per connection; `li` orders frames (non-contiguous)",
+      clientId: "orders and fills: `I` (client order id; null when the order has none)",
+      liquidationPrice: "`l` (null when not applicable, per the venue)",
+      fee: "trade `f`; feeToken not stated → null",
     },
   }),
   url: (n) => S.wsUrl[n],
@@ -220,7 +223,7 @@ function decodeTrades(d: unknown): DecodedEvent[] {
     const i = isObj(t) ? idOf(t.i) : null;
     if (!isObj(t) || h === null || typeof t.s !== "string") { bad.push("h/s"); continue; }
     fills.push({
-      fillId: i === null ? h : `${h}:${i}`,
+      fillId: i === null ? h : `${h}:${i}`, clientId: typeof t.I === "string" ? t.I : null,
       symbol: t.s, dex: null, side: pick(TRADE_SIDE, t.ts), price: dec(t, "p", bad), size: dec(t, "a", bad),
       fee: dec(t, "f", bad), feeToken: null, closedPnl: dec(t, "n", bad), orderId: i,
       liquidity: t.te === "fulfill_maker" ? "maker" : t.te === "fulfill_taker" ? "taker" : null, time: ts(t, "t", bad),

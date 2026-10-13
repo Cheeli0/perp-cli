@@ -87,6 +87,9 @@ export const hyperliquid: VenueCodec = {
       nextFundingTime: "Hourly settlement rule (venue-definition)",
       openInterest: "Base units, one side",
       user: "By address, no auth. clearinghouseState/openOrders per selected dex (opts.hip3Dexes); userFills is replayable (deduped by tid)",
+      clientId: "orders: cloid (null when the order has none). fills: cloid only when the frame carries it (WsFill documents none) — else null; join OrderRow.clientId by orderId",
+      liquidationPrice: "liquidationPx (null when the venue sends null, e.g. no liquidation risk)",
+      fee: "fee in feeToken (negative = rebate)",
       bbo: "bbo{coin}: full top of book per frame, no sequence",
     },
   }),
@@ -344,7 +347,8 @@ function decodeFills(d: unknown): DecodedEvent[] {
     const id = isObj(f) ? idOf(f.tid) : null;
     if (!isObj(f) || id === null || typeof f.coin !== "string") { bad.push("tid/coin"); continue; }
     fills.push({
-      fillId: id, symbol: f.coin, dex: dexOf(f.coin),
+      // WsFill documents no cloid; read it when the frame carries one (join OrderRow.clientId by orderId otherwise).
+      fillId: id, clientId: typeof f.cloid === "string" ? f.cloid : null, symbol: f.coin, dex: dexOf(f.coin),
       side: pick(SIDE, f.side),
       price: dec(f, "px", bad), size: dec(f, "sz", bad), fee: dec(f, "fee", bad),
       feeToken: typeof f.feeToken === "string" ? f.feeToken : null, closedPnl: dec(f, "closedPnl", bad),

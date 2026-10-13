@@ -38,6 +38,9 @@ export const arcus: VenueCodec = {
       openInterest: "Base units, one side (~60 s venue cadence)",
       user: "By address, no auth (subaccount → accountIndex). account re-snapshots every 5 s; userFills replays on resubscribe (deduped by tradeId). Streaming `account` order events carry no balances and are not emitted",
       bbo: "bbo{market}; lastSequenceId orders frames (non-contiguous)",
+      clientId: "orders and fills: clientId (omitted by the venue when the order had none → null)",
+      liquidationPrice: "not published (WS or REST) → always null",
+      fee: "fill `fee`; feeToken not stated → null",
     },
   }),
   url: (n) => S.wsUrl[n],
@@ -222,13 +225,25 @@ function decodeAccount(f: Obj): DecodedEvent[] {
   return out;
 }
 
+/**
+ * Position fields (docs.arcus.xyz channels#positions: the snapshot map "has the same shape as positions in
+ * REST GET /v1/positions"; that schema lists marketId, marketDisplayName, side, size ("Signed position
+ * quantity. Positive for long, negative for short"), averageEntryPrice, cumulativeFunding, marginMode,
+ * borrowedCapital, marginUsed, positionValueNotional, unrealizedPnl, markPx, sequenceNumber). No
+ * leverage and no liquidation price are published → null. Streaming deltas carry a subset (docs example:
+ * side/size/averageEntryPrice); absent fields are null for that row. (The main wallet had no open
+ * position during the Phase 0 / Phase 2 live runs, so this mapping is from the docs.)
+ */
 function positionRow(p: Obj, d: ArcusData, bad: string[]): PositionRow | null {
   const symbol = symbolOf(p, d);
   if (symbol === null) { bad.push("market"); return null; }
+  const size = dec(p, "size", bad); // signed (docs: positive long, negative short)
   return {
-    symbol, dex: null, side: pick(POS_SIDE, p.side), size: dec(p, "size", bad), entryPrice: dec(p, "averageEntryPrice", bad),
-    markPrice: null, positionValue: null, unrealizedPnl: dec(p, "unrealizedPnl", bad), liquidationPrice: dec(p, "liquidationPrice", bad),
-    marginUsed: null, leverage: null, venueTs: null,
+    symbol, dex: null, side: pick(POS_SIDE, p.side), size: size === null ? null : size.replace(/^-/, ""),
+    entryPrice: dec(p, "averageEntryPrice", bad), markPrice: dec(p, "markPx", bad), positionValue: dec(p, "positionValueNotional", bad),
+    unrealizedPnl: dec(p, "unrealizedPnl", bad),
+    liquidationPrice: null, // Arcus publishes no liquidation price (REST GET /v1/positions has none either)
+    marginUsed: dec(p, "marginUsed", bad), leverage: null, venueTs: null,
   };
 }
 
@@ -296,7 +311,7 @@ function fillRow(x: Obj, d: ArcusData, bad: string[]): FillRow | null {
   const price = "price" in x ? dec(x, "price", bad) : dec(x, "fillPrice", bad);
   const size = "size" in x ? dec(x, "size", bad) : dec(x, "fillSize", bad);
   return {
-    fillId: id, symbol, dex: null, side: pick(SIDE, x.side), price, size, fee: dec(x, "fee", bad), feeToken: null,
+    fillId: id, clientId: idOf(x.clientId), symbol, dex: null, side: pick(SIDE, x.side), price, size, fee: dec(x, "fee", bad), feeToken: null,
     closedPnl: dec(x, "closedPnl", bad), orderId: idOf(x.orderId),
     liquidity: x.role === "MAKER" ? "maker" : x.role === "TAKER" ? "taker" : null,
     time: ts(x, "createdAt", bad, 1e-3), // µs

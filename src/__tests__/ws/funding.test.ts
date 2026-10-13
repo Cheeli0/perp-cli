@@ -2,7 +2,7 @@
 import { describe, expect, it } from "vitest";
 import { createFundingComparator, toApr, toHourly } from "../../ws/funding.js";
 import { defaultCanonicalize } from "../../ws/canonical.js";
-import { shiftDecimal, toDec } from "../../ws/dec.js";
+import { mulDecimalInt, shiftDecimal, toDec } from "../../ws/dec.js";
 import { hyperliquid } from "../../ws/codecs/hyperliquid.js";
 import { pacifica } from "../../ws/codecs/pacifica.js";
 import { lighter } from "../../ws/codecs/lighter.js";
@@ -199,6 +199,14 @@ describe("Dec helpers", () => {
     expect(shiftDecimal("1e-7", -2)).toBe("0.000000001");
     expect(shiftDecimal("150", -2)).toBe("1.5");
     expect(shiftDecimal("abc", -2)).toBeUndefined();
+  });
+  it("mulDecimalInt is exact", () => {
+    expect(mulDecimalInt("291.492488", 196, -6)).toBe("0.057132527648");
+    expect(mulDecimalInt("291.492488", 0, -6)).toBe("0");
+    expect(mulDecimalInt("-1.5", 3, 0)).toBe("-4.5");
+    expect(mulDecimalInt("100", 10000, -6)).toBe("1");
+    expect(mulDecimalInt("1e3", 1, 0)).toBeUndefined();
+    expect(mulDecimalInt("1", 1.5, 0)).toBeUndefined();
   });
   it("toDec keeps strings verbatim, numbers via String, rejects garbage", () => {
     expect(toDec("0.10")).toBe("0.10");

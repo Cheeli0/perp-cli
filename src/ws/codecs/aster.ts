@@ -67,7 +67,7 @@ export const aster: VenueCodec = {
       openInterest: "Not on WS (REST only)",
       fundingInterval: `Labelled REST source ${FUNDING_INFO}, refreshed hourly; missing → null`,
       volume24hNotional: "!ticker@arr q (quote-asset volume)",
-      user: "Aster private channels (signed USER_STREAM listenKey) arrive in 0.14.5",
+      user: "KNOWN GAP in 0.14.4: no Aster user channels (signed USER_STREAM listenKey) — kind:\"user\" rejects CAPABILITY_UNSUPPORTED; arrives in 0.14.5",
       bbo: "<symbol>@bookTicker; `u` orders frames (non-contiguous)",
     },
   }),

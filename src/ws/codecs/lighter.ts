@@ -12,7 +12,7 @@
  * Docs: apidocs.lighter.xyz/docs/websocket-reference; fixtures src/__tests__/fixtures/ws/lighter{,-rh}/.
  */
 
-import { shiftDecimal } from "../dec.js";
+import { mulDecimalInt, shiftDecimal } from "../dec.js";
 import { badShape, fetchJson } from "../directory.js";
 import { VENUE_STATIC } from "../venue-static.js";
 import type {
@@ -64,7 +64,10 @@ function makeLighter(venue: "lighter" | "lighter-rh", quote: string): VenueCodec
         rate: "WS funding is PERCENT per 1 h on the wire; emitted as a fraction per 1 h",
         nextFundingTime: "Hourly settlement rule (venue-definition)",
         openInterest: "USD notional (Phase 0), sides not stated by the venue",
-        user: "By accountIndex. user_stats / account_all_positions / account_all_trades need no auth; account_all_orders needs CredentialProvider.authToken (re-called at 80 % TTL). account_all_trades does not replay → gap refetch-required for fills after a reconnect. Fill fee units are not documented → null",
+        user: "By accountIndex. user_stats / account_all_positions / account_all_trades need no auth; account_all_orders needs CredentialProvider.authToken (re-called at 80 % TTL). account_all_trades does not replay → gap refetch-required for fills after a reconnect",
+        clientId: "orders: client_order_id; fills: ask_/bid_client_id_str of our side; 0 = no client id → null",
+        liquidationPrice: "liquidation_price; \"0\" (no liquidation price, e.g. well-covered cross margin) → null, as in the CLI REST path",
+        fee: "taker_fee / maker_fee are a rate in 1e-6 of usd_amount (omitted when 0): fee = usd_amount × rate × 1e-6 in the collateral token",
         bbo: "ticker/{market_id}; `nonce` orders frames (non-contiguous)",
         ...(S.wsUrl.testnet === null ? { "network:testnet": "Testnet WS answers HTTP 403 (CloudFront)" } : {}),
       },
@@ -163,7 +166,7 @@ function makeLighter(venue: "lighter" | "lighter-rh", quote: string): VenueCodec
             case "user_stats": return decodeUserStats(venue, wire, f, snapshot);
             case "account_all_positions": return decodePositions(venue, wire, f, d, snapshot);
             case "account_all_orders": return decodeOrders(venue, wire, f, d, snapshot);
-            case "account_all_trades": return decodeTrades(venue, wire, f, d, snapshot);
+            case "account_all_trades": return decodeTrades(venue, wire, f, d, snapshot, quote);
             default: return decodeTicker(venue, wire, f, d);
           }
         }
@@ -235,6 +238,21 @@ function accountOf(wire: string): string {
   return wire.slice(wire.indexOf("/") + 1);
 }
 
+/** Liquidation price: the venue sends "0" (or ≤ 0) when the position has none → null (src/exchanges/lighter.ts positions). */
+function positivePrice(v: Dec | null): Dec | null {
+  return v !== null && Number(v) > 0 ? v : null;
+}
+
+/**
+ * Client order index (string form preferred). Valid ids are 1 … 2^48 − 1 (the CLI refuses 0 and its
+ * order-event matcher treats 0 as "no client id": src/exchanges/lighter.ts lighterClientOrderIndex /
+ * lighterEventOutcome) → 0 = none → null.
+ */
+function clientIdOf(str: unknown, num: unknown): string | null {
+  const id = idOf(str) === null ? idOf(num) : idOf(str);
+  return id === null || /^0+$/.test(id) ? null : id;
+}
+
 function decodeUserStats(venue: string, wire: string, f: Obj, snapshot: boolean): DecodedEvent[] {
   if (!isObj(f.stats)) return [protocolError(`${venue} ${wire} frame without stats`, wire)];
   const bad: string[] = [];
@@ -266,7 +284,7 @@ function decodePositions(venue: string, wire: string, f: Obj, d: LighterData, sn
     rows.push({
       symbol, dex: null, side: p.sign === 1 ? "long" : p.sign === -1 ? "short" : null, size: size.replace(/^-/, ""),
       entryPrice: dec(p, "avg_entry_price", bad), markPrice: null, positionValue: dec(p, "position_value", bad),
-      unrealizedPnl: dec(p, "unrealized_pnl", bad), liquidationPrice: dec(p, "liquidation_price", bad),
+      unrealizedPnl: dec(p, "unrealized_pnl", bad), liquidationPrice: positivePrice(dec(p, "liquidation_price", bad)),
       marginUsed: dec(p, "allocated_margin", bad), leverage: null, venueTs,
     });
   }
@@ -288,7 +306,7 @@ function decodeOrders(venue: string, wire: string, f: Obj, d: LighterData, snaps
       if (!OPEN_ORDER.has(String(o.status))) { remove.push(id); continue; }
       const known = d.idToSymbol.get(String(o.market_index));
       rows.push({
-        orderId: id, clientId: idOf(o.client_order_id), symbol: known !== undefined ? known : `#${String(o.market_index)}`, dex: null,
+        orderId: id, clientId: clientIdOf(o.client_order_id, o.client_order_index), symbol: known !== undefined ? known : `#${String(o.market_index)}`, dex: null,
         side: typeof o.is_ask === "boolean" ? (o.is_ask ? "sell" : "buy") : null,
         type: typeof o.type === "string" ? o.type : null, status: typeof o.status === "string" ? o.status : null,
         price: dec(o, "price", bad), size: dec(o, "initial_base_amount", bad), filled: dec(o, "filled_base_amount", bad),
@@ -302,7 +320,25 @@ function decodeOrders(venue: string, wire: string, f: Obj, d: LighterData, snaps
   return out;
 }
 
-function decodeTrades(venue: string, wire: string, f: Obj, d: LighterData, snapshot: boolean): DecodedEvent[] {
+/**
+ * Fee: Trade.taker_fee / maker_fee are integers "omitted if zero" (websocket reference). Unit: a RATE in
+ * 1e-6 of usd_amount — the CLI's trade history reads them the same way (src/exchanges/lighter.ts
+ * getTradeHistory; live rows: a liquidation carries 10000 = 1 %, the orderBooks liquidation_fee of
+ * 1.0000 %). fee = usd_amount × rate × 1e-6, in the collateral token; a missing rate field = 0 (documented
+ * omitempty); a missing usd_amount → null.
+ */
+function feeOf(t: Obj, maker: boolean | null, bad: string[]): Dec | null {
+  if (maker === null) return null;
+  const rate = maker ? t.maker_fee : t.taker_fee;
+  if (rate !== undefined && (typeof rate !== "number" || !Number.isInteger(rate))) { bad.push(maker ? "maker_fee" : "taker_fee"); return null; }
+  const usd = dec(t, "usd_amount", bad);
+  if (usd === null) return null;
+  const fee = mulDecimalInt(usd, rate === undefined ? 0 : rate, -6);
+  if (fee === undefined) { bad.push("usd_amount"); return null; }
+  return fee;
+}
+
+function decodeTrades(venue: string, wire: string, f: Obj, d: LighterData, snapshot: boolean, quote: string): DecodedEvent[] {
   // The `subscribed/` snapshot carries `trades: {}` or `[]` (Phase 0: no replay of recent fills).
   const groups: unknown[] = Array.isArray(f.trades) ? [f.trades] : isObj(f.trades) ? Object.values(f.trades) : [];
   if (!Array.isArray(f.trades) && !isObj(f.trades)) return [protocolError(`${venue} ${wire} frame without trades`, wire)];
@@ -319,18 +355,23 @@ function decodeTrades(venue: string, wire: string, f: Obj, d: LighterData, snaps
       const known = d.idToSymbol.get(String(t.market_id));
       const base = {
         fillId: id, symbol: known !== undefined ? known : `#${String(t.market_id)}`, dex: null,
-        price: dec(t, "price", bad), size: dec(t, "size", bad),
-        fee: null, feeToken: null, closedPnl: null, // fee fields are integers in undocumented units
-        time: ts(t, "timestamp", bad),
+        price: dec(t, "price", bad), size: dec(t, "size", bad), closedPnl: null, time: ts(t, "timestamp", bad),
       };
-      const leg = (ask: boolean): FillRow => ({
-        ...base, side: ask ? "sell" : "buy", orderId: ask ? idOf(t.ask_id_str) : idOf(t.bid_id_str),
-        liquidity: typeof t.is_maker_ask !== "boolean" ? null : (t.is_maker_ask === ask ? "maker" : "taker"),
-      });
+      const leg = (ask: boolean): FillRow => {
+        const maker = typeof t.is_maker_ask === "boolean" ? t.is_maker_ask === ask : null;
+        const fee = feeOf(t, maker, bad);
+        return {
+          ...base, side: ask ? "sell" : "buy",
+          orderId: ask ? (idOf(t.ask_id_str) === null ? idOf(t.ask_id) : idOf(t.ask_id_str)) : (idOf(t.bid_id_str) === null ? idOf(t.bid_id) : idOf(t.bid_id_str)),
+          clientId: ask ? clientIdOf(t.ask_client_id_str, t.ask_client_id) : clientIdOf(t.bid_client_id_str, t.bid_client_id),
+          liquidity: maker === null ? null : maker ? "maker" : "taker",
+          fee, feeToken: fee === null ? null : quote,
+        };
+      };
       // A self-trade has our account on both sides: two fills sharing the trade id (deduped by id + side).
       if (isAsk) fills.push(leg(true));
       if (isBid) fills.push(leg(false));
-      if (!isAsk && !isBid) fills.push({ ...base, side: null, orderId: null, liquidity: null });
+      if (!isAsk && !isBid) fills.push({ ...base, side: null, orderId: null, clientId: null, liquidity: null, fee: null, feeToken: null });
     }
   }
   const out: DecodedEvent[] = [{ t: "user", wire, deltas: [{ kind: "fills", snapshot, fills } satisfies UserDelta] }];

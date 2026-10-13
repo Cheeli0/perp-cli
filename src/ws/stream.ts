@@ -86,6 +86,7 @@ function isBrowserLike(): boolean {
   return g.window !== undefined && g.document !== undefined;
 }
 
+/** @experimental 0.14.x (stable from 0.15.0) */
 export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = {}): VenueStream {
   const venue = codec.venue;
   const network: Network = opts.network === undefined ? "mainnet" : opts.network;

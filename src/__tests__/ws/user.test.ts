@@ -601,3 +601,103 @@ describe("CLI credential provider behaviour", () => {
     expect(q.warnings).toEqual([]);
   });
 });
+
+describe("clientId round-trip, Lighter fees, Arcus positions (consumer requests)", () => {
+  it("hyperliquid: cloid on open orders, order updates and (when present) fills", async () => {
+    const r = await userStream(hyperliquid, HL_ROUTES, hlUser, ["orders", "fills"]);
+    r.t.last().open();
+    const order = { coin: "BTC", side: "B", limitPx: "1", sz: "1", oid: 5, timestamp: 1, origSz: "1", cloid: "0x0000000000000000000000000000abcd" };
+    r.t.last().message({ channel: "openOrders", data: { dex: "", user: EVM, orders: [order] } });
+    expect(r.of("orders").at(-1)!.orders[0].clientId).toBe("0x0000000000000000000000000000abcd");
+    r.t.last().message({ channel: "orderUpdates", data: [{ order: { ...order, oid: 6, cloid: "0x0000000000000000000000000000beef" }, status: "open", statusTimestamp: 2 }] });
+    expect(r.of("orders").at(-1)!.orders.map(o => o.clientId)).toEqual(["0x0000000000000000000000000000abcd", "0x0000000000000000000000000000beef"]);
+    r.t.last().message({ channel: "userFills", data: { user: EVM, fills: [{ coin: "BTC", px: "1", sz: "1", side: "B", time: 1, tid: 1, oid: 5, crossed: true, fee: "0", feeToken: "USDC", closedPnl: "0", cloid: "0x0000000000000000000000000000abcd" }, { coin: "BTC", px: "1", sz: "1", side: "B", time: 2, tid: 2, oid: 7, crossed: true, fee: "0", feeToken: "USDC", closedPnl: "0" }] } });
+    expect(r.of("fill").map(f => f.fill.clientId)).toEqual(["0x0000000000000000000000000000abcd", null]);
+  });
+
+  it("pacifica: I on order updates and trades", async () => {
+    const r = await userStream(pacifica, PACIFICA_ROUTES, pacUser, ["orders", "fills"]);
+    r.t.last().open();
+    const cid = "00000000-0000-4000-8000-000000000001";
+    r.t.last().message({ channel: "account_order_updates", data: [{ i: 5, I: cid, s: "BTC", d: "bid", ip: "1", a: "1", f: "0", os: "open", ot: "limit", li: 1 }] });
+    r.t.last().message({ channel: "account_trades", data: [{ h: 9, i: 5, I: cid, s: "BTC", p: "1", a: "1", te: "fulfill_taker", ts: "open_long", f: "0", n: "0", t: 1, li: 2 }] });
+    expect(r.of("orders").at(-1)!.orders[0].clientId).toBe(cid);
+    expect(r.of("fill")[0].fill.clientId).toBe(cid);
+  });
+
+  it("lighter: client_order_id on orders; client ids and fee (usd_amount × rate × 1e-6) per leg on fills", async () => {
+    const cred: CredentialProvider = {
+      user: async () => ({ venue: "lighter", accountIndex: LIGHTER_ACCT }),
+      authToken: async () => ({ token: "t".repeat(32), expiresAt: Date.now() + 3_600_000 }),
+    };
+    const r = await userStream(lighter, LIGHTER_ROUTES, cred, ["orders", "fills"]);
+    r.t.last().open();
+    r.t.last().message({
+      channel: `account_all_orders:${LIGHTER_ACCT}`, type: "update/account_all_orders",
+      orders: { 1: [{ order_index: 77, order_id: "77", client_order_index: 4242, client_order_id: "4242", market_index: 1, is_ask: false, status: "open", price: "1", initial_base_amount: "1", filled_base_amount: "0", remaining_base_amount: "1" }] },
+    });
+    expect(r.of("orders").at(-1)!.orders[0]).toMatchObject({ orderId: "77", clientId: "4242" });
+    // the documented example trade (websocket reference, Trade JSON): taker bid, maker ask; we are both sides
+    const trade = {
+      trade_id: 16164557907, trade_id_str: "16164557907", type: "trade", market_id: 1, size: "0.1336", price: "2181.83", usd_amount: "291.492488",
+      ask_id_str: "281476612587355", bid_id_str: "562948334068259", ask_client_id_str: "363283", bid_client_id_str: "23004521241",
+      ask_account_id: LIGHTER_ACCT, bid_account_id: LIGHTER_ACCT, is_maker_ask: true, timestamp: 1773854156654, taker_fee: 196, maker_fee: 28,
+    };
+    r.t.last().message({ channel: `account_all_trades:${LIGHTER_ACCT}`, type: "update/account_all_trades", trades: { 1: [trade] } });
+    expect(r.of("fill").map(f => [f.fill.side, f.fill.liquidity, f.fill.clientId, f.fill.fee, f.fill.feeToken])).toEqual([
+      ["sell", "maker", "363283", "0.008161789664", "USDC"],
+      ["buy", "taker", "23004521241", "0.057132527648", "USDC"],
+    ]);
+    // a zero fee is omitted by the venue (omitempty) → "0"
+    r.t.last().message({ channel: `account_all_trades:${LIGHTER_ACCT}`, type: "update/account_all_trades", trades: { 1: [{ ...trade, trade_id_str: "2", maker_fee: undefined, bid_account_id: 5 }] } });
+    expect(r.of("fill").at(-1)!.fill).toMatchObject({ side: "sell", liquidity: "maker", fee: "0" });
+  });
+
+  it("arcus: clientId on orders and fills; signed position size, mark, value, margin; no liquidation price", async () => {
+    const r = await userStream(arcus, ARCUS_ROUTES, arcUser, ["positions", "orders", "fills"]);
+    r.t.last().open();
+    for (const f of fixtureFrames("arcus", "private-account").slice(1)) r.t.last().message(f);
+    expect(r.of("fills")[0].fills.map(f => f.clientId)).toEqual(["dummy-id-12", "dummy-id-14"]);
+    r.t.last().message({ type: "channel_data", channel: "orders", id: EVM, contents: { orderId: "o-1", clientId: "my-order-42", marketId: 1, side: "BUY", status: "OPEN", price: "1", originalSize: "1", remainingSize: "1" } });
+    expect(r.of("orders").at(-1)!.orders[0]).toMatchObject({ orderId: "o-1", clientId: "my-order-42" });
+    r.t.last().message({ type: "channel_data", channel: "positions", id: EVM, contents: { isSnapshot: false, marketId: 1, side: "SHORT", size: "-0.2", averageEntryPrice: "80000", markPx: "79000", positionValueNotional: "15800", unrealizedPnl: "200", marginUsed: "790" } });
+    expect(r.of("positions").at(-1)!.positions[0]).toEqual(expect.objectContaining({
+      symbol: "BTC-USD", side: "short", size: "0.2", markPrice: "79000", positionValue: "15800", unrealizedPnl: "200", marginUsed: "790", liquidationPrice: null,
+    }));
+  });
+});
+
+describe("lighter: liquidation price \"0\" and client id 0 (review)", () => {
+  const cred: CredentialProvider = {
+    user: async () => ({ venue: "lighter", accountIndex: LIGHTER_ACCT }),
+    authToken: async () => ({ token: "t".repeat(32), expiresAt: Date.now() + 3_600_000 }),
+  };
+  const pos = (liq: string) => ({
+    market_id: 1, symbol: "BTC", sign: -1, position: "0.5", avg_entry_price: "80000", position_value: "40000",
+    unrealized_pnl: "-10", realized_pnl: "0", liquidation_price: liq, allocated_margin: "0",
+  });
+
+  it("an open position with liquidation_price \"0\" → null; a positive one is kept", async () => {
+    const r = await userStream(lighter, LIGHTER_ROUTES, cred, ["positions"]);
+    r.t.last().open();
+    r.t.last().message({ channel: `account_all_positions:${LIGHTER_ACCT}`, type: "subscribed/account_all_positions", positions: { 1: pos("0"), 0: { ...pos("3100.5"), market_id: 0, symbol: "ETH" } } });
+    const rows = r.of("positions").at(-1)!.positions;
+    expect(rows.find(p => p.symbol === "BTC")).toMatchObject({ side: "short", size: "0.5", liquidationPrice: null });
+    expect(rows.find(p => p.symbol === "ETH")).toMatchObject({ liquidationPrice: "3100.5" });
+  });
+
+  it("client id 0 means none → null on orders and fills", async () => {
+    const r = await userStream(lighter, LIGHTER_ROUTES, cred, ["orders", "fills"]);
+    r.t.last().open();
+    r.t.last().message({
+      channel: `account_all_orders:${LIGHTER_ACCT}`, type: "update/account_all_orders",
+      orders: { 1: [{ order_index: 77, order_id: "77", client_order_index: 0, client_order_id: "0", market_index: 1, is_ask: true, status: "open", price: "1", initial_base_amount: "1" }] },
+    });
+    expect(r.of("orders").at(-1)!.orders[0].clientId).toBeNull();
+    r.t.last().message({
+      channel: `account_all_trades:${LIGHTER_ACCT}`, type: "update/account_all_trades",
+      trades: { 1: [{ trade_id_str: "3", market_id: 1, size: "1", price: "1", usd_amount: "1", ask_id_str: "77", bid_id_str: "9", ask_client_id: 0, ask_client_id_str: "0", bid_client_id_str: "5", ask_account_id: LIGHTER_ACCT, bid_account_id: 2, is_maker_ask: true, timestamp: 1 }] },
+    });
+    expect(r.of("fill").at(-1)!.fill.clientId).toBeNull();
+  });
+});
