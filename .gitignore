@@ -20,3 +20,9 @@ CLAUDE.md
 .omc/
 GROWTH.md
 .playwright-mcp/
+
+# macOS Finder metadata
+.DS_Store
+
+# Local mainnet verification log (wallet addresses, balances) — kept out of the repo
+docs/MAINNET-VERIFICATION-STATUS.md
