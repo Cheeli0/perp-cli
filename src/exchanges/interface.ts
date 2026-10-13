@@ -15,7 +15,8 @@ export interface ExchangeMarketInfo {
   volume24h: string | null;
   /** null = venue does not publish open interest (never "0" as a stand-in) */
   openInterest: string | null;
-  maxLeverage: number;
+  /** null = the venue does not publish it (Aster: the public exchangeInfo carries no leverage) */
+  maxLeverage: number | null;
   /** quantity precision (e.g. 0 = integers only, 2 = 0.01); null = unknown */
   sizeDecimals: number | null;
   /** lot step size (e.g. "1", "0.1", "0.001"); null = unknown */
@@ -38,13 +39,14 @@ export interface ExchangeMarketInfo {
  * A venue that publishes no tiers (`marginTiers === null`) has one flat cap,
  * `maxLeverage`, at every size — that is the venue's definition, not a fallback.
  */
-export function maxLeverageForNotional(market: ExchangeMarketInfo, notional: number): number {
+export function maxLeverageForNotional(market: ExchangeMarketInfo, notional: number): number | null {
   if (!Number.isFinite(notional)) {
     throw new Error(`maxLeverageForNotional: notional must be finite (got ${notional})`);
   }
   const tiers = market.marginTiers;
-  if (tiers === null || tiers.length === 0) return market.maxLeverage;
-  let effective = market.maxLeverage;
+  if (tiers === null || tiers.length === 0) return market.maxLeverage; // null = not published
+  // No headline but published tiers: the first (lowest-notional) tier is the cap below every threshold.
+  let effective = market.maxLeverage ?? tiers[0].maxLeverage;
   for (const t of tiers) {
     if (notional >= t.lowerBound) effective = t.maxLeverage;
   }

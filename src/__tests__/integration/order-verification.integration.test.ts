@@ -228,7 +228,8 @@ describe("Hyperliquid mainnet — order verification (read-only)", () => {
       // Allow equality since some may still be 50x; the key check is that the
       // field is populated and numeric
       expect(lowCap.maxLeverage).toBeGreaterThan(0);
-      expect(lowCap.maxLeverage).toBeLessThanOrEqual(btc!.maxLeverage);
+      expect(btc!.maxLeverage).not.toBeNull(); // HL publishes it
+      expect(lowCap.maxLeverage).toBeLessThanOrEqual(btc!.maxLeverage!);
     }
   });
 

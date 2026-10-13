@@ -205,6 +205,11 @@ type ResolvedSigner = {
  */
 export const ASTER_INCOME_MAX_PAGES = 60;
 
+/** GET /fapi/v3/klines maximum rows per request (docs: limit max 1500). */
+const ASTER_KLINE_PAGE = 1500;
+/** Page cap for one range (150 000 bars). */
+const ASTER_KLINE_MAX_PAGES = 100;
+
 export class AsterAdapter implements ExchangeAdapter {
   readonly name = "aster";
   readonly chain = "bnb";
@@ -450,36 +455,49 @@ export class AsterAdapter implements ExchangeAdapter {
       this._loadFundingInfo(),
     ]);
 
+    if (!Array.isArray(info?.symbols)) {
+      throw new PerpError("EXCHANGE_ERROR", `Aster exchangeInfo has no symbol list (${JSON.stringify(info).slice(0, 120)})`, { exchange: "aster" });
+    }
+    if (!Array.isArray(tickers)) {
+      throw new PerpError("EXCHANGE_ERROR", `Aster 24h ticker is not a list (${JSON.stringify(tickers).slice(0, 120)})`, { exchange: "aster" });
+    }
     const tickerMap = new Map<string, Record<string, unknown>>();
-    for (const t of tickers ?? []) {
+    for (const t of tickers) {
       tickerMap.set(String(t.symbol), t);
     }
 
-    let premiumMap = new Map<string, Record<string, unknown>>();
-    try {
-      const premiums = await this._publicGet("/fapi/v3/premiumIndex") as Array<Record<string, unknown>>;
-      premiumMap = new Map(premiums.map(p => [String(p.symbol), p]));
-    } catch { /* non-critical */ }
+    // The mark price comes from premiumIndex only: a failed read throws (never a "0" / last-trade
+    // stand-in), and a symbol missing from it is left out of the list below.
+    const premiums = await this._publicGet("/fapi/v3/premiumIndex");
+    if (!Array.isArray(premiums)) {
+      throw new PerpError("EXCHANGE_ERROR", `Aster premiumIndex is not a list (${JSON.stringify(premiums).slice(0, 120)})`, { exchange: "aster" });
+    }
+    const premiumMap = new Map((premiums as Array<Record<string, unknown>>).map(p => [String(p.symbol), p]));
 
-    this._ingestPriceFilters(info?.symbols ?? []);
+    this._ingestPriceFilters(info.symbols);
 
-    const tradingSymbols = (info?.symbols ?? [])
-      .filter((s) => String(s.contractType) === "PERPETUAL" && String(s.status) === "TRADING");
+    // USDT-quoted perps only: the CLI symbol mapping (ETH ↔ ETHUSDT) cannot address the USD1 / U
+    // quoted markets (live 2026-10-13: 22 USD1 + 2 U), so listing them would offer untradeable rows.
+    const tradingSymbols = info.symbols
+      .filter((s) => String(s.contractType) === "PERPETUAL" && String(s.status) === "TRADING" && String(s.quoteAsset) === "USDT");
 
-    const result = tradingSymbols.map((s) => {
+    const result = tradingSymbols.flatMap((s) => {
       const sym = String(s.symbol);
       const ticker = tickerMap.get(sym);
       const premium = premiumMap.get(sym);
-      const maxLev = Number(s.maxLeverage ?? 50);
+      const mark = Number(premium?.markPrice);
+      if (premium === undefined || !(mark > 0)) return []; // no published mark price → not listed at 0
+      // Public exchangeInfo carries no leverage (the bracket endpoint is signed) → unknown.
+      const maxLev = null;
 
       const lotFilter = (s.filters as Array<Record<string, unknown>> | undefined)
         ?.find(f => f.filterType === "LOT_SIZE");
 
       const fundingHours = this._fundingHoursCache.get(this._fromApi(sym));
 
-      return {
+      return [{
         symbol: this._fromApi(sym),
-        markPrice: String(premium?.markPrice ?? ticker?.lastPrice ?? "0"),
+        markPrice: String(premium.markPrice),
         indexPrice: premium?.indexPrice != null ? String(premium.indexPrice) : null,
         fundingRate: premium?.lastFundingRate != null ? String(premium.lastFundingRate) : null,
         volume24h: ticker?.quoteVolume != null ? String(ticker.quoteVolume) : null,
@@ -490,7 +508,7 @@ export class AsterAdapter implements ExchangeAdapter {
         stepSize: lotFilter?.stepSize != null ? String(lotFilter.stepSize) : null,
         fundingHours: fundingHours ?? null,
         marginTiers: null,
-      };
+      }];
     });
 
     this._marketsCache = result;
@@ -637,33 +655,65 @@ export class AsterAdapter implements ExchangeAdapter {
     const data = await this._publicGet("/fapi/v3/fundingRate", {
       symbol: this._toApi(symbol),
       limit: String(limit),
-    }) as Array<Record<string, unknown>>;
-
-    return (data ?? []).map((d) => ({
-      time: Number(d.fundingTime ?? 0),
-      rate: venueRateField(d.fundingRate, "fundingRate fundingRate", "aster"),
-      price: d.markPrice ? String(d.markPrice) : null,
-    }));
+    });
+    if (!Array.isArray(data)) {
+      throw new PerpError("EXCHANGE_ERROR", `Aster fundingRate history is not a list (${JSON.stringify(data).slice(0, 120)})`, { exchange: "aster" });
+    }
+    return (data as Array<Record<string, unknown>>).map((d) => {
+      const time = Number(d.fundingTime);
+      if (d.fundingTime === undefined || d.fundingTime === null || !Number.isFinite(time) || time <= 0) {
+        throw new PerpError("EXCHANGE_ERROR", `Aster fundingRate row without a numeric fundingTime: ${JSON.stringify(d).slice(0, 160)}`, { exchange: "aster" });
+      }
+      return {
+        time,
+        rate: venueRateField(d.fundingRate, "fundingRate fundingRate", "aster"),
+        price: d.markPrice ? String(d.markPrice) : null,
+      };
+    });
   }
 
+  /**
+   * Candles over [startTime, endTime]. GET /fapi/v3/klines returns at most 1500 bars per request
+   * (1501 → -1130), so the range is read in pages that start after the last bar returned — a long
+   * range is never cut to the first page. More than ASTER_KLINE_MAX_PAGES pages → INVALID_PARAMS.
+   */
   async getKlines(symbol: string, interval: string, startTime: number, endTime: number): Promise<ExchangeKline[]> {
-    const data = await this._publicGet("/fapi/v3/klines", {
-      symbol: this._toApi(symbol),
-      interval,
-      startTime: String(startTime),
-      endTime: String(endTime),
-      limit: "500",
-    }) as Array<unknown[]>;
-
-    return (data ?? []).map((k) => ({
-      time: Number(k[0]),
-      open: String(k[1]),
-      high: String(k[2]),
-      low: String(k[3]),
-      close: String(k[4]),
-      volume: String(k[5]),
-      trades: Number(k[8] ?? 0),
-    }));
+    if (!(startTime <= endTime)) {
+      throw new PerpError("INVALID_PARAMS", `Aster klines: start ${startTime} is after end ${endTime}`, {
+        remediation: "Pass a --start that is before --end",
+      });
+    }
+    const out: ExchangeKline[] = [];
+    let from = startTime;
+    for (let page = 0; from <= endTime; page++) {
+      if (page >= ASTER_KLINE_MAX_PAGES) {
+        throw new PerpError("INVALID_PARAMS", `Aster: ${interval} candles over this range need more than ${ASTER_KLINE_MAX_PAGES} requests`, {
+          remediation: "Narrow --start / --end or use a longer interval",
+        });
+      }
+      const data = await this._publicGet("/fapi/v3/klines", {
+        symbol: this._toApi(symbol), interval,
+        startTime: String(from), endTime: String(endTime), limit: String(ASTER_KLINE_PAGE),
+      });
+      if (!Array.isArray(data)) {
+        throw new PerpError("EXCHANGE_ERROR", `Aster klines is not a list (${JSON.stringify(data).slice(0, 120)})`, { exchange: "aster" });
+      }
+      for (const k of data as unknown[][]) {
+        const time = Number(k[0]);
+        const trades = Number(k[8]);
+        if (!Number.isFinite(time) || !Number.isFinite(trades)) {
+          throw new PerpError("EXCHANGE_ERROR", `Aster kline row without open time / trade count: ${JSON.stringify(k).slice(0, 120)}`, { exchange: "aster" });
+        }
+        out.push({ time, open: String(k[1]), high: String(k[2]), low: String(k[3]), close: String(k[4]), volume: String(k[5]), trades });
+      }
+      if (data.length < ASTER_KLINE_PAGE) break;
+      const next = Number((data[data.length - 1] as unknown[])[0]) + 1;
+      if (next <= from) {
+        throw new PerpError("EXCHANGE_ERROR", `Aster klines page did not advance past ${from}`, { exchange: "aster" });
+      }
+      from = next;
+    }
+    return out;
   }
 
   // ── Account ──

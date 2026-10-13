@@ -137,6 +137,27 @@ export function findRate(ratesByExchange: RateMap, exchange: string, symbol: str
   return map.get(upper) ?? map.get(upper + "-PERP") ?? map.get(upper.replace(/-PERP$/, ""));
 }
 
+/**
+ * Leverage for an entry: the configured value, capped by every leg's published max.
+ * A leg whose max is unpublished (undefined) is not a cap — the venue enforces its own
+ * limit on setLeverage / the order — and `logUnknown` names it, so it is never read as 1x.
+ */
+export function cappedLeverage(
+  configured: number,
+  legs: { exchange: string; maxLeverage: number | undefined }[],
+  logUnknown: (msg: string) => void,
+): number {
+  let leverage = configured;
+  for (const leg of legs) {
+    if (leg.maxLeverage === undefined) {
+      logUnknown(`  [LEV] ${leg.exchange} does not publish a max leverage — using ${configured}x; the venue enforces its cap`);
+    } else {
+      leverage = Math.min(leverage, leg.maxLeverage);
+    }
+  }
+  return leverage;
+}
+
 /** Match a symbol against a target, accounting for -PERP suffix variations. */
 export function matchSymbol(s: string, target: string): boolean {
   const u = s.toUpperCase();
@@ -212,7 +233,11 @@ async function marketFundingHours(adapter: ExchangeAdapter, exchangeName: string
   return getFundingHours(exchangeName);
 }
 
-/** Score a symbol's funding rate using history. Returns null if insufficient data. */
+/**
+ * Score a symbol's funding rate using history. null = not enough data (fewer than 2 history
+ * points, or the per-symbol funding basis is unknown). A failed read THROWS — callers must not
+ * mistake a 429 / timeout for "history too thin".
+ */
 export async function scoreFunding(
   adapter: ExchangeAdapter,
   symbol: string,
@@ -223,21 +248,21 @@ export async function scoreFunding(
   const key = `${exchangeName}:${symbol}`;
   const cached = cache?.get(key);
   if (cached && Date.now() - cached.ts < 10 * 60 * 1000) return cached.score;
-  // Outside the try: an unknown venue is a configuration error, not "no score".
   const venueHours = hasPerSymbolFundingHours(adapter) ? null : getFundingHours(exchangeName);
-  try {
-    const fH = venueHours !== null ? venueHours : await marketFundingHours(adapter, exchangeName, symbol);
-    if (fH === null) return null; // per-symbol basis unknown — the hourly rate would be a guess
-    const history = await adapter.getFundingHistory(symbol, periods);
-    if (history.length < 2) return null;
-    const rates = history.map(h => parseFloat(h.rate));
-    const avgRate = rates.reduce((s, r) => s + r, 0) / rates.length;
-    const consistency = rates.filter(r => r > 0).length / rates.length;
-    const annualized = annualizeHourlyRate(avgRate / fH);
-    const score: FundingScore = { symbol, exchange: exchangeName, avgRate, consistency, annualized, payments: rates.length };
-    cache?.set(key, { score, ts: Date.now() });
-    return score;
-  } catch { return null; }
+  const fH = venueHours !== null ? venueHours : await marketFundingHours(adapter, exchangeName, symbol);
+  if (fH === null) return null; // per-symbol basis unknown — the hourly rate would be a guess
+  const history = await adapter.getFundingHistory(symbol, periods);
+  if (history.length < 2) return null;
+  const rates = history.map(h => parseFloat(h.rate));
+  if (rates.some(r => !Number.isFinite(r))) {
+    throw new PerpError("EXCHANGE_ERROR", `${exchangeName} ${symbol}: funding history has a non-numeric rate`, { exchange: exchangeName });
+  }
+  const avgRate = rates.reduce((s, r) => s + r, 0) / rates.length;
+  const consistency = rates.filter(r => r > 0).length / rates.length;
+  const annualized = annualizeHourlyRate(avgRate / fH);
+  const score: FundingScore = { symbol, exchange: exchangeName, avgRate, consistency, annualized, payments: rates.length };
+  cache?.set(key, { score, ts: Date.now() });
+  return score;
 }
 
 /**
@@ -259,7 +284,8 @@ export async function fetchRates(
     m.fundingHours = await marketFundingHours(adapter, exchangeName, m.symbol);
   }
 
-  const result: { symbol: string; rate: number; price: number; sizeDecimals: number; maxLeverage: number; fundingHours: number }[] = [];
+  // maxLeverage undefined = not published by the venue (callers cap by published maxes only — see cappedLeverage).
+  const result: { symbol: string; rate: number; price: number; sizeDecimals: number; maxLeverage?: number; fundingHours: number }[] = [];
   for (const m of withRates) {
     // Skip aster symbols with unknown funding period — the hourly rate would be a guess.
     if (m.fundingHours === null) continue;
@@ -271,7 +297,7 @@ export async function fetchRates(
       rate: parseFloat(m.fundingRate!),
       price: parseFloat(m.markPrice),
       sizeDecimals: m.sizeDecimals,
-      maxLeverage: m.maxLeverage,
+      maxLeverage: m.maxLeverage ?? undefined,
       fundingHours: m.fundingHours,
     });
   }

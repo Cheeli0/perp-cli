@@ -26,7 +26,7 @@ export interface TradeValidation {
     symbol: string;
     markPrice: number;
     fundingRate: number;
-    maxLeverage: number;
+    maxLeverage: number | null;
   };
   timestamp: string;
 }
@@ -119,7 +119,12 @@ export async function validateTrade(
   // reject an order sized past a threshold even though the flat value allows it,
   // so resolve the cap AT THIS ORDER'S NOTIONAL.
   const effectiveMax = maxLeverageForNotional(market as ExchangeMarketInfo, notional);
-  const leverage = params.leverage ?? effectiveMax;
+  // A venue that publishes no max leverage (Aster's public exchangeInfo): the margin estimate
+  // uses 1x — the most conservative requirement — and says so; the venue enforces its own cap.
+  if (effectiveMax === null && params.leverage === undefined) {
+    warnings.push(`Max leverage for ${sym} is not published by ${adapter.name} — margin estimated at 1x; pass --leverage for a tighter estimate`);
+  }
+  const leverage = params.leverage ?? effectiveMax ?? 1;
   if (!Number.isFinite(leverage) || leverage <= 0) {
     throw new Error(`No usable leverage for ${sym} (resolved=${leverage}); supply params.leverage explicitly.`);
   }
@@ -258,7 +263,7 @@ export async function validateTrade(
 
   const valid = checks.every(c => c.passed);
 
-  if (leverage > effectiveMax) {
+  if (effectiveMax !== null && market.maxLeverage !== null && leverage > effectiveMax) {
     // Compare against the tier that applies at this notional, not the headline
     // cap — otherwise the check is tautological whenever leverage defaulted FROM
     // maxLeverage, and it never fires for the tiered case it exists to catch.

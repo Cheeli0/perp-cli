@@ -16,6 +16,7 @@ import {
   transferUsdcToPerp,
   getPerpSymbol,
   findRate,
+  cappedLeverage,
   getPriceEstimate,
   fetchRates,
   botSpotPerpMatches, assertFundingArbLegs, cancelBotSymbols, collectFundingSince } from "./funding-arb-utils.js";
@@ -661,9 +662,10 @@ export class FundingArbStrategy implements Strategy {
 
           // Determine leverage for this symbol
           const configLeverage = params.leverage ?? 3;
-          const longMaxLev = findRate(ratesByExchange, best.longExchange, best.symbol)?.maxLeverage ?? 1;
-          const shortMaxLev = findRate(ratesByExchange, best.shortExchange, best.symbol)?.maxLeverage ?? 1;
-          const leverage = Math.min(configLeverage, longMaxLev, shortMaxLev);
+          const leverage = cappedLeverage(configLeverage, [
+            { exchange: best.longExchange, maxLeverage: findRate(ratesByExchange, best.longExchange, best.symbol)?.maxLeverage },
+            { exchange: best.shortExchange, maxLeverage: findRate(ratesByExchange, best.shortExchange, best.symbol)?.maxLeverage },
+          ], ctx.log);
 
           // Set leverage on both exchanges before ordering
           try {
@@ -1062,9 +1064,8 @@ export class FundingArbStrategy implements Strategy {
       const configLeverage = params.leverage ?? 3;
       const perpSymbolUpper = getPerpSymbol(opp.symbol, opp.shortExchange).toUpperCase();
       const perpMaxLev = findRate(ratesByExchange, opp.shortExchange, perpSymbolUpper)?.maxLeverage
-        ?? findRate(ratesByExchange, opp.shortExchange, opp.symbol.toUpperCase())?.maxLeverage
-        ?? 1;
-      const leverage = Math.min(configLeverage, perpMaxLev);
+        ?? findRate(ratesByExchange, opp.shortExchange, opp.symbol.toUpperCase())?.maxLeverage;
+      const leverage = cappedLeverage(configLeverage, [{ exchange: opp.shortExchange, maxLeverage: perpMaxLev }], ctx.log);
 
       // Set leverage on perp before ordering
       try {
