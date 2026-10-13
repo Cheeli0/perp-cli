@@ -319,21 +319,31 @@ export async function approveRisexAgentWith(opts: ApproveRisexAgentOpts, deps: R
     throw e;
   }
 
+  // A failed status read is treated like "not Active": the signer is registered (or may be) with
+  // FULL permissions, so it is never left behind unrecorded and unrevoked.
   let status: number | null = null;
+  let readError: string | null = null;
   for (let i = 0; i < CONFIRM_ATTEMPTS; i++) {
-    status = await sessionKeyStatus(client, account, signerAddress);
+    try {
+      status = await sessionKeyStatus(client, account, signerAddress);
+      readError = null;
+    } catch (e) {
+      status = null;
+      readError = extractErrorMessage(e);
+    }
     if (status === STATUS_ACTIVE) break;
     await deps.sleep(CONFIRM_INTERVAL_MS);
   }
   if (status !== STATUS_ACTIVE) {
+    const what = readError !== null ? `its status could not be read (${readError})` : `it did not become Active (status ${String(status)})`;
     // It may still activate with FULL permissions: revoke it now (gasless, master-signed).
     const r = await revokeAfterFailure([]);
     if (r.revoked) {
-      throw new PerpError("APPROVE_FAILED", `RISEx signer ${signerAddress} did not become Active (status ${String(status)}); it was revoked and its key deleted`, {
+      throw new PerpError("APPROVE_FAILED", `RISEx signer ${signerAddress}: ${what}; it was revoked and its key deleted`, {
         exchange: "risex", remediation: `Retry: perp${net} wallet agent approve risex`,
       });
     }
-    throw new PerpError("APPROVE_PARTIAL", `RISEx signer ${signerAddress} is not Active (status ${String(status)}) and the automatic revoke failed (${r.why})`, {
+    throw new PerpError("APPROVE_PARTIAL", `RISEx signer ${signerAddress}: ${what}, and the automatic revoke failed (${r.why})`, {
       exchange: "risex",
       remediation: `It may activate with FULL permissions. Revoke it: ${revokeHint} (or in the RISEx app). Its key is kept in OWS wallet "${agentWalletName}" and recorded as NOT trading-only`,
     });
@@ -367,6 +377,11 @@ export async function approveRisexAgentWith(opts: ApproveRisexAgentOpts, deps: R
   }
 
   return metaOf(true, RISEX_NON_TRADING_PERMISSIONS.slice(), restricted.verifiedAt);
+}
+
+/** Venue status of a stored signer (1 = Active, 3 = Revoked; anything else = not registered). */
+export async function risexSignerStatus(meta: RisexAgentMeta): Promise<number | null> {
+  return sessionKeyStatus(risexClient(meta.network), meta.accountAddress, meta.signerAddress);
 }
 
 /** Revoke a stored signer with the master wallet that owns it. */

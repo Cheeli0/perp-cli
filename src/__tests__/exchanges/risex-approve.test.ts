@@ -25,7 +25,7 @@ function walletSigner(): EvmSigner {
   return { getAddress: () => w.address, signTypedData: (d, t, v) => w.signTypedData(d, t, v), signMessage: m => w.signMessage(m) };
 }
 
-type Over = { register?: () => Response; status?: number; revoke?: () => Response };
+type Over = { register?: () => Response; status?: number; statusRead?: () => Response; revoke?: () => Response };
 let fetchMock: ReturnType<typeof vi.fn>;
 let posts: string[];
 function routes(o: Over = {}): void {
@@ -37,7 +37,7 @@ function routes(o: Over = {}): void {
       case "/v1/auth/eip712-domain": return ok({ name: "RISEx", version: "1", chain_id: "4153", verifying_contract: RISEX_PINS.mainnet.auth });
       case "/v1/system/config": return ok({ addresses: { router: RISEX_PINS.mainnet.router, auth: RISEX_PINS.mainnet.auth }, is_maintenance_mode: false });
       case "/v1/auth/register-signer": return o.register ? o.register() : ok({ transaction_hash: "0xreg", success: true });
-      case "/v1/auth/session-key-status": return ok({ status: o.status ?? 1 });
+      case "/v1/auth/session-key-status": return o.statusRead ? o.statusRead() : ok({ status: o.status ?? 1 });
       case "/v1/auth/revoke-signer": return o.revoke ? o.revoke() : ok({ transaction_hash: "0xrev", success: true });
     }
     if (url.pathname.startsWith("/v1/nonce-state/")) return ok({ nonce_anchor: "3", current_bitmap_index: 0, bitmap: "0x0" });
@@ -139,6 +139,24 @@ describe("approveRisexAgentWith", () => {
     routes({ status: 0, revoke: () => err(500, "Internal", "E0701") });
     await expect(approveRisexAgentWith(OPTS, deps())).rejects.toMatchObject({ structured: { code: "APPROVE_PARTIAL" } });
     expect(wallets.has(WALLET)).toBe(true);
+    expect(saved[0].permissions.tradingOnly).toBe(false);
+  });
+
+  it("a failing status read after registration is treated as not Active: revoked + dropped, or kept + recorded", async () => {
+    routes({ statusRead: () => err(503, "Unavailable", "upstream down") });
+    const d = deps();
+    const e = await approveRisexAgentWith(OPTS, d).catch((x: unknown) => x as PerpError) as PerpError;
+    expect(e.structured.code).toBe("APPROVE_FAILED");
+    expect(e.message).toMatch(/could not be read/);
+    expect(posts).toContain("/v1/auth/revoke-signer");
+    expect(d.deleted).toEqual([WALLET]);
+    expect(saved).toEqual([]);
+
+    wallets.clear();
+    routes({ statusRead: () => { throw new TypeError("fetch failed"); }, revoke: () => err(500, "Internal", "E0701") });
+    await expect(approveRisexAgentWith(OPTS, deps())).rejects.toMatchObject({ structured: { code: "APPROVE_PARTIAL" } });
+    expect(wallets.has(WALLET)).toBe(true);
+    expect(saved).toHaveLength(1);
     expect(saved[0].permissions.tradingOnly).toBe(false);
   });
 

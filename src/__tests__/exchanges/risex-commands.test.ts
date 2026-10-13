@@ -10,12 +10,14 @@ import { resolve } from "node:path";
 const preflight = vi.fn();
 const revoke = vi.fn();
 const verify = vi.fn();
+const signerStatus = vi.fn();
 vi.mock("../../exchanges/risex/agent.js", async (orig) => ({
   ...(await orig<typeof import("../../exchanges/risex/agent.js")>()),
   risexRotatePreflight: (...a: unknown[]) => preflight(...a),
   revokeRisexAgent: (...a: unknown[]) => revoke(...a),
   approveRisexAgent: vi.fn(async () => { throw new Error("approve must not run in this test"); }),
   verifyRisexAgent: (...a: unknown[]) => verify(...a),
+  risexSignerStatus: (...a: unknown[]) => signerStatus(...a),
 }));
 
 import "../../exchanges/venues/index.js";
@@ -41,7 +43,7 @@ const PARAMS: ApproveAgentParams = {
 };
 
 beforeEach(() => {
-  preflight.mockReset(); revoke.mockReset(); verify.mockReset();
+  preflight.mockReset(); revoke.mockReset(); verify.mockReset(); signerStatus.mockReset();
   vi.stubGlobal("fetch", vi.fn(async (u: string) => { throw new Error(`unexpected network call: ${u}`); }));
 });
 
@@ -52,6 +54,25 @@ describe("approve risex --rotate", () => {
     await expect(approveVenueAgent(PARAMS)).rejects.toThrow(/no RISE-chain ETH/);
     expect(preflight).toHaveBeenCalledTimes(1);
     expect(revoke).not.toHaveBeenCalled();
+  });
+});
+
+describe("approve risex --rotate: old signer status decides revoke vs local forget", () => {
+  it("never registered (status 0) → not revoked on the venue, only forgotten locally", async () => {
+    writeMeta({ ...META, permissions: { tradingOnly: false, disabled: [], verifiedAt: null } });
+    preflight.mockResolvedValue(undefined);
+    signerStatus.mockResolvedValue(0);
+    await expect(approveVenueAgent(PARAMS)).rejects.toThrow(/approve must not run/);
+    expect(revoke).not.toHaveBeenCalled();
+  });
+
+  it("Active (status 1) → revoked before the new approve", async () => {
+    writeMeta(META);
+    preflight.mockResolvedValue(undefined);
+    signerStatus.mockResolvedValue(1);
+    revoke.mockResolvedValue({ txHash: "0x1" });
+    await expect(approveVenueAgent(PARAMS)).rejects.toThrow(/approve must not run/);
+    expect(revoke).toHaveBeenCalledTimes(1);
   });
 });
 

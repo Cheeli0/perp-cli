@@ -822,7 +822,7 @@ export async function approveVenueAgent(p: ApproveAgentParams): Promise<ApproveA
       });
     }
     const expiresAt = parseExpiresInParam(p.expiresIn);
-    const { approveRisexAgent, revokeRisexAgent, risexAgentWalletName, risexRotatePreflight } = await import("../exchanges/risex/agent.js");
+    const { approveRisexAgent, revokeRisexAgent, risexAgentWalletName, risexRotatePreflight, risexSignerStatus } = await import("../exchanges/risex/agent.js");
     acquireLock("risex");
     try {
       const existing = getVenueAgent("risex", agentName);
@@ -835,7 +835,10 @@ export async function approveVenueAgent(p: ApproveAgentParams): Promise<ApproveA
         // Rotate: the new signer's checks (pins, maintenance, master gas) pass first, then a
         // venue-confirmed revoke of the old signer, then drop its key, then approve.
         await risexRotatePreflight(masterName, p.passphrase, p.network);
-        await revokeRisexAgent({ meta: existing, masterOwsWallet: masterName, passphrase: p.passphrase });
+        // A kept record whose signer never registered (or is already revoked) has nothing to
+        // revoke on the venue: it is only forgotten locally. An Active one is revoked first.
+        const status = await risexSignerStatus(existing);
+        if (status === 1) await revokeRisexAgent({ meta: existing, masterOwsWallet: masterName, passphrase: p.passphrase });
         try { loadOws().deleteWallet(existing.agentWalletName); } catch { /* already gone */ }
         deleteVenueAgent("risex", agentName);
       } else if (p.rotate && loadOws().listWallets().some((w: { name: string }) => w.name === risexAgentWalletName(masterName, p.network))) {

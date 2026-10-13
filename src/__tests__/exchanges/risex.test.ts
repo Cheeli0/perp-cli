@@ -4,7 +4,7 @@
  * test key (no network, no real wallet). Live checks are in the integration suite.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Wallet, verifyTypedData, getAddress } from "ethers";
@@ -181,12 +181,30 @@ describe("nonce manager", () => {
     expect(Date.now() - t0).toBeGreaterThanOrEqual(4_000);
   }, 15_000);
 
-  it("a stale lock (holder process gone) is taken over safely", async () => {
-    writeFileSync(join(nonceDir, "mainnet-0xfed.json.lock"), `999999999\n${Date.now()}\ndead`);
+  it("a stale lock (old AND holder process gone) is taken over safely", async () => {
+    const lock = join(nonceDir, "mainnet-0xfed.json.lock");
+    writeFileSync(lock, `999999999\n${Date.now()}\ndead`);
+    const old = new Date(Date.now() - 120_000);
+    utimesSync(lock, old, old);
     const slot = await allocateNonce("mainnet", "0xfed", async () => ({ anchor: 1n, currentBitmapIndex: 0 }), nonceDir);
     expect(slot).toEqual({ anchor: 2n, bit: 0 });
     expect(readdirSync(nonceDir).filter(f => f.includes(".lock"))).toEqual([]);
   });
+
+  it("an empty / unparseable young lock is respected (never stolen) → LOCK_HELD", async () => {
+    writeFileSync(join(nonceDir, "mainnet-0xe0.json.lock"), "");
+    await expect(allocateNonce("mainnet", "0xe0", async () => ({ anchor: 1n, currentBitmapIndex: 0 }), nonceDir))
+      .rejects.toMatchObject({ structured: { code: "LOCK_HELD" } });
+  }, 15_000);
+
+  it("an old lock whose holder is still alive is respected → LOCK_HELD", async () => {
+    const lock = join(nonceDir, "mainnet-0xa1.json.lock");
+    writeFileSync(lock, `${process.pid}\n0\nlive`);
+    const old = new Date(Date.now() - 120_000);
+    utimesSync(lock, old, old);
+    await expect(allocateNonce("mainnet", "0xa1", async () => ({ anchor: 1n, currentBitmapIndex: 0 }), nonceDir))
+      .rejects.toMatchObject({ structured: { code: "LOCK_HELD" } });
+  }, 15_000);
 
   it("concurrent allocations in one process get distinct pairs", async () => {
     const remote = async () => ({ anchor: 2n, currentBitmapIndex: 0 });
@@ -372,8 +390,13 @@ describe("adapter: placeOrder", () => {
     const badLev = MARKETS.map(m => m.market_id === "1" ? { ...m, config: { ...m.config, max_leverage: "abc" } } : m);
     routeFetch([url => url.pathname === "/v1/markets" ? ok({ markets: badLev }) : undefined, ...base]);
     await expect((await adapter()).applyLeverage("BTC", 5, null)).rejects.toMatchObject({ structured: { code: "EXCHANGE_ERROR" } });
-    routeFetch([...base, url => url.pathname === "/v1/portfolio/details" ? ok({ summary: {}, positions: [{ market_id: "1", size: "", margin_mode: 0 }] }) : undefined]);
+    routeFetch([...base, url => url.pathname === "/v1/account/position" ? ok({ position: { size: "", margin_mode: 0 } }) : undefined]);
     await expect((await adapter()).applyLeverage("BTC", 5, null)).rejects.toMatchObject({ structured: { code: "EXCHANGE_ERROR" } });
+    // An unknown margin_mode is an error, never "cross".
+    routeFetch([...base, url => url.pathname === "/v1/account/position" ? ok({ position: { size: "0", margin_mode: 7 } }) : undefined]);
+    await expect((await adapter()).applyLeverage("BTC", 5, "cross")).rejects.toThrow(/unknown margin_mode/);
+    routeFetch([...base, url => url.pathname === "/v1/portfolio/details" ? ok({ summary: {}, positions: [{ market_id: "1", size: "1", avg_entry_price: "1", mark_price: "1", liquidation_price: "0", unrealized_pnl: "0", leverage: "1" }] }) : undefined]);
+    await expect((await adapter({ signer: false })).getPositions()).rejects.toThrow(/unknown margin_mode/);
   });
 
   it("refusals before signing: wider than the match band, off-tick, below min, reduce-only market, stop orders", async () => {
@@ -486,7 +509,7 @@ describe("adapter: cancel / cancel-all / leverage", () => {
 
   it("margin-mode switch with an open position is refused before sending; leverage bounded by the market", async () => {
     routeFetch([...base,
-      url => url.pathname === "/v1/portfolio/details" ? ok({ summary: {}, positions: [{ market_id: "1", size: "0.1", margin_mode: 0 }] }) : undefined,
+      url => url.pathname === "/v1/account/position" ? ok({ position: { size: "0.1", margin_mode: 0 } }) : undefined,
       url => url.pathname === "/v1/account/leverage" ? ok({ transaction_hash: "0x3", block_number: "3", receipt: { status: 1 } }) : undefined,
     ]);
     const a = await adapter();

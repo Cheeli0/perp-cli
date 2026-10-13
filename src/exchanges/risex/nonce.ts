@@ -19,7 +19,7 @@
  * The state file holds no secrets.
  */
 
-import { closeSync, existsSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { PerpError } from "../../errors.js";
 import type { Network } from "../venue-types.js";
@@ -64,10 +64,15 @@ function pidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
 }
 
-/** A lock is stale when its holder process is gone, or it is older than LOCK_STALE_MS. */
+/**
+ * A lock is stale only when it is older than LOCK_STALE_MS AND its holder process is gone. A young
+ * lock, a live holder, or unparseable content (never written that way — the lock is linked into
+ * place complete) is respected.
+ */
 function lockIsStale(content: string, mtimeMs: number): boolean {
+  if (Date.now() - mtimeMs <= LOCK_STALE_MS) return false;
   const pid = Number(content.split("\n")[0]);
-  return !pidAlive(pid) || Date.now() - mtimeMs > LOCK_STALE_MS;
+  return !pidAlive(pid);
 }
 
 /**
@@ -92,11 +97,16 @@ async function withLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
   const deadline = Date.now() + LOCK_WAIT_MS;
   const token = `${process.pid}\n${Date.now()}\n${Math.random().toString(36).slice(2)}`;
   for (;;) {
+    // The lock is written to a private temp file first and LINKED into place (link fails if the
+    // lock exists), so a reader never sees an empty or partial lock.
+    const tmp = `${lock}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+    writeFileSync(tmp, token, { mode: 0o600 });
     try {
-      const fd = openSync(lock, "wx", 0o600);
-      try { writeFileSync(fd, token); } finally { closeSync(fd); }
+      linkSync(tmp, lock);
+      unlinkSync(tmp);
       break;
     } catch (e) {
+      try { unlinkSync(tmp); } catch { /* gone */ }
       if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
       let content: string;
       let mtimeMs: number;

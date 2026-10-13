@@ -367,7 +367,7 @@ export class RisexAdapter implements ExchangeAdapter, TradingV2 {
         liquidationPrice: positiveOrNull(p.liquidation_price),
         unrealizedPnl: decReq(p.unrealized_pnl, "unrealized_pnl"),
         leverage: lev,
-        marginMode: p.margin_mode === 1 ? "isolated" : "cross",
+        marginMode: marginModeOf(p.margin_mode),
       });
     }
     return out;
@@ -666,11 +666,11 @@ export class RisexAdapter implements ExchangeAdapter, TradingV2 {
     if (!Number.isInteger(leverage) || leverage < 1 || leverage > max) {
       throw new PerpError("INVALID_PARAMS", `RISEx ${risexSymbolOf(m)} leverage must be an integer 1..${max} (got ${leverage})`, { exchange: "risex" });
     }
-    const { positions } = await this.portfolio();
-    const row = positions.find(p => String(p.market_id) === m.market_id);
-    const hasPosition = row !== undefined && Number(decReq(row.size, "position size")) !== 0;
-    // A market without account state is in the venue's default margin mode (cross).
-    const currentMode: "cross" | "isolated" = row?.margin_mode === 1 ? "isolated" : "cross";
+    // The on-chain position slot of this market (also for a market never traded: size 0 + its mode).
+    const pos = await this.client.get<{ position?: Record<string, unknown> }>("/v1/account/position", { account: lower(account), market_id: m.market_id });
+    if (pos.position === undefined || pos.position === null) throw new PerpError("EXCHANGE_ERROR", "RISEx /v1/account/position: no position object", { exchange: "risex" });
+    const hasPosition = Number(decReq(pos.position.size, "position size")) !== 0;
+    const currentMode = marginModeOf(pos.position.margin_mode);
     const raw: unknown[] = [];
     if (marginMode !== null && marginMode !== currentMode) {
       if (hasPosition) {
@@ -785,6 +785,13 @@ export class RisexAdapter implements ExchangeAdapter, TradingV2 {
   automationGate(): PerpError {
     return unsupported(this.venue.displayName, "automation", "unattended trading on RISEx is not enabled until its trading path is verified on mainnet (and it has no TP/SL yet)", "Trade RISEx manually with perp trade …");
   }
+}
+
+/** RISEx margin_mode code → mode; anything else is an error, never a default. */
+function marginModeOf(v: unknown): "cross" | "isolated" {
+  if (v === 0) return "cross";
+  if (v === 1) return "isolated";
+  throw new PerpError("EXCHANGE_ERROR", `RISEx: unknown margin_mode ${JSON.stringify(v)}`, { exchange: "risex" });
 }
 
 function historyStatus(o: Pick<HistoryOrder, "status" | "filled_size">): OrderStatus {
