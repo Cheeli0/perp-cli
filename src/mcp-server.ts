@@ -1721,7 +1721,7 @@ server.tool(
   "trade_preview",
   `Preview a trade WITHOUT executing. Runs trade_execute's pre-send checks read-only (size parse, order validation incl. TIF, quarantine, local risk limits — never forced) and reports any refusal as valid:false with its code + remediation; also returns the estimated fill price from the book, notional, margin impact, the builder fee the order would carry, and the existing position. Venue trading fees are NOT estimated. ALWAYS call this before trade_execute and show the result to the user for confirmation. ${HL_SCOPE_NOTE}`,
   {
-    exchange: z.string().describe(`Exchange: ${listVenues().filter(v => v.create !== null).map(v => v.id).join(", ")} (aliases accepted)`),
+    exchange: z.string().describe(`Exchange: ${listVenues().filter(v => v.roles.includes("trading")).map(v => v.id).join(", ")} (aliases accepted)`),
     symbol: z.string().describe("Trading symbol (e.g., BTC, ETH, SOL)"),
     side: z.enum(["buy", "sell"]).describe("Order side"),
     size: z.string().describe("Order size (base currency units, e.g., '0.1' for 0.1 BTC)"),
@@ -1871,7 +1871,7 @@ server.tool(
   "trade_execute",
   `Execute a REAL trade on the server's network (meta.network; PERP_NETWORK, default mainnet). IMPORTANT: Always call trade_preview first and get explicit user confirmation before calling this tool. Refused with RISK_VIOLATION when the order breaches the local risk limits (perp risk set; there is no override over MCP) or when the symbol is quarantined (only reduce-only orders pass). Every order is written to the execution log. Supports market and limit orders. Returns the uniform OrderResult (status, finality, filledSize, execution: slippage / protection price / TIF sent) with the raw venue response under \`legacy\`, plus top-level filledSize / requestedSize / partial. Outcomes: an unknown outcome (transport failure after send, or a non-final venue ack) → ok:false, code ORDER_PENDING, executed:false, pending:true and a "do NOT resubmit" remediation — the symbol is quarantined for opening orders until a human clears it; a final rejection / cancel with nothing filled → ORDER_REJECTED, executed:false; a cancel after a partial fill → executed:true, partial:true with the real filledSize. ${HL_SCOPE_NOTE}`,
   {
-    exchange: z.string().describe(`Exchange: ${listVenues().filter(v => v.create !== null).map(v => v.id).join(", ")} (aliases accepted)`),
+    exchange: z.string().describe(`Exchange: ${listVenues().filter(v => v.roles.includes("trading")).map(v => v.id).join(", ")} (aliases accepted)`),
     symbol: z.string().describe("Trading symbol (e.g., BTC, ETH, SOL)"),
     side: z.enum(["buy", "sell"]).describe("Order side"),
     size: z.string().describe("Order size (base currency units)"),
@@ -2011,7 +2011,7 @@ server.tool(
   "trade_close",
   `Close an existing position. IMPORTANT: Call trade_preview first with the opposite side to show impact, then get user confirmation. Verified close: \`closedSize\` is the measured / venue-final fill (one residual market close is attempted); a residual still open → ORDER_PARTIAL error (symbol quarantined). Includes the uniform OrderResult of the reduce-only market order. ${HL_SCOPE_NOTE}`,
   {
-    exchange: z.string().describe(`Exchange: ${listVenues().filter(v => v.create !== null).map(v => v.id).join(", ")} (aliases accepted)`),
+    exchange: z.string().describe(`Exchange: ${listVenues().filter(v => v.roles.includes("trading")).map(v => v.id).join(", ")} (aliases accepted)`),
     symbol: z.string().describe("Symbol to close (e.g., BTC, ETH)"),
   },
   async ({ exchange, symbol }) => {

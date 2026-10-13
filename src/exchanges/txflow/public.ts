@@ -192,10 +192,14 @@ export function joinSnapshot(dir: readonly TxflowMarketMeta[], ctxs: readonly Tx
   return out;
 }
 
-/** Hourly funding fraction for one ctx, or null when absent or the interval is not one hour. */
+/**
+ * Hourly funding fraction for one ctx, or null (unknown) when the rate is absent or the one-hour
+ * interval cannot be PROVEN from next − prev funding time (a missing time is unknown, never assumed 1h).
+ */
 export function hourlyFundingOf(ctx: TxflowCtx): string | null {
   if (ctx.fundingPct === null) return null;
-  if (ctx.nextFundingTime !== null && ctx.prevFundingTime !== null && ctx.nextFundingTime - ctx.prevFundingTime !== TXFLOW_SETTLEMENT_MS) return null;
+  if (ctx.nextFundingTime === null || ctx.prevFundingTime === null) return null;
+  if (ctx.nextFundingTime - ctx.prevFundingTime !== TXFLOW_SETTLEMENT_MS) return null;
   return percentToFraction(ctx.fundingPct);
 }
 

@@ -1631,3 +1631,12 @@ qfex: {
 - **부수 효과 없음:** `reduceOnlyGate()`는 `null`이 됐지만 자동화는 위 자동화 게이트가 따로 막는다. Q2 해제로 열린 것은 수동 reduce-only 명령뿐이다.
 
 **러너**: `scripts/e2e`에는 프로필·`DESIGN_ITEMS` Q1–Q23·`ITEM_VENUES`/`NOT_COVERED` 항목만 추가했다. 공통 trade 단계 중 qfex에서 `CAPABILITY_UNSUPPORTED`로 멈추는 것은 amend(Q5), stop·TP/SL(Q21), resting reduce-only limit(GTC·ALO, `scale-tp` 포함)에 의존하는 단계다(의도된 동작, `docs/TEST-PLAN.md` §9.2). 시장가·IOC reduce-only 청산 단계는 Q2 해제로 실행된다.
+
+
+## 15. RISEx · TxFlow (9·10번째 venue, 2026-10-14)
+
+> 계획: `.omc/plans/venues-risex-txflow.md` (로컬). 결정: Q-R2 (signer on-chain trading-only 제한), Q-R3 (RISEx 입출금 앱 전용), Q-T1 (TxFlow bulk funding = WS one-shot snapshot).
+
+**TxFlow (`txflow` | `txf`)** — `roles: ["marketData"]`, `capabilities: null`, `apiStatus: unofficial` (공식 API 없음; app.txflow.com 이 쓰는 비공식 HL-style `POST /info` + WS). `perpMeta` 디렉터리(음수 `szDecimals` → 정확한 lot step), WS `allAssetCtxs` 1회 스냅샷을 coin id(=perpMeta `index`)로 조인, funding 은 %/h → 소수/h(정확한 두 자리 이동), `fundingVerified: false`. 403 / 200+`{message}` / 형태 변경은 `EXCHANGE_ERROR`, fallback 없음. 모든 계정·거래·자금·agent·builder·봇 경로는 요청 전에 `CAPABILITY_UNSUPPORTED` (`venue.ts roleUnsupported`). JSON `venueApi` / 행별 `apiStatus`, 사람 출력 각주, MCP meta, 랜딩 화면에 "unofficial" 표기.
+
+**RISEx (`risex` | `rise`)** — RISE chain on-chain 오더북, USDC. account(master)는 설정만 서명, 모든 주문은 session signer 의 EIP-712 `VerifyWitness` permit. 승인 = master `RegisterSigner` + signer `VerifySigner` → signer 가 거래(permission 2) 외 모든 권한에 `DisablePermission` 서명, master 가 on-chain 전송(가스 필요) → `hasPermission` 으로 최종 상태 증명; 실패 시 자동 revoke. 증거: `src/__tests__/fixtures/risex/permissions-evidence.json`. Funding: `current_funding_rate` = 직전 정산 시간당 값 (`fundingVerified: true`, 증거 `funding-payments-evidence.json`). nonce: (anchor+1, bit) 를 파일 락 아래 전송 전에 기록·소각, 재사용 없음. 결과 불명 → 1회 조회(nonce 소비 여부, client id) 후 `ORDER_PENDING` + quarantine. 입출금 명령은 `CAPABILITY_UNSUPPORTED` (앱 전용), testnet faucet 만 지원. TP/SL·amend·builder fee·자동화는 아직 거절. 메인넷 주문은 미검증 (testnet E2E 만).

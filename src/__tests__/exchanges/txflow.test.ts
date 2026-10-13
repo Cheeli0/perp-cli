@@ -195,6 +195,16 @@ describe("markets and funding (fixture)", () => {
     expect(rates[0]).toMatchObject({ basis: { kind: "perHours", hours: 1 }, nextFundingTime: 1_791_907_200_000 });
   });
 
+  it("a missing next / prev funding time leaves the interval unproven → funding null, no funding row", async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, META));
+    const ctxs = [{ coin: "1", ctx: ctx("0.00125000", "83263.0", { prevFundingTime: undefined }) }];
+    const d = { wsFactory: fakeWs([{ channel: "allAssetCtxs", data: { ctxs } }]).factory, warn: vi.fn() };
+    expect((await fetchTxflowMarkets("mainnet", d)).find(m => m.symbol === "BTC")?.fundingRate).toBeNull();
+    fetchMock.mockResolvedValue(jsonResponse(200, META));
+    const d2 = { wsFactory: fakeWs([{ channel: "allAssetCtxs", data: { ctxs } }]).factory, warn: vi.fn() };
+    expect(await fetchTxflowFundingRates("mainnet", d2)).toEqual([]);
+  });
+
   it("testnet → NOT_IMPLEMENTED (no testnet)", async () => {
     await expect(fetchTxflowMarkets("testnet", deps())).rejects.toMatchObject({ structured: { code: "NOT_IMPLEMENTED" } });
   });
@@ -264,6 +274,17 @@ describe("write-refusal table: -e txflow writes refuse before any I/O", () => {
     ["wallet", "agent", "approve", "txflow"],
     ["wallet", "agent", "import", "txflow"],
     ["wallet", "builder", "approve", "txflow"],
+    ["wallet", "agent", "revoke", "txflow", "x"],
+    ["-e", "txflow", "trade", "tpsl", "BTC", "long", "--tp", "90000"],
+    ["-e", "txflow", "trade", "stop", "BTC", "sell", "0.001", "70000"],
+    ["-e", "txflow", "funds", "transfer", "10", "0x0000000000000000000000000000000000000001"],
+    ["funds", "rebalance", "execute", "--exchanges", "txflow,hyperliquid"],
+    ["-e", "txflow", "strategy", "twap", "BTC", "buy", "0.01", "10m"],
+    ["-e", "txflow", "strategy", "grid", "BTC", "--upper", "90000", "--lower", "80000", "--grids", "5", "--size", "0.001"],
+    ["-e", "txflow", "strategy", "dca", "BTC", "buy", "10", "1h"],
+    ["-e", "txflow", "strategy", "trailing-stop", "BTC", "--trail", "1"],
+    ["-e", "txflow", "strategy", "quick-grid", "BTC"],
+    ["arb", "exec", "BTC", "txflow", "hyperliquid", "10"],
   ];
 
   for (const args of CASES) {

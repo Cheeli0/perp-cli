@@ -1369,6 +1369,12 @@ export function registerFundsCommands(
       const amountNum = Number(parsePositiveDecimal(amount, "amount"));
       if (isNaN(amountNum) || amountNum <= 0) throw new Error("Invalid amount");
       const exchangeOpt = program.opts().exchange as string | undefined;
+      // -e names a venue this command cannot move funds on: refuse instead of transferring on Hyperliquid.
+      if (exchangeOpt !== undefined) {
+        const def = getVenue(exchangeOpt);
+        if (!def.roles.includes("account")) throw roleUnsupported(def, "transfer");
+        if (def.id === "risex") throw unsupported("risex", "transfer", RISEX_FUNDS_APP_ONLY.reason, RISEX_FUNDS_APP_ONLY.remediation);
+      }
       if (exchangeOpt !== undefined && getVenue(exchangeOpt).id === "qfex") {
         if (isDryRun()) {
           return printFundsPlan({ action: "transfer", venue: "qfex", network: getNetwork(), asset: "USDC", amount, from: opts.from ?? "the key's account", destination });
