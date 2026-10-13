@@ -1,0 +1,129 @@
+{
+  "venue": "hyperliquid",
+  "captured": "2026-10-13 (live probe, scripts/ws-probe)",
+  "channel": "userFills",
+  "kind": "private",
+  "note": "Anonymized (ids remapped, amounts ×1.0731, times shifted). isSnapshot:true is re-sent on every (re)subscribe, same conn or new conn (30 fills observed) → replayable, dedupe by tid. Trimmed to 3 fills.",
+  "frames": [
+    {
+      "channel": "userFills",
+      "data": {
+        "isSnapshot": true,
+        "user": "0x000000000000000000000000000000000000dEaD",
+        "fills": [
+          {
+            "coin": "xyz:GOLD",
+            "px": "4468.3",
+            "sz": "0.00537",
+            "side": "B",
+            "time": 1790958415212,
+            "startPosition": "0.0",
+            "dir": "Open Long",
+            "closedPnl": "0.0",
+            "hash": "0xd0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d000000001",
+            "oid": 900002,
+            "crossed": true,
+            "fee": "0.019303",
+            "tid": 900003,
+            "feeToken": "USDC",
+            "twapId": null
+          },
+          {
+            "coin": "xyz:GOLD",
+            "px": "4468.2",
+            "sz": "0.00537",
+            "side": "A",
+            "time": 1790958431492,
+            "startPosition": "0.00537",
+            "dir": "Close Long",
+            "closedPnl": "-0.000537",
+            "hash": "0xd0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d000000004",
+            "oid": 900005,
+            "crossed": true,
+            "fee": "0.019302",
+            "tid": 900006,
+            "feeToken": "USDC",
+            "twapId": null
+          },
+          {
+            "coin": "xyz:GOLD",
+            "px": "4472.8",
+            "sz": "0.00322",
+            "side": "B",
+            "time": 1790959512965,
+            "startPosition": "0.0",
+            "dir": "Open Long",
+            "closedPnl": "0.0",
+            "hash": "0xd0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d000000007",
+            "oid": 900008,
+            "crossed": true,
+            "fee": "0.011593",
+            "tid": 900009,
+            "feeToken": "USDC",
+            "twapId": null
+          }
+        ]
+      }
+    },
+    {
+      "channel": "userFills",
+      "data": {
+        "isSnapshot": true,
+        "user": "0x000000000000000000000000000000000000dEaD",
+        "fills": [
+          {
+            "coin": "xyz:GOLD",
+            "px": "4468.3",
+            "sz": "0.00537",
+            "side": "B",
+            "time": 1790958415212,
+            "startPosition": "0.0",
+            "dir": "Open Long",
+            "closedPnl": "0.0",
+            "hash": "0xd0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d000000001",
+            "oid": 900002,
+            "crossed": true,
+            "fee": "0.019303",
+            "tid": 900003,
+            "feeToken": "USDC",
+            "twapId": null
+          },
+          {
+            "coin": "xyz:GOLD",
+            "px": "4468.2",
+            "sz": "0.00537",
+            "side": "A",
+            "time": 1790958431492,
+            "startPosition": "0.00537",
+            "dir": "Close Long",
+            "closedPnl": "-0.000537",
+            "hash": "0xd0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d000000004",
+            "oid": 900005,
+            "crossed": true,
+            "fee": "0.019302",
+            "tid": 900006,
+            "feeToken": "USDC",
+            "twapId": null
+          },
+          {
+            "coin": "xyz:GOLD",
+            "px": "4472.8",
+            "sz": "0.00322",
+            "side": "B",
+            "time": 1790959512965,
+            "startPosition": "0.0",
+            "dir": "Open Long",
+            "closedPnl": "0.0",
+            "hash": "0xd0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d000000007",
+            "oid": 900008,
+            "crossed": true,
+            "fee": "0.011593",
+            "tid": 900009,
+            "feeToken": "USDC",
+            "twapId": null
+          }
+        ]
+      }
+    }
+  ]
+}

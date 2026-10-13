@@ -1,0 +1,74 @@
+{
+  "venue": "pacifica",
+  "captured": "2026-10-13 (live probe, scripts/ws-probe)",
+  "channel": "bbo",
+  "kind": "public",
+  "note": "Per symbol. `li` (last order id) is strictly increasing across frames but not contiguous — usable for ordering/dedupe only, not gap detection. `i` is not monotonic.",
+  "frames": [
+    {
+      "channel": "bbo",
+      "data": {
+        "s": "BTC",
+        "i": 13515342797,
+        "li": 14188962842,
+        "t": 1791900008628,
+        "b": "83231",
+        "B": "0.27785",
+        "a": "83232",
+        "A": "0.53713"
+      }
+    },
+    {
+      "channel": "bbo",
+      "data": {
+        "s": "BTC",
+        "i": 13515342328,
+        "li": 14188963054,
+        "t": 1791900008928,
+        "b": "83231",
+        "B": "0.27785",
+        "a": "83232",
+        "A": "0.51561"
+      }
+    },
+    {
+      "channel": "bbo",
+      "data": {
+        "s": "BTC",
+        "i": 13515342937,
+        "li": 14188963072,
+        "t": 1791900008953,
+        "b": "83231",
+        "B": "0.27785",
+        "a": "83232",
+        "A": "0.53713"
+      }
+    },
+    {
+      "channel": "bbo",
+      "data": {
+        "s": "BTC",
+        "i": 13515342937,
+        "li": 14188963123,
+        "t": 1791900009008,
+        "b": "83231",
+        "B": "0.27785",
+        "a": "83232",
+        "A": "0.51561"
+      }
+    },
+    {
+      "channel": "bbo",
+      "data": {
+        "s": "BTC",
+        "i": 13515342990,
+        "li": 14188963161,
+        "t": 1791900009029,
+        "b": "83231",
+        "B": "0.29329",
+        "a": "83232",
+        "A": "0.51561"
+      }
+    }
+  ]
+}

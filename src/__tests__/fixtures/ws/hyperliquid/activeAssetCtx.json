@@ -1,0 +1,93 @@
+{
+  "venue": "hyperliquid",
+  "captured": "2026-10-13 (live probe, scripts/ws-probe)",
+  "channel": "activeAssetCtx",
+  "kind": "public",
+  "note": "Per-coin, ~1 s cadence. HIP-3 coin keyed as '<dex>:<COIN>'.",
+  "frames": [
+    {
+      "channel": "activeAssetCtx",
+      "data": {
+        "coin": "BTC",
+        "ctx": {
+          "funding": "0.0000031342",
+          "openInterest": "38255.44852",
+          "prevDayPx": "82942.0",
+          "dayNtlVlm": "3107616136.9192795753",
+          "premium": "-0.0005403458",
+          "oraclePx": "83280.0",
+          "markPx": "83238.0",
+          "midPx": "83234.5",
+          "impactPxs": [
+            "83224.3",
+            "83235.0"
+          ],
+          "dayBaseVlm": "37536.75126"
+        }
+      }
+    },
+    {
+      "channel": "activeAssetCtx",
+      "data": {
+        "coin": "BTC",
+        "ctx": {
+          "funding": "0.0000031342",
+          "openInterest": "38255.44852",
+          "prevDayPx": "82942.0",
+          "dayNtlVlm": "3107616136.9192795753",
+          "premium": "-0.0005403458",
+          "oraclePx": "83280.0",
+          "markPx": "83238.0",
+          "midPx": "83234.5",
+          "impactPxs": [
+            "83224.3",
+            "83235.0"
+          ],
+          "dayBaseVlm": "37536.75126"
+        }
+      }
+    },
+    {
+      "channel": "activeAssetCtx",
+      "data": {
+        "coin": "xyz:XYZ100",
+        "ctx": {
+          "funding": "0.00000625",
+          "openInterest": "8719.1348",
+          "prevDayPx": "30746.0",
+          "dayNtlVlm": "187776714.4953000247",
+          "premium": "0.0000681952",
+          "oraclePx": "30574.0",
+          "markPx": "30578.0",
+          "midPx": "30576.0",
+          "impactPxs": [
+            "30575.0",
+            "30577.17"
+          ],
+          "dayBaseVlm": "6141.7568"
+        }
+      }
+    },
+    {
+      "channel": "activeAssetCtx",
+      "data": {
+        "coin": "xyz:XYZ100",
+        "ctx": {
+          "funding": "0.00000625",
+          "openInterest": "8719.1348",
+          "prevDayPx": "30746.0",
+          "dayNtlVlm": "187776714.4953000247",
+          "premium": "0.0000681952",
+          "oraclePx": "30574.0",
+          "markPx": "30578.0",
+          "midPx": "30576.0",
+          "impactPxs": [
+            "30575.0",
+            "30577.17"
+          ],
+          "dayBaseVlm": "6141.7568"
+        }
+      }
+    }
+  ]
+}

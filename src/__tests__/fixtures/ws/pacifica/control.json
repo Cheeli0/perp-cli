@@ -1,0 +1,32 @@
+{
+  "venue": "pacifica",
+  "captured": "2026-10-13 (live probe, scripts/ws-probe)",
+  "channel": "control",
+  "kind": "public",
+  "note": "subscribe ack (echo of params; also sent for an unknown symbol — no error frame), pong.",
+  "frames": [
+    {
+      "channel": "subscribe",
+      "data": {
+        "source": "prices"
+      }
+    },
+    {
+      "channel": "subscribe",
+      "data": {
+        "source": "bbo",
+        "symbol": "BTC"
+      }
+    },
+    {
+      "channel": "pong"
+    },
+    {
+      "channel": "unsubscribe",
+      "data": {
+        "source": "bbo",
+        "symbol": "BTC"
+      }
+    }
+  ]
+}

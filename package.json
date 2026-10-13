@@ -7,6 +7,34 @@
     "perp-mcp": "dist/mcp-server.js",
     "perp-guardrail": "dist/guardrail/perp-guardrail.js"
   },
+  "exports": {
+    "./ws": {
+      "types": "./dist/ws/index.d.ts",
+      "import": "./dist/ws/index.js",
+      "default": "./dist/ws/index.js"
+    },
+    "./ws/node": {
+      "types": "./dist/ws/node.d.ts",
+      "import": "./dist/ws/node.js",
+      "default": "./dist/ws/node.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "typesVersions": {
+    "*": {
+      "ws": [
+        "dist/ws/index.d.ts"
+      ],
+      "ws/node": [
+        "dist/ws/node.d.ts"
+      ]
+    }
+  },
+  "sideEffects": [
+    "./dist/index.js",
+    "./dist/mcp-server.js",
+    "./dist/guardrail/perp-guardrail.js"
+  ],
   "files": [
     "dist",
     "skills",
@@ -14,7 +42,7 @@
   ],
   "type": "module",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && tsup --config tsup.ws.config.ts",
     "dev": "tsc --watch",
     "test": "vitest run --exclude '**/integration/**'",
     "test:integration": "vitest run -c vitest.integration.config.ts",

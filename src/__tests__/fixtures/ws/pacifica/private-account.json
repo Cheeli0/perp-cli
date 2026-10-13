@@ -1,0 +1,79 @@
+{
+  "venue": "pacifica",
+  "captured": "2026-10-13 (live probe, scripts/ws-probe)",
+  "channel": "account_info / account_positions",
+  "kind": "private",
+  "note": "Anonymized. account_positions sends a snapshot array (+li) on subscribe; account_info a snapshot then changes. account_trades / account_order_updates send NO snapshot on (re)subscribe → not replayable.",
+  "frames": [
+    {
+      "channel": "subscribe",
+      "data": {
+        "source": "account_info",
+        "account": "DummyPacificaAccount111111111111111111111111",
+        "full": false
+      }
+    },
+    {
+      "channel": "subscribe",
+      "data": {
+        "source": "account_positions",
+        "account": "DummyPacificaAccount111111111111111111111111"
+      }
+    },
+    {
+      "channel": "subscribe",
+      "data": {
+        "source": "account_order_updates",
+        "account": "DummyPacificaAccount111111111111111111111111"
+      }
+    },
+    {
+      "channel": "subscribe",
+      "data": {
+        "source": "account_trades",
+        "account": "DummyPacificaAccount111111111111111111111111"
+      }
+    },
+    {
+      "channel": "subscribe",
+      "data": {
+        "source": "account_trades",
+        "account": "DummyPacificaAccount111111111111111111111111"
+      }
+    },
+    {
+      "channel": "account_positions",
+      "data": [],
+      "li": 900010
+    },
+    {
+      "channel": "account_info",
+      "data": {
+        "b": "-0.082524",
+        "f": 0,
+        "ae": "0.028483",
+        "as": "0.006282",
+        "aw": "0.006282",
+        "pb": "0",
+        "mu": "0",
+        "cm": "0",
+        "pc": 0,
+        "oc": 0,
+        "sc": 0,
+        "t": 1791035103648,
+        "sb": [
+          {
+            "s": "SOL",
+            "a": "0.0010340",
+            "lr": "0.9",
+            "aw": "0.00007314",
+            "pb": "0",
+            "dw": "0",
+            "dd": "53655",
+            "wd": "268275"
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "venue": "arcus",
+  "captured": "2026-10-13 (live probe, scripts/ws-probe)",
+  "channel": "predictedFunding",
+  "kind": "public",
+  "note": "Per market; rate1h. Snapshot on subscribe; updates on recompute.",
+  "frames": [
+    {
+      "type": "subscribed",
+      "channel": "predictedFunding",
+      "id": "BTC-USD",
+      "contents": {
+        "market": "BTC-USD",
+        "rate1h": "0.0000125",
+        "sampleCount": 60,
+        "timestampMs": 1791899949900
+      }
+    }
+  ]
+}

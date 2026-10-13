@@ -1,0 +1,81 @@
+{
+  "venue": "arcus",
+  "captured": "2026-10-13 (live probe, scripts/ws-probe)",
+  "channel": "bbo",
+  "kind": "public",
+  "note": "lastSequenceId / globalSequenceId strictly increasing, not contiguous (ordering only). timestamp µs.",
+  "frames": [
+    {
+      "type": "subscribed",
+      "channel": "bbo",
+      "id": "BTC-USD",
+      "contents": {
+        "bestBid": {
+          "price": "83151.6",
+          "size": "0.48793307"
+        },
+        "bestAsk": {
+          "price": "83151.7",
+          "size": "0.48202108"
+        },
+        "lastSequenceId": 414246424,
+        "globalSequenceId": 3910307146,
+        "timestamp": 1791900008416354
+      }
+    },
+    {
+      "type": "channel_data",
+      "channel": "bbo",
+      "id": "BTC-USD",
+      "contents": {
+        "bestBid": {
+          "price": "83151.6",
+          "size": "0.48793307"
+        },
+        "bestAsk": {
+          "price": "83151.7",
+          "size": "0.72379463"
+        },
+        "timestamp": 1791900008628816,
+        "lastSequenceId": 414246445,
+        "globalSequenceId": 3910307725
+      }
+    },
+    {
+      "type": "channel_data",
+      "channel": "bbo",
+      "id": "BTC-USD",
+      "contents": {
+        "bestBid": {
+          "price": "83151.6",
+          "size": "0.48793307"
+        },
+        "bestAsk": {
+          "price": "83151.7",
+          "size": "0.31999408"
+        },
+        "timestamp": 1791900008650353,
+        "lastSequenceId": 414246446,
+        "globalSequenceId": 3910307793
+      }
+    },
+    {
+      "type": "channel_data",
+      "channel": "bbo",
+      "id": "BTC-USD",
+      "contents": {
+        "bestBid": {
+          "price": "83151.6",
+          "size": "0.48793307"
+        },
+        "bestAsk": {
+          "price": "83151.7",
+          "size": "0.72378101"
+        },
+        "timestamp": 1791900008804506,
+        "lastSequenceId": 414246451,
+        "globalSequenceId": 3910308526
+      }
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "venue": "hyperliquid",
+  "captured": "2026-10-13 (live probe, scripts/ws-probe)",
+  "channel": "openOrders",
+  "kind": "private",
+  "note": "Anonymized. Snapshot on subscribe, re-pushed ~5 s.",
+  "frames": [
+    {
+      "channel": "openOrders",
+      "data": {
+        "dex": "",
+        "user": "0x000000000000000000000000000000000000dEaD",
+        "orders": []
+      }
+    }
+  ]
+}

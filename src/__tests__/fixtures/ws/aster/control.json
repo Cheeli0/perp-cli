@@ -1,0 +1,24 @@
+{
+  "venue": "aster",
+  "captured": "2026-10-13 (live probe, scripts/ws-probe)",
+  "channel": "control",
+  "kind": "public",
+  "note": "Raw /ws socket: SUBSCRIBE / LIST_SUBSCRIPTIONS / UNSUBSCRIBE results. An unknown stream name is accepted silently (result null, listed, no data).",
+  "frames": [
+    {
+      "id": 1,
+      "result": null
+    },
+    {
+      "id": 2,
+      "result": [
+        "btcusdt@bookTicker",
+        "nopeprobe@bookTicker"
+      ]
+    },
+    {
+      "id": 3,
+      "result": null
+    }
+  ]
+}

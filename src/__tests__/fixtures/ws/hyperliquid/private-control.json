@@ -1,0 +1,63 @@
+{
+  "venue": "hyperliquid",
+  "captured": "2026-10-13 (live probe, scripts/ws-probe)",
+  "channel": "control",
+  "kind": "private",
+  "note": "Anonymized subscriptionResponse acks for user channels (server adds dex:'' and aggregateByTime:false).",
+  "frames": [
+    {
+      "channel": "subscriptionResponse",
+      "data": {
+        "method": "subscribe",
+        "subscription": {
+          "type": "clearinghouseState",
+          "dex": "",
+          "user": "0x000000000000000000000000000000000000dEaD"
+        }
+      }
+    },
+    {
+      "channel": "subscriptionResponse",
+      "data": {
+        "method": "subscribe",
+        "subscription": {
+          "type": "clearinghouseState",
+          "dex": "xyz",
+          "user": "0x000000000000000000000000000000000000dEaD"
+        }
+      }
+    },
+    {
+      "channel": "subscriptionResponse",
+      "data": {
+        "method": "subscribe",
+        "subscription": {
+          "type": "openOrders",
+          "dex": "",
+          "user": "0x000000000000000000000000000000000000dEaD"
+        }
+      }
+    },
+    {
+      "channel": "subscriptionResponse",
+      "data": {
+        "method": "subscribe",
+        "subscription": {
+          "type": "orderUpdates",
+          "user": "0x000000000000000000000000000000000000dEaD"
+        }
+      }
+    },
+    {
+      "channel": "subscriptionResponse",
+      "data": {
+        "method": "subscribe",
+        "subscription": {
+          "type": "userFills",
+          "user": "0x000000000000000000000000000000000000dEaD",
+          "aggregateByTime": false
+        }
+      }
+    }
+  ]
+}

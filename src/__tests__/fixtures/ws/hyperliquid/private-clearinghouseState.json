@@ -1,0 +1,59 @@
+{
+  "venue": "hyperliquid",
+  "captured": "2026-10-13 (live probe, scripts/ws-probe)",
+  "channel": "clearinghouseState",
+  "kind": "private",
+  "note": "Anonymized. Snapshot on subscribe, then re-pushed ~every 5 s even without changes (usable as liveness). One subscription per dex ('' and 'xyz').",
+  "frames": [
+    {
+      "channel": "clearinghouseState",
+      "data": {
+        "dex": "",
+        "user": "0x000000000000000000000000000000000000dEaD",
+        "clearinghouseState": {
+          "marginSummary": {
+            "accountValue": "0.0",
+            "totalNtlPos": "0.0",
+            "totalRawUsd": "0.0",
+            "totalMarginUsed": "0.0"
+          },
+          "crossMarginSummary": {
+            "accountValue": "0.0",
+            "totalNtlPos": "0.0",
+            "totalRawUsd": "0.0",
+            "totalMarginUsed": "0.0"
+          },
+          "crossMaintenanceMarginUsed": "0.0",
+          "withdrawable": "0.0",
+          "assetPositions": [],
+          "time": 1791035142454
+        }
+      }
+    },
+    {
+      "channel": "clearinghouseState",
+      "data": {
+        "dex": "xyz",
+        "user": "0x000000000000000000000000000000000000dEaD",
+        "clearinghouseState": {
+          "marginSummary": {
+            "accountValue": "0.0",
+            "totalNtlPos": "0.0",
+            "totalRawUsd": "0.0",
+            "totalMarginUsed": "0.0"
+          },
+          "crossMarginSummary": {
+            "accountValue": "0.0",
+            "totalNtlPos": "0.0",
+            "totalRawUsd": "0.0",
+            "totalMarginUsed": "0.0"
+          },
+          "crossMaintenanceMarginUsed": "0.0",
+          "withdrawable": "0.0",
+          "assetPositions": [],
+          "time": 1791035142508
+        }
+      }
+    }
+  ]
+}

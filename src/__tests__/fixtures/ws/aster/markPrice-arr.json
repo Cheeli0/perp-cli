@@ -1,0 +1,99 @@
+{
+  "venue": "aster",
+  "captured": "2026-10-13 (live probe, scripts/ws-probe)",
+  "channel": "!markPrice@arr@1s",
+  "kind": "public",
+  "note": "Combined-stream envelope {stream,data}. All symbols every 1 s (784 incl. non-USDT quotes; trimmed). r = current-period accruing estimate (== premiumIndex.lastFundingRate, != last settled /fapi/v3/fundingRate), T = nextFundingTime ms.",
+  "frames": [
+    {
+      "stream": "!markPrice@arr@1s",
+      "data": [
+        {
+          "e": "markPriceUpdate",
+          "E": 1791900009000,
+          "s": "ASTERUSDT",
+          "p": "0.69103893",
+          "P": "0.69122200",
+          "i": "0.69102167",
+          "r": "0.00005000",
+          "T": 1791907200000
+        },
+        {
+          "e": "markPriceUpdate",
+          "E": 1791900009000,
+          "s": "BTCUSDT",
+          "p": "83233.22908696",
+          "P": "83340.60124807",
+          "i": "83275.39586957",
+          "r": "0.00005218",
+          "T": 1791907200000
+        },
+        {
+          "e": "markPriceUpdate",
+          "E": 1791900009000,
+          "s": "ETHUSDT",
+          "p": "2502.63095155",
+          "P": "2506.87462694",
+          "i": "2503.84976744",
+          "r": "0.00002140",
+          "T": 1791907200000
+        },
+        {
+          "e": "markPriceUpdate",
+          "E": 1791900009000,
+          "s": "BTCUSD1",
+          "p": "83220.80000000",
+          "P": "83318.72414232",
+          "i": "83255.81154017",
+          "r": "0.00005719",
+          "T": 1791907200000
+        }
+      ]
+    },
+    {
+      "stream": "!markPrice@arr@1s",
+      "data": [
+        {
+          "e": "markPriceUpdate",
+          "E": 1791900010000,
+          "s": "ASTERUSDT",
+          "p": "0.69080000",
+          "P": "0.69122198",
+          "i": "0.69095500",
+          "r": "0.00005000",
+          "T": 1791907200000
+        },
+        {
+          "e": "markPriceUpdate",
+          "E": 1791900010000,
+          "s": "BTCUSDT",
+          "p": "83232.24430435",
+          "P": "83340.57779620",
+          "i": "83274.41108696",
+          "r": "0.00005218",
+          "T": 1791907200000
+        },
+        {
+          "e": "markPriceUpdate",
+          "E": 1791900010000,
+          "s": "ETHUSDT",
+          "p": "2502.42002132",
+          "P": "2506.87427674",
+          "i": "2503.63883721",
+          "r": "0.00002140",
+          "T": 1791907200000
+        },
+        {
+          "e": "markPriceUpdate",
+          "E": 1791900010000,
+          "s": "BTCUSD1",
+          "p": "83220.80000000",
+          "P": "83318.70256834",
+          "i": "83254.44848422",
+          "r": "0.00005719",
+          "T": 1791907200000
+        }
+      ]
+    }
+  ]
+}

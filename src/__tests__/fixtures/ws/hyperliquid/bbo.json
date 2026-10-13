@@ -1,0 +1,123 @@
+{
+  "venue": "hyperliquid",
+  "captured": "2026-10-13 (live probe, scripts/ws-probe)",
+  "channel": "bbo",
+  "kind": "public",
+  "note": "Full top-of-book per message: bbo = [bid, ask] each {px, sz, n} (either may be null). `time` ms; no sequence number.",
+  "frames": [
+    {
+      "channel": "bbo",
+      "data": {
+        "coin": "BTC",
+        "time": 1791900008348,
+        "bbo": [
+          {
+            "px": "83234.0",
+            "sz": "0.00277",
+            "n": 2
+          },
+          {
+            "px": "83235.0",
+            "sz": "19.04009",
+            "n": 57
+          }
+        ]
+      }
+    },
+    {
+      "channel": "bbo",
+      "data": {
+        "coin": "BTC",
+        "time": 1791900008748,
+        "bbo": [
+          {
+            "px": "83234.0",
+            "sz": "0.00277",
+            "n": 2
+          },
+          {
+            "px": "83235.0",
+            "sz": "19.07501",
+            "n": 58
+          }
+        ]
+      }
+    },
+    {
+      "channel": "bbo",
+      "data": {
+        "coin": "BTC",
+        "time": 1791900008816,
+        "bbo": [
+          {
+            "px": "83234.0",
+            "sz": "0.00277",
+            "n": 2
+          },
+          {
+            "px": "83235.0",
+            "sz": "19.05058",
+            "n": 57
+          }
+        ]
+      }
+    },
+    {
+      "channel": "bbo",
+      "data": {
+        "coin": "BTC",
+        "time": 1791900009153,
+        "bbo": [
+          {
+            "px": "83234.0",
+            "sz": "0.00277",
+            "n": 2
+          },
+          {
+            "px": "83235.0",
+            "sz": "19.01566",
+            "n": 56
+          }
+        ]
+      }
+    },
+    {
+      "channel": "bbo",
+      "data": {
+        "coin": "xyz:XYZ100",
+        "time": 1791900008348,
+        "bbo": [
+          {
+            "px": "30575.0",
+            "sz": "4.4348",
+            "n": 3
+          },
+          {
+            "px": "30576.0",
+            "sz": "2.6831",
+            "n": 1
+          }
+        ]
+      }
+    },
+    {
+      "channel": "bbo",
+      "data": {
+        "coin": "xyz:XYZ100",
+        "time": 1791900008419,
+        "bbo": [
+          {
+            "px": "30575.0",
+            "sz": "4.8436",
+            "n": 4
+          },
+          {
+            "px": "30576.0",
+            "sz": "2.6831",
+            "n": 1
+          }
+        ]
+      }
+    }
+  ]
+}
