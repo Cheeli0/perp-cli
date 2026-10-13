@@ -24,13 +24,30 @@ vi.mock("ethers", async (orig) => {
   return { ...real, ethers: { ...real.ethers, JsonRpcProvider, Contract } };
 });
 
-const { evmOnchainBalances, mainnetEvmChains, stableTotal } = await import("../onchain-balances.js");
+const solTokenAccounts: Record<string, unknown[] | Error> = {};
+vi.mock("@solana/web3.js", async (orig) => {
+  const real = await orig<typeof import("@solana/web3.js")>();
+  class Connection {
+    async getBalance() { return 17_183_250; } // 0.01718325 SOL
+    async getParsedTokenAccountsByOwner(_o: unknown, f: { mint: { toBase58(): string } }) {
+      const v = solTokenAccounts[f.mint.toBase58()];
+      if (v instanceof Error) throw v;
+      return { value: (v ?? []).map(a => ({ account: { data: { parsed: { info: { tokenAmount: a } } } } })) };
+    }
+  }
+  return { ...real, Connection };
+});
+
+const { evmOnchainBalances, mainnetEvmChains, solanaOnchainBalances, stableTotal } = await import("../onchain-balances.js");
+const SOL_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const SOL_USDT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 
 const ADDR = "0x1111111111111111111111111111111111111111";
 const ARB_USDC = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831";
 const BSC_USDT = "0x55d398326f99059fF775485246999027B3197955";
 
 beforeEach(() => {
+  for (const k of Object.keys(solTokenAccounts)) delete solTokenAccounts[k];
   rpcUrls.length = 0;
   failing.clear();
   for (const k of Object.keys(raw)) delete raw[k];
@@ -69,10 +86,11 @@ describe("evmOnchainBalances", () => {
     expect(total.errors).toEqual(["bsc USDT: rpc timeout"]);
   });
 
-  it("unknown native price → usdValue null (balance still shown)", async () => {
+  it("unknown native price → usdValue null with the reason in priceError (balance still shown)", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("offline"); }));
     const rows = await evmOnchainBalances(ADDR, false, ["arbitrum"]);
-    expect(rows.find(r => r.token === "ETH")).toMatchObject({ balance: "0.001", usdValue: null, error: null });
+    expect(rows.find(r => r.token === "ETH")).toMatchObject({ balance: "0.001", usdValue: null, error: null, priceError: expect.stringContaining("offline") });
+    expect(rows.find(r => r.token === "USDC")?.priceError).toBeNull();
   });
 
   it("every chain goes through the (mocked) provider — no real RPC in unit tests", async () => {
@@ -83,5 +101,26 @@ describe("evmOnchainBalances", () => {
   it("`only` limits the chains; testnet reads Arbitrum Sepolia only", async () => {
     expect(new Set((await evmOnchainBalances(ADDR, false, ["arbitrum"])).map(r => r.chain))).toEqual(new Set(["arbitrum"]));
     expect(new Set((await evmOnchainBalances(ADDR, true)).map(r => r.chain))).toEqual(new Set(["arbitrum-sepolia"]));
+  });
+});
+
+describe("solanaOnchainBalances", () => {
+  const OWNER = "So11111111111111111111111111111111111111112";
+
+  it("sums raw amounts across token accounts exactly (BigInt), SOL from lamports", async () => {
+    solTokenAccounts[SOL_USDC] = [{ amount: "17000000" }, { amount: "48092" }];
+    solTokenAccounts[SOL_USDT] = [];
+    const rows = await solanaOnchainBalances(OWNER, false);
+    expect(rows.map(r => [r.token, r.balance])).toEqual([["SOL", "0.01718325"], ["USDC", "17.048092"], ["USDT", "0"]]);
+    expect(stableTotal(rows).usd).toBeCloseTo(17.048092, 9);
+  });
+
+  it("a token account without a raw amount, or a failed read → that token is balance null + error", async () => {
+    solTokenAccounts[SOL_USDC] = [{ uiAmount: 5 }];
+    solTokenAccounts[SOL_USDT] = new Error("429 Too Many Requests");
+    const rows = await solanaOnchainBalances(OWNER, false);
+    expect(rows.find(r => r.token === "USDC")).toMatchObject({ balance: null, error: expect.stringContaining("raw amount") });
+    expect(rows.find(r => r.token === "USDT")).toMatchObject({ balance: null, error: "429 Too Many Requests" });
+    expect(stableTotal(rows).errors).toHaveLength(2);
   });
 });

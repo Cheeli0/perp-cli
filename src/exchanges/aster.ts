@@ -197,6 +197,9 @@ type ResolvedSigner = {
 
 // ── AsterAdapter ──────────────────────────────────────────────────────────────
 
+/** Max 1000-row pages of 7-day commission income read for symbol discovery (20 000 fills). */
+export const ASTER_INCOME_MAX_PAGES = 20;
+
 export class AsterAdapter implements ExchangeAdapter {
   readonly name = "aster";
   readonly chain = "bnb";
@@ -829,25 +832,48 @@ export class AsterAdapter implements ExchangeAdapter {
   }
 
   /**
-   * Symbols with account activity: open positions plus every symbol with a COMMISSION income row
-   * in the venue's default window (GET /fapi/v3/income without a time range: recent 7 days).
-   * Aster's userTrades / allOrders both require `symbol`, so this is the per-symbol fan-out set.
-   * 1000 rows (the endpoint max) may be a truncated window → EXCHANGE_ERROR, never a partial list.
+   * Symbols with account activity: open positions, open orders, and every symbol with a
+   * COMMISSION income row in the last 7 days (the venue's default window). Aster's userTrades /
+   * allOrders both require `symbol`, so this is the per-symbol fan-out set. Income is read in
+   * pages of 1000 (the endpoint max; startTime / endTime are inclusive) walking back from now;
+   * more than ASTER_INCOME_MAX_PAGES pages → EXCHANGE_ERROR, never a partial set. Orders on a
+   * symbol that never filled, is not open and has no position cannot be found (allOrders needs it).
    */
   private async _tradedApiSymbols(r: ReturnType<AsterAdapter["_resolveSigner"]>): Promise<Set<string>> {
     const positions = await this.getPositions();
     const apiSymbols = new Set(positions.map(p => this._toApi(p.symbol)));
-    const income = await this._signedGetEip712("/fapi/v3/income", { incomeType: "COMMISSION", limit: "1000" }, r);
-    if (!Array.isArray(income)) {
-      throw new PerpError("EXCHANGE_ERROR", `Aster income history is not a list (${JSON.stringify(income).slice(0, 120)})`, { exchange: "aster" });
+    const open = await this._signedGetEip712("/fapi/v3/openOrders", {}, r);
+    if (!Array.isArray(open)) {
+      throw new PerpError("EXCHANGE_ERROR", `Aster open orders is not a list (${JSON.stringify(open).slice(0, 120)})`, { exchange: "aster" });
     }
-    if (income.length >= 1000) {
-      throw new PerpError("EXCHANGE_ERROR", "Aster returned 1000 commission rows (the endpoint maximum) — the 7-day symbol list may be truncated", {
-        exchange: "aster", remediation: "Query a single symbol in the Aster web app, or retry later",
-      });
+    for (const o of open as Array<Record<string, unknown>>) {
+      if (typeof o.symbol === "string" && o.symbol !== "") apiSymbols.add(o.symbol);
     }
-    for (const row of income as Array<Record<string, unknown>>) {
-      if (typeof row.symbol === "string" && row.symbol !== "") apiSymbols.add(row.symbol);
+    const startTime = Date.now() - 7 * 86_400_000;
+    let endTime = Date.now();
+    for (let page = 0; ; page++) {
+      if (page >= ASTER_INCOME_MAX_PAGES) {
+        throw new PerpError("EXCHANGE_ERROR", `Aster commission history exceeds ${ASTER_INCOME_MAX_PAGES * 1000} rows in 7 days — the symbol list would be incomplete`, {
+          exchange: "aster", remediation: "Check fills per symbol in the Aster web app",
+        });
+      }
+      const income = await this._signedGetEip712("/fapi/v3/income", {
+        incomeType: "COMMISSION", startTime: String(startTime), endTime: String(endTime), limit: "1000",
+      }, r);
+      if (!Array.isArray(income)) {
+        throw new PerpError("EXCHANGE_ERROR", `Aster income history is not a list (${JSON.stringify(income).slice(0, 120)})`, { exchange: "aster" });
+      }
+      let oldest = Infinity;
+      for (const row of income as Array<Record<string, unknown>>) {
+        if (typeof row.symbol === "string" && row.symbol !== "") apiSymbols.add(row.symbol);
+        const t = Number(row.time);
+        if (!Number.isFinite(t)) {
+          throw new PerpError("EXCHANGE_ERROR", `Aster income row without a numeric time: ${JSON.stringify(row).slice(0, 160)}`, { exchange: "aster" });
+        }
+        oldest = Math.min(oldest, t);
+      }
+      if (income.length < 1000 || oldest <= startTime) break;
+      endTime = oldest - 1;
     }
     return apiSymbols;
   }
@@ -875,8 +901,10 @@ export class AsterAdapter implements ExchangeAdapter {
         if (side !== "buy" && side !== "sell") {
           throw new PerpError("EXCHANGE_ERROR", `Aster allOrders row with unknown side "${side}"`, { exchange: "aster" });
         }
+        const time = Number(field(o, "time"));
+        if (!Number.isFinite(time)) throw new PerpError("EXCHANGE_ERROR", `Aster allOrders row with a non-numeric time`, { exchange: "aster" });
         rows.push({
-          time: Number(field(o, "time")),
+          time,
           order: {
             orderId: field(o, "orderId"),
             symbol: this._fromApi(field(o, "symbol")),
@@ -919,8 +947,10 @@ export class AsterAdapter implements ExchangeAdapter {
         if (typeof t.buyer !== "boolean") {
           throw new PerpError("EXCHANGE_ERROR", `Aster userTrades row without a boolean buyer: ${JSON.stringify(t).slice(0, 160)}`, { exchange: "aster" });
         }
+        const time = Number(field(t, "time"));
+        if (!Number.isFinite(time)) throw new PerpError("EXCHANGE_ERROR", `Aster userTrades row with a non-numeric time`, { exchange: "aster" });
         allTrades.push({
-          time: Number(field(t, "time")),
+          time,
           symbol: this._fromApi(field(t, "symbol")),
           side: t.buyer ? "buy" as const : "sell" as const,
           price: field(t, "price"),

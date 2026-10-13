@@ -20,7 +20,10 @@ export interface OnchainBalance {
   balance: string | null;
   /** Stablecoins at $1; native tokens at the Hyperliquid mid; null when unknown. */
   usdValue: number | null;
+  /** Why the balance read failed (balance null). */
   error: string | null;
+  /** Why a native token's usdValue is null although its balance was read. */
+  priceError: string | null;
 }
 
 interface TokenPin { symbol: string; address: string; decimals: number }
@@ -73,49 +76,67 @@ const TESTNET_EVM_CHAINS: Record<string, EvmChainPin> = {
   },
 };
 
-const SOLANA = {
-  mainnet: {
-    rpcUrl: "https://api.mainnet-beta.solana.com",
-    tokens: [
-      { symbol: "USDC", address: relayToken("solana", "USDC").address, decimals: 6 },
-      { symbol: "USDT", address: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", decimals: 6 },
-    ],
-  },
-  testnet: {
-    rpcUrl: "https://api.devnet.solana.com",
-    tokens: [{ symbol: "USDP", address: "USDPqRbLidFGufty2s3oizmDEKdqx7ePTqzDMbf5ZKM", decimals: 6 }],
-  },
-} as const;
+/** Built on use (not at import) so a registry change can only break `wallet balance`, never startup. */
+function solanaPins(testnet: boolean): { rpcUrl: string; tokens: TokenPin[] } {
+  return testnet
+    ? { rpcUrl: "https://api.devnet.solana.com", tokens: [{ symbol: "USDP", address: "USDPqRbLidFGufty2s3oizmDEKdqx7ePTqzDMbf5ZKM", decimals: 6 }] }
+    : {
+      rpcUrl: "https://api.mainnet-beta.solana.com",
+      tokens: [
+        { symbol: "USDC", address: relayToken("solana", "USDC").address, decimals: 6 },
+        { symbol: "USDT", address: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", decimals: 6 },
+      ],
+    };
+}
+
+/** Per-request timeout of every read here: a stuck public RPC becomes a per-row error, not a hang. */
+export const ONCHAIN_READ_TIMEOUT_MS = 10_000;
+const timedFetch: typeof fetch = (input, init) => fetch(input, { ...init, signal: AbortSignal.timeout(ONCHAIN_READ_TIMEOUT_MS) });
 
 const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e)).slice(0, 160);
 
-/** USD mids of the native gas tokens from Hyperliquid allMids; a missing / failed price → absent. */
-async function nativePrices(): Promise<Map<string, number>> {
-  const out = new Map<string, number>();
+interface Prices { px: Map<string, number>; error: string | null }
+
+/**
+ * USD mids of the native gas tokens from Hyperliquid allMids. A failed / missing price leaves the
+ * native row's usdValue null and names the reason in `priceError`; balances are unaffected.
+ */
+async function nativePrices(): Promise<Prices> {
+  const px = new Map<string, number>();
   try {
-    const res = await fetch(HYPERLIQUID_API_URL, {
+    const res = await timedFetch(HYPERLIQUID_API_URL, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type: "allMids" }),
     });
-    if (!res.ok) return out;
+    if (!res.ok) return { px, error: `Hyperliquid allMids HTTP ${res.status}` };
     const mids = await res.json() as Record<string, unknown>;
     for (const sym of ["ETH", "BNB", "SOL"]) {
-      const px = Number(mids[sym]);
-      if (typeof mids[sym] === "string" && Number.isFinite(px) && px > 0) out.set(sym, px);
+      const v = Number(mids[sym]);
+      if (typeof mids[sym] === "string" && Number.isFinite(v) && v > 0) px.set(sym, v);
     }
-  } catch { /* price unknown → usdValue null for natives; balances are unaffected */ }
-  return out;
+    return { px, error: null };
+  } catch (e) {
+    return { px, error: `Hyperliquid allMids: ${errText(e)}` };
+  }
 }
 
-function row(chain: string, token: string, kind: "stable" | "native", balance: string | null, prices: Map<string, number>, error: string | null): OnchainBalance {
+function row(chain: string, token: string, kind: "stable" | "native", balance: string | null, prices: Prices, error: string | null): OnchainBalance {
   let usdValue: number | null = null;
-  if (balance !== null) usdValue = kind === "stable" ? Number(balance) : (prices.has(token) ? Number(balance) * prices.get(token)! : null);
-  return { chain, token, kind, balance, usdValue, error };
+  let priceError: string | null = null;
+  if (balance !== null) {
+    if (kind === "stable") usdValue = Number(balance);
+    else if (prices.px.has(token)) usdValue = Number(balance) * prices.px.get(token)!;
+    else priceError = prices.error ?? `no Hyperliquid mid for ${token}`;
+  }
+  return { chain, token, kind, balance, usdValue, error, priceError };
 }
 
 type Ethers = typeof import("ethers")["ethers"];
 
-async function evmChainBalances(ethers: Ethers, chain: string, pin: EvmChainPin, address: string, prices: Map<string, number>): Promise<OnchainBalance[]> {
-  const provider = new ethers.JsonRpcProvider(pin.rpcUrl, pin.chainId, { staticNetwork: true });
+async function evmChainBalances(ethers: Ethers, chain: string, pin: EvmChainPin, address: string, prices: Prices): Promise<OnchainBalance[]> {
+  const req = new ethers.FetchRequest(pin.rpcUrl);
+  req.timeout = ONCHAIN_READ_TIMEOUT_MS;
+  // batchMaxCount 1: one plain JSON-RPC call per read (not every public RPC accepts batches).
+  const provider = new ethers.JsonRpcProvider(req, pin.chainId, { staticNetwork: true, batchMaxCount: 1 });
   const native = provider.getBalance(address)
     .then(b => row(chain, pin.native, "native", ethers.formatEther(b), prices, null))
     .catch(e => row(chain, pin.native, "native", null, prices, errText(e)));
@@ -139,9 +160,9 @@ export async function evmOnchainBalances(address: string, testnet: boolean, only
 /** SOL + USDC / USDT (mainnet) or USDP (devnet) of a Solana address. */
 export async function solanaOnchainBalances(address: string, testnet: boolean): Promise<OnchainBalance[]> {
   const { Connection, PublicKey } = await import("@solana/web3.js");
-  const cfg = testnet ? SOLANA.testnet : SOLANA.mainnet;
+  const cfg = solanaPins(testnet);
   const chain = testnet ? "solana-devnet" : "solana";
-  const connection = new Connection(cfg.rpcUrl);
+  const connection = new Connection(cfg.rpcUrl, { fetch: timedFetch as never });
   const owner = new PublicKey(address);
   const prices = await nativePrices();
   const sol = connection.getBalance(owner)

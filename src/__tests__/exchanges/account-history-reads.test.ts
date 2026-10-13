@@ -19,7 +19,7 @@ async function asterAdapter(routes: Record<string, (params: Record<string, strin
   t._resolveSigner = vi.fn().mockReturnValue({ kind: "agent", signer: {}, agent: {} });
   t.getPositions = vi.fn().mockResolvedValue(positions);
   const signed = vi.fn(async (path: string, params: Record<string, string>) => {
-    const route = routes[path];
+    const route = routes[path] ?? (path === "/fapi/v3/openOrders" ? () => [] : undefined);
     if (!route) throw new Error(`unexpected ${path}`);
     return route(params);
   });
@@ -36,7 +36,7 @@ describe("AsterAdapter.getOrderHistory — same symbol discovery, no hard-coded 
 
   it("queries the income symbols (not BTC/ETH/SOL/BNB/XRP) and sorts newest first", async () => {
     const { ast, signed } = await asterAdapter({
-      "/fapi/v3/income": () => [{ symbol: "DOGEUSDT" }],
+      "/fapi/v3/income": () => [{ symbol: "DOGEUSDT", time: 1 }],
       "/fapi/v3/allOrders": () => [order("DOGEUSDT", 1), order("DOGEUSDT", 5, "SELL")],
     });
     const rows = await ast.getOrderHistory(30);
@@ -46,22 +46,51 @@ describe("AsterAdapter.getOrderHistory — same symbol discovery, no hard-coded 
 
   it("a failed allOrders read throws instead of being skipped", async () => {
     const { ast } = await asterAdapter({
-      "/fapi/v3/income": () => [{ symbol: "DOGEUSDT" }],
+      "/fapi/v3/income": () => [{ symbol: "DOGEUSDT", time: 1 }],
       "/fapi/v3/allOrders": () => { throw new Error("HTTP 418"); },
     });
     await expect(ast.getOrderHistory(30)).rejects.toThrow("418");
   });
 
-  it("1000 income rows (endpoint max, possibly truncated) → EXCHANGE_ERROR, not a partial list", async () => {
-    const { ast } = await asterAdapter({ "/fapi/v3/income": () => Array.from({ length: 1000 }, () => ({ symbol: "SOLUSDT" })) });
+  it("income is paged back from now in 1000-row pages (endTime = oldest − 1) until a short page", async () => {
+    const now = Date.now();
+    const pages = [
+      Array.from({ length: 1000 }, (_, i) => ({ symbol: "SOLUSDT", time: now - i })),
+      [{ symbol: "ETHUSDT", time: now - 5000 }],
+    ];
+    const { ast, signed } = await asterAdapter({
+      "/fapi/v3/income": () => pages.shift()!,
+      "/fapi/v3/allOrders": () => [],
+    });
+    await ast.getOrderHistory(30);
+    const incomeCalls = signed.mock.calls.filter((c) => c[0] === "/fapi/v3/income").map((c) => c[1]);
+    expect(incomeCalls).toHaveLength(2);
+    expect(Number(incomeCalls[1].endTime)).toBe(now - 999 - 1);
+    expect(Number(incomeCalls[0].startTime)).toBe(Number(incomeCalls[1].startTime));
+    expect(signed.mock.calls.filter((c) => c[0] === "/fapi/v3/allOrders").map((c) => c[1].symbol).sort()).toEqual(["ETHUSDT", "SOLUSDT"]);
+  });
+
+  it("more pages than ASTER_INCOME_MAX_PAGES → EXCHANGE_ERROR, never a partial symbol set", async () => {
+    let t = Date.now();
+    const { ast } = await asterAdapter({ "/fapi/v3/income": () => Array.from({ length: 1000 }, () => ({ symbol: "SOLUSDT", time: t-- })) });
     await expect(ast.getOrderHistory(30)).rejects.toMatchObject({ structured: expect.objectContaining({ code: "EXCHANGE_ERROR" }) });
+  });
+
+  it("symbols with open orders but no fills / position are included (GET /fapi/v3/openOrders)", async () => {
+    const { ast, signed } = await asterAdapter({
+      "/fapi/v3/openOrders": () => [{ symbol: "XRPUSDT" }],
+      "/fapi/v3/income": () => [],
+      "/fapi/v3/allOrders": () => [order("XRPUSDT", 9)],
+    });
+    expect((await ast.getOrderHistory(30)).map((o) => o.symbol)).toEqual(["XRP"]);
+    expect(signed.mock.calls.filter((c) => c[0] === "/fapi/v3/allOrders").map((c) => c[1].symbol)).toEqual(["XRPUSDT"]);
   });
 });
 
 describe("AsterAdapter.getTradeHistory — symbols from income, never a guess", () => {
   it("finds fills on symbols without an open position via COMMISSION income rows", async () => {
     const { ast, signed } = await asterAdapter({
-      "/fapi/v3/income": () => [{ symbol: "SOLUSDT", incomeType: "COMMISSION" }, { symbol: "SOLUSDT" }, { symbol: "ETHUSDT" }],
+      "/fapi/v3/income": () => [{ symbol: "SOLUSDT", time: 1, incomeType: "COMMISSION" }, { symbol: "SOLUSDT", time: 1 }, { symbol: "ETHUSDT", time: 1 }],
       "/fapi/v3/userTrades": (p) => (p.symbol === "SOLUSDT" ? [trade("SOLUSDT", 2, false), trade("SOLUSDT", 1, true)] : [trade("ETHUSDT", 3, true)]),
     });
     const rows = await ast.getTradeHistory(30);
@@ -79,7 +108,7 @@ describe("AsterAdapter.getTradeHistory — symbols from income, never a guess", 
 
   it("a failed userTrades read throws instead of being skipped", async () => {
     const { ast } = await asterAdapter({
-      "/fapi/v3/income": () => [{ symbol: "SOLUSDT" }],
+      "/fapi/v3/income": () => [{ symbol: "SOLUSDT", time: 1 }],
       "/fapi/v3/userTrades": () => { throw new Error("HTTP 429"); },
     });
     await expect(ast.getTradeHistory(30)).rejects.toThrow("429");
@@ -87,7 +116,7 @@ describe("AsterAdapter.getTradeHistory — symbols from income, never a guess", 
 
   it("a row missing a field is an EXCHANGE_ERROR, not a zero", async () => {
     const { ast } = await asterAdapter({
-      "/fapi/v3/income": () => [{ symbol: "SOLUSDT" }],
+      "/fapi/v3/income": () => [{ symbol: "SOLUSDT", time: 1 }],
       "/fapi/v3/userTrades": () => [{ symbol: "SOLUSDT", time: 1, buyer: true, qty: "1", commission: "0" }],
     });
     await expect(ast.getTradeHistory(30)).rejects.toMatchObject({ structured: expect.objectContaining({ code: "EXCHANGE_ERROR" }) });

@@ -757,6 +757,11 @@ function registerAnalyticsSubcommands(
             let adapter;
             try {
               adapter = await getAdapterForExchange(ex);
+            } catch (e) {
+              errors[`${ex}.adapter`] = errText(e);
+              return;
+            }
+            try {
               const balance = await adapter.getBalance();
               totalEquity += Number(balance.equity);
               totalUPnl += Number(balance.unrealizedPnl);

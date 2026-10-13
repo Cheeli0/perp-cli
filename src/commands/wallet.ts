@@ -155,6 +155,52 @@ function balanceTable(balances: readonly TokenBalance[]): string {
   return makeTable(["Chain", "Token", "Balance", "USD Value"], rows);
 }
 
+/** One address's balances — the same shape on every `wallet balance` path. */
+interface BalanceEntry {
+  wallet?: string;
+  exchange?: string;
+  chain: "evm" | "solana";
+  address: string;
+  balances: TokenBalance[];
+  stableUsd: number;
+  errors: string[];
+}
+
+async function balanceEntry(label: { wallet?: string; exchange?: string }, vm: "evm" | "solana", address: string, testnet: boolean): Promise<BalanceEntry> {
+  const balances = vm === "solana" ? await getSolanaBalances(address, testnet) : await getEvmBalances(address, testnet);
+  const total = stableTotal(balances);
+  return { ...label, chain: vm, address, balances, stableUsd: total.usd, errors: total.errors };
+}
+
+/** Reads each distinct address once (several venues often share one key), in order. */
+async function balanceEntries(items: Array<{ label: { wallet?: string; exchange?: string }; vm: "evm" | "solana"; address: string }>, testnet: boolean): Promise<BalanceEntry[]> {
+  const seen = new Map<string, BalanceEntry>();
+  const out: BalanceEntry[] = [];
+  for (const it of items) {
+    const key = `${it.vm}:${it.address.toLowerCase()}`;
+    const prev = seen.get(key);
+    if (prev !== undefined) {
+      if (it.label.exchange !== undefined) prev.exchange = prev.exchange === undefined ? it.label.exchange : `${prev.exchange},${it.label.exchange}`;
+      continue;
+    }
+    const entry = await balanceEntry(it.label, it.vm, it.address, testnet);
+    seen.set(key, entry);
+    out.push(entry);
+  }
+  return out;
+}
+
+/** Exactly one JSON document (an array of entries), or one table per entry. */
+function printBalanceEntries(entries: readonly BalanceEntry[], json: boolean): void {
+  if (json) return printJson(jsonOk(entries));
+  for (const e of entries) {
+    const who = [e.wallet, e.exchange].filter(x => x !== undefined).join(" / ");
+    console.log(chalk.cyan.bold(`\n  ${who} (${e.chain} ${e.address.slice(0, 8)}...)`));
+    console.log(balanceTable(e.balances));
+  }
+  console.log();
+}
+
 // ── Derive address from private key ──────────────────────────
 
 async function deriveSolanaAddress(key: string): Promise<string> {
@@ -901,38 +947,23 @@ export function registerWalletCommands(
         if (activeEntries.length === 0) {
           const settings = loadSettings();
           if (settings.owsActiveWallet) {
+            // Only loading the OWS vault may fall through to the env path; balance reads report
+            // their own per-token errors and any other failure propagates.
+            let owsAccounts: Array<{ chainId: string; address: string }> | null = null;
             try {
               const { loadOws } = await import("../signer/ows-loader.js");
-              const ows = loadOws();
-              const owsWallet = ows.getWallet(settings.owsActiveWallet);
-              const owsResults: { wallet: string; chain: "evm" | "solana"; address: string; balances: unknown; stableUsd: number; errors: string[] }[] = [];
-              for (const acct of owsWallet.accounts) {
-                const isEvm = (acct as { chainId: string }).chainId.startsWith("eip155:");
-                const isSol = (acct as { chainId: string }).chainId.startsWith("solana:");
-                if (!isEvm && !isSol) continue;
-                const address = (acct as { address: string }).address;
-                const balances = isSol
-                  ? await getSolanaBalances(address, opts.testnet)
-                  : await getEvmBalances(address, opts.testnet);
-                if (isJson()) {
-                  owsResults.push({
-                    wallet: settings.owsActiveWallet,
-                    chain: isSol ? "solana" : "evm",
-                    address,
-                    balances,
-                    stableUsd: stableTotal(balances).usd,
-                    errors: stableTotal(balances).errors,
-                  });
-                } else {
-                  console.log(chalk.cyan.bold(`\n  ${settings.owsActiveWallet} (${isSol ? "solana" : "evm"} ${address.slice(0, 8)}...)`));
-                  console.log(balanceTable(balances));
-                }
-              }
-              if (isJson()) printJson(jsonOk(owsResults));
-              else console.log();
-              return;
+              owsAccounts = loadOws().getWallet(settings.owsActiveWallet).accounts as Array<{ chainId: string; address: string }>;
             } catch {
-              // OWS module unavailable or vault missing — fall through to env path
+              owsAccounts = null; // OWS module unavailable or vault missing — use the env path below
+            }
+            if (owsAccounts !== null) {
+              const results: BalanceEntry[] = [];
+              for (const acct of owsAccounts) {
+                const vm = acct.chainId.startsWith("solana:") ? "solana" : acct.chainId.startsWith("eip155:") ? "evm" : null;
+                if (vm === null) continue;
+                results.push(await balanceEntry({ wallet: settings.owsActiveWallet }, vm, acct.address, opts.testnet));
+              }
+              return printBalanceEntries(results, isJson());
             }
           }
 
@@ -956,43 +987,15 @@ export function registerWalletCommands(
             process.exit(1);
           }
 
-          for (const we of envEntries) {
-            if (!isJson()) console.log(chalk.cyan.bold(`\n  ${we.exchange} (${we.address.slice(0, 8)}...)`));
-            const balances = we.chain === "solana"
-              ? await getSolanaBalances(we.address, opts.testnet)
-              : await getEvmBalances(we.address, opts.testnet);
-
-            if (isJson()) { printJson(jsonOk({ exchange: we.exchange, address: we.address, balances })); continue; }
-
-            console.log(balanceTable(balances));
-          }
-          console.log();
-          return;
+          return printBalanceEntries(await balanceEntries(envEntries.map(we => ({ label: { exchange: we.exchange }, vm: we.chain, address: we.address })), opts.testnet), isJson());
         }
 
-        for (const ae of activeEntries) {
-          if (!isJson()) console.log(chalk.cyan.bold(`\n  ${ae.name} (${ae.exchange})`));
-          const balances = ae.type === "solana"
-            ? await getSolanaBalances(ae.address, opts.testnet)
-            : await getEvmBalances(ae.address, opts.testnet);
-
-          if (isJson()) { printJson(jsonOk({ wallet: ae.name, exchange: ae.exchange, balances })); continue; }
-
-          console.log(balanceTable(balances));
-        }
-        console.log();
-        return;
+        return printBalanceEntries(await balanceEntries(activeEntries.map(ae => ({
+          label: { wallet: ae.name, exchange: ae.exchange }, vm: ae.type === "solana" ? "solana" as const : "evm" as const, address: ae.address,
+        })), opts.testnet), isJson());
       }
 
-      if (!isJson()) console.log(chalk.cyan(`\n  Fetching balance for "${entry.name}" (${entry.address.slice(0, 8)}...)\n`));
-      const balances = entry.type === "solana"
-        ? await getSolanaBalances(entry.address, opts.testnet)
-        : await getEvmBalances(entry.address, opts.testnet);
-
-      if (isJson()) return printJson(jsonOk({ wallet: entry.name, balances }));
-
-      console.log(balanceTable(balances));
-      console.log();
+      return printBalanceEntries([await balanceEntry({ wallet: entry.name }, entry.type === "solana" ? "solana" : "evm", entry.address, opts.testnet)], isJson());
     });
 
   // ── direct address balance (kept for convenience) ──
