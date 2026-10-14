@@ -56,7 +56,7 @@ describe("parity with the CLI", () => {
     const codecVenues = CODECS.map(c => c.venue);
     for (const v of codecVenues) expect(CLI_VENUE_IDS, v).toContain(v);
     for (const v of CLI_VENUE_IDS) {
-      if (codecVenues.includes(v)) continue;
+      if ((codecVenues as readonly string[]).includes(v)) continue;
       expect(CLI_VENUES_WITHOUT_WS, `CLI venue "${v}" has no ws codec — add it to CLI_VENUES_WITHOUT_WS`).toContain(v);
     }
     for (const v of CLI_VENUES_WITHOUT_WS) expect(codecVenues).not.toContain(v);
