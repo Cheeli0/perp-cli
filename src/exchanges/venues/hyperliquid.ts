@@ -46,7 +46,7 @@ export const hyperliquidVenue: VenueDefinition = {
   agentKeyKind: "evm",
   secretStorage: { kind: "ows-wallet", dir: null },
   // REST: src/exchanges/hyperliquid.ts; mainnet WS: src/dashboard/ws-feeds.ts.
-  // Testnet WS is not in code → null. signingChainId: L1 action phantom-agent domain (hyperliquid.ts).
+  // Testnet WS per the HL websocket docs (opened in the 2026-10-13 ws probe). signingChainId: L1 action phantom-agent domain (hyperliquid.ts).
   networks: {
     mainnet: {
       restUrl: "https://api.hyperliquid.xyz",
@@ -61,7 +61,7 @@ export const hyperliquidVenue: VenueDefinition = {
     },
     testnet: {
       restUrl: "https://api.hyperliquid-testnet.xyz",
-      wsUrl: null,
+      wsUrl: "wss://api.hyperliquid-testnet.xyz/ws",
       explorerUrl: null,
       signingChainId: 1337,
       settlementChain: "hyperliquid",

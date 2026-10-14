@@ -1,0 +1,38 @@
+{
+  "venue": "lighter",
+  "captured": "2026-10-13 (live probe, scripts/ws-probe)",
+  "channel": "control",
+  "kind": "public",
+  "note": "connected, pong, unsubscribed, and error frames. Errors carry no channel field: {error:{code,message}}. 20001 = auth required (account_all_orders), 30002 = not subscribed, 30005 = invalid channel.",
+  "frames": [
+    {
+      "session_id": "00000000-0000-0000-0000-000000000000",
+      "type": "connected"
+    },
+    {
+      "type": "pong"
+    },
+    {
+      "type": "unsubscribed",
+      "channel": "user_stats:1000001"
+    },
+    {
+      "error": {
+        "code": 20001,
+        "message": "invalid param : auth field is required: account_all_orders:1000001"
+      }
+    },
+    {
+      "error": {
+        "code": 30002,
+        "message": "Not Subscribed to : account_all_orders:1000001"
+      }
+    },
+    {
+      "error": {
+        "code": 30005,
+        "message": "Invalid Channel:  (marketId)"
+      }
+    }
+  ]
+}

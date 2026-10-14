@@ -1,0 +1,26 @@
+{
+  "venue": "arcus",
+  "captured": "2026-10-13 (live probe, scripts/ws-probe)",
+  "channel": "control",
+  "kind": "public",
+  "note": "connected, app pong ({type:ping} → {type:pong}), error frame without channel/id (message truncated here). Server also sends WS-protocol pings every 30 s.",
+  "frames": [
+    {
+      "type": "connected",
+      "connection_id": "1000000000000000000"
+    },
+    {
+      "type": "pong"
+    },
+    {
+      "type": "error",
+      "message": "Invalid market 'NOPE-PROBE'. Valid markets: [MU-USD BABA-USD HOOD-USD GLD-USD SK …]"
+    },
+    {
+      "type": "unsubscribed",
+      "channel": "userFills",
+      "id": "0x000000000000000000000000000000000000dEaD",
+      "accountIndex": 0
+    }
+  ]
+}

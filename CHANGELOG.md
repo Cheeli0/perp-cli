@@ -4,6 +4,20 @@ All notable changes to `perp-cli`. Format follows [Keep a Changelog](https://kee
 
 ## [Unreleased]
 
+### NEW: `perp-cli/ws` — composable WebSocket library (0.14.4, @experimental)
+
+- **New public entry points** `perp-cli/ws` (browser: native `WebSocket` / `fetch`, ESM, ES2020, no side effects, no top-level await, no global touched at module load) and `perp-cli/ws/node` (same API + a `ws` transport). Venues: hyperliquid (native + HIP-3), pacifica, lighter, lighter-rh, aster, arcus.
+- **Channels:** all-market / per-market state (`MarketUpdate`: mark, index, bid/ask, last, raw funding with `rateKind` / intervals / `predictedRate`, OI with unit, 24 h notional), `bbo`, and user channels (account, positions, orders, fills) for hyperliquid, pacifica, lighter, lighter-rh and arcus. **Aster user channels are a known gap in 0.14.4** (`CAPABILITY_UNSUPPORTED`; 0.14.5). `book` / `trades` arrive in 0.14.5.
+- **Funding comparator** (`createFundingComparator`) with `kind: "current" | "next" | "predicted" | "lastSettled" | "accruing"`, stale legs, `mixedKinds`; `toHourly` / `toApr` (events are never pre-annualized).
+- **Credentials:** async `CredentialProvider` (`user()`, `authToken()` for the Lighter orders channel, re-called at 80 % TTL with retries); the library never holds keys; tokens are redacted everywhere.
+- **Fills:** `fills` (one snapshot batch) / `fill` (live) events, de-duplicated by fill id + side + order id; `gap { action: "refetch-required" }` where the venue does not replay (Pacifica fills + orders, Lighter fills) or a replay does not reach back. `orders.complete` is false where the venue sends no order snapshot (Pacifica).
+- **Documented behaviours:** unknown = `null` (never `0`); malformed frames are `WS_PROTOCOL_ERROR` events (never dropped); the ack timeout equals the channel's stale threshold (no ack and no data → a pending subscription fails with `WS_PROTOCOL_ERROR`); before an async iterator is attached, state / non-fatal error events are kept in a ring of the last `buffer.size` (the iterator then gets a non-fatal `STREAM_OVERFLOW` with the discarded count) while fills and gaps are never evicted; per-venue reconnect backoff and new-connection budgets.
+- **New error codes** (CLI `ERROR_CODES`): `WS_PROTOCOL_ERROR`, `WS_AUTH_FAILED`, `SUBSCRIPTION_LIMIT`, `STREAM_OVERFLOW`. `classifyError` keeps the code of a structurally-typed `WsError`.
+- **Stability:** `@experimental` in 0.14.x — breaking changes only in a minor bump, called out here; events carry `schema: 1`. Stable at 0.15.0.
+- **BEHAVIOR CHANGE — package exports:** `package.json` now has an `exports` map (`./ws`, `./ws/node`, `./package.json`). **Deep imports such as `perp-cli/dist/*` no longer resolve.** The `perp`, `perp-mcp` and `perp-guardrail` binaries are unchanged.
+- Hyperliquid and Lighter testnet WebSocket URLs added to the venue definitions (lighter-rh testnet WS answers HTTP 403 and stays unset).
+- Docs: `skills/perp-cli/references/ws-library.md`; examples under `examples/` (browser funding compare, Next 13.5 smoke build, Node stream).
+
 ### FIX: bridge with OWS wallets, deBridge true cost, withdraw / transfer without -e, alerts, Aster USDC withdraw
 
 - **Bridge** (`funds bridge quote|send|exchange`, rebalance auto-bridge): signs with the OWS master (EVM and Solana) instead of treating the `ows:<wallet>` reference as a raw key (was `invalid BytesLike value`, 500). Errors are PerpError (`INVALID_PARAMS`, `INSUFFICIENT_BALANCE`, `NO_BRIDGE_ROUTE`), the selected provider is the one executed, `exchange` help says it is a wallet-to-wallet bridge.

@@ -1,0 +1,144 @@
+{
+  "venue": "arcus",
+  "captured": "2026-10-13 (live probe, scripts/ws-probe)",
+  "channel": "account / positions / orders / userFills",
+  "kind": "private",
+  "note": "Anonymized. No auth: subscribe by address (id), accountIndex defaults to 0. account re-pushed as isSnapshot:true ~5 s. userFills isSnapshot:true re-sent on resubscribe → replayable (dedupe by tradeId). Lists trimmed to 2.",
+  "frames": [
+    {
+      "type": "subscribed",
+      "channel": "account",
+      "id": "0x000000000000000000000000000000000000dEaD",
+      "accountIndex": 0,
+      "contents": {
+        "isSnapshot": true,
+        "address": "0x000000000000000000000000000000000000dEaD",
+        "accountIndex": 0,
+        "lastSequenceId": 79,
+        "netQuoteBalance": "0.008471091",
+        "freeCollateral": "0.008471091",
+        "accountEquity": "0.007894037",
+        "netDeposits": "0.0644",
+        "positions": {}
+      }
+    },
+    {
+      "type": "subscribed",
+      "channel": "positions",
+      "id": "0x000000000000000000000000000000000000dEaD",
+      "accountIndex": 0,
+      "contents": {
+        "isSnapshot": true,
+        "lastSequenceId": 79,
+        "address": "0x000000000000000000000000000000000000dEaD",
+        "accountIndex": 0,
+        "positions": {}
+      }
+    },
+    {
+      "type": "subscribed",
+      "channel": "orders",
+      "id": "0x000000000000000000000000000000000000dEaD",
+      "accountIndex": 0,
+      "contents": {
+        "isSnapshot": true,
+        "lastSequenceId": 79,
+        "openOrders": [],
+        "recentClosedOrders": [
+          {
+            "orderId": "dummy-id-11",
+            "clientId": "dummy-id-12",
+            "address": "0x000000000000000000000000000000000000dEaD",
+            "marketId": 3,
+            "marketDisplayName": "SOL-USD",
+            "side": "SELL",
+            "type": "LIMIT",
+            "status": "FILLED",
+            "price": "114.698",
+            "originalSize": "0.0537",
+            "filledSize": "0.0537",
+            "remainingSize": "0",
+            "avgFillPrice": "115.273",
+            "timeInForce": "IOC",
+            "goodTilTime": "1794418029201000",
+            "reduceOnly": true,
+            "createdAt": 1790962029384033,
+            "updatedAt": 1790962029380999,
+            "sequenceNumber": 77
+          },
+          {
+            "orderId": "dummy-id-13",
+            "clientId": "dummy-id-14",
+            "address": "0x000000000000000000000000000000000000dEaD",
+            "marketId": 3,
+            "marketDisplayName": "SOL-USD",
+            "side": "BUY",
+            "type": "LIMIT",
+            "status": "FILLED",
+            "price": "115.810",
+            "originalSize": "0.0537",
+            "filledSize": "0.0537",
+            "remainingSize": "0",
+            "avgFillPrice": "115.228",
+            "timeInForce": "IOC",
+            "goodTilTime": "1794418020228000",
+            "createdAt": 1790962020411158,
+            "updatedAt": 1790962020408120,
+            "sequenceNumber": 76
+          }
+        ]
+      }
+    },
+    {
+      "type": "subscribed",
+      "channel": "userFills",
+      "id": "0x000000000000000000000000000000000000dEaD",
+      "accountIndex": 0,
+      "contents": {
+        "isSnapshot": true,
+        "fills": [
+          {
+            "tradeId": "900015",
+            "orderId": "dummy-id-11",
+            "address": "0x000000000000000000000000000000000000dEaD",
+            "accountIndex": 0,
+            "marketId": 3,
+            "marketDisplayName": "SOL-USD",
+            "clientId": "dummy-id-12",
+            "side": "SELL",
+            "originalSize": "0.0537",
+            "size": "0.0537",
+            "price": "115.273",
+            "fee": "0.001227662",
+            "closedPnl": "0.001025848",
+            "role": "TAKER",
+            "remainingSize": "0",
+            "positionEffect": "CLOSE_LONG",
+            "createdAt": 1790962029380999,
+            "sequenceNumber": 77
+          },
+          {
+            "tradeId": "900016",
+            "orderId": "dummy-id-13",
+            "address": "0x000000000000000000000000000000000000dEaD",
+            "accountIndex": 0,
+            "marketId": 3,
+            "marketDisplayName": "SOL-USD",
+            "clientId": "dummy-id-14",
+            "side": "BUY",
+            "originalSize": "0.0537",
+            "size": "0.0537",
+            "price": "115.228",
+            "fee": "0.001227182",
+            "closedPnl": "-0.001227182",
+            "role": "TAKER",
+            "remainingSize": "0",
+            "positionEffect": "OPEN_LONG",
+            "createdAt": 1790962020408120,
+            "sequenceNumber": 76
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -14,8 +14,7 @@ export type LighterVenueId = "lighter" | "lighter-rh";
 /**
  * Lighter (main). REST hosts are the values LighterAdapter used before
  * venue-parameterization. Mainnet WS is the one ws-feeds.ts connects to.
- * Testnet WS is not in code or docs we hold → null (a WS upgrade on
- * wss://testnet.zklighter.elliot.ai/stream answered 101 on 2026-09-30, but that is a probe, not a source).
+ * Testnet WS per apidocs.lighter.xyz websocket-reference (opened in the 2026-10-13 ws probe).
  * explorerUrl is the explorer API host; callers append `/api/...`
  * (lighter-spot.ts uses `${explorerUrl}/api/markets`). The testnet explorer host
  * is the one lighter-ts-sdk documented (`https://testnet.explorer.elliot.ai/api`).
@@ -34,7 +33,7 @@ export const LIGHTER_NETWORKS: { mainnet: VenueNetworkConfig; testnet: VenueNetw
   },
   testnet: {
     restUrl: "https://testnet.zklighter.elliot.ai",
-    wsUrl: null,
+    wsUrl: "wss://testnet.zklighter.elliot.ai/stream",
     explorerUrl: "https://testnet.explorer.elliot.ai",
     signingChainId: 300,
     settlementChain: "ethereum",
@@ -54,7 +53,8 @@ export const LIGHTER_NETWORKS: { mainnet: VenueNetworkConfig; testnet: VenueNetw
  * explorerUrl is the explorer **API** host (`https://explorerapi.rh.lighter.xyz/api/`,
  * rate-limits.md); no UI explorer URL is documented.
  * Testnet WS is not documented → null (a WS upgrade on
- * wss://api.rh-testnet.lighter.xyz/stream answered 101 on 2026-09-30).
+ * wss://api.rh-testnet.lighter.xyz/stream answered 101 on 2026-09-30, but HTTP 403 from
+ * CloudFront in the 2026-10-13 ws probe).
  * Testnet explorer is not documented → null.
  * rpcUrl (mainnet): Robinhood Chain RPC — the L1 the RH contract lives on
  * (GET /api/v1/layer1BasicInfo l1_providers chainId 4663; eth_chainId 0x1237 verified

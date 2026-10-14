@@ -1,0 +1,115 @@
+{
+  "venue": "pacifica",
+  "captured": "2026-10-13 (live probe, scripts/ws-probe)",
+  "channel": "prices",
+  "kind": "public",
+  "note": "All symbols every ~3 s (trimmed to 4). funding = last settled hourly rate (== REST funding_rate/history latest), next_funding = predicted. open_interest in base units, volume_24h USD.",
+  "frames": [
+    {
+      "channel": "prices",
+      "data": [
+        {
+          "symbol": "FARTCOIN",
+          "funding": "0.0000125",
+          "next_funding": "0.0000125",
+          "oracle": "0.160209",
+          "mark": "0.160209",
+          "mid": "0.1601",
+          "yesterday_price": "0.1675",
+          "open_interest": "772022.6",
+          "volume_24h": "94454.05198",
+          "timestamp": 1791900006320
+        },
+        {
+          "symbol": "TSLA",
+          "funding": "0.0000125",
+          "next_funding": "0.0000125",
+          "oracle": "373.902084",
+          "mark": "373.902084",
+          "mid": "373.79",
+          "yesterday_price": "380.35",
+          "open_interest": "512.58",
+          "volume_24h": "70003.31648",
+          "timestamp": 1791900006320
+        },
+        {
+          "symbol": "BTC",
+          "funding": "0.00000429",
+          "next_funding": "0.00000325",
+          "oracle": "83281.383863",
+          "mark": "83238.731962",
+          "mid": "83237.5",
+          "yesterday_price": "83025",
+          "open_interest": "493.94911",
+          "volume_24h": "485331489.28508",
+          "timestamp": 1791900006320
+        },
+        {
+          "symbol": "ETH",
+          "funding": "0.00000518",
+          "next_funding": "0.00000234",
+          "oracle": "2503.846825",
+          "mark": "2502.482",
+          "mid": "2502.45",
+          "yesterday_price": "2541",
+          "open_interest": "14040.995",
+          "volume_24h": "304261751.94582",
+          "timestamp": 1791900006320
+        }
+      ]
+    },
+    {
+      "channel": "prices",
+      "data": [
+        {
+          "symbol": "TSLA",
+          "funding": "0.0000125",
+          "next_funding": "0.0000125",
+          "oracle": "373.902993",
+          "mark": "373.902993",
+          "mid": "373.78",
+          "yesterday_price": "380.35",
+          "open_interest": "512.58",
+          "volume_24h": "70003.31648",
+          "timestamp": 1791900009318
+        },
+        {
+          "symbol": "FARTCOIN",
+          "funding": "0.0000125",
+          "next_funding": "0.0000125",
+          "oracle": "0.160212",
+          "mark": "0.160212",
+          "mid": "0.16",
+          "yesterday_price": "0.1675",
+          "open_interest": "772022.6",
+          "volume_24h": "94454.05198",
+          "timestamp": 1791900009318
+        },
+        {
+          "symbol": "BTC",
+          "funding": "0.00000429",
+          "next_funding": "0.00000325",
+          "oracle": "83279.275418",
+          "mark": "83239.3",
+          "mid": "83231.5",
+          "yesterday_price": "83025",
+          "open_interest": "493.94911",
+          "volume_24h": "485331489.28508",
+          "timestamp": 1791900009318
+        },
+        {
+          "symbol": "ETH",
+          "funding": "0.00000518",
+          "next_funding": "0.00000234",
+          "oracle": "2503.714231",
+          "mark": "2502.504",
+          "mid": "2502.15",
+          "yesterday_price": "2541",
+          "open_interest": "14040.995",
+          "volume_24h": "304261751.94582",
+          "timestamp": 1791900009318
+        }
+      ]
+    }
+  ]
+}

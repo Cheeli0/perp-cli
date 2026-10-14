@@ -1,0 +1,14 @@
+{
+  "name": "perp-cli-ws-next-smoke",
+  "private": true,
+  "description": "Next 13.5 (webpack, transpilePackages) build of the ws-funding-compare-browser example against an installed perp-cli",
+  "scripts": {
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "next": "13.5.11",
+    "react": "18.2.0",
+    "react-dom": "18.2.0"
+  }
+}

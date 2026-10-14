@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>perp-cli/ws funding compare</title>
+  <style>
+    body { font: 14px/1.4 system-ui, sans-serif; margin: 16px; }
+    table { border-collapse: collapse; } td, th { padding: 2px 8px; text-align: left; }
+    tbody tr:hover { background: #8882; } pre { background: #8881; padding: 8px; }
+  </style>
+  <!-- The page loads the built library straight from the repo (run `pnpm build` first).
+       An app with a bundler imports "perp-cli/ws" from the installed package instead. -->
+  <script type="importmap">{ "imports": { "perp-cli/ws": "../../dist/ws/index.js" } }</script>
+</head>
+<body>
+  <h1>perp-cli/ws — live funding compare</h1>
+  <div id="app"></div>
+  <script type="module">
+    import { startFundingCompare } from "./app.js";
+    window.stopFundingCompare = startFundingCompare(document.getElementById("app"));
+  </script>
+</body>
+</html>

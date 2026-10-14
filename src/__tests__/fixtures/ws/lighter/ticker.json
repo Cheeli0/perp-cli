@@ -1,0 +1,85 @@
+{
+  "venue": "lighter",
+  "captured": "2026-10-13 (live probe, scripts/ws-probe)",
+  "channel": "ticker/1",
+  "kind": "public",
+  "note": "nonce strictly increasing but NOT contiguous (ordering only). last_updated_at µs, timestamp ms.",
+  "frames": [
+    {
+      "channel": "ticker:1",
+      "last_updated_at": 1791900008492912,
+      "nonce": 24550321506,
+      "ticker": {
+        "s": "BTC",
+        "a": {
+          "price": "83230.5",
+          "size": "0.03003"
+        },
+        "b": {
+          "price": "83228.7",
+          "size": "0.00130"
+        },
+        "last_updated_at": 1791900008492912
+      },
+      "timestamp": 1791900008501,
+      "type": "subscribed/ticker"
+    },
+    {
+      "channel": "ticker:1",
+      "last_updated_at": 1791900008623033,
+      "nonce": 24550321684,
+      "ticker": {
+        "s": "BTC",
+        "a": {
+          "price": "83230.5",
+          "size": "0.03003"
+        },
+        "b": {
+          "price": "83228.7",
+          "size": "0.26152"
+        },
+        "last_updated_at": 1791900008623033
+      },
+      "timestamp": 1791900008625,
+      "type": "update/ticker"
+    },
+    {
+      "channel": "ticker:1",
+      "last_updated_at": 1791900008640019,
+      "nonce": 24550321709,
+      "ticker": {
+        "s": "BTC",
+        "a": {
+          "price": "83230.5",
+          "size": "0.03003"
+        },
+        "b": {
+          "price": "83228.7",
+          "size": "0.00130"
+        },
+        "last_updated_at": 1791900008640019
+      },
+      "timestamp": 1791900008641,
+      "type": "update/ticker"
+    },
+    {
+      "channel": "ticker:1",
+      "last_updated_at": 1791900008775734,
+      "nonce": 24550321868,
+      "ticker": {
+        "s": "BTC",
+        "a": {
+          "price": "83230.5",
+          "size": "0.03003"
+        },
+        "b": {
+          "price": "83228.7",
+          "size": "0.00376"
+        },
+        "last_updated_at": 1791900008775734
+      },
+      "timestamp": 1791900008777,
+      "type": "update/ticker"
+    }
+  ]
+}

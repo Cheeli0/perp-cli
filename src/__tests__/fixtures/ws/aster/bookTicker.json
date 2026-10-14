@@ -1,0 +1,65 @@
+{
+  "venue": "aster",
+  "captured": "2026-10-13 (live probe, scripts/ws-probe)",
+  "channel": "btcusdt@bookTicker",
+  "kind": "public",
+  "note": "u (updateId) strictly increasing, not contiguous (ordering only). T transaction ms, E event ms.",
+  "frames": [
+    {
+      "stream": "btcusdt@bookTicker",
+      "data": {
+        "e": "bookTicker",
+        "u": 600370038568,
+        "s": "BTCUSDT",
+        "b": "83225.8",
+        "B": "0.551",
+        "a": "83225.9",
+        "A": "0.001",
+        "T": 1791900008500,
+        "E": 1791900008537
+      }
+    },
+    {
+      "stream": "btcusdt@bookTicker",
+      "data": {
+        "e": "bookTicker",
+        "u": 600370038623,
+        "s": "BTCUSDT",
+        "b": "83225.8",
+        "B": "0.551",
+        "a": "83225.9",
+        "A": "0.461",
+        "T": 1791900008500,
+        "E": 1791900008539
+      }
+    },
+    {
+      "stream": "btcusdt@bookTicker",
+      "data": {
+        "e": "bookTicker",
+        "u": 600370042768,
+        "s": "BTCUSDT",
+        "b": "83225.8",
+        "B": "1.349",
+        "a": "83225.9",
+        "A": "0.461",
+        "T": 1791900008650,
+        "E": 1791900008691
+      }
+    },
+    {
+      "stream": "btcusdt@bookTicker",
+      "data": {
+        "e": "bookTicker",
+        "u": 600370052594,
+        "s": "BTCUSDT",
+        "b": "83225.8",
+        "B": "1.349",
+        "a": "83225.9",
+        "A": "0.001",
+        "T": 1791900009050,
+        "E": 1791900009067
+      }
+    }
+  ]
+}

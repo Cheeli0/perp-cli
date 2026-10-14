@@ -46,6 +46,15 @@ export const ERROR_CODES = {
    */
   ACTION_REJECTED:      { code: "ACTION_REJECTED",      status: 422, retryable: false },
 
+  // WebSocket library (perp-cli/ws, src/ws/errors.ts keeps a parity-tested copy)
+  /** A venue frame could not be parsed or classified (never silently dropped). */
+  WS_PROTOCOL_ERROR:    { code: "WS_PROTOCOL_ERROR",    status: 502, retryable: false },
+  WS_AUTH_FAILED:       { code: "WS_AUTH_FAILED",       status: 401, retryable: false },
+  /** A subscription / connection budget (venue limit or caller budget) would be exceeded. */
+  SUBSCRIPTION_LIMIT:   { code: "SUBSCRIPTION_LIMIT",   status: 400, retryable: false },
+  /** An event stream's bounded buffer overflowed; the subscription was closed. */
+  STREAM_OVERFLOW:      { code: "STREAM_OVERFLOW",      status: 507, retryable: false },
+
   // 5xx - System / transient errors
   EXCHANGE_UNREACHABLE: { code: "EXCHANGE_UNREACHABLE", status: 503, retryable: true },
   RATE_LIMITED: { code: "RATE_LIMITED", status: 429, retryable: true, retryAfterMs: 1000 },
@@ -102,6 +111,12 @@ export function classifyError(err: unknown, exchange?: string): StructuredError 
     // caller provided one and the error didn't already attach it.
     const ex = (err.structured.exchange ?? exchange);
     return ex !== undefined ? { ...err.structured, exchange: ex } : { ...err.structured };
+  }
+  // Structural PerpError (perp-cli/ws WsError is a separate leaf class): keep its registered code.
+  if (err instanceof Error && isStructuredLike(err)) {
+    const s = err.structured;
+    const ex = s.exchange ?? exchange;
+    return ex !== undefined ? { ...s, exchange: ex } : { ...s };
   }
   const message = extractErrorMessage(err);
   const lower = message.toLowerCase();
@@ -233,6 +248,14 @@ export function classifyError(err: unknown, exchange?: string): StructuredError 
     return { ...ERROR_CODES.EXCHANGE_ERROR, message, exchange };
   }
   return { ...ERROR_CODES.UNKNOWN, message };
+}
+
+function isStructuredLike(err: Error): err is Error & { structured: StructuredError } {
+  const s = (err as { structured?: unknown }).structured;
+  if (s === null || typeof s !== "object") return false;
+  const { code, message, status, retryable } = s as Record<string, unknown>;
+  return typeof code === "string" && Object.prototype.hasOwnProperty.call(ERROR_CODES, code)
+    && typeof message === "string" && typeof status === "number" && typeof retryable === "boolean";
 }
 
 /** Custom error class that carries a structured error code */

@@ -1,0 +1,35 @@
+{
+  "venue": "hyperliquid",
+  "captured": "2026-10-13 (live probe, scripts/ws-probe)",
+  "channel": "control",
+  "kind": "public",
+  "note": "subscriptionResponse acks, app pong, and the error frame for an unknown subscription type. An unknown COIN gets no error frame: the server closes the socket (client sees 1006).",
+  "frames": [
+    {
+      "channel": "subscriptionResponse",
+      "data": {
+        "method": "subscribe",
+        "subscription": {
+          "type": "allDexsAssetCtxs"
+        }
+      }
+    },
+    {
+      "channel": "subscriptionResponse",
+      "data": {
+        "method": "subscribe",
+        "subscription": {
+          "type": "activeAssetCtx",
+          "coin": "BTC"
+        }
+      }
+    },
+    {
+      "channel": "pong"
+    },
+    {
+      "channel": "error",
+      "data": "Error parsing JSON into valid websocket request: {\"method\":\"subscribe\",\"subscription\":{\"type\":\"nopeType\"}}"
+    }
+  ]
+}

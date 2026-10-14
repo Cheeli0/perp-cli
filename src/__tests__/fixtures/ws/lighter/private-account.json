@@ -1,0 +1,98 @@
+{
+  "venue": "lighter",
+  "captured": "2026-10-13 (live probe, scripts/ws-probe)",
+  "channel": "user_stats / account_all_positions / account_all_orders / account_all_trades",
+  "kind": "private",
+  "note": "Anonymized. user_stats, account_all_positions, account_all_trades work WITHOUT auth; account_all_orders needs auth (error 20001 otherwise). account_all_trades 'subscribed/' snapshot carried trades:{} despite non-zero daily_volume → no replay of recent fills. Positions trimmed to 2 markets.",
+  "frames": [
+    {
+      "channel": "user_stats:1000001",
+      "stats": {
+        "collateral": "0.002285",
+        "portfolio_value": "0.002285",
+        "leverage": "0.00",
+        "available_balance": "0.002285",
+        "margin_usage": "0.00",
+        "buying_power": "0",
+        "account_trading_mode": 1,
+        "cross_stats": {
+          "collateral": "0.002285",
+          "portfolio_value": "0.002285",
+          "leverage": "0.00",
+          "available_balance": "0.002285",
+          "margin_usage": "0.00",
+          "buying_power": "0"
+        },
+        "total_stats": {
+          "collateral": "0.002285",
+          "portfolio_value": "0.002285",
+          "leverage": "0.00",
+          "available_balance": "0.002285",
+          "margin_usage": "0.00",
+          "buying_power": "0"
+        }
+      },
+      "timestamp": 1791035142897,
+      "type": "subscribed/user_stats"
+    },
+    {
+      "bo_positions": {},
+      "channel": "account_all_positions:1000001",
+      "positions": {
+        "0": {
+          "market_id": 0,
+          "symbol": "ETH",
+          "initial_margin_fraction": "5.37",
+          "open_order_count": 0,
+          "pending_order_count": 0,
+          "position_tied_order_count": 0,
+          "sign": 1,
+          "position": "0.0000",
+          "avg_entry_price": "0.00",
+          "position_value": "0.000000",
+          "unrealized_pnl": "0.000000",
+          "realized_pnl": "0.000000",
+          "liquidation_price": "0",
+          "margin_mode": 0,
+          "margin_set_flag": 1,
+          "allocated_margin": "0.000000"
+        },
+        "1": {
+          "market_id": 1,
+          "symbol": "BTC",
+          "initial_margin_fraction": "10.73",
+          "open_order_count": 0,
+          "pending_order_count": 0,
+          "position_tied_order_count": 0,
+          "sign": 1,
+          "position": "0.00000",
+          "avg_entry_price": "0.0",
+          "position_value": "0.000000",
+          "unrealized_pnl": "0.000000",
+          "realized_pnl": "0.000000",
+          "liquidation_price": "0",
+          "margin_mode": 0,
+          "margin_set_flag": 1,
+          "allocated_margin": "0.000000"
+        }
+      },
+      "shares": [],
+      "transaction_time": 1790969450855877,
+      "type": "subscribed/account_all_positions"
+    },
+    {
+      "channel": "account_all_orders:1000001",
+      "orders": {},
+      "type": "subscribed/account_all_orders"
+    },
+    {
+      "channel": "account_all_trades:1000001",
+      "daily_volume": 232.9270967,
+      "monthly_volume": 466.7602676,
+      "total_volume": 713.7903997,
+      "trades": {},
+      "type": "subscribed/account_all_trades",
+      "weekly_volume": 232.9270967
+    }
+  ]
+}
