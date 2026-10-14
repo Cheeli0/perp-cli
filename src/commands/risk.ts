@@ -146,11 +146,12 @@ export function registerRiskCommands(
         console.log(`  Positions:            ${assessment.metrics.positionCount}`);
         console.log(`  Largest Position:     $${formatUsd(assessment.metrics.largestPositionUsd)}`);
         console.log(`  Max Leverage Used:    ${assessment.metrics.maxLeverageUsed}x`);
-        if (assessment.metrics.minLiquidationDistancePct >= 0) {
-          const ldColor = assessment.metrics.minLiquidationDistancePct < assessment.limits.minLiquidationDistance
+        const minLiq = assessment.metrics.minLiquidationDistancePct;
+        if (minLiq !== null) {
+          const ldColor = minLiq < assessment.limits.minLiquidationDistance
             ? chalk.red
             : chalk.green;
-          console.log(`  Min Liq Distance:     ${ldColor(`${assessment.metrics.minLiquidationDistancePct.toFixed(1)}%`)}`);
+          console.log(`  Min Liq Distance:     ${ldColor(`${minLiq.toFixed(1)}%`)}`);
         }
         for (const { exchange, position: p } of positions.filter(x => x.position.liquidationPrice === null)) {
           console.log(`  Liq Price ${exchange}:${p.symbol}: ${chalk.yellow("unknown (venue does not report)")} — not in Min Liq Distance`);

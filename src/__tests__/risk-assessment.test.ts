@@ -299,9 +299,15 @@ describe("Liquidation Distance in assessRisk", () => {
     expect(result.metrics.minLiquidationDistancePct).toBeCloseTo(20, 1);
   });
 
-  it("should report -1 for minLiquidationDistancePct when no positions", () => {
+  it("should report null (unknown) for minLiquidationDistancePct when no positions — not a -1 sentinel", () => {
     const result = assessRisk([], [], defaultLimits);
-    expect(result.metrics.minLiquidationDistancePct).toBe(-1);
+    expect(result.metrics.minLiquidationDistancePct).toBeNull();
+  });
+
+  it("is null when no open position reports a liquidation price", () => {
+    const balances = [{ exchange: "test", balance: makeBalance(10000, 8000, 2000, 0) }];
+    const positions = [{ exchange: "test", position: { ...makePosition("BTC", "long", 0.01, 100000, 2, 0), liquidationPrice: null } }];
+    expect(assessRisk(balances, positions, defaultLimits).metrics.minLiquidationDistancePct).toBeNull();
   });
 
   it("should include liquidationDistances array in assessment", () => {

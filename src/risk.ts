@@ -133,7 +133,8 @@ export interface RiskAssessment {
     marginUtilization: number;
     largestPositionUsd: number;
     maxLeverageUsed: number;
-    minLiquidationDistancePct: number;
+    /** null = no position with a known liquidation price (no positions, or none reported) — never a -1 sentinel */
+    minLiquidationDistancePct: number | null;
   };
   liquidationDistances: LiquidationDistanceInfo[];
   limits: RiskLimits;
@@ -239,10 +240,10 @@ export function assessRisk(
 
   // Check liquidation distances
   const liquidationDistances = getLiquidationDistances(positions, lim);
-  let minLiquidationDistancePct = Infinity;
+  let minLiquidationDistancePct: number | null = null;
 
   for (const ld of liquidationDistances) {
-    if (ld.distancePct < minLiquidationDistancePct) {
+    if (minLiquidationDistancePct === null || ld.distancePct < minLiquidationDistancePct) {
       minLiquidationDistancePct = ld.distancePct;
     }
     if (ld.distancePct < lim.minLiquidationDistance) {
@@ -255,8 +256,6 @@ export function assessRisk(
       });
     }
   }
-
-  if (minLiquidationDistancePct === Infinity) minLiquidationDistancePct = -1; // no positions
 
   // Determine overall risk level
   let level: RiskLevel = "low";
