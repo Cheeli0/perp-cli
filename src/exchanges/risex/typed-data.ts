@@ -45,6 +45,12 @@ export interface RisexPins {
    * (ids 0..4; ids ≥5 rejected by ABI enum decoding). An upgrade refuses trading until re-reviewed.
    */
   authImplementation: string;
+  /** EIP-1967 implementation of the RISExUniversalRouter proxy (every permit-gated action). */
+  routerImplementation: string;
+  /** The account registry the Authorization contract reads (`getAccountRegistry()`; its getUserId is STATICCALLed by hasPermission / sessionKeys). */
+  accountRegistry: string;
+  /** EIP-1967 implementation of the account registry proxy. */
+  accountRegistryImplementation: string;
 }
 
 /** Verified 2026-10-14 from GET /v1/system/config and /v1/auth/eip712-domain on each network. */
@@ -56,6 +62,9 @@ export const RISEX_PINS: Readonly<Record<Network, RisexPins>> = {
     rpcUrl: "https://rpc.risechain.com",
     // eth_getStorageAt(auth, EIP-1967 implementation slot), 2026-10-14.
     authImplementation: "0xCCCb0483342d77AbC4337f3e12514eC8E78b3e28",
+    routerImplementation: "0xe2da7a94a81fe9ee58f70ebce862a176280092ae",
+    accountRegistry: "0x1238991cac4e65902c08213e79909a9c813eebc3",
+    accountRegistryImplementation: "0x531a0c7687cbaf02383b21443619487eb18b91e5",
   },
   testnet: {
     chainId: 11155931,
@@ -64,6 +73,9 @@ export const RISEX_PINS: Readonly<Record<Network, RisexPins>> = {
     // eth_chainId 0xaa39db = 11155931 (verified); the testnet system config lists no RPC.
     rpcUrl: "https://testnet.riselabs.xyz",
     authImplementation: "0xc5b84461547eb5397a7c3fd067abfcbc24b53663",
+    routerImplementation: "0x9218cd0d7626d9611b62e55dc3659936f9e57f68",
+    accountRegistry: "0xf733038054cfb47fa9da1a1d6e79be6fb61f0a70",
+    accountRegistryImplementation: "0x99ccc05d52b69bd889a8ab4bc7c12b47aca94b58",
   },
 };
 

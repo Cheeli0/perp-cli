@@ -36,7 +36,7 @@ import type { EvmSigner } from "../../signer/interface.js";
 import type { Network } from "../venue-types.js";
 import { RisexSendUnknown, type RisexClient } from "./client.js";
 import { risexClient } from "./public.js";
-import { allocateAccountNonce, assertTradingOnlyOnChain, chainReader, loadSigningContext, type RisexChainReader, type RisexSigningContext } from "./session.js";
+import { allocateAccountNonce, assertReviewedContracts, assertTradingOnlyOnChain, chainReader, loadSigningContext, type RisexChainReader, type RisexSigningContext } from "./session.js";
 import {
   RISEX_AUTH_IFACE, RISEX_NON_TRADING_PERMISSIONS, RISEX_PERMISSION_IDS, RISEX_PINS, RISEX_TRADING_PERMISSION, signChecked,
   type NonceSlot,
@@ -223,8 +223,10 @@ export interface RisexApproveDeps {
  * Checks that refuse without side effects (signing context pins, maintenance, the master's gas):
  * run before registering — and, for --rotate, before the old signer is revoked.
  */
-export async function risexApprovePreflight(network: Network, client: RisexClient, account: string, assertGas: (a: string) => Promise<void>): Promise<RisexSigningContext> {
+export async function risexApprovePreflight(network: Network, client: RisexClient, chain: RisexChainReader, account: string, assertGas: (a: string) => Promise<void>): Promise<RisexSigningContext> {
   const ctx = await loadSigningContext(client, network);
+  // The reviewed contracts (implementation pins, no permission id ≥5) before anything is registered.
+  await assertReviewedContracts(chain, network);
   await assertGas(account);
   return ctx;
 }
@@ -233,7 +235,7 @@ export async function risexApprovePreflight(network: Network, client: RisexClien
 export async function risexRotatePreflight(masterOwsWallet: string, passphrase: string | null, network: Network): Promise<void> {
   const { OwsEvmSigner } = await import("../../signer/ows-evm.js");
   const account = getAddress(OwsEvmSigner.create(masterOwsWallet, passphrase ?? "").getAddress());
-  await risexApprovePreflight(network, risexClient(network), account, a => assertRestrictGas(network, a));
+  await risexApprovePreflight(network, risexClient(network), chainReader(network), account, a => assertRestrictGas(network, a));
 }
 
 /** Full approve with OWS master + OWS agent wallet. Returns the meta of a trading-only signer (the caller persists it). */
@@ -278,7 +280,7 @@ export async function approveRisexAgentWith(opts: ApproveRisexAgentOpts, deps: R
   const account = getAddress(master.getAddress());
 
   // Everything that can refuse without side effects runs first.
-  const ctx = await risexApprovePreflight(network, client, account, deps.assertGas);
+  const ctx = await risexApprovePreflight(network, client, deps.chain, account, deps.assertGas);
 
   const agentWalletName = risexAgentWalletName(opts.masterOwsWallet, network);
   if (ows.walletExists(agentWalletName)) {

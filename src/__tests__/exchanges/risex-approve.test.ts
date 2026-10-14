@@ -21,7 +21,8 @@ import { PerpError } from "../../errors.js";
 const chainExtras = (low: () => number) => ({
   sessionKey: async () => ({ expiration: 2_000_000_000, bitmap: 0xffffffe0n | BigInt(low()), status: 1 }),
   permissionIdExists: async () => false,
-  authImplementation: async () => RISEX_PINS.mainnet.authImplementation,
+  implementationOf: async (proxy: string) => ({ [RISEX_PINS.mainnet.auth.toLowerCase()]: RISEX_PINS.mainnet.authImplementation, [RISEX_PINS.mainnet.router.toLowerCase()]: RISEX_PINS.mainnet.routerImplementation, [RISEX_PINS.mainnet.accountRegistry.toLowerCase()]: RISEX_PINS.mainnet.accountRegistryImplementation } as Record<string, string>)[proxy.toLowerCase()] as string,
+  accountRegistry: async () => RISEX_PINS.mainnet.accountRegistry,
 });
 const bitsOf = (perms: Map<number, boolean>) => [...perms].reduce((acc, [p, on]) => acc | (on ? 1 << p : 0), 0);
 
@@ -106,6 +107,23 @@ describe("approveRisexAgentWith", () => {
     expect(posts).toEqual(["/v1/auth/register-signer"]);
     expect(wallets.has(WALLET)).toBe(true);
     expect(saved).toEqual([]);
+  });
+
+  it("an upgraded contract (pin mismatch) refuses in the pre-check, before anything is created or registered", async () => {
+    routes();
+    const d = deps();
+    d.chain = { ...d.chain, implementationOf: async () => "0x0000000000000000000000000000000000000bad" };
+    await expect(approveRisexAgentWith(OPTS, d)).rejects.toMatchObject({ structured: { code: "POLICY_DENIED" } });
+    expect(posts).toEqual([]);
+    expect(wallets.size).toBe(0);
+  });
+
+  it("a new permission id ≥5 refuses in the pre-check", async () => {
+    routes();
+    const d = deps();
+    d.chain = { ...d.chain, permissionIdExists: async () => true };
+    await expect(approveRisexAgentWith(OPTS, d)).rejects.toMatchObject({ structured: { code: "POLICY_DENIED" } });
+    expect(posts).toEqual([]);
   });
 
   it("the gas pre-check refuses before anything is created or registered", async () => {

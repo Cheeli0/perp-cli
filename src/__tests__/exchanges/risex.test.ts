@@ -30,7 +30,8 @@ import { newVenueClientOrderId } from "../../exchanges/trading-v2.js";
 const chainExtras = (low: () => number) => ({
   sessionKey: async () => ({ expiration: 2_000_000_000, bitmap: 0xffffffe0n | BigInt(low()), status: 1 }),
   permissionIdExists: async () => false,
-  authImplementation: async () => RISEX_PINS.mainnet.authImplementation,
+  implementationOf: async (proxy: string) => ({ [RISEX_PINS.mainnet.auth.toLowerCase()]: RISEX_PINS.mainnet.authImplementation, [RISEX_PINS.mainnet.router.toLowerCase()]: RISEX_PINS.mainnet.routerImplementation, [RISEX_PINS.mainnet.accountRegistry.toLowerCase()]: RISEX_PINS.mainnet.accountRegistryImplementation } as Record<string, string>)[proxy.toLowerCase()] as string,
+  accountRegistry: async () => RISEX_PINS.mainnet.accountRegistry,
 });
 const bitsOf = (perms: Map<number, boolean>) => [...perms].reduce((acc, [p, on]) => acc | (on ? 1 << p : 0), 0);
 
@@ -310,7 +311,7 @@ async function adapter(opts: { signer?: boolean; chain?: { isNonceUsed: () => Pr
     account: ACCOUNT, signer, meta: null,
     noSignerReason: signer === null ? new PerpError("AGENT_NOT_REGISTERED", "no signer") : null,
     nonceDir, sleep: async () => undefined,
-    chain: { hasPermission: async () => true, isNonceUsed: opts.chain?.isNonceUsed ?? (async () => false), ...chainExtras(() => 0b00100) },
+    chain: { hasPermission: async (_a: string, _s: string, p: number) => p === 2, isNonceUsed: opts.chain?.isNonceUsed ?? (async () => false), ...chainExtras(() => 0b00100) },
     quarantine: opts.quarantine ?? (() => undefined),
   });
 }
@@ -456,7 +457,7 @@ describe("adapter: placeOrder", () => {
     const signer = await LocalEvmSigner.create(Wallet.createRandom().privateKey);
     const a = new RisexAdapter(getVenue("risex"), "mainnet", {
       account: ACCOUNT, signer, meta: null, noSignerReason: null, nonceDir, sleep: async () => undefined,
-      chain: { hasPermission: async () => true, isNonceUsed: async () => { throw new Error("rpc down"); }, ...chainExtras(() => 0b00100) },
+      chain: { hasPermission: async (_a: string, _s: string, p: number) => p === 2, isNonceUsed: async () => { throw new Error("rpc down"); }, ...chainExtras(() => 0b00100) },
     });
     vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const e = await a.placeOrder(req({ clientOrderId: "424242" })).catch((x: unknown) => x as PerpError) as PerpError;

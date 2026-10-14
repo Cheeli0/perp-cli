@@ -1,7 +1,8 @@
 /**
- * M1: trading-only is proven from the RAW sessionKeys bitmap (+ the Authorization implementation pin
- * and a "no permission id ≥5" probe), at approve, at verify and once per adapter session before the
- * first permit. Mocked chain reader / HTTP; no network.
+ * M1: trading-only is proven from the RAW sessionKeys bitmap (+ the pinned Authorization / Router /
+ * AccountRegistry implementations, a "no permission id ≥5" probe and a per-id hasPermission
+ * cross-check), at approve, at verify and before permits (re-checked after a TTL). Mocked chain
+ * reader / HTTP; no network.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -9,6 +10,13 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Wallet } from "ethers";
 import "../../exchanges/venues/index.js";
+
+// The process-wide rate limiter keys off Date.now(); the TTL test moves the clock, which would leave
+// the limiter waiting for a slot in the "future" in later tests. Rate limiting is not under test here.
+vi.mock("../../exchanges/rate-limiter.js", async orig => ({
+  ...(await orig<typeof import("../../exchanges/rate-limiter.js")>()),
+  acquireRate: async () => undefined,
+}));
 import { getVenue } from "../../exchanges/venue.js";
 import { PerpError } from "../../errors.js";
 import { LocalEvmSigner } from "../../signer/evm-local.js";
@@ -21,15 +29,27 @@ import type { RisexAgentMeta } from "../../settings.js";
 const ACCOUNT = "0x938a104179a2D23DeC249A968ecd5B4F8B857cac";
 const SIGNER = "0x00000000000000000000000000000000000000a1";
 
-function reader(o: { bitmap?: bigint; status?: number; impl?: string; id5?: boolean } = {}): RisexChainReader & { reads: () => number } {
+type ReaderOpts = {
+  bitmap?: bigint; status?: number; impl?: string; routerImpl?: string; registry?: string; registryImpl?: string; id5?: boolean;
+  /** hasPermission answers (default: derived from the bitmap). */
+  has?: (p: number) => boolean;
+};
+function reader(o: ReaderOpts = {}): RisexChainReader & { reads: () => number } {
   let reads = 0;
+  const pin = RISEX_PINS.mainnet;
+  const impls: Record<string, string> = {
+    [pin.auth.toLowerCase()]: o.impl ?? pin.authImplementation,
+    [pin.router.toLowerCase()]: o.routerImpl ?? pin.routerImplementation,
+    [pin.accountRegistry.toLowerCase()]: o.registryImpl ?? pin.accountRegistryImplementation,
+  };
   return {
     reads: () => reads,
-    hasPermission: async (_a, _s, p) => (((o.bitmap ?? 0xffffffe4n) >> BigInt(p)) & 1n) === 1n,
+    hasPermission: async (_a, _s, p) => (o.has ? o.has(p) : (((o.bitmap ?? 0xffffffe4n) >> BigInt(p)) & 1n) === 1n),
     isNonceUsed: async () => false,
     sessionKey: async () => { reads++; return { expiration: 2_000_000_000, bitmap: o.bitmap ?? 0xffffffe4n, status: o.status ?? 1 }; },
     permissionIdExists: async () => o.id5 ?? false,
-    authImplementation: async () => o.impl ?? RISEX_PINS.mainnet.authImplementation,
+    implementationOf: async proxy => impls[proxy.toLowerCase()] as string,
+    accountRegistry: async () => o.registry ?? pin.accountRegistry,
   };
 }
 
@@ -51,10 +71,22 @@ describe("assertTradingOnlyOnChain", () => {
     ["revoked signer", { status: 3 }, /status 3/],
     ["an upgraded Authorization implementation", { impl: "0x0000000000000000000000000000000000000bad" }, /upgraded/],
     ["a new permission id 5", { id5: true }, /permission id 5/],
-  ])("refuses %s → POLICY_DENIED", async (_n, o, re) => {
+    ["an upgraded router implementation", { routerImpl: "0x0000000000000000000000000000000000000bad" }, /router was upgraded/],
+    ["a different account registry", { registry: "0x0000000000000000000000000000000000000bad" }, /account registry 0x/],
+    ["an upgraded account registry implementation", { registryImpl: "0x0000000000000000000000000000000000000bad" }, /account registry was upgraded/],
+    ["hasPermission disagreeing with the bitmap", { has: (p: number) => p === 2 || p === 4 }, /hasPermission disagrees/],
+  ] as Array<[string, ReaderOpts, RegExp]>)("refuses %s → POLICY_DENIED", async (_n, o, re) => {
     const e = await assertTradingOnlyOnChain(reader(o), "mainnet", ACCOUNT, SIGNER).catch((x: unknown) => x as PerpError) as PerpError;
     expect(e.structured.code).toBe("POLICY_DENIED");
     expect(e.message).toMatch(re);
+  });
+
+  it("an upgrade refusal says cancels are refused too, where to manage orders, and how to revoke", async () => {
+    const e = await assertTradingOnlyOnChain(reader({ routerImpl: "0x0000000000000000000000000000000000000bad" }), "mainnet", ACCOUNT, SIGNER).catch((x: unknown) => x as PerpError) as PerpError;
+    expect(e.structured.remediation).toMatch(/cancel and cancel-all/);
+    expect(e.structured.remediation).toMatch(/app\.rise\.trade/);
+    expect(e.structured.remediation).toMatch(/wallet agent revoke risex <name>/);
+    expect(e.structured.remediation).toMatch(/Update perp-cli/);
   });
 });
 
@@ -101,6 +133,30 @@ describe("adapter: proof once per session before the first permit", () => {
     const a = await make(reader({ bitmap: 0xffffffffn }));
     await expect(a.placeOrder(order)).rejects.toMatchObject({ structured: { code: "POLICY_DENIED" } });
     expect(posts).toEqual([]);
+  });
+
+  it("the proof is re-checked after the TTL: a contract upgrade mid-session stops trading (fake timers)", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const o: ReaderOpts = {};
+      const r = reader(o);
+      const live: RisexChainReader = { ...r, implementationOf: async p => (o.impl !== undefined && p.toLowerCase() === RISEX_PINS.mainnet.auth.toLowerCase() ? o.impl : r.implementationOf(p)) };
+      const a = await make(live);
+      await a.placeOrder(order);
+      vi.setSystemTime(Date.now() + 30_000);
+      await a.placeOrder({ ...order, clientOrderId: "12" }); // within the TTL: no re-check
+      expect(r.reads()).toBe(1);
+      o.impl = "0x0000000000000000000000000000000000000bad"; // the Authorization is upgraded
+      vi.setSystemTime(Date.now() + 61_000);
+      await expect(a.placeOrder({ ...order, clientOrderId: "13" })).rejects.toMatchObject({ structured: { code: "POLICY_DENIED" } });
+      expect(posts).toEqual(["/v1/orders/place", "/v1/orders/place"]);
+      // A failed proof is not cached: once restored, the next action proves again and trades.
+      o.impl = undefined;
+      await a.placeOrder({ ...order, clientOrderId: "14" });
+      expect(posts).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("a trading-only signer is proven once, then orders flow", async () => {
