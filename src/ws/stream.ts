@@ -862,7 +862,11 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
       st.refs.add(sub);
     }
     for (const w of directoryWarnings) sub.emit(errorEvent("EXCHANGE_ERROR", w, null, null, false));
-    if (canonicalWarning !== null) sub.emit(canonicalWarning);
+    if (canonicalWarning !== null && canonicalWarning.type === "error") {
+      // Logged here, after the budget / limit checks passed and the subscription is registered.
+      log("warn", "canonicals-missing", canonicalWarning.message, { missing: canonicalWarning.details?.missing });
+      sub.emit(canonicalWarning);
+    }
     if (target.kind === "user") {
       for (const w of list) {
         const g = w.gaps?.onSubscribe;
@@ -914,7 +918,6 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
         withHints.length === 0 ? undefined : { suggestions: Object.fromEntries(withHints.map(p => [p.c, p.s])) });
     }
     const message = `${venue}: no market with canonical(s) ${list}${hint}; subscribed to the other ${canonicals.length - missing.length}`;
-    log("warn", "canonicals-missing", message, { missing });
     return { symbols, warning: errorEvent("SYMBOL_NOT_FOUND", message, remediation, null, false, { missing, suggestions }) };
   }
 

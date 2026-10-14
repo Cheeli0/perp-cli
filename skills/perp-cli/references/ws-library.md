@@ -201,8 +201,8 @@ await Promise.all(streams.map((s) => s.close()));
 - Iterator buffer: market/bbo/account/positions/orders events are **state** and coalesce by key (never
   fatal). Fills and control events are not coalesced; a full buffer → fatal `STREAM_OVERFLOW` and the
   subscription closes. Before the iterator exists, state/error controls are kept in a ring of the last
-  `size` (the iterator first gets a non-fatal `STREAM_OVERFLOW` with the discarded count); fills and
-  gaps are never evicted.
+  `size` (the iterator first gets a non-fatal `STREAM_OVERFLOW` with the discarded count); fills,
+  gaps and the one-time `SYMBOL_NOT_FOUND` warning are never evicted.
 
 ## 4. Event fields and nullability
 

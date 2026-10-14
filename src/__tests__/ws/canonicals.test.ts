@@ -110,6 +110,46 @@ describe("allMarkets canonicals: partial match", () => {
   });
 });
 
+describe("allMarkets canonicals: warning delivery", () => {
+  it("the one-time SYMBOL_NOT_FOUND warning survives the pre-iterator ring (many state events before the iterator)", async () => {
+    const t = fakeTransport();
+    const stream = createVenueStream(aster, {
+      transport: t.factory, fetch: fakeFetch(ASTER_ROUTES), visibility: null,
+      buffer: { size: 3 }, reconnect: { maxAttempts: null, baseMs: 1, maxMs: 2 },
+    });
+    const sub = stream.subscribe({ kind: "allMarkets", canonicals: ["BTC", "NOPE"] });
+    await flush(30);
+    for (let i = 0; i < 6; i++) { // each cycle: live → reconnecting → connecting (state controls)
+      t.last().open();
+      t.last().serverClose(1006);
+      await new Promise(r => setTimeout(r, 10));
+    }
+    const it = sub[Symbol.asyncIterator]();
+    const seen: StreamControl[] = [];
+    for (let i = 0; i < 3; i++) seen.push((await it.next()).value as StreamControl);
+    expect(seen[0]).toMatchObject({ type: "error", code: "STREAM_OVERFLOW", fatal: false }); // older state events were discarded
+    expect(seen).toContainEqual(expect.objectContaining({ type: "error", code: "SYMBOL_NOT_FOUND", details: expect.objectContaining({ missing: ["NOPE"] }) }));
+    await stream.close();
+  });
+
+  it("the canonicals-missing log is written only after the budget checks pass", async () => {
+    const logs: string[] = [];
+    const t = fakeTransport();
+    const stream = createVenueStream(aster, {
+      transport: t.factory, fetch: fakeFetch(ASTER_ROUTES), visibility: null,
+      budget: { maxSubscriptions: 1 }, logger: (l) => logs.push(l.event),
+    });
+    const err = await stream.subscribe({ kind: "allMarkets", canonicals: ["BTC", "NOPE"] }).ready.then(() => null, (e: unknown) => e as WsError);
+    expect(err?.structured.code).toBe("SUBSCRIPTION_LIMIT"); // aster allMarkets needs 2 wire subscriptions
+    expect(logs).not.toContain("canonicals-missing");
+    const ok = createVenueStream(aster, { transport: fakeTransport().factory, fetch: fakeFetch(ASTER_ROUTES), visibility: null, logger: (l) => logs.push(l.event) });
+    ok.subscribe({ kind: "allMarkets", canonicals: ["BTC", "NOPE"] });
+    await flush(30);
+    expect(logs.filter(e => e === "canonicals-missing")).toHaveLength(1);
+    await ok.close();
+  });
+});
+
 describe("allMarkets canonicals: errors", () => {
   async function reject(codec: VenueCodec, routes: Record<string, unknown>, target: AllMarketsTarget, opts: VenueStreamOptions = {}) {
     const t = fakeTransport();
