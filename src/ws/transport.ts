@@ -14,7 +14,7 @@ export function resolveTransport(opts: VenueStreamOptions, venue: string): WsFac
   if (typeof Ctor !== "function") {
     throw new WsError("INVALID_PARAMS", "No global WebSocket in this runtime (Node 20 has none)", {
       exchange: venue,
-      remediation: "import from perp-cli/ws/node or pass transport",
+      remediation: "import from the /node entry (perp-cli/ws/node or @hypurrquant/perp-ws/node) or pass transport",
     });
   }
   return (url: string) => {

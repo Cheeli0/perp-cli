@@ -42,7 +42,7 @@
   ],
   "type": "module",
   "scripts": {
-    "build": "tsc && tsup --config tsup.ws.config.ts",
+    "build": "tsc && tsup --config tsup.ws.config.ts && tsup --config tsup.perp-ws.config.ts",
     "dev": "tsc --watch",
     "test": "vitest run --exclude '**/integration/**'",
     "test:integration": "vitest run -c vitest.integration.config.ts",
@@ -51,7 +51,7 @@
     "e2e:typecheck": "tsc -p scripts/e2e/tsconfig.json",
     "typecheck:test": "tsc -p tsconfig.test.json",
     "sync-skill-version": "node scripts/sync-skill-version.mjs",
-    "prepublishOnly": "node scripts/sync-skill-version.mjs && node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && pnpm run build"
+    "prepublishOnly": "node scripts/sync-skill-version.mjs --check && node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && pnpm run build"
   },
   "keywords": [
     "pacifica",

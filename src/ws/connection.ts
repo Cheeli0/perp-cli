@@ -14,7 +14,7 @@ export const HANDSHAKE_REMEDIATION =
   "connection refused before open — network, venue outage, or Origin/CORS block (see capability matrix: browser)";
 
 export const MAX_PAYLOAD_REMEDIATION =
-  "Raise the cap: createVenueStream(codec, { transport: createNodeTransport({ maxPayload: bytes }) }) from perp-cli/ws/node";
+  "Raise the cap: createVenueStream(codec, { transport: createNodeTransport({ maxPayload: bytes }) }) from the /node entry";
 
 /** The `ws` error raised when an inbound message exceeds the transport's maxPayload (perp-cli/ws/node). */
 function isMaxPayloadError(e: unknown): boolean {

@@ -256,7 +256,7 @@ describe("runtime", () => {
     delete g.WebSocket;
     try {
       expect(() => createVenueStream(hyperliquid, { fetch: fakeFetch({}) })).toThrow(expect.objectContaining({
-        structured: expect.objectContaining({ code: "INVALID_PARAMS", remediation: "import from perp-cli/ws/node or pass transport" }),
+        structured: expect.objectContaining({ code: "INVALID_PARAMS", remediation: "import from the /node entry (perp-cli/ws/node or @hypurrquant/perp-ws/node) or pass transport" }),
       }));
     } finally {
       if (saved !== undefined) g.WebSocket = saved;

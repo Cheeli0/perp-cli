@@ -14,39 +14,51 @@ Runnable examples: `examples/ws-funding-compare-browser`, `examples/ws-next-smok
 
 ## 1. Install and import
 
-```sh
-npm install perp-cli
-```
+Two packages, **the same code and API** (built from one source):
 
-| Runtime | Import | Transport |
+| Package | Install | When |
 |---|---|---|
-| Browser (any bundler, Next.js, Vite, static page) | `perp-cli/ws` | the page's native `WebSocket` and `fetch` |
-| Node 20+ | `perp-cli/ws/node` | `ws` (Node 20 has no global `WebSocket`); same API |
+| **`@hypurrquant/perp-ws`** (recommended for integrators) | `npm install @hypurrquant/perp-ws` (+ `ws` for the Node entry) | apps, dashboards, bots — **no dependencies** (~100 KB ESM) |
+| `perp-cli/ws` | `npm install perp-cli` | perp-cli is already installed (the CLI pulls ~140 MB of CLI deps) |
 
+| Runtime | `@hypurrquant/perp-ws` | `perp-cli` | Transport |
+|---|---|---|---|
+| Browser (any bundler, Next.js, Vite, static page), Node ≥ 22 without `ws` | `@hypurrquant/perp-ws` | `perp-cli/ws` | the runtime's native `WebSocket` and `fetch` |
+| Node 20+ | `@hypurrquant/perp-ws/node` | `perp-cli/ws/node` | `ws` (16 MiB message cap, protocol ping/pong); same API |
+
+- **`ws` for the Node entry:** `@hypurrquant/perp-ws` declares `ws` (`^8.21.0`) as an **optional peer
+  dependency** — `npm install @hypurrquant/perp-ws ws`. Importing `/node` never fails; creating a stream
+  or transport without `ws` throws `INVALID_PARAMS` ("npm install ws@^8.21.0"). The Node entry uses `ws`
+  even on Node ≥ 22 (which has a global `WebSocket`) for the inbound size cap and ping/pong handling; on
+  Node ≥ 22 you may use the browser entry instead (global `WebSocket`, no `ws`, no size cap of ours).
+  `perp-cli` ships `ws` as a regular dependency.
 - ESM only, ES2020, no side effects, no top-level await, touches no global at module load (safe in
-  SSR / prerendering). Next.js 13.5+: `transpilePackages: ["perp-cli"]`.
+  SSR / prerendering). Next.js 13.5+: `transpilePackages: ["@hypurrquant/perp-ws"]` (or `["perp-cli"]`).
 - TypeScript: `moduleResolution` `"bundler"`, `"node16"` / `"nodenext"`, or `"node"` (via `typesVersions`).
-- Only `perp-cli/ws`, `perp-cli/ws/node` and `perp-cli/package.json` are importable (no deep imports).
-- `perp-cli/ws/node` caps one inbound message at 16 MiB (`DEFAULT_MAX_PAYLOAD`; real frames are ≤ ~150 KB).
+- Only the entries above (and `<package>/package.json`) are importable (no deep imports).
+- The examples below import `@hypurrquant/perp-ws`; with perp-cli, replace it by `perp-cli/ws`
+  (`@hypurrquant/perp-ws/node` → `perp-cli/ws/node`). Everything else is identical.
+- The Node entry caps one inbound message at 16 MiB (`DEFAULT_MAX_PAYLOAD`; real frames are ≤ ~150 KB).
   An oversized message closes the socket (`reconnecting` reason `WS_PROTOCOL_ERROR`, naming
   `WS_ERR_UNSUPPORTED_MESSAGE_LENGTH`); 3 within 10 min fail the subscriptions with `WS_PROTOCOL_ERROR`.
   Raise the cap with `createVenueStream(codec, { transport: createNodeTransport({ maxPayload }) })`.
-- `perp-cli/ws` in Node 20 without a `transport` throws `INVALID_PARAMS` ("import from perp-cli/ws/node or
-  pass transport").
+- The browser entry in Node 20 without a `transport` throws `INVALID_PARAMS` ("import from the /node
+  entry … or pass transport").
 
 ### Static page without a bundler
 
-`dist/ws/index.js` is one self-contained ESM file with **no bare imports**, so a plain HTML page can load
-it through an import map. The map points the public specifier at the file; your code still imports
-`"perp-cli/ws"` (that is the "no deep imports" rule: never write `perp-cli/dist/...` in JS — the file path
-lives only in the map, which is the page's job, like a bundler's resolver):
+`dist/index.js` of `@hypurrquant/perp-ws` (`dist/ws/index.js` of perp-cli) is one self-contained ESM
+file with **no bare imports**, so a plain HTML page can load it through an import map. The map points the
+public specifier at the file; your code still imports `"@hypurrquant/perp-ws"` (that is the "no deep
+imports" rule: never write `.../dist/...` in JS — the file path lives only in the map, which is the
+page's job, like a bundler's resolver):
 
 ```html
 <script type="importmap">
-  { "imports": { "perp-cli/ws": "/node_modules/perp-cli/dist/ws/index.js" } }
+  { "imports": { "@hypurrquant/perp-ws": "/node_modules/@hypurrquant/perp-ws/dist/index.js" } }
 </script>
 <script type="module">
-  import { createVenueStream, hyperliquid } from "perp-cli/ws";
+  import { createVenueStream, hyperliquid } from "@hypurrquant/perp-ws";
   const stream = createVenueStream(hyperliquid);
   stream.subscribe({ kind: "allMarkets", symbols: ["BTC"] }).on((e) => {
     if (e.type === "market") document.title = `BTC ${e.mark ?? "—"}`;
@@ -56,15 +68,15 @@ lives only in the map, which is the page's job, like a bundler's resolver):
 
 Serve the page and `node_modules` from the same static server (any origin works: the venues do not check
 Origin and their REST CORS is `*`). Do the same with a CDN that serves npm files (e.g.
-`https://cdn.jsdelivr.net/npm/perp-cli@0.15.0/dist/ws/index.js`). `perp-cli/ws/node` is Node-only (it
-imports `ws`); never map it in a browser.
+`https://cdn.jsdelivr.net/npm/@hypurrquant/perp-ws@0.15.0/dist/index.js`). The `/node` entry is
+Node-only (it loads `ws`); never map it in a browser.
 
 ## 2. Minimal examples
 
 All-market state for one venue (Node):
 
 ```ts
-import { createVenueStream, hyperliquid, toApr } from "perp-cli/ws/node";
+import { createVenueStream, hyperliquid, toApr } from "@hypurrquant/perp-ws/node";
 
 const stream = createVenueStream(hyperliquid, { hip3Dexes: ["xyz"] }); // HIP-3 dexes are opt-in
 stream.onState((s) => console.log("state", s.status));
@@ -84,7 +96,7 @@ await stream.close();
 Async iteration instead of callbacks:
 
 ```ts
-import { createVenueStream, pacifica } from "perp-cli/ws/node";
+import { createVenueStream, pacifica } from "@hypurrquant/perp-ws/node";
 
 const stream = createVenueStream(pacifica);
 for await (const e of stream.subscribe({ kind: "market", symbol: "BTC", channels: ["market", "bbo"] })) {
@@ -99,7 +111,7 @@ Funding comparison across venues (browser):
 ```ts
 import {
   arcus, aster, createFundingComparator, createVenueStream, hyperliquid, lighter, lighterRh, pacifica, toHourly,
-} from "perp-cli/ws";
+} from "@hypurrquant/perp-ws";
 
 const streams = [hyperliquid, pacifica, lighter, lighterRh, aster, arcus].map((c) => createVenueStream(c));
 const cmp = createFundingComparator({ streams, kind: "next", minVenues: 2 });
@@ -189,7 +201,7 @@ Pacifica allows ≤ 20 bbo channels per connection (`SUBSCRIPTION_LIMIT` beyond)
 ## 5. Funding comparator
 
 ```ts
-import { createFundingComparator, type FundingRow, type VenueStream } from "perp-cli/ws";
+import { createFundingComparator, type FundingRow, type VenueStream } from "@hypurrquant/perp-ws";
 
 declare const streams: VenueStream[];
 const cmp = createFundingComparator({ streams, kind: "next", include: ["BTC", "ETH"], minVenues: 2 });
@@ -232,7 +244,7 @@ Options and defaults:
 import {
   createFundingComparator, createVenueStream, aster, hyperliquid, lighter, toHourly,
   type FundingLeg, type FundingRow, type MarketUpdate,
-} from "perp-cli/ws";
+} from "@hypurrquant/perp-ws";
 
 const streams = [hyperliquid, lighter, aster].map((c) => createVenueStream(c));
 // Same wire channel as the comparator's own subscription (ref-counted): no extra venue traffic.
@@ -276,7 +288,7 @@ cmp.subscribe((rows) => {
 ## 6. User (account) channels
 
 ```ts
-import { createVenueStream, lighter, type CredentialProvider } from "perp-cli/ws";
+import { createVenueStream, lighter, type CredentialProvider } from "@hypurrquant/perp-ws";
 
 const credentials: CredentialProvider = {
   user: async () => ({ venue: "lighter", accountIndex: 12345 }),

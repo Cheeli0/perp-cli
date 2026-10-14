@@ -17,7 +17,8 @@ open http://localhost:8080/examples/ws-funding-compare-browser/
 ```
 
 `app.js` imports `perp-cli/ws`; the page maps that specifier to `../../dist/ws/index.js` with an import
-map. In an app with a bundler, install `perp-cli` and import `perp-cli/ws` — the
+map. In an app with a bundler, install `@hypurrquant/perp-ws` (zero dependencies) and import it — or
+`perp-cli/ws` if perp-cli is already installed; the import map maps either specifier the same way. The
 [`ws-next-smoke`](../ws-next-smoke) example builds this same `app.js` with Next 13.5.
 
 Public data only (no keys). The page opens one WebSocket per venue.

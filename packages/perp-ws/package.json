@@ -1,0 +1,81 @@
+{
+  "name": "@hypurrquant/perp-ws",
+  "version": "0.14.3",
+  "description": "Live market, funding and account WebSocket streams for perp DEXes (Hyperliquid incl. HIP-3, Pacifica, Lighter, Lighter RH, Aster, Arcus) — zero-dependency browser + Node library, the same code as perp-cli/ws",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js",
+      "default": "./dist/node.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "typesVersions": {
+    "*": {
+      "node": [
+        "dist/node.d.ts"
+      ]
+    }
+  },
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "prepublishOnly": "node ../../scripts/perp-ws-prepublish.mjs"
+  },
+  "dependencies": {},
+  "peerDependencies": {
+    "ws": "^8.21.0"
+  },
+  "peerDependenciesMeta": {
+    "ws": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "author": "HypurrQuant",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hypurrquant/perp-cli.git",
+    "directory": "packages/perp-ws"
+  },
+  "homepage": "https://github.com/hypurrquant/perp-cli/blob/main/skills/perp-cli/references/ws-library.md",
+  "bugs": {
+    "url": "https://github.com/hypurrquant/perp-cli/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "websocket",
+    "perpetual",
+    "perp",
+    "dex",
+    "funding-rate",
+    "funding",
+    "market-data",
+    "hyperliquid",
+    "hip-3",
+    "pacifica",
+    "lighter",
+    "aster",
+    "arcus",
+    "browser",
+    "typescript"
+  ]
+}
