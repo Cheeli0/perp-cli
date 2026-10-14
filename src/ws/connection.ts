@@ -13,6 +13,14 @@ import type { CloseReason, ConnectionState, StreamLog, VenueId, WsFactory, WsLik
 export const HANDSHAKE_REMEDIATION =
   "connection refused before open — network, venue outage, or Origin/CORS block (see capability matrix: browser)";
 
+export const MAX_PAYLOAD_REMEDIATION =
+  "Raise the cap: createVenueStream(codec, { transport: createNodeTransport({ maxPayload: bytes }) }) from perp-cli/ws/node";
+
+/** The `ws` error raised when an inbound message exceeds the transport's maxPayload (perp-cli/ws/node). */
+function isMaxPayloadError(e: unknown): boolean {
+  return e !== null && typeof e === "object" && (e as { code?: unknown }).code === "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH";
+}
+
 const STALE_TICK_MS = 1000;
 
 export interface WireLiveness {
@@ -30,7 +38,7 @@ export interface ConnectionHooks {
   onSocketDown(): void;
   onState(state: ConnectionState): void;
   /** The socket closed unexpectedly; return true when the stream handled it and no reconnect is wanted. */
-  onUnexpectedClose(reason: CloseReason, opened: boolean): boolean;
+  onUnexpectedClose(reason: CloseReason, opened: boolean, maxPayloadExceeded: boolean): boolean;
   liveness(): WireLiveness[];
   log(level: StreamLog["level"], event: string, message: string, details?: Record<string, unknown>): void;
 }
@@ -207,6 +215,7 @@ export class Connection {
       return;
     }
     this.ws = ws;
+    let socketError: unknown = null;
     ws.onopen = () => {
       if (this.ws !== ws) return;
       this.opened = true;
@@ -222,15 +231,27 @@ export class Connection {
       if (text === null) this.h.onUnreadableFrame(recvTs);
       else this.h.onText(text, recvTs);
     };
-    ws.onerror = () => {
+    ws.onerror = (ev) => {
       if (this.ws !== ws) return;
-      this.h.log("warn", "socket-error", "socket error event (a close follows)");
+      socketError = ev;
+      this.h.log("warn", "socket-error", isMaxPayloadError(ev)
+        ? "inbound message exceeded the transport's maxPayload (WS_ERR_UNSUPPORTED_MESSAGE_LENGTH); a close follows"
+        : "socket error event (a close follows)");
     };
     ws.onclose = (ev) => {
       if (this.ws !== ws) return;
       const wasOpen = this.opened;
       this.detach();
-      const reason: CloseReason = wasOpen
+      const tooLarge = isMaxPayloadError(socketError);
+      // The transport dropped an oversized message and closed with 1009 (the local close reads 1006).
+      const reason: CloseReason = tooLarge
+        ? {
+          code: "WS_PROTOCOL_ERROR",
+          message: `Socket closed: an inbound message exceeded the transport's maxPayload (WS_ERR_UNSUPPORTED_MESSAGE_LENGTH, sent close 1009)`,
+          wsCode: 1009,
+          remediation: MAX_PAYLOAD_REMEDIATION,
+        }
+        : wasOpen
         ? {
           code: "EXCHANGE_UNREACHABLE",
           message: this.o.redact(`Socket closed by the venue (code ${ev.code}${ev.reason ? `, ${ev.reason}` : ""})`),
@@ -243,7 +264,7 @@ export class Connection {
           wsCode: ev.code,
           remediation: HANDSHAKE_REMEDIATION,
         };
-      if (this.h.onUnexpectedClose(reason, wasOpen)) return;
+      if (this.h.onUnexpectedClose(reason, wasOpen, tooLarge)) return;
       this.handleClose(reason);
     };
   }

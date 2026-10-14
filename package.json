@@ -51,7 +51,7 @@
     "e2e:typecheck": "tsc -p scripts/e2e/tsconfig.json",
     "typecheck:test": "tsc -p tsconfig.test.json",
     "sync-skill-version": "node scripts/sync-skill-version.mjs",
-    "prepublishOnly": "node scripts/sync-skill-version.mjs && rm -rf dist && pnpm run build"
+    "prepublishOnly": "node scripts/sync-skill-version.mjs && node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && pnpm run build"
   },
   "keywords": [
     "pacifica",

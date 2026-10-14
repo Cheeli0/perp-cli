@@ -27,6 +27,10 @@ npm install perp-cli
   SSR / prerendering). Next.js 13.5+: `transpilePackages: ["perp-cli"]`.
 - TypeScript: `moduleResolution` `"bundler"`, `"node16"` / `"nodenext"`, or `"node"` (via `typesVersions`).
 - Only `perp-cli/ws`, `perp-cli/ws/node` and `perp-cli/package.json` are importable (no deep imports).
+- `perp-cli/ws/node` caps one inbound message at 16 MiB (`DEFAULT_MAX_PAYLOAD`; real frames are ≤ ~150 KB).
+  An oversized message closes the socket (`reconnecting` reason `WS_PROTOCOL_ERROR`, naming
+  `WS_ERR_UNSUPPORTED_MESSAGE_LENGTH`); 3 within 10 min fail the subscriptions with `WS_PROTOCOL_ERROR`.
+  Raise the cap with `createVenueStream(codec, { transport: createNodeTransport({ maxPayload }) })`.
 - `perp-cli/ws` in Node 20 without a `transport` throws `INVALID_PARAMS` ("import from perp-cli/ws/node or
   pass transport").
 

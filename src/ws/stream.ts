@@ -56,6 +56,9 @@ const MARKET_CHANNELS: ReadonlyArray<string> = ["market", "bbo", "book", "trades
 /** Channels whose decoders ship in 0.15.1 (CAPABILITY_UNSUPPORTED until then). */
 const LATER_CHANNELS: ReadonlyArray<string> = ["book", "trades"];
 const NETWORKS: ReadonlyArray<Network> = ["mainnet", "testnet"];
+/** Oversized-message closes within the window before the subscriptions fail (instead of reconnecting forever). */
+const MAX_PAYLOAD_CLOSES = 3;
+const MAX_PAYLOAD_WINDOW_MS = 10 * 60_000;
 // "\u0020" keeps this text from reading as an import to the boundary test's source scan.
 const CODEC_REMEDIATION = "Pass a codec export, e.g. import { hyperliquid } from\u0020'perp-cli/ws'";
 
@@ -167,6 +170,8 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
   const tokenFetches = new Map<string, Promise<TokenState>>();
   const tokenRetryTimers = new Set<ReturnType<typeof setTimeout>>();
   /** Running acquireToken loops per purpose, with everyone waiting on them. */
+  /** Times of recent closes caused by an inbound message over the transport's maxPayload. */
+  const maxPayloadCloses: number[] = [];
   const tokenLoops = new Map<string, Array<{ onOk: (t: TokenState) => void; onFail: (err: WsError) => void }>>();
 
   function log(level: StreamLog["level"], event: string, message: string, details?: Record<string, unknown>): void {
@@ -241,7 +246,8 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
         for (const sub of Array.from(subs.keys())) dropSub(sub, err);
       }
     },
-    onUnexpectedClose: (reason, opened) => handleBadSubscribeClose(reason, opened),
+    onUnexpectedClose: (reason, opened, maxPayloadExceeded) =>
+      maxPayloadExceeded ? handleMaxPayloadClose(reason) : handleBadSubscribeClose(reason, opened),
     liveness: () => {
       const out: WireLiveness[] = [];
       for (const w of wires.values()) {
@@ -670,6 +676,27 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
    * socket and is still unacked. Resubscribes after (re)open and ambiguous cases are ordinary reconnects.
    * Returns true when no channel is left (the stream went idle; no reconnect).
    */
+  /**
+   * An inbound message exceeded the transport's maxPayload. Reconnect (the frame may be one-off), but
+   * after MAX_PAYLOAD_CLOSES such closes within MAX_PAYLOAD_WINDOW_MS the same frame keeps coming back:
+   * fail the subscriptions on this socket with WS_PROTOCOL_ERROR instead of reconnecting forever. The
+   * oversized frame is never parsed, so it cannot be attributed to one channel.
+   */
+  function handleMaxPayloadClose(reason: CloseReason): boolean {
+    const now = clock();
+    while (maxPayloadCloses.length > 0 && now - maxPayloadCloses[0] > MAX_PAYLOAD_WINDOW_MS) maxPayloadCloses.shift();
+    maxPayloadCloses.push(now);
+    log("warn", "max-payload", reason.message, { count: maxPayloadCloses.length, limit: MAX_PAYLOAD_CLOSES });
+    if (maxPayloadCloses.length < MAX_PAYLOAD_CLOSES) return false;
+    maxPayloadCloses.length = 0;
+    const err = wsError("WS_PROTOCOL_ERROR",
+      `${venue}: inbound messages exceeded the transport's maxPayload ${MAX_PAYLOAD_CLOSES} times (WS_ERR_UNSUPPORTED_MESSAGE_LENGTH); stopped reconnecting`,
+      reason.remediation === null ? undefined : reason.remediation, { wsCode: 1009 });
+    log("error", "max-payload-repeated", err.message);
+    for (const sub of Array.from(subs.keys())) dropSub(sub, err);
+    return wires.size === 0;
+  }
+
   function handleBadSubscribeClose(reason: CloseReason, opened: boolean): boolean {
     if (!codec.closesOnBadSubscribe || !opened) return false;
     const now = clock();

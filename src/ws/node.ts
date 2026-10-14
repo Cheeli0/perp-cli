@@ -16,7 +16,8 @@ export * from "./index.js";
  * measured are ~120 KB (Hyperliquid allDexsAssetCtxs) and ~147 KB (Lighter market_stats/all snapshot),
  * so 16 MiB leaves >100x headroom while bounding memory per socket. An oversized message is dropped:
  * `ws` emits an error (code WS_ERR_UNSUPPORTED_MESSAGE_LENGTH), sends close 1009 to the server and the
- * local close fires as 1006, which the stream handles through its normal reconnect path.
+ * local close fires as 1006. The stream reports it as a WS_PROTOCOL_ERROR close reason and reconnects;
+ * 3 such closes within 10 min fail the socket's subscriptions with WS_PROTOCOL_ERROR.
  */
 export const DEFAULT_MAX_PAYLOAD = 16 * 1024 * 1024;
 
