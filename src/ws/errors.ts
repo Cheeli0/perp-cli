@@ -14,6 +14,7 @@ export const WS_ERROR_CODES = {
   INVALID_PARAMS: { status: 400, retryable: false },
   RATE_LIMITED: { status: 429, retryable: true },
   EXCHANGE_ERROR: { status: 502, retryable: true },
+  SYMBOL_NOT_FOUND: { status: 404, retryable: false },
 } as const;
 
 export type WsErrorCode = keyof typeof WS_ERROR_CODES;

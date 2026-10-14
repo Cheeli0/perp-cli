@@ -263,7 +263,19 @@ export type StreamControl =
     /** Redacted excerpt (≤ 200 chars) of the offending frame, or null. */
     raw: string | null;
     fatal: boolean;
+    /** Structured context, when the code has any (e.g. SYMBOL_NOT_FOUND: the missing canonicals). */
+    details?: StreamErrorDetails;
   };
+
+/**
+ * `details` of a `{ type: "error" }` control. SYMBOL_NOT_FOUND (non-fatal, kind:"allMarkets" with
+ * `canonicals`): `missing` = requested canonicals with no market on this venue (the others are
+ * subscribed); `suggestions` = per missing canonical, close directory canonicals (may be empty).
+ */
+export interface StreamErrorDetails {
+  missing?: string[];
+  suggestions?: Record<string, string[]>;
+}
 
 export interface StreamLog {
   ts: number;
@@ -291,7 +303,10 @@ export interface VenueWsCapabilities {
 // ── Stream ──
 
 /**
- * All-market state, optionally narrowed (pass at most one of the two filters):
+ * All-market state, optionally narrowed (pass at most one of the two filters). With `canonicals`,
+ * the ones this venue lists are subscribed and the rest are reported once as a non-fatal
+ * `{ type: "error", code: "SYMBOL_NOT_FOUND", fatal: false, details: { missing, suggestions } }`;
+ * only when none exist does `ready` reject INVALID_PARAMS.
  * - `symbols`: this venue's DIRECTORY symbols, exact and case-sensitive (`BTC` on hyperliquid, `BTCUSDT`
  *   on aster, `BTC-USD` on arcus) — see stream.markets();
  * - `canonicals`: canonical names (`"BTC"`, HIP-3 `"xyz:TSLA"`) → every directory market whose canonical

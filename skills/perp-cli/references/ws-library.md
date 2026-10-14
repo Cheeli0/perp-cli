@@ -117,14 +117,18 @@ const streams: VenueStream[] = [hyperliquid, pacifica, lighter, aster, arcus].ma
 for (const stream of streams) {
   // canonicals: "BTC" → hyperliquid/pacifica/lighter BTC, aster BTCUSDT + BTCUSD1, arcus BTC-USD.
   // (symbols would need each venue's directory symbols; ["BTC"] rejects on aster and arcus.)
-  const sub = stream.subscribe({ kind: "allMarkets", canonicals: ["BTC", "ETH"] });
+  // A canonical this venue does not list (e.g. SOL somewhere) is skipped with a non-fatal warning;
+  // ready rejects only when the venue lists none of them.
+  const sub = stream.subscribe({ kind: "allMarkets", canonicals: ["BTC", "ETH", "SOL"] });
   sub.ready.then(
     () => show(stream.venue, "live"),
     (err: unknown) => show(stream.venue, `FAILED: ${err instanceof Error ? err.message : String(err)}`),
   );
   sub.on((e) => {
     if (e.type === "market") show(stream.venue, `${e.symbol} ${e.mark ?? "—"}`);
-    else if (e.type === "error" && e.fatal) show(stream.venue, `FAILED: ${e.code} ${e.message}`);
+    else if (e.type === "error" && e.code === "SYMBOL_NOT_FOUND") {
+      show(stream.venue, `not listed here: ${e.details?.missing?.join(", ")}`); // non-fatal: the rest stream
+    } else if (e.type === "error" && e.fatal) show(stream.venue, `FAILED: ${e.code} ${e.message}`);
   });
   stream.onState((st) => { if (st.status === "closed") show(stream.venue, `closed: ${st.reason.message}`); });
 }
@@ -163,8 +167,11 @@ await Promise.all(streams.map((s) => s.close()));
     — `["BTC"]` is `BTC` on hyperliquid / pacifica / lighter / lighter-rh (USDG), `BTCUSDT` + `BTCUSD1` on
     aster and `BTC-USD` on arcus; HIP-3 markets are `"<dex>:<BASE>"` (`"xyz:TSLA"`, with `hip3Dexes`) and
     `"BTC"` never pulls them in. Canonicals come from `opts.canonicalize` (default: USD-like quotes
-    collapse) — see `MarketDirectoryEntry.canonical` in `stream.markets()`. A canonical with no market on
-    that venue rejects `INVALID_PARAMS` (with `details.suggestions`, e.g. `"xyz:TSLA"` for `"TSLA"`).
+    collapse) — see `MarketDirectoryEntry.canonical` in `stream.markets()`. Canonicals the venue does
+    not list are **skipped and reported once** as a non-fatal control
+    `{ type: "error", code: "SYMBOL_NOT_FOUND", fatal: false, details: { missing: string[], suggestions:
+    Record<string, string[]> } }` (suggestions e.g. `"xyz:TSLA"` for `"TSLA"`; the others are subscribed and
+    `ready` resolves). Only when the venue lists **none** of them does `ready` reject `INVALID_PARAMS`.
     **`symbols`** are this venue's exact directory symbols. Pass **one or the other** — both together
     reject `INVALID_PARAMS`. Same wire subscription and budget either way (filtering is client-side);
   - `{ kind: "market", symbol, channels: ["market" | "bbo"] }`. `"book"` and `"trades"` are already in
@@ -431,6 +438,7 @@ Where an error surfaces:
 | `CAPABILITY_UNSUPPORTED` | channel / network not available for the venue (see `capabilities.notes`) |
 | `EXCHANGE_UNREACHABLE` | network / outage / handshake refused (reconnects automatically) |
 | `INVALID_PARAMS` | bad symbol, dex, channel or option |
+| `SYMBOL_NOT_FOUND` | non-fatal: requested `canonicals` this venue does not list (`details.missing`, `details.suggestions`); the rest stream |
 | `RATE_LIMITED`, `EXCHANGE_ERROR` | REST bootstrap failures |
 
 ## 8. Budgets and limits
@@ -453,7 +461,8 @@ Where an error surfaces:
 - **Do** respect `SUBSCRIPTION_LIMIT` and the per-IP note above; coalesce UI updates (~1/s).
 - **Don't** pass private keys to the library; return short-lived tokens from `authToken()`.
 - **Do** use `canonicals` for the same markets on several venues; `symbols` are per-venue directory symbols
-  (`["BTC"]` rejects on aster and arcus).
+  (`["BTC"]` rejects on aster and arcus). Show the `SYMBOL_NOT_FOUND` warning (which canonicals a venue
+  lacks) instead of an empty cell.
 - **Do** surface every `ready` rejection and every `fatal` error event per venue (see the price-wall
   pattern in §2). **Never treat `idle` (or a venue with no data) as fine**: `idle` means the stream has no
   active subscription — usually because a subscribe was rejected — not "connected and quiet".

@@ -1,7 +1,8 @@
 /**
  * kind:"allMarkets" with `canonicals` (blind dogfood round 3): one subscription works across venues
  * whose directory symbols differ (aster BTCUSDT / BTCUSD1, arcus BTC-USD, lighter-rh USDG, HIP-3
- * "<dex>:<BASE>"). Unknown canonicals and mixed filters reject INVALID_PARAMS before anything is sent.
+ * "<dex>:<BASE>"). Canonicals a venue does not list → one non-fatal SYMBOL_NOT_FOUND control (details:
+ * missing + suggestions), the rest subscribed; none listed, or mixed filters → INVALID_PARAMS.
  */
 import { describe, expect, it } from "vitest";
 import { createVenueStream } from "../../ws/stream.js";
@@ -24,7 +25,7 @@ async function run(codec: VenueCodec, routes: Record<string, unknown>, frames: u
   ws.open();
   for (const f of frames) ws.message(f);
   const symbols = new Set(events.filter((e): e is MarketUpdate => e.type === "market").map(m => m.symbol));
-  const errors = events.filter(e => e.type === "error");
+  const errors = events.filter((e): e is Extract<StreamControl, { type: "error" }> => e.type === "error");
   return { stream, sub, t, symbols, errors };
 }
 
@@ -72,6 +73,43 @@ describe("allMarkets canonicals", () => {
   });
 });
 
+describe("allMarkets canonicals: partial match", () => {
+  it("some canonicals missing → active, one non-fatal SYMBOL_NOT_FOUND listing them (with suggestions)", async () => {
+    const control = fixtureFrames("arcus", "control");
+    const r = await run(arcus, ARCUS_ROUTES, [control[0], ...fixtureFrames("arcus", "markets"), control[1]], { kind: "allMarkets", canonicals: ["BTC", "SOL", "eth"] });
+    await expect(r.sub.ready).resolves.toBeUndefined();
+    expect(r.symbols).toEqual(new Set(["BTC-USD"]));
+    expect(r.errors).toEqual([{
+      type: "error", venue: "arcus", code: "SYMBOL_NOT_FOUND", fatal: false, raw: null,
+      message: "arcus: no market with canonical(s) SOL, eth (did you mean ETH for eth?); subscribed to the other 1",
+      remediation: expect.stringContaining("MarketDirectoryEntry.canonical"),
+      details: { missing: ["SOL", "eth"], suggestions: { SOL: [], eth: ["ETH"] } },
+    }]);
+  });
+
+  it("hyperliquid: \"TSLA\" is not \"xyz:TSLA\" (HIP-3 prefix still required) → warning suggests it, BTC subscribed", async () => {
+    const r = await run(hyperliquid, HL_ROUTES, fixtureFrames("hyperliquid", "allDexsAssetCtxs"),
+      { kind: "allMarkets", canonicals: ["BTC", "TSLA"] }, { hip3Dexes: ["xyz"] });
+    await expect(r.sub.ready).resolves.toBeUndefined();
+    expect(r.symbols).toEqual(new Set(["BTC"]));
+    expect(r.errors).toHaveLength(1);
+    expect(r.errors[0]).toMatchObject({ code: "SYMBOL_NOT_FOUND", fatal: false, details: { missing: ["TSLA"], suggestions: { TSLA: ["xyz:TSLA"] } } });
+  });
+
+  it("the warning reaches the async iterator too, before the market events", async () => {
+    const t = fakeTransport();
+    const stream = createVenueStream(aster, { transport: t.factory, fetch: fakeFetch(ASTER_ROUTES), visibility: null });
+    const sub = stream.subscribe({ kind: "allMarkets", canonicals: ["BTC", "NOPE"] });
+    await flush(30);
+    t.last().open();
+    for (const f of ASTER_FRAMES) t.last().message(f);
+    const it = sub[Symbol.asyncIterator]();
+    const first = await it.next();
+    expect(first.value).toMatchObject({ type: "error", code: "SYMBOL_NOT_FOUND", fatal: false, details: { missing: ["NOPE"] } });
+    await stream.close();
+  });
+});
+
 describe("allMarkets canonicals: errors", () => {
   async function reject(codec: VenueCodec, routes: Record<string, unknown>, target: AllMarketsTarget, opts: VenueStreamOptions = {}) {
     const t = fakeTransport();
@@ -80,16 +118,16 @@ describe("allMarkets canonicals: errors", () => {
     return { err, t };
   }
 
-  it("an unknown canonical → INVALID_PARAMS before anything is sent", async () => {
-    const { err, t } = await reject(arcus, ARCUS_ROUTES, { kind: "allMarkets", canonicals: ["BTC", "DOGE"] });
-    expect(err?.structured).toMatchObject({ code: "INVALID_PARAMS", message: "arcus: no market with canonical(s) DOGE" });
+  it("none of the canonicals on this venue → INVALID_PARAMS before anything is sent", async () => {
+    const { err, t } = await reject(arcus, ARCUS_ROUTES, { kind: "allMarkets", canonicals: ["DOGE", "PEPE"] });
+    expect(err?.structured).toMatchObject({ code: "INVALID_PARAMS", message: "arcus: no market with canonical(s) DOGE, PEPE" });
     expect(t.sockets).toHaveLength(0);
   });
 
   it.each([
     ["case", aster, ASTER_ROUTES, "btc", ["BTC"], {}],
     ["HIP-3 base without the dex prefix", hyperliquid, HL_ROUTES, "TSLA", ["xyz:TSLA"], { hip3Dexes: ["xyz"] }],
-  ] as Array<[string, VenueCodec, Record<string, unknown>, string, string[], VenueStreamOptions]>)("%s → did-you-mean suggestions", async (_n, codec, routes, c, want, opts) => {
+  ] as Array<[string, VenueCodec, Record<string, unknown>, string, string[], VenueStreamOptions]>)("%s, nothing else matching → rejected with did-you-mean suggestions", async (_n, codec, routes, c, want, opts) => {
     const { err } = await reject(codec, routes, { kind: "allMarkets", canonicals: [c] }, opts);
     expect(err?.structured.code).toBe("INVALID_PARAMS");
     expect(err?.message).toContain(`did you mean ${want.join(" / ")} for ${c}`);
