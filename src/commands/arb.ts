@@ -4,6 +4,7 @@ import chalk from "chalk";
 import { annualizeRate, computeAnnualSpread, toHourlyRate, estimateHourlyFunding, annualizeHourlyRate, estimateHourlyFundingFromHourly } from "../funding.js";
 import {
   fetchAllFundingRates,
+  fetchCanonicalPriceGroups,
   fetchSymbolFundingRates,
   TOP_SYMBOLS,
   type FundingRateSnapshot,
@@ -355,36 +356,40 @@ export async function handleRates(isJson: () => boolean, opts: { symbol?: string
 }
 
 /**
- * Cross-venue price basis. Markets are matched by `canonical` symbol across every verified
- * market-data venue (fetchAllFundingRates — the perp-perp scan's grouping, so the same guards
- * apply: unclassified / ambiguous tickers have no canonical and never pair, and a venue whose
- * mark deviates more than MAX_PRICE_DEVIATION_PCT from the group median is dropped). The chosen
- * cheap / rich pair must itself agree within MAX_PRICE_DEVIATION_PCT: a wider gap is a
- * different asset under the same ticker (BB on Lighter 8.50 vs Aster 0.0091), not a basis.
+ * Cross-venue price basis — a PRICE comparison, independent of funding.
+ *
+ * Venue scope: every venue with the "trading" role (both legs must be executable), whether or not
+ * its funding rate is verified; market-data-only venues (TxFlow, unofficial API) are out. Prices
+ * come from each venue's market directory and are grouped by `canonical` symbol with the funding
+ * scan's guards (fetchCanonicalPriceGroups): unclassified / ambiguous tickers have no canonical and
+ * never pair, and a venue whose mark deviates more than MAX_PRICE_DEVIATION_PCT from the group
+ * median is dropped. The chosen cheap / rich pair must itself agree within MAX_PRICE_DEVIATION_PCT:
+ * a wider gap is a different asset under the same ticker (BB on Lighter 8.50 vs Aster 0.0091).
  * A venue that fails is reported on stderr and is absent from the scan, never silently empty.
  */
 export async function handleBasisScan(isJson: () => boolean, opts: { minBasis: string; symbol?: string }): Promise<void> {
   if (!isJson()) console.log(chalk.cyan("  Fetching prices for basis calculation...\n"));
   const filterSymbol = opts.symbol?.toUpperCase();
-  const snapshot = await fetchAllFundingRates(filterSymbol !== undefined ? { symbols: [filterSymbol] } : undefined);
+  const snapshot = await fetchCanonicalPriceGroups(listVenuesWithRole("trading"), {
+    symbols: filterSymbol !== undefined ? [filterSymbol] : undefined, tag: "basis-scan",
+  });
   for (const [venue, msg] of Object.entries(snapshot.exchangeErrors)) console.error(`[basis-scan] ${venue} fetch failed: ${msg}`);
 
   type BasisOpp = { symbol: string; prices: Record<string, number>; priceDiff: number; pctDiff: number; buyOn: string; sellOn: string };
   const opps: BasisOpp[] = [];
-  for (const group of snapshot.symbols) {
-    const priced = group.rates.filter(r => r.markPrice > 0);
+  for (const [symbol, priced] of snapshot.groups) {
     if (priced.length < 2) continue;
     let min = priced[0], max = priced[0];
     for (const r of priced) { if (r.markPrice < min.markPrice) min = r; if (r.markPrice > max.markPrice) max = r; }
     if (min.exchange === max.exchange) continue;
     const diff = max.markPrice - min.markPrice; const avgPrice = (max.markPrice + min.markPrice) / 2; const pctDiff = (diff / avgPrice) * 100;
     if (!(pctDiff <= MAX_PRICE_DEVIATION_PCT)) {
-      console.error(`[basis-scan] excluded ${group.symbol} ${min.exchange}↔${max.exchange}: mark gap ${pctDiff.toFixed(1)}% > ${MAX_PRICE_DEVIATION_PCT}% (likely a different asset with the same ticker)`);
+      console.error(`[basis-scan] excluded ${symbol} ${min.exchange}↔${max.exchange}: mark gap ${pctDiff.toFixed(1)}% > ${MAX_PRICE_DEVIATION_PCT}% (likely a different asset with the same ticker)`);
       continue;
     }
     if (pctDiff * 365 >= parseFloat(opts.minBasis)) {
       const priceObj: Record<string, number> = {}; for (const r of priced) priceObj[r.exchange] = r.markPrice;
-      opps.push({ symbol: group.symbol, prices: priceObj, priceDiff: diff, pctDiff, buyOn: min.exchange, sellOn: max.exchange });
+      opps.push({ symbol, prices: priceObj, priceDiff: diff, pctDiff, buyOn: min.exchange, sellOn: max.exchange });
     }
   }
   opps.sort((a, b) => b.pctDiff - a.pctDiff);
