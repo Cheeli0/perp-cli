@@ -19,7 +19,7 @@
 // Usage: node scripts/ws-gate/release-gate.mjs   (network: npm registry + venue WebSockets)
 import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const REPO = resolve(import.meta.dirname, "../..");
@@ -44,6 +44,35 @@ function check(name, ok, detail) {
 }
 
 const tail = (s, n = 40) => s.split("\n").slice(-n).join("\n");
+
+/**
+ * Node binaries for the perp-ws consumer matrix: this node, PATH, nvm, fnm, Homebrew node@N, plus
+ * PERP_GATE_NODES (":"-separated paths). The newest binary per major ≥ 20 is used.
+ */
+function nodeMatrix() {
+  const cands = new Set([process.execPath]);
+  for (const p of (spawnSync("which", ["-a", "node"], { encoding: "utf8" }).stdout ?? "").split("\n")) if (p.trim() !== "") cands.add(p.trim());
+  for (const p of (process.env.PERP_GATE_NODES ?? "").split(":")) if (p !== "") cands.add(p);
+  const dirs = [
+    [join(homedir(), ".nvm/versions/node"), "bin/node"],
+    [join(homedir(), ".local/share/fnm/node-versions"), "installation/bin/node"],
+    [join(homedir(), "Library/Application Support/fnm/node-versions"), "installation/bin/node"],
+  ];
+  for (const [d, rel] of dirs) if (existsSync(d)) for (const v of readdirSync(d)) cands.add(join(d, v, rel));
+  for (const d of ["/opt/homebrew/opt", "/usr/local/opt"]) if (existsSync(d)) for (const v of readdirSync(d)) if (/^node(@\d+)?$/.test(v)) cands.add(join(d, v, "bin/node"));
+  const byMajor = new Map();
+  for (const bin of cands) {
+    if (!existsSync(bin)) continue;
+    const v = (spawnSync(bin, ["-v"], { encoding: "utf8" }).stdout ?? "").trim();
+    const m = /^v(\d+)\.(\d+)\.(\d+)$/.exec(v);
+    if (m === null || Number(m[1]) < 20) continue;
+    const key = Number(m[1]);
+    const cur = byMajor.get(key);
+    const num = Number(m[1]) * 1e6 + Number(m[2]) * 1e3 + Number(m[3]);
+    if (cur === undefined || num > cur.num) byMajor.set(key, { bin, version: v, num });
+  }
+  return [...byMajor.entries()].sort((a, b) => a[0] - b[0]).map(([major, x]) => ({ major, bin: x.bin, version: x.version }));
+}
 
 // 1. build + unit tests of the library
 run("build (tsc + tsup)", "pnpm", ["-s", "run", "build"]);
@@ -156,7 +185,11 @@ try { b.createVenueStream(b.hyperliquid); } catch (e) { err = e; }
 if (err?.structured?.code !== "INVALID_PARAMS" || !String(err.structured.remediation).includes("npm install ws")) throw new Error("expected INVALID_PARAMS + npm install ws, got " + (err?.stack ?? err));
 console.log("browser entry:", Object.keys(a).length, "exports; /node without ws:", err.structured.code, "-", err.message, "|", err.structured.remediation);
 `);
-run("perp-ws consumer: imports; /node without ws → INVALID_PARAMS (npm install ws)", "node", ["no-ws.mjs"], { cwd: P });
+const NODES = nodeMatrix();
+const missingMajors = [20, 22, 24].filter(m => !NODES.some(n => n.major === m));
+check(`perp-ws consumer: Node matrix ${NODES.map(n => n.version).join(", ")}`, NODES.length > 0,
+  `${NODES.map(n => `${n.version} (${n.bin})`).join("; ")}${missingMajors.length > 0 ? `; skipped (not installed): Node ${missingMajors.join(", ")}` : ""}`);
+for (const n of NODES) run(`perp-ws consumer [${n.version}]: imports; /node without ws → INVALID_PARAMS (npm install ws)`, n.bin, ["no-ws.mjs"], { cwd: P });
 run("perp-ws consumer: npm install ws + typescript (dev tools)", "npm", ["install", "--no-audit", "--no-fund", "--ignore-scripts", "ws@^8.21.0", "typescript@5", "@types/node@20"], { cwd: P });
 writeFileSync(join(P, "with-ws.mjs"), `
 import { createVenueStream, hyperliquid } from "@hypurrquant/perp-ws/node";
@@ -169,7 +202,7 @@ console.log("live via /node + ws:", e.venue, e.symbol, "mark", e.mark, "rate", e
 await stream.close();
 process.exit(0);
 `);
-run("perp-ws consumer: /node with ws streams live (hyperliquid BTC)", "node", ["with-ws.mjs"], { cwd: P, timeout: 120_000 });
+for (const n of NODES) run(`perp-ws consumer [${n.version}]: /node with ws streams live (hyperliquid BTC)`, n.bin, ["with-ws.mjs"], { cwd: P, timeout: 120_000 });
 writeFileSync(join(P, "consumer.ts"), `
 import { createVenueStream, createFundingComparator, hyperliquid, toApr, type MarketUpdate, type UserUpdate } from "@hypurrquant/perp-ws";
 import { createNodeTransport, nodeTransport } from "@hypurrquant/perp-ws/node";
@@ -214,6 +247,8 @@ const lines = [
   "# perp-cli/ws + @hypurrquant/perp-ws 0.15.0 — release gate",
   "",
   `Date: ${new Date().toISOString()}  ·  Node ${process.version}  ·  repo ${spawnSync("git", ["rev-parse", "--short", "HEAD"], { cwd: REPO, encoding: "utf8" }).stdout.trim()} (+ working tree)  ·  tarballs ${tgz}, ${pwTgzName} (${pwSize} B)`,
+  "",
+  `perp-ws consumer Node matrix: ${NODES.map(n => n.version).join(", ")}${missingMajors.length > 0 ? ` (not installed, skipped: Node ${missingMajors.join(", ")})` : ""}`,
   "",
   `**Result: ${pass ? "PASS" : "FAIL"}** (${steps.filter(s => s.code === 0).length}/${steps.length} steps)`,
   "",

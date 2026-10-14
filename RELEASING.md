@@ -8,11 +8,13 @@ Two npm packages are released together, **always with the same version**:
 | `@hypurrquant/perp-ws` | `packages/perp-ws` | the same `src/ws/**` built standalone (zero dependencies; `ws` is an optional peer) |
 
 `scripts/sync-skill-version.mjs` keeps `skills/perp-cli/SKILL.md` and `packages/perp-ws/package.json` at
-perp-cli's version (CI runs it with `--check`; both `prepublishOnly` hooks refuse to publish on drift).
+perp-cli's version. Syncing (write mode) is an **explicit release step** (step 1); CI and both
+`prepublishOnly` hooks only run `--check` and refuse to publish on drift — a publish never rewrites files.
 
 ## Steps
 
-1. Bump the version in the root `package.json` (e.g. `0.15.0`), then sync:
+1. Bump the version in the root `package.json` (e.g. `0.15.0`), then sync (write mode — the only
+   step that edits SKILL.md / `packages/perp-ws/package.json`) and commit the result:
 
    ```sh
    pnpm run sync-skill-version            # SKILL.md + packages/perp-ws/package.json
@@ -26,12 +28,14 @@ perp-cli's version (CI runs it with `--check`; both `prepublishOnly` hooks refus
    ```sh
    npx tsc --noEmit && pnpm run typecheck:test && pnpm test
    node scripts/ws-gate/release-gate.mjs   # packs and checks both packages (network required)
+   # the perp-ws consumer steps run under every Node ≥ 20 found (PATH, nvm, fnm, Homebrew node@N,
+   # or PERP_GATE_NODES=/path/node20:/path/node24); the report lists which versions ran
    ```
 
 4. Commit, tag (`git tag v0.15.0`), push the commit and the tag.
 
-5. Publish `perp-cli` from the repository root. Its `prepublishOnly` syncs the version, deletes `dist/`
-   and rebuilds:
+5. Publish `perp-cli` from the repository root. Its `prepublishOnly` checks the version sync (fails on
+   drift: go back to step 1), deletes `dist/` and rebuilds:
 
    ```sh
    npm publish

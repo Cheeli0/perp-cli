@@ -21,16 +21,31 @@ export * from "./index.js";
 type WsModule = typeof WebSocket;
 let wsModule: WsModule | null = null;
 
+/** true only when the failure is resolving the bare specifier `ws` itself (not a module `ws` requires). */
+function isWsNotFound(e: unknown): boolean {
+  if (e === null || typeof e !== "object" || (e as { code?: unknown }).code !== "MODULE_NOT_FOUND") return false;
+  const first = String((e as { message?: unknown }).message).split("\n")[0];
+  if (!/^Cannot find module 'ws'$/.test(first)) return false;
+  const stack = (e as { requireStack?: unknown }).requireStack;
+  return !Array.isArray(stack) || !stack.some(p => typeof p === "string" && /[\\/]node_modules[\\/]ws[\\/]/.test(p));
+}
+
 /** Load the `ws` package on first use (resolved from this file, i.e. the consumer's node_modules). */
 function loadWs(): WsModule {
   if (wsModule !== null) return wsModule;
   try {
     wsModule = createRequire(import.meta.url)("ws") as WsModule;
   } catch (e) {
-    if ((e as { code?: unknown }).code !== "MODULE_NOT_FOUND") throw e;
-    throw new WsError("INVALID_PARAMS", "The /node entry needs the `ws` package (an optional peer dependency), and it is not installed", {
-      remediation: "npm install ws@^8.21.0 — or, on Node ≥ 22 / in a browser, import the browser entry (global WebSocket) or pass opts.transport",
-    });
+    // Only "`ws` itself cannot be resolved" means not installed. A MODULE_NOT_FOUND raised from inside
+    // an installed `ws` (a broken install / missing file) is a different problem: rethrow with context.
+    if (isWsNotFound(e)) {
+      throw new WsError("INVALID_PARAMS", "The /node entry needs the `ws` package (an optional peer dependency), and it is not installed", {
+        remediation: "npm install ws@^8.21.0 — or, on Node ≥ 22 / in a browser, import the browser entry (global WebSocket) or pass opts.transport",
+      });
+    }
+    const err = new Error(`The /node entry could not load the \`ws\` package: ${e instanceof Error ? e.message : String(e)}`);
+    (err as Error & { cause?: unknown }).cause = e;
+    throw err;
   }
   return wsModule;
 }
