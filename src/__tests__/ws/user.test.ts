@@ -261,7 +261,7 @@ describe("arcus user channels", () => {
 });
 
 describe("user channel gating", () => {
-  it("aster user channels → CAPABILITY_UNSUPPORTED (0.14.5)", async () => {
+  it("aster user channels → CAPABILITY_UNSUPPORTED (0.15.1)", async () => {
     const r = await userStream(aster, ASTER_ROUTES, { user: async () => ({ venue: "aster", user: EVM, signer: EVM }) }, ["fills"]);
     await expect(r.sub.ready).rejects.toMatchObject({ structured: { code: "CAPABILITY_UNSUPPORTED" } });
     expect(r.t.sockets).toHaveLength(0);

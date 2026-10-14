@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// perp-cli/ws 0.14.4 release gate (plan ws-0.14.4 Phase 4). Required steps, output recorded to
-// .omc/research/ws-0.14.4-release-gate.md (gitignored):
+// perp-cli/ws 0.15.0 release gate (plan ws-0.14.4 Phase 4). Required steps, output recorded to
+// .omc/research/ws-0.15.0-release-gate.md (gitignored):
 //   1. build (tsc + tsup) and the ws unit tests (incl. bundle purity: no Node built-ins / ws / Buffer /
 //      process, no top-level await, no load-time globals, ES2020 syntax, API snapshot)
 //   2. pnpm pack → tarball contents
@@ -19,7 +19,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const REPO = resolve(import.meta.dirname, "../..");
-const OUT = join(REPO, ".omc/research/ws-0.14.4-release-gate.md");
+const OUT = join(REPO, ".omc/research/ws-0.15.0-release-gate.md");
 const WORK = mkdtempSync(join(tmpdir(), "perp-ws-gate-"));
 const steps = [];
 
@@ -114,7 +114,7 @@ run("node example smoke: examples/ws-node-stream (hyperliquid BTC, 15 s)", "node
 // report
 const pass = steps.every(s => s.code === 0);
 const lines = [
-  "# perp-cli/ws 0.14.4 — release gate",
+  "# perp-cli/ws 0.15.0 — release gate",
   "",
   `Date: ${new Date().toISOString()}  ·  Node ${process.version}  ·  repo ${spawnSync("git", ["rev-parse", "--short", "HEAD"], { cwd: REPO, encoding: "utf8" }).stdout.trim()} (+ working tree)  ·  tarball ${tgz}`,
   "",

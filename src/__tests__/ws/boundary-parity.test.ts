@@ -22,8 +22,8 @@ const WS_DIR = resolve(import.meta.dirname, "../../ws");
 const CODECS = [hyperliquid, pacifica, lighter, lighterRh, aster, arcus];
 
 /**
- * CLI venues with no perp-cli/ws codec yet. Explicit and test-visible: ondo/qfex arrive in 0.14.5;
- * risex/txflow are CLI venues planned after 0.14.4 (listed ahead so adding them does not break this).
+ * CLI venues with no perp-cli/ws codec yet. Explicit and test-visible: ondo/qfex arrive in 0.15.1;
+ * risex/txflow are CLI venues without a ws codec.
  */
 const CLI_VENUES_WITHOUT_WS = ["ondo", "qfex", "risex", "txflow"];
 

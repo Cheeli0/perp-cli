@@ -35,7 +35,7 @@ const all = files(DIR).map(path => ({ path, rel: path.slice(DIR.length + 1), jso
 const priv = all.filter(f => f.json.kind === "private");
 
 describe("WS fixture scrub", () => {
-  it("has fixtures for every 0.14.4 venue, public and private", () => {
+  it("has fixtures for every 0.15.0 venue, public and private", () => {
     const venues = new Set(all.map(f => f.rel.split("/")[0]));
     for (const v of ["hyperliquid", "pacifica", "lighter", "lighter-rh", "aster", "arcus"]) expect(venues.has(v)).toBe(true);
     for (const v of ["hyperliquid", "pacifica", "lighter", "lighter-rh", "arcus"]) {
