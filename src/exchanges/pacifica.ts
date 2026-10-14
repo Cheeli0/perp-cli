@@ -1494,15 +1494,21 @@ export class PacificaAdapter implements ExchangeAdapter {
   }
 
   async getFundingHistory(symbol: string, limit = 10): Promise<{ time: number; rate: string; price: string | null }[]> {
-    const result = await this.client.getFundingHistory(symbol, { limit });
-    const data = ((result as Record<string, unknown>).data ?? result) as Record<string, unknown>[];
-    if (!Array.isArray(data)) return [];
+    // The client unwraps the {success, data} envelope: the answer is the row list itself.
+    const data = await this.client.getFundingHistory(symbol, { limit });
+    if (!Array.isArray(data)) {
+      throw new PerpError("EXCHANGE_ERROR", `Pacifica /funding_rate/history returned no row list (${JSON.stringify(data).slice(0, 120)})`, { exchange: "pacifica" });
+    }
     // `200 []` for an unlisted symbol (live): checked against the market directory.
-    return nonEmptyOrListed(this, symbol, data.map((h) => ({
-      time: Number(h.created_at ?? 0),
-      rate: venueRateField(h.funding_rate, "funding history funding_rate", "pacifica"),
-      price: String(h.oracle_price ?? "0"),
-    })));
+    return nonEmptyOrListed(this, symbol, (data as Array<Record<string, unknown>>).map((h) => {
+      const oracle = h.oracle_price;
+      return {
+        time: pacificaTime(h, "/funding_rate/history"),
+        rate: venueRateField(h.funding_rate, "funding history funding_rate", "pacifica"),
+        // absent → null (unknown), never "0"
+        price: (typeof oracle === "string" && oracle !== "") || (typeof oracle === "number" && Number.isFinite(oracle)) ? String(oracle) : null,
+      };
+    }));
   }
 
   async getKlines(symbol: string, interval: string, startTime: number, endTime: number): Promise<ExchangeKline[]> {

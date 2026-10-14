@@ -142,6 +142,23 @@ describe("Pacifica", () => {
   });
 });
 
+describe("Pacifica funding history is strict (review L2)", () => {
+  const pac = (rows: unknown) => stubAdapter(PacificaAdapter.prototype, "pacifica", { client: { getFundingHistory: vi.fn(async () => rows) } }, ["BTC"]);
+
+  it("maps the live row shape", async () => {
+    const r = await pac([{ oracle_price: "83703.548788", funding_rate: "0.0000125", next_funding_rate: "0.0000125", created_at: 1791950402115 }]).getFundingHistory("BTC");
+    expect(r).toEqual([{ time: 1791950402115, rate: "0.0000125", price: "83703.548788" }]);
+  });
+  it("a non-list answer is EXCHANGE_ERROR, not []", async () => {
+    await expect(pac({ unexpected: true }).getFundingHistory("BTC")).rejects.toMatchObject({ structured: expect.objectContaining({ code: "EXCHANGE_ERROR" }) });
+  });
+  it("a row without created_at is EXCHANGE_ERROR (never time 0); a missing oracle_price is null (never \"0\")", async () => {
+    await expect(pac([{ funding_rate: "0.0000125", oracle_price: "1" }]).getFundingHistory("BTC")).rejects.toMatchObject({ structured: expect.objectContaining({ code: "EXCHANGE_ERROR" }) });
+    const [row] = await pac([{ funding_rate: "0.0000125", created_at: 5 }]).getFundingHistory("BTC");
+    expect(row.price).toBeNull();
+  });
+});
+
 describe("Ondo", () => {
   it("trades / candles: 200 [] for an unlisted market → SYMBOL_NOT_FOUND; a listed market keeps []", async () => {
     const client = { publicGet: vi.fn(async () => []), get: vi.fn(async () => []) };
