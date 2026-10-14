@@ -10,13 +10,6 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Wallet } from "ethers";
 import "../../exchanges/venues/index.js";
-
-// The process-wide rate limiter keys off Date.now(); the TTL test moves the clock, which would leave
-// the limiter waiting for a slot in the "future" in later tests. Rate limiting is not under test here.
-vi.mock("../../exchanges/rate-limiter.js", async orig => ({
-  ...(await orig<typeof import("../../exchanges/rate-limiter.js")>()),
-  acquireRate: async () => undefined,
-}));
 import { getVenue } from "../../exchanges/venue.js";
 import { PerpError } from "../../errors.js";
 import { LocalEvmSigner } from "../../signer/evm-local.js";

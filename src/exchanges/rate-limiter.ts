@@ -22,7 +22,10 @@ class TokenBucket {
 
   private refill(): void {
     const now = Date.now();
-    this.tokens = Math.min(this.policy.capacity, this.tokens + ((now - this.last) / 1000) * this.policy.refillPerSec);
+    // Clamped: a wall clock stepping backwards (NTP, VM resume, fake timers) must not drive the bucket
+    // negative and stall every request until the clock catches up.
+    const elapsedMs = Math.max(0, now - this.last);
+    this.tokens = Math.min(this.policy.capacity, this.tokens + (elapsedMs / 1000) * this.policy.refillPerSec);
     this.last = now;
   }
 
