@@ -30,10 +30,11 @@ export class LiquidationMmStrategy implements Strategy {
   }
 
   private _config: Record<string, unknown> = {};
+  private _oiUnknownLogged = false;
 
   async init(ctx: StrategyContext, snapshot: EnrichedSnapshot): Promise<void> {
     this._config = ctx.config;
-    ctx.state.set("prevOi", parseFloat(snapshot.openInterest) || 0);
+    ctx.state.set("prevOi", snapshot.openInterest === null ? 0 : parseFloat(snapshot.openInterest) || 0);
     ctx.state.set("cascadeMode", false);
     ctx.state.set("cascadeTicks", 0);
     const p = this.params;
@@ -45,7 +46,12 @@ export class LiquidationMmStrategy implements Strategy {
     const actions: StrategyAction[] = [];
     actions.push({ type: "cancel_all" });
 
-    const currentOi = parseFloat(snapshot.openInterest) || 0;
+    // Unknown OI (null): cascade detection is off — said once per run, never computed on a fake 0.
+    if (snapshot.openInterest === null && !this._oiUnknownLogged) {
+      this._oiUnknownLogged = true;
+      ctx.log("  [LIQUIDATION-MM] open interest unknown — OI cascade detection is off");
+    }
+    const currentOi = snapshot.openInterest === null ? 0 : parseFloat(snapshot.openInterest) || 0;
     const prevOi = (ctx.state.get("prevOi") as number) ?? currentOi;
     let cascadeMode = (ctx.state.get("cascadeMode") as boolean) ?? false;
     let cascadeTicks = (ctx.state.get("cascadeTicks") as number) ?? 0;

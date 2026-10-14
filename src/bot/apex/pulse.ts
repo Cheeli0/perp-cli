@@ -44,6 +44,8 @@ export function detectPulse(
   history: Map<string, { oi: number; volume: number }[]>,
 ): PulseSignal {
   const symbol = "unknown"; // caller sets the actual symbol
+  // Unknown OI → no pulse signal (the OI change cannot be computed).
+  if (current.openInterest === null) return { symbol, tier: "NONE", confidence: 0, oiChange: 0, volumeRatio: 0 };
   const currentOi = parseFloat(current.openInterest);
   const currentVolume = current.volume24h;
 

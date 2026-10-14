@@ -31,7 +31,8 @@ function scoreStructure(snapshot: EnrichedSnapshot): number {
   else if (vol > 1_000_000) score += 15;
 
   // OI component (0-50): higher open interest = more conviction
-  const oi = parseFloat(snapshot.openInterest);
+  // null (unknown) → no OI score, the same as below every threshold — never a parsed fake 0.
+  const oi = snapshot.openInterest === null ? NaN : parseFloat(snapshot.openInterest);
   if (oi > 50_000_000) score += 50;
   else if (oi > 20_000_000) score += 40;
   else if (oi > 5_000_000) score += 25;
