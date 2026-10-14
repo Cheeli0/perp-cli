@@ -60,7 +60,7 @@ const NETWORKS: ReadonlyArray<Network> = ["mainnet", "testnet"];
 const MAX_PAYLOAD_CLOSES = 3;
 const MAX_PAYLOAD_WINDOW_MS = 10 * 60_000;
 // "\u0020" keeps this text from reading as an import to the boundary test's source scan.
-const CODEC_REMEDIATION = "Pass a codec export, e.g. import { hyperliquid } from\u0020'perp-cli/ws'";
+const CODEC_REMEDIATION = "Pass a codec export, e.g. import { hyperliquid } from\u0020'@hypurrquant/perp-ws' (or 'perp-cli/ws')";
 
 /** createVenueStream's first argument must be a codec object (not a venue name / undefined). */
 function checkCodec(codec: unknown): asserts codec is VenueCodec {
@@ -869,7 +869,7 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
     }
     if (codec.user.inPageSecrets && isBrowserLike() && opts.allowInPageSecrets !== true) {
       throw wsError("CAPABILITY_UNSUPPORTED", `${venue} user channels need a signing secret in the page`,
-        "Pass allowInPageSecrets: true to accept that trade-off, or run the stream server-side (perp-cli/ws/node)");
+        "Pass allowInPageSecrets: true to accept that trade-off, or run the stream server-side (the /node entry)");
     }
     if (!Array.isArray(channels)) throw wsError("INVALID_PARAMS", "kind \"user\" needs a channels array", `Use ${USER_CHANNELS.join(" / ")}`);
     const bad = channels.filter(c => !USER_CHANNELS.includes(c));

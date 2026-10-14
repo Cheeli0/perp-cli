@@ -90,9 +90,10 @@ describe("perp-cli/ws bundle purity", () => {
     expect(audit(nodeJs)).toEqual([]);
   });
 
-  it("node.js imports only `ws`", () => {
+  it("node.js imports only node:module (`ws` is required lazily, never imported statically)", () => {
     const specs = [...nodeJs.matchAll(/^\s*import\s[^"']*["']([^"']+)["']/gm)].map(m => m[1]);
-    expect(specs).toEqual(["ws"]);
+    expect(specs).toEqual(["node:module"]);
+    expect(nodeJs).not.toMatch(/from\s*["']ws["']/);
   });
 
   it("imports in Node with WebSocket and fetch removed from globalThis; createVenueStream needs a transport", async () => {
@@ -104,7 +105,7 @@ describe("perp-cli/ws bundle purity", () => {
       const mod = await import(`${pathToFileURL(join(out, "index.js")).href}?t=${Date.now()}`) as typeof import("../../ws/index.js");
       expect(typeof mod.createVenueStream).toBe("function");
       expect(() => mod.createVenueStream(mod.hyperliquid)).toThrow(expect.objectContaining({
-        structured: expect.objectContaining({ code: "INVALID_PARAMS", remediation: "import from perp-cli/ws/node or pass transport" }),
+        structured: expect.objectContaining({ code: "INVALID_PARAMS", remediation: "import from the /node entry (perp-cli/ws/node or @hypurrquant/perp-ws/node) or pass transport" }),
       }));
     } finally {
       if (saved.WebSocket !== undefined) g.WebSocket = saved.WebSocket;

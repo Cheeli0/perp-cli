@@ -13,7 +13,8 @@ node examples/ws-node-stream/stream.mjs arcus BTC-USD --user      # + your accou
 - Venues: `hyperliquid`, `pacifica`, `lighter`, `lighter-rh`, `aster`, `arcus` (symbols as listed by
   `stream.markets()`, e.g. `BTCUSDT` on Aster, `BTC-USD` on Arcus, `xyz:TSLA` with `hip3Dexes`).
 - `perp-cli/ws/node` supplies the `ws` transport (Node 20 has no global `WebSocket`); the API is the
-  same as `perp-cli/ws`.
+  same as `perp-cli/ws`. Standalone: `npm install @hypurrquant/perp-ws ws` and import
+  `@hypurrquant/perp-ws/node` (`ws` is an optional peer dependency there).
 - `--user` uses the CLI's credential provider (`dist/ws-cli/credentials.js`): the address / account id
   comes from the active OWS wallet and registered agents, the Lighter orders token from the agent
   keystore (a keystore with a passphrase is refused, never prompted). It is not part of the published

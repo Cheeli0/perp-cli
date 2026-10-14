@@ -15,7 +15,8 @@ const common: Options = {
   treeshake: true,
   sourcemap: false,
   clean: false,
-  external: ["ws"],
+  external: ["ws", "node:module"],
+  removeNodeProtocol: false,
   tsconfig: "tsconfig.ws.json",
 };
 

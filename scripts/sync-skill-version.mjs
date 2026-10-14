@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 /**
  * Sync skills/perp-cli/SKILL.md `metadata.version` and the install-guard
- * comment to package.json's version field.
+ * comment to package.json's version field, and keep packages/perp-ws
+ * (@hypurrquant/perp-ws, built from the same src/ws) in lockstep: its
+ * `version` must equal perp-cli's.
  *
  * Two modes:
  *   - default   — write SKILL.md with the synced version (used by
@@ -28,16 +30,29 @@ const updated = skill
   .replace(/^(\s*version:\s*)"[\d.]+"/m, `$1"${pkg.version}"`)
   .replace(/(must be >= )[\d.]+/g, `$1${pkg.version}`);
 
-if (updated === skill) {
-  console.log(`[sync-skill-version] OK (already at ${pkg.version})`);
+const wsPkgPath = resolve(root, "packages/perp-ws/package.json");
+const wsPkgText = readFileSync(wsPkgPath, "utf-8");
+const wsPkg = JSON.parse(wsPkgText);
+const wsDrift = wsPkg.version !== pkg.version;
+
+if (updated === skill && !wsDrift) {
+  console.log(`[sync-skill-version] OK (SKILL.md and @hypurrquant/perp-ws already at ${pkg.version})`);
   process.exit(0);
 }
 
 if (isCheck) {
-  console.error(`[sync-skill-version] DRIFT — SKILL.md is not synced to package.json@${pkg.version}`);
+  if (updated !== skill) console.error(`[sync-skill-version] DRIFT — SKILL.md is not synced to package.json@${pkg.version}`);
+  if (wsDrift) console.error(`[sync-skill-version] DRIFT — packages/perp-ws is ${wsPkg.version}, perp-cli is ${pkg.version}`);
   console.error(`  Fix: pnpm run sync-skill-version`);
   process.exit(1);
 }
 
-writeFileSync(skillPath, updated, "utf-8");
-console.log(`[sync-skill-version] SKILL.md synced to ${pkg.version}`);
+if (updated !== skill) {
+  writeFileSync(skillPath, updated, "utf-8");
+  console.log(`[sync-skill-version] SKILL.md synced to ${pkg.version}`);
+}
+if (wsDrift) {
+  wsPkg.version = pkg.version;
+  writeFileSync(wsPkgPath, `${JSON.stringify(wsPkg, null, 2)}\n`, "utf-8");
+  console.log(`[sync-skill-version] packages/perp-ws synced to ${pkg.version}`);
+}

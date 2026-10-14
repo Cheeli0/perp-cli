@@ -1,15 +1,39 @@
 /**
- * perp-cli/ws/node — everything from perp-cli/ws plus a `ws`-based transport (Node 20 has no global
- * WebSocket). `createVenueStream` here defaults `transport` to nodeTransport.
+ * perp-cli/ws/node (also published as @hypurrquant/perp-ws/node) — everything from the browser entry
+ * plus a `ws`-based transport. `createVenueStream` here defaults `transport` to nodeTransport.
+ *
+ * `ws` is used even on Node ≥ 22 (which has a global WebSocket) for the inbound maxPayload cap,
+ * protocol ping/pong and Node 20 support. In @hypurrquant/perp-ws it is an OPTIONAL peer dependency,
+ * loaded lazily: importing this entry never fails; creating a stream / transport without `ws` installed
+ * throws INVALID_PARAMS with the install remediation. (Node ≥ 22 without `ws`: use the browser entry.)
  *
  * @experimental 0.15.x (stable from 0.16.0 after consumer sign-off)
  */
 
-import WebSocket from "ws";
+import { createRequire } from "node:module";
+import type WebSocket from "ws";
+import { WsError } from "./errors.js";
 import { createVenueStream as createBrowserStream } from "./stream.js";
 import type { VenueCodec, VenueStream, VenueStreamOptions, WsFactory, WsLike } from "./types.js";
 
 export * from "./index.js";
+
+type WsModule = typeof WebSocket;
+let wsModule: WsModule | null = null;
+
+/** Load the `ws` package on first use (resolved from this file, i.e. the consumer's node_modules). */
+function loadWs(): WsModule {
+  if (wsModule !== null) return wsModule;
+  try {
+    wsModule = createRequire(import.meta.url)("ws") as WsModule;
+  } catch (e) {
+    if ((e as { code?: unknown }).code !== "MODULE_NOT_FOUND") throw e;
+    throw new WsError("INVALID_PARAMS", "The /node entry needs the `ws` package (an optional peer dependency), and it is not installed", {
+      remediation: "npm install ws@^8.21.0 — or, on Node ≥ 22 / in a browser, import the browser entry (global WebSocket) or pass opts.transport",
+    });
+  }
+  return wsModule;
+}
 
 /**
  * Default cap on one inbound message (bytes). `ws` defaults to 100 MiB; the largest real public frames
@@ -32,6 +56,7 @@ export function createNodeTransport(opts: NodeTransportOptions = {}): WsFactory 
   if (!Number.isSafeInteger(maxPayload) || maxPayload <= 0) {
     throw new RangeError(`createNodeTransport: maxPayload must be a positive integer (got ${String(opts.maxPayload)})`);
   }
+  const WebSocket = loadWs();
   return (url: string): WsLike => {
     const ws = new WebSocket(url, { maxPayload });
     // `ws` throws on an 'error' event without a listener (e.g. close() while CONNECTING): keep one.
@@ -56,9 +81,16 @@ export function createNodeTransport(opts: NodeTransportOptions = {}): WsFactory 
   };
 }
 
-/** Default Node transport (`createNodeTransport()` with the 16 MiB maxPayload cap). */
-export const nodeTransport: WsFactory = createNodeTransport();
+let defaultTransport: WsFactory | null = null;
+
+/** Default Node transport (`createNodeTransport()` with the 16 MiB maxPayload cap; `ws` loaded on first use). */
+export const nodeTransport: WsFactory = (url: string): WsLike => {
+  if (defaultTransport === null) defaultTransport = createNodeTransport();
+  return defaultTransport(url);
+};
 
 export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = {}): VenueStream {
+  const useDefault = opts.transport === undefined || opts.transport === nodeTransport;
+  if (useDefault) loadWs(); // missing `ws` → INVALID_PARAMS now, not a reconnect loop later
   return createBrowserStream(codec, opts.transport === undefined ? { ...opts, transport: nodeTransport } : opts);
 }

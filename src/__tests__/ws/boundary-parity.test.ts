@@ -35,13 +35,13 @@ function tsFiles(dir: string): string[] {
 }
 
 describe("import boundary", () => {
-  it("src/ws/** imports only src/ws/** (node.ts may also import `ws`)", () => {
+  it("src/ws/** imports only src/ws/** (node.ts may also import `ws` types and node:module)", () => {
     for (const file of tsFiles(WS_DIR)) {
       const src = readFileSync(file, "utf8");
       const specs = [...src.matchAll(/(?:from|import)\s*\(?\s*["']([^"']+)["']/g)].map(m => m[1]);
       for (const spec of specs) {
         const rel = relative(WS_DIR, file);
-        if (spec === "ws" && rel === "node.ts") continue;
+        if ((spec === "ws" || spec === "node:module") && rel === "node.ts") continue;
         expect(spec.startsWith("."), `${rel} imports "${spec}"`).toBe(true);
         const target = resolve(dirname(file), spec);
         expect(target.startsWith(WS_DIR), `${rel} imports "${spec}" outside src/ws`).toBe(true);

@@ -16,3 +16,7 @@ npx next build && npx next start              # http://localhost:3000
 
 `pages/index.js` imports `startFundingCompare` statically, so `next build` also proves the library can be
 evaluated during server prerendering (it touches no global at module load) and calls it in `useEffect`.
+
+With `@hypurrquant/perp-ws` instead: `npm install @hypurrquant/perp-ws`, set
+`transpilePackages: ["@hypurrquant/perp-ws"]` and import `@hypurrquant/perp-ws` in `app.js`. The release
+gate runs this build against both packages.

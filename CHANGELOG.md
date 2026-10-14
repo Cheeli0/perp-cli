@@ -4,6 +4,14 @@ All notable changes to `perp-cli`. Format follows [Keep a Changelog](https://kee
 
 ## [Unreleased]
 
+### NEW: `@hypurrquant/perp-ws` — the WebSocket library as a standalone, zero-dependency package
+
+- **`@hypurrquant/perp-ws`** (`packages/perp-ws`) is built from the same `src/ws/**` with the same tsup options as `perp-cli/ws` (the bundles are byte-identical): same code, same API, **no `dependencies`** (~97 KB packed vs ~140 MB for `npm i perp-cli`). Entries: `@hypurrquant/perp-ws` (browser / bundlers / Node ≥ 22 with the global `WebSocket`) and `@hypurrquant/perp-ws/node` (`ws` transport). Recommended install for integrators; `perp-cli/ws` keeps working unchanged for perp-cli users.
+- **`ws` is an optional peer dependency** of `@hypurrquant/perp-ws` (`^8.21.0`). The `/node` entry now loads `ws` lazily (both packages): importing it never fails; creating a stream or transport without `ws` throws `INVALID_PARAMS` with `npm install ws@^8.21.0` (no reconnect loop). It keeps using `ws` on Node ≥ 22 for the 16 MiB message cap and ping/pong.
+- Versions in lockstep: `scripts/sync-skill-version.mjs` also syncs / `--check`s `packages/perp-ws/package.json`; `packages/perp-ws` `prepublishOnly` refuses drift, cleans and rebuilds its `dist/`. Release steps for both packages: `RELEASING.md`.
+- Remediation texts name both packages (`perp-cli/ws/node or @hypurrquant/perp-ws/node`); the skill reference code blocks import `@hypurrquant/perp-ws` (the release gate typechecks them against both packages).
+- Release gate: packs `@hypurrquant/perp-ws`, asserts a clean install has 0 transitive dependencies, the `/node` entry without `ws` (clear error) and with it (live stream), consumer tsc (bundler / node16 / node10), attw and the Next 13.5 build + chunk purity against it.
+
 ### NEW: `perp-cli/ws` — composable WebSocket library (@experimental)
 
 - **New public entry points** `perp-cli/ws` (browser: native `WebSocket` / `fetch`, ESM, ES2020, no side effects, no top-level await, no global touched at module load) and `perp-cli/ws/node` (same API + a `ws` transport). Venues: hyperliquid (native + HIP-3), pacifica, lighter, lighter-rh, aster, arcus.

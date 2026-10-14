@@ -77,7 +77,7 @@ describe("createVenueStream arguments", () => {
   ])("codec = %s → INVALID_PARAMS with the import remediation", (_n, codec) => {
     const e = syncError(() => createVenueStream(codec as never, { transport: fakeTransport().factory }));
     expect(e.structured.code).toBe("INVALID_PARAMS");
-    expect(e.structured.remediation).toBe("Pass a codec export, e.g. import { hyperliquid } from 'perp-cli/ws'");
+    expect(e.structured.remediation).toBe("Pass a codec export, e.g. import { hyperliquid } from '@hypurrquant/perp-ws' (or 'perp-cli/ws')");
   });
 });
 
