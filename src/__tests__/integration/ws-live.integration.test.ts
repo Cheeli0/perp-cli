@@ -1,5 +1,5 @@
 /**
- * perp-cli/ws gated live check (plan ws-0.14.4 Phase 1 / 4): public channels on the six 0.14.4
+ * perp-cli/ws gated live check (plan ws-0.14.4 Phase 1 / 4): public channels on the six 0.15.0
  * venues, mainnet. Opt-in: PERP_WS_LIVE=1 pnpm test:integration -- ws-live
  * Read-only public data; one socket per venue for ≤ 30 s.
  */

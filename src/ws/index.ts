@@ -2,7 +2,7 @@
  * perp-cli/ws — browser-safe composable WebSocket library (plan ws-0.14.4).
  * ESM, ES2020, no side effects, no top-level await, no globals touched at module load.
  *
- * @experimental 0.14.x: breaking changes only in a minor bump; events carry `schema: 1`.
+ * @experimental 0.15.x: breaking changes only in a minor bump; events carry `schema: 1`. Stable from 0.16.0 after consumer sign-off.
  */
 
 export type * from "./types.js";

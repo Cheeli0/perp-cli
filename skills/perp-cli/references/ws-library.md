@@ -4,8 +4,9 @@
 custom live dashboard, funding comparison or price/account feed for **hyperliquid** (native + HIP-3),
 **pacifica**, **lighter**, **lighter-rh**, **aster** and **arcus**, in the browser or in Node.
 
-> **Stability:** 0.14.x is **@experimental** — breaking changes only in a minor bump (CHANGELOG
-> callouts); every event carries `schema: 1`. Stable from **0.15.0**.
+> **Stability:** ships in **0.15.0** and is **@experimental** through 0.15.x — breaking changes only in a
+> minor bump (CHANGELOG callouts); every event carries `schema: 1`. **@stable from 0.16.0** after consumer
+> sign-off. Planned for **0.15.1**: Aster user channels, Ondo / QFEX, `book` / `trades`, `perp stream`.
 
 Runnable examples: `examples/ws-funding-compare-browser`, `examples/ws-next-smoke`,
 `examples/ws-node-stream` in the perp-cli repository.
@@ -27,6 +28,31 @@ npm install perp-cli
 - Only `perp-cli/ws`, `perp-cli/ws/node` and `perp-cli/package.json` are importable (no deep imports).
 - `perp-cli/ws` in Node 20 without a `transport` throws `INVALID_PARAMS` ("import from perp-cli/ws/node or
   pass transport").
+
+### Static page without a bundler
+
+`dist/ws/index.js` is one self-contained ESM file with **no bare imports**, so a plain HTML page can load
+it through an import map. The map points the public specifier at the file; your code still imports
+`"perp-cli/ws"` (that is the "no deep imports" rule: never write `perp-cli/dist/...` in JS — the file path
+lives only in the map, which is the page's job, like a bundler's resolver):
+
+```html
+<script type="importmap">
+  { "imports": { "perp-cli/ws": "/node_modules/perp-cli/dist/ws/index.js" } }
+</script>
+<script type="module">
+  import { createVenueStream, hyperliquid } from "perp-cli/ws";
+  const stream = createVenueStream(hyperliquid);
+  stream.subscribe({ kind: "allMarkets", symbols: ["BTC"] }).on((e) => {
+    if (e.type === "market") document.title = `BTC ${e.mark ?? "—"}`;
+  });
+</script>
+```
+
+Serve the page and `node_modules` from the same static server (any origin works: the venues do not check
+Origin and their REST CORS is `*`). Do the same with a CDN that serves npm files (e.g.
+`https://cdn.jsdelivr.net/npm/perp-cli@0.15.0/dist/ws/index.js`). `perp-cli/ws/node` is Node-only (it
+imports `ws`); never map it in a browser.
 
 ## 2. Minimal examples
 
@@ -92,7 +118,8 @@ await Promise.all(streams.map((s) => s.close()));
   (`idle`) when the last one leaves. The market directory is loaded once over REST (`stream.markets()`).
 - `subscribe(target)`:
   - `{ kind: "allMarkets", symbols? }` → `MarketUpdate` for every (or the listed) market;
-  - `{ kind: "market", symbol, channels: ["market" | "bbo"] }` (`book`, `trades` arrive in 0.14.5);
+  - `{ kind: "market", symbol, channels: ["market" | "bbo"] }`. `"book"` and `"trades"` are already in
+    the types but **reject with `CAPABILITY_UNSUPPORTED` until 0.15.1** — don't ship UI that needs them;
   - `{ kind: "user", channels: ["account" | "positions" | "orders" | "fills"] }` (needs `credentials`).
   Unknown symbols reject with `INVALID_PARAMS` before anything is sent.
 - `Subscription`: `on(cb)` (unbuffered), `for await` (bounded buffer, `opts.buffer.size`, default 1024),
@@ -157,15 +184,80 @@ const cmp = createFundingComparator({ streams, kind: "next", include: ["BTC", "E
 const rows: FundingRow[] = cmp.rows();
 ```
 
-- `kind`: `"current"` (default; each leg's `rate`, `mixedKinds` flags rows mixing kinds), `"predicted"`,
-  `"lastSettled"`, `"accruing"`, and **`"next"`** — per venue the accruing rate when published, else the
-  predicted one. A leg without the requested kind has `rate: null, kindUnavailable: true` (never
-  substituted).
-- A leg is `stale` when its stream is not `live` or its rate is older than 2 × the venue's
-  `staleAfterMs` (Arcus 3×). Skip stale legs.
-- `canonical`: `defaultCanonicalize` maps HIP-3 to `"<dex>:<BASE>"` and USD-like quotes (USDT, USD1,
-  USDC, USD, USDG) to `"<BASE>"`; any other quote → `null` (not compared). Pass `canonicalize` to change it.
-- `onControl` receives the streams' `state` / `error` events and `{type:"listener-error"}`.
+Options and defaults:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `kind` | `"current"` | which rate each leg contributes (below) |
+| `minVenues` | `2` | rows need ≥ this many **distinct venues with a non-null rate** |
+| `staleAfterMs` | 2 × the venue's `stream.staleAfterMs` (Arcus 3×) | a leg is `stale` when its stream is not `live` or its rate is older than this. Venue defaults: hyperliquid 30 s (all markets), pacifica 10 s, lighter / lighter-rh 10 s, aster 5 s, arcus 15 s |
+| `include` | all | allowlist of canonical symbols |
+| `canonicalize` | `defaultCanonicalize` | HIP-3 → `"<dex>:<BASE>"`; USD-like quotes (USDT, USD1, USDC, USD, USDG) → `"<BASE>"`; any other quote → `null` (not compared) |
+| `onControl` | none | the streams' `state` / `error` events and `{type:"listener-error"}` |
+
+- `kind`: `"current"` (each leg's `rate`), `"predicted"`, `"lastSettled"`, `"accruing"`, and **`"next"`** —
+  per venue the accruing rate when published, else the predicted one. A leg without the requested kind
+  has `rate: null, kindUnavailable: true` (never substituted).
+- **`mixedKinds`** is true when a row's legs with a rate use different kinds. With `kind: "next"` it is
+  **true by design** whenever an accruing venue (hyperliquid, aster: the current period so far) meets a
+  predicted one (pacifica, lighter, lighter-rh, arcus: the venue's estimate of the next payment). Both
+  are forward-looking estimates of the coming payment, so the row is usable for ranking; care when you
+  need exact like-for-like numbers (e.g. P&L attribution, or an accruing rate early in its period that
+  can still move a lot) — then use `kind: "accruing"` or `"predicted"` and accept fewer legs.
+- **Several legs per venue:** one venue can contribute more than one leg to a row. Aster lists BTC as
+  `BTCUSDT` (quote USDT) and `BTCUSD1` (quote USD1); both canonicalize to `"BTC"`. Pick one per venue
+  before ranking — by `quote`, or by the most liquid market (below) — or pass a `canonicalize` that
+  returns `null` for the quotes you don't want.
+- **`fundingVerified`** (per leg): the CLI's verdict that the venue's funding unit and which published
+  rate actually settles were confirmed against its funding payments. All six venues in 0.15.0 are
+  `true`; a `false` leg (a future venue) is indicative only — the CLI keeps such venues out of funding
+  comparison and refuses them as funding-arb legs, so do the same.
+- **Filter illiquid outliers before ranking spreads.** Tiny or newly listed markets often show extreme
+  rates (hundreds of % APR) that cannot be traded at size. Require a minimum 24 h notional and/or open
+  interest per leg; the comparator legs carry no volume, so read it from the same streams:
+
+```ts
+import {
+  createFundingComparator, createVenueStream, aster, hyperliquid, lighter, toHourly,
+  type FundingLeg, type FundingRow, type MarketUpdate,
+} from "perp-cli/ws";
+
+const streams = [hyperliquid, lighter, aster].map((c) => createVenueStream(c));
+// Same wire channel as the comparator's own subscription (ref-counted): no extra venue traffic.
+const notional = new Map<string, number>(); // "<venue>|<symbol>" → 24 h notional
+for (const s of streams) {
+  s.subscribe({ kind: "allMarkets" }).on((e) => {
+    if (e.type !== "market") return;
+    const u: MarketUpdate = e;
+    if (u.volume24hNotional !== null) notional.set(`${u.venue}|${u.symbol}`, Number(u.volume24hNotional));
+  });
+}
+
+const MIN_NOTIONAL = 1_000_000;
+/** One leg per venue: the most liquid market that passes the filter (null volume = unknown → skipped). */
+function pickLegs(row: FundingRow): FundingLeg[] {
+  const best = new Map<string, { leg: FundingLeg; vol: number }>();
+  for (const leg of row.legs) {
+    if (leg.rate === null || leg.stale || !leg.fundingVerified) continue;
+    const vol = notional.get(`${leg.venue}|${leg.symbol}`);
+    if (vol === undefined || vol < MIN_NOTIONAL) continue;
+    const cur = best.get(leg.venue);
+    if (cur === undefined || vol > cur.vol) best.set(leg.venue, { leg, vol });
+  }
+  return Array.from(best.values(), (b) => b.leg);
+}
+
+const cmp = createFundingComparator({ streams, kind: "next" });
+cmp.subscribe((rows) => {
+  for (const row of rows) {
+    const legs = pickLegs(row)
+      .map((l) => ({ venue: l.venue, h: toHourly(l.rate, l.funding.rateIntervalHours) }))
+      .filter((x): x is { venue: typeof x.venue; h: number } => x.h !== null)
+      .sort((a, b) => a.h - b.h);
+    if (legs.length >= 2) console.log(row.canonical, legs[0].venue, legs[legs.length - 1].venue);
+  }
+});
+```
 
 ## 6. User (account) channels
 
@@ -198,14 +290,14 @@ sub.on((e) => {
 - **The library never holds keys.** `CredentialProvider` is async callbacks: `user()` (the account
   identity), `authToken({ purpose, maxTtlSec })` (Lighter `account_all_orders`; re-called at 80 % of the
   TTL with backoff retries; a read-only `ro:` token is recommended in browsers), `hmacSha256` /
-  `signTypedData` (reserved for 0.14.5 venues). Tokens handed in are redacted from every error, log and
+  `signTypedData` (reserved for 0.15.1 venues). Tokens handed in are redacted from every error, log and
   raw excerpt.
 - `allowInPageSecrets: true` is required for venues whose auth needs a signing secret in the page
-  (Aster / Ondo / QFEX, 0.14.5). Without it they reject `CAPABILITY_UNSUPPORTED` in a browser.
+  (Aster / Ondo / QFEX, 0.15.1). Without it they reject `CAPABILITY_UNSUPPORTED` in a browser.
 - `UserRef` per venue: hyperliquid `{ address }` (no auth), pacifica `{ account }` (Solana address, no
   auth), lighter / lighter-rh `{ accountIndex }`, arcus `{ address, subaccount }` (`null` = account 0, no auth).
-- **KNOWN GAP (0.14.4): Aster user channels are not implemented** — `kind: "user"` on aster rejects
-  `CAPABILITY_UNSUPPORTED` (no parity; 0.14.5).
+- **KNOWN GAP (0.15.0): Aster user channels are not implemented** — `kind: "user"` on aster rejects
+  `CAPABILITY_UNSUPPORTED` (no parity; 0.15.1).
 
 Events:
 - `account` — `equity, available, marginUsed, unrealizedPnl` (+ `dex` on hyperliquid, one per perp dex);

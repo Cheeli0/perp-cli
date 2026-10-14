@@ -69,14 +69,14 @@ export interface FundingComparator {
   close(): void;
 }
 
-/** @experimental 0.14.x (stable from 0.15.0) */
+/** @experimental 0.15.x (stable from 0.16.0 after consumer sign-off) */
 export function toHourly(rate: Dec | null, rateIntervalHours: number | null): number | null {
   if (rate === null || rateIntervalHours === null || !(rateIntervalHours > 0)) return null;
   const n = Number(rate);
   return Number.isFinite(n) ? n / rateIntervalHours : null;
 }
 
-/** @experimental 0.14.x (stable from 0.15.0) */
+/** @experimental 0.15.x (stable from 0.16.0 after consumer sign-off) */
 export function toApr(rate: Dec | null, rateIntervalHours: number | null): number | null {
   const h = toHourly(rate, rateIntervalHours);
   return h === null ? null : h * 24 * 365;
@@ -106,7 +106,7 @@ function pick(u: MarketUpdate, kind: ComparatorKind, predictedPublished: boolean
   }
 }
 
-/** @experimental 0.14.x (stable from 0.15.0) */
+/** @experimental 0.15.x (stable from 0.16.0 after consumer sign-off) */
 export function createFundingComparator(opts: FundingComparatorOptions): FundingComparator {
   const kind: ComparatorKind = opts.kind === undefined ? "current" : opts.kind;
   const minVenues = opts.minVenues === undefined ? 2 : opts.minVenues;

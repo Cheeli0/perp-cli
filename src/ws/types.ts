@@ -1,5 +1,5 @@
 /**
- * perp-cli/ws public types (plan ws-0.14.4 §4). @experimental through 0.14.x: breaking changes
+ * perp-cli/ws public types (plan ws-0.14.4 §4). @experimental through 0.15.x (stable from 0.16.0 after consumer sign-off): breaking changes
  * only in a minor bump; every event carries `schema: 1`.
  *
  * Null rules (§3): unknown = null. A field the venue never sent is null; a field the latest frame
@@ -41,7 +41,7 @@ export interface CloseReason {
   remediation: string | null;
 }
 
-/** @experimental 0.14.x (stable from 0.15.0) */
+/** @experimental 0.15.x (stable from 0.16.0 after consumer sign-off) */
 export type ConnectionState =
   | { status: "idle" }
   | { status: "connecting"; attempt: number }
@@ -62,7 +62,7 @@ export type Canonicalize = (
 export type Source = "ws" | "snapshot" | `rest:${string}` | "venue-definition";
 export type RateKind = "lastSettled" | "accruing" | "predicted";
 
-/** @experimental 0.14.x (stable from 0.15.0) */
+/** @experimental 0.15.x (stable from 0.16.0 after consumer sign-off) */
 export interface MarketDirectoryEntry {
   venue: VenueId;
   dex: string | null;
@@ -95,7 +95,7 @@ export interface FundingState {
   marketClosed: boolean | null;
 }
 
-/** @experimental 0.14.x (stable from 0.15.0) */
+/** @experimental 0.15.x (stable from 0.16.0 after consumer sign-off) */
 export interface MarketUpdate {
   type: "market";
   schema: 1;
@@ -120,7 +120,7 @@ export interface MarketUpdate {
   asOf: Partial<Record<MarketField, number>>;
 }
 
-/** @experimental 0.14.x (stable from 0.15.0) */
+/** @experimental 0.15.x (stable from 0.16.0 after consumer sign-off) */
 export interface BboUpdate {
   type: "bbo"; schema: 1; venue: VenueId; dex: string | null; symbol: string;
   bid: Dec | null; bidSize: Dec | null; ask: Dec | null; askSize: Dec | null; venueTs: number | null; recvTs: number;
@@ -192,7 +192,7 @@ export interface FillRow {
   time: number | null;
 }
 
-/** @experimental 0.14.x (stable from 0.15.0) */
+/** @experimental 0.15.x (stable from 0.16.0 after consumer sign-off) */
 export type UserUpdate =
   | {
     type: "account"; schema: 1; venue: VenueId;
@@ -218,12 +218,12 @@ export type UserUpdate =
    */
   | { type: "fills"; schema: 1; venue: VenueId; snapshot: true; fills: FillRow[]; source: Source; recvTs: number };
 
-/** @experimental 0.14.x (stable from 0.15.0) */
+/** @experimental 0.15.x (stable from 0.16.0 after consumer sign-off) */
 export type UserRef =
   | { venue: "hyperliquid"; address: `0x${string}` }
   | { venue: "pacifica"; account: string }
   | { venue: "lighter" | "lighter-rh"; accountIndex: number }
-  /** KNOWN GAP in 0.14.4: Aster user channels are not implemented (CAPABILITY_UNSUPPORTED); 0.14.5. */
+  /** KNOWN GAP in 0.15.0: Aster user channels are not implemented (CAPABILITY_UNSUPPORTED); 0.15.1. */
   | { venue: "aster"; user: `0x${string}`; signer: `0x${string}` }
   /** subaccount null = the venue default account (0). */
   | { venue: "arcus"; address: `0x${string}`; subaccount: number | null }
@@ -239,7 +239,7 @@ export interface TypedData {
 
 /**
  * Async credentials; the library never holds keys (only short-lived tokens it is handed).
- * @experimental 0.14.x (stable from 0.15.0)
+ * @experimental 0.15.x (stable from 0.16.0 after consumer sign-off)
  */
 export interface CredentialProvider {
   user(): Promise<UserRef>;
@@ -251,7 +251,7 @@ export interface CredentialProvider {
   authToken?(req: { purpose: string; maxTtlSec: number }): Promise<{ token: string; expiresAt: number }>;
 }
 
-/** @experimental 0.14.x (stable from 0.15.0) */
+/** @experimental 0.15.x (stable from 0.16.0 after consumer sign-off) */
 export type StreamControl =
   | { type: "state"; venue: VenueId; state: ConnectionState }
   | {
@@ -276,7 +276,7 @@ export interface StreamLog {
 
 // ── Capability matrix (static, §6) ──
 
-/** @experimental 0.14.x (stable from 0.15.0) */
+/** @experimental 0.15.x (stable from 0.16.0 after consumer sign-off) */
 export interface VenueWsCapabilities {
   /** true = works from a browser page (Origin/CORS checked, Phase 0); "in-page-secrets" = needs allowInPageSecrets. */
   browser: boolean | "in-page-secrets";
@@ -295,7 +295,7 @@ export type MarketTarget =
   | { kind: "user"; channels: UserChannel[] }
   | { kind: "market"; symbol: string; channels: Array<"market" | "bbo" | "book" | "trades"> };
 
-/** @experimental 0.14.x (stable from 0.15.0) */
+/** @experimental 0.15.x (stable from 0.16.0 after consumer sign-off) */
 export interface VenueStreamOptions {
   network?: Network;
   /** hyperliquid: HIP-3 dexes to include. Default [] = native only. */
@@ -307,7 +307,7 @@ export interface VenueStreamOptions {
   canonicalize?: Canonicalize;
   /** Needed for kind:"user". */
   credentials?: CredentialProvider;
-  /** Default false. Required for user channels whose auth needs a signing secret in the page (Aster/Ondo/QFEX, 0.14.5). */
+  /** Default false. Required for user channels whose auth needs a signing secret in the page (Aster/Ondo/QFEX, 0.15.1). */
   allowInPageSecrets?: boolean;
   /** ≤ venue limits. */
   budget?: { maxSubscriptions?: number; maxSockets?: number; newConnectionsPerMin?: number };
@@ -324,7 +324,7 @@ export interface VenueStreamOptions {
   clock?: () => number;
 }
 
-/** @experimental 0.14.x (stable from 0.15.0) */
+/** @experimental 0.15.x (stable from 0.16.0 after consumer sign-off) */
 export interface Subscription<E> extends AsyncIterable<E | StreamControl> {
   /** Unbuffered callback. Returns an unsubscribe-from-callback function. */
   on(cb: (e: E | StreamControl) => void): () => void;
@@ -444,7 +444,7 @@ export interface LabelledRefresh {
   run(ctx: CodecContext, dir: CodecDirectory): Promise<string[]>;
 }
 
-/** @experimental 0.14.x (stable from 0.15.0) */
+/** @experimental 0.15.x (stable from 0.16.0 after consumer sign-off) */
 export interface VenueCodec {
   readonly venue: VenueId;
   readonly capabilities: VenueWsCapabilities;

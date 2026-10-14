@@ -28,7 +28,7 @@ This skill uses progressive disclosure. Read these on demand:
 - `references/commands.md` — full command tree for every group (market, account, trade, outcome, arb, funds, wallet, risk, history, strategy, background, alerts, settings, backtest)
 - `references/agent-operations.md` — non-interactive setup flows, idempotency rules, error codes, common mistakes
 - `references/strategies.md` — funding-arb decision framework + risk-management playbook (read before designing arb strategy)
-- `references/ws-library.md` — `perp-cli/ws` library (0.14.4, @experimental): build a live dashboard / funding comparison / account feed in the browser or Node (streams, events, nullability, comparator, user channels, errors, capability matrix)
+- `references/ws-library.md` — `perp-cli/ws` library (0.15.0, @experimental): build a live dashboard / funding comparison / account feed in the browser or Node (streams, events, nullability, comparator, user channels, errors, capability matrix)
 
 Also bundled under `scripts/`: `preflight.sh`, `arb-monitor.sh`, `funding-analysis.sh`, `spot-perp-scan.sh`, `validate-arb.sh`. Use these for repeatable multi-step diagnostics.
 

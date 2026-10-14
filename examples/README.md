@@ -1,6 +1,6 @@
 # perp-cli/ws examples
 
-Runnable examples for the `perp-cli/ws` library (0.14.4, @experimental). They double as smoke tests in
+Runnable examples for the `perp-cli/ws` library (0.15.0, @experimental). They double as smoke tests in
 the release gate (`node scripts/ws-gate/release-gate.mjs`).
 
 | Example | Runtime | Shows |

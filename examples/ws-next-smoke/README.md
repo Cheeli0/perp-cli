@@ -2,7 +2,7 @@
 
 Builds the [browser funding-compare example](../ws-funding-compare-browser) with **Next 13.5 (webpack)**
 and `transpilePackages: ["perp-cli"]` against an installed `perp-cli` — the setup a static Next.js
-consumer uses. It is a required step of the 0.14.4 release gate (`node scripts/ws-gate/release-gate.mjs`
+consumer uses. It is a required step of the 0.15.0 release gate (`node scripts/ws-gate/release-gate.mjs`
 packs the tarball, installs it here in a temp copy and runs `next build`).
 
 Manual run against a packed tarball:

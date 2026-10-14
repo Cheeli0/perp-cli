@@ -86,7 +86,7 @@ function isBrowserLike(): boolean {
   return g.window !== undefined && g.document !== undefined;
 }
 
-/** @experimental 0.14.x (stable from 0.15.0) */
+/** @experimental 0.15.x (stable from 0.16.0 after consumer sign-off) */
 export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = {}): VenueStream {
   const venue = codec.venue;
   const network: Network = opts.network === undefined ? "mainnet" : opts.network;
@@ -702,7 +702,7 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
       if (extra.length > 0 || target.channels.length === 0) {
         throw wsError("CAPABILITY_UNSUPPORTED",
           target.channels.length === 0 ? "kind \"market\" needs at least one channel" : `${venue} channel(s) ${extra.join(", ")} are not available in this release`,
-          "Use channels \"market\" / \"bbo\" (book and trades arrive in 0.14.5)");
+          "Use channels \"market\" / \"bbo\" (book and trades arrive in 0.15.1)");
       }
     }
     if (target.kind === "user") checkUserTarget(target.channels);

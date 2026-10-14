@@ -2,7 +2,7 @@
  * perp-cli/ws/node — everything from perp-cli/ws plus a `ws`-based transport (Node 20 has no global
  * WebSocket). `createVenueStream` here defaults `transport` to nodeTransport.
  *
- * @experimental 0.14.x
+ * @experimental 0.15.x (stable from 0.16.0 after consumer sign-off)
  */
 
 import WebSocket from "ws";
