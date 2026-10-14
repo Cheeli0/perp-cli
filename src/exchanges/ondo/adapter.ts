@@ -793,7 +793,7 @@ export class OndoAdapter implements ExchangeAdapter, TradingV2 {
       price: t.price,
       size: t.size,
       fee: null, // public tape: no fee applies to the viewer
-    })));
+    })), ondoPlainSymbol(ondoVenueSymbol(symbol)));
   }
 
   async getFundingHistory(symbol: string, limit?: number): Promise<{ time: number; rate: string; price: string | null }[]> {
@@ -820,7 +820,7 @@ export class OndoAdapter implements ExchangeAdapter, TradingV2 {
       volume: c.volume,
       quoteVolume: null,
       trades: null, // Ondo publishes no per-candle trade count
-    })));
+    })), ondoPlainSymbol(ondoVenueSymbol(symbol)));
   }
 
   // ── Legacy ExchangeAdapter: account ──

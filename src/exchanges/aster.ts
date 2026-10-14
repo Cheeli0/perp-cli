@@ -682,7 +682,7 @@ export class AsterAdapter implements ExchangeAdapter {
         rate: venueRateField(d.fundingRate, "fundingRate fundingRate", "aster"),
         price: d.markPrice ? String(d.markPrice) : null,
       };
-    }));
+    }), this._fromApi(this._toApi(symbol)));
   }
 
   /**

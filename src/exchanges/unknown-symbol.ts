@@ -9,7 +9,7 @@
  * (a listed market with no trades / candles in the window is a real empty result).
  */
 
-import { PerpError } from "../errors.js";
+import { PerpError, classifyError } from "../errors.js";
 import type { ExchangeMarketInfo } from "./interface.js";
 
 /** SYMBOL_NOT_FOUND for `symbol` on `venue`, with the listing command as remediation. */
@@ -28,15 +28,31 @@ export function listsSymbol(markets: readonly Pick<ExchangeMarketInfo, "symbol">
 }
 
 /**
- * `rows` as returned by the venue, unless they are empty and `symbol` is not in the venue's
+ * `rows` as returned by the venue, unless they are empty and the market is not in the venue's
  * market directory — then SYMBOL_NOT_FOUND. The directory is read only for an empty answer.
+ *
+ * `directorySymbol` is the symbol in the directory's form, derived by the adapter from what the
+ * user typed (Ondo "TSLA-USD.P" → "TSLA", Aster "BTCUSDT" → "BTC"); `symbol` is kept for messages.
+ * A failed directory read is re-thrown with its code (and so its retryable flag), saying what was
+ * being checked — never turned into SYMBOL_NOT_FOUND or an empty result.
  */
 export async function nonEmptyOrListed<T>(
   adapter: { readonly name: string; getMarkets(): Promise<Pick<ExchangeMarketInfo, "symbol">[]> },
   symbol: string,
   rows: T[],
+  directorySymbol: string = symbol,
 ): Promise<T[]> {
   if (rows.length > 0) return rows;
-  if (!listsSymbol(await adapter.getMarkets(), symbol)) throw symbolNotFound(adapter.name, symbol);
+  let markets: Pick<ExchangeMarketInfo, "symbol">[];
+  try {
+    markets = await adapter.getMarkets();
+  } catch (e) {
+    const c = classifyError(e, adapter.name);
+    throw new PerpError(c.code, `${adapter.name}: ${symbol} returned no rows and the market list could not be read to check the symbol — ${c.message}`, {
+      exchange: adapter.name,
+      ...(c.remediation !== undefined ? { remediation: c.remediation } : {}),
+    });
+  }
+  if (!listsSymbol(markets, directorySymbol)) throw symbolNotFound(adapter.name, symbol);
   return rows;
 }

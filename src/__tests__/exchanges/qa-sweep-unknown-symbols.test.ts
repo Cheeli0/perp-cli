@@ -60,6 +60,18 @@ describe("nonEmptyOrListed", () => {
   it("empty + listed → the real empty result", async () => {
     await expect(nonEmptyOrListed(adapter(["BTC"]), "btc", [])).resolves.toEqual([]);
   });
+  it("compares the directory form of a venue-form symbol (passed by the adapter)", async () => {
+    await expect(nonEmptyOrListed(adapter(["TSLA"]), "TSLA-USD.P", [], "TSLA")).resolves.toEqual([]);
+  });
+  it("a failing directory read keeps its code / retryable and says what was being checked", async () => {
+    const { PerpError } = await import("../../errors.js");
+    const a = { name: "ondo", getMarkets: vi.fn(async () => { throw new PerpError("RATE_LIMITED", "429 Too Many Requests"); }) };
+    await expect(nonEmptyOrListed(a, "NOPE", [])).rejects.toMatchObject({
+      structured: expect.objectContaining({ code: "RATE_LIMITED", retryable: true, message: expect.stringMatching(/ondo: NOPE returned no rows and the market list could not be read to check the symbol — 429 Too Many Requests/) }),
+    });
+    const b = { name: "aster", getMarkets: vi.fn(async () => { throw new Error("fetch failed"); }) };
+    await expect(nonEmptyOrListed(b, "NOPE", [])).rejects.toMatchObject({ structured: expect.objectContaining({ code: "EXCHANGE_UNREACHABLE", retryable: true }) });
+  });
   it("matches case-insensitively, ignoring a -PERP suffix", () => {
     expect(listsSymbol([{ symbol: "BTC-PERP" }], "btc")).toBe(true);
     expect(listsSymbol([{ symbol: "BTC" }], "BTC-PERP")).toBe(true);
@@ -138,6 +150,13 @@ describe("Ondo", () => {
     await expect(a.getKlines("NOPE", "1h", 0, 3_600_000)).rejects.toMatchObject(NOT_FOUND("ondo"));
     await expect(a.getRecentTrades("AAPL")).resolves.toEqual([]);
   });
+
+  it("a venue-form symbol (TSLA-USD.P) of a listed market with an empty window stays []", async () => {
+    const client = { publicGet: vi.fn(async () => []), get: vi.fn(async () => []) };
+    const a = stubAdapter(OndoAdapter.prototype, "ondo", { client }, ["TSLA"]);
+    await expect(a.getRecentTrades("TSLA-USD.P")).resolves.toEqual([]);
+    await expect(a.getKlines("tsla-usd.p", "1h", 0, 3_600_000)).resolves.toEqual([]);
+  });
 });
 
 describe("funding history of an unknown symbol", () => {
@@ -147,6 +166,14 @@ describe("funding history of an unknown symbol", () => {
     (a as unknown as Record<string, unknown>)._publicGet = vi.fn(async () => []);
     (a as unknown as Record<string, unknown>).getMarkets = vi.fn(async () => [{ symbol: "BTC" }]);
     await expect(a.getFundingHistory("NOPE")).rejects.toMatchObject(NOT_FOUND("aster"));
+  });
+
+  it("Aster: a venue-form symbol (BTCUSDT) of a listed market with no rows stays []", async () => {
+    const { AsterAdapter } = await import("../../exchanges/aster.js");
+    const a = new AsterAdapter(undefined, false);
+    (a as unknown as Record<string, unknown>)._publicGet = vi.fn(async () => []);
+    (a as unknown as Record<string, unknown>).getMarkets = vi.fn(async () => [{ symbol: "BTC" }]);
+    await expect(a.getFundingHistory("BTCUSDT")).resolves.toEqual([]);
   });
 
   it("Hyperliquid: resolved against the asset map before the request (the venue answers HTTP 500)", async () => {
