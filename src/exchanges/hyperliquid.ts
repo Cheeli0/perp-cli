@@ -717,7 +717,7 @@ export class HyperliquidAdapter implements ExchangeAdapter {
       // A dex-prefixed symbol must name THIS adapter's dex — never rewritten onto another dex.
       const [prefix, base] = sym.split(":");
       if (prefix.toLowerCase() !== this._dex.toLowerCase()) {
-        throw new PerpError("SYMBOL_NOT_FOUND", `Hyperliquid symbol ${symbol} is on dex "${prefix.toLowerCase()}", not ${this._dex ? `this adapter's dex "${this._dex}"` : "the native perp dex"}`, {
+        throw new PerpError("SYMBOL_NOT_FOUND", `Hyperliquid symbol ${prefix.toLowerCase()}:${base} is on dex "${prefix.toLowerCase()}", not ${this._dex ? `this adapter's dex "${this._dex}"` : "the native perp dex"}`, {
           exchange: "hyperliquid", remediation: `Select the dex: perp -e hyperliquid --dex ${prefix.toLowerCase()} ...`,
         });
       }
@@ -854,8 +854,9 @@ export class HyperliquidAdapter implements ExchangeAdapter {
     // funding / dayNtlVlm / openInterest "0.0") are not markets: excluded from the listing and
     // everything built on it. They stay in the asset map (_loadAssetMap), so an explicit symbol
     // still resolves for orders / position reads.
+    const delisted = new Set<string>();
     const result = universe.flatMap((asset: Record<string, unknown>, i: number) => {
-      if (asset.isDelisted === true) return [];
+      if (asset.isDelisted === true) { delisted.add(String(asset.name)); return []; }
       const ctx = (ctxs[i] ?? {}) as Record<string, unknown>;
       const sym = String(asset.name);
       const szDec = this._szDecimalsMap.get(sym) ?? (asset.szDecimals !== undefined ? Number(asset.szDecimals) : null);
@@ -875,7 +876,22 @@ export class HyperliquidAdapter implements ExchangeAdapter {
         marginTiers: tierMap.get(Number(asset.marginTableId)) ?? null,
       }];
     });
+    this._delisted = delisted;
     this._marketsCache = result; this._marketsCacheTime = Date.now(); return result;
+  }
+
+  /** Display names of the delisted assets seen by the last getMarkets() (meta isDelisted). */
+  private _delisted = new Set<string>();
+
+  /**
+   * Why `symbol` is not in getMarkets(): it is delisted (message), or null when it is not a
+   * delisted asset. Read after getMarkets(). `market info` uses it to say "delisted" rather than
+   * "not found" — the asset map still resolves it for orders / positions / history.
+   */
+  delistedMessage(symbol: string): string | null {
+    const resolved = this.resolveSymbol(symbol.toUpperCase());
+    if (!this._delisted.has(resolved)) return null;
+    return `${resolved.replace(/-PERP$/, "")} is delisted on Hyperliquid (positions / history still readable)`;
   }
 
   async getOrderbook(symbol: string) {

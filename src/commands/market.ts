@@ -218,7 +218,10 @@ export function registerMarketCommands(
       if (!m) {
         // Printed (envelope / Error + Remediation) and exit 1 via withJsonErrors.
         return void await withJsonErrors(isJson(), async () => {
-          throw new PerpError("SYMBOL_NOT_FOUND", `Market ${normalizeSymbolArg(symbol)} not found on ${adapter.name}`, {
+          const delisted = typeof (adapter as { delistedMessage?: unknown }).delistedMessage === "function"
+            ? (adapter as unknown as { delistedMessage(s: string): string | null }).delistedMessage(symbol)
+            : null;
+          throw new PerpError("SYMBOL_NOT_FOUND", delisted ?? `Market ${normalizeSymbolArg(symbol)} not found on ${adapter.name}`, {
             exchange: adapter.name,
             remediation: `List markets: perp -e ${adapter.name} market list`,
           });

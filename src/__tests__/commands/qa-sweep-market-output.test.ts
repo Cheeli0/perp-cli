@@ -106,6 +106,19 @@ describe("4. market info <unknown symbol>", () => {
   });
 });
 
+describe("4b. market info <delisted>", () => {
+  it("SYMBOL_NOT_FOUND says the market is delisted (positions / history still readable)", async () => {
+    const { out, exitCode } = await run({
+      getMarkets: async () => [BTC],
+      delistedMessage: (s: string) => (s.toUpperCase() === "MATIC" ? "MATIC is delisted on Hyperliquid (positions / history still readable)" : null),
+    } as Partial<ExchangeAdapter>, ["market", "info", "MATIC"], true);
+    const env = JSON.parse(out[out.length - 1]);
+    expect(env.error).toMatchObject({ code: "SYMBOL_NOT_FOUND", message: "MATIC is delisted on Hyperliquid (positions / history still readable)" });
+    expect(env.error.remediation).toMatch(/perp -e hyperliquid market list/);
+    expect(exitCode).toBe(1);
+  });
+});
+
 describe("5. HIP-3 dex symbol display", () => {
   it("normalizeSymbolArg keeps the dex prefix lower case", () => {
     expect(normalizeSymbolArg("xyz:xyz100")).toBe("xyz:XYZ100");

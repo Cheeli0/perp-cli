@@ -127,6 +127,25 @@ describe("5. Hyperliquid delisted assets and unlisted coins", () => {
     expect(m[0]).toMatchObject({ openInterest: "100", fundingRate: "0.0000125" });
   });
 
+  it("a delisted coin still resolves for orders / positions: getAssetIndex, szDecimals, lot step", async () => {
+    const a = hl({ metaAndAssetCtxs: () => META, allMids: () => ({}) });
+    (a as unknown as { _szDecimalsMap: Map<string, number> })._szDecimalsMap.set("MATIC-PERP", 1);
+    await a.getMarkets();
+    await expect(a.getAssetIndex("MATIC")).resolves.toBe(1);
+    expect(a.getSzDecimals("MATIC")).toBe(1);
+    expect(a.lotStepOf("MATIC")).toBe("0.1");
+    // the close path's mark price reads meta directly, not the filtered market list
+    await expect(a.markPrice("MATIC")).resolves.toBe(0.37621);
+  });
+
+  it("delistedMessage names a delisted coin (market info says why it is not listed)", async () => {
+    const a = hl({ metaAndAssetCtxs: () => META, allMids: () => ({}) });
+    await a.getMarkets();
+    expect(a.delistedMessage("matic")).toMatch(/MATIC is delisted on Hyperliquid \(positions \/ history still readable\)/);
+    expect(a.delistedMessage("BTC")).toBeNull();
+    expect(a.delistedMessage("NOPE")).toBeNull();
+  });
+
   it("legacy public rows (market data / funding scans) skip delisted assets", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify(META), { status: 200 })));
     try {
