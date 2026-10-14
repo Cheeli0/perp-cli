@@ -9,7 +9,7 @@
 import { PerpError } from "../../errors.js";
 import type {
   ExchangeAdapter, ExchangeBalance, ExchangeFundingPayment, ExchangeKline, ExchangeMarketInfo, ExchangeOrder,
-  ExchangePosition, ExchangeTrade,
+  ExchangePosition, ExchangeTrade, ExchangePublicTrade,
 } from "../interface.js";
 import { unsupported } from "../trading-v2.js";
 import { roleUnsupported, networkConfig, type VenueDefinition } from "../venue.js";
@@ -70,7 +70,7 @@ export class TxflowPublicAdapter implements ExchangeAdapter {
     return { bids: side(levels[0] as unknown[]), asks: side(levels[1] as unknown[]) };
   }
 
-  async getRecentTrades(symbol: string, limit = 50): Promise<ExchangeTrade[]> {
+  async getRecentTrades(symbol: string, limit = 50): Promise<ExchangePublicTrade[]> {
     const m = await this.market(symbol);
     const res = await this.client.info<unknown>({ type: "trades", coin: String(m.index) });
     if (!Array.isArray(res)) throw txflowShapeError("trades is not an array");
@@ -79,7 +79,7 @@ export class TxflowPublicAdapter implements ExchangeAdapter {
       if (x.side !== "B" && x.side !== "A") throw txflowShapeError(`trade side ${String(x.side)}`);
       if (typeof x.time !== "number") throw txflowShapeError("trade without time");
       // Public tape carries no fee; "0" follows the legacy ExchangeTrade convention for public trades.
-      return { time: x.time, symbol: m.symbol, side: x.side === "B" ? "buy" : "sell", price: dec(x.px, "trade px"), size: dec(x.sz, "trade sz"), fee: "0" };
+      return { time: x.time, symbol: m.symbol, side: x.side === "B" ? "buy" : "sell", price: dec(x.px, "trade px"), size: dec(x.sz, "trade sz"), fee: null };
     });
   }
 
@@ -104,6 +104,7 @@ export class TxflowPublicAdapter implements ExchangeAdapter {
         time: x.t,
         open: dec(x.o, "candle o"), high: dec(x.h, "candle h"), low: dec(x.l, "candle l"), close: dec(x.c, "candle c"),
         volume: dec(x.v, "candle v"),
+        quoteVolume: null,
         trades: typeof x.n === "number" ? x.n : null,
       };
     });

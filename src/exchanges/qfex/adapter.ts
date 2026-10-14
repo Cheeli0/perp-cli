@@ -47,7 +47,7 @@ import { assertWithdrawAllowed, forgetWithdrawAttempt, recordWithdrawAttempt } f
 import { builderGateOf, NO_BUILDER, type BuilderDecision, type BuilderFeeGate } from "../builder-fee.js";
 import type {
   ExchangeAdapter, ExchangeBalance, ExchangeFundingPayment, ExchangeKline, ExchangeMarketInfo, ExchangeOrder,
-  ExchangePosition, ExchangeTrade,
+  ExchangePosition, ExchangeTrade, ExchangePublicTrade,
 } from "../interface.js";
 import type { IocOutcome } from "../ioc-outcome.js";
 import { alignProtectionPrice, floorSize, requireOnTick, slippagePrice, subDecimal } from "../precision.js";
@@ -121,7 +121,26 @@ interface QfexHistoricOrder {
 interface QfexUserTrade {
   symbol: string; side: string; price: number; quantity: number; fee: number; order_timestamp: number;
 }
-interface QfexCandle { startedAt: string; open: string; high: string; low: string; close: string; baseTokenVolume: string }
+interface QfexCandle { startedAt: string; open: string; high: string; low: string; close: string; baseTokenVolume: string; usdVolume: string }
+
+/**
+ * Candle volumes. GET /candles returns `usdVolume` (populated) and `baseTokenVolume`, which the
+ * venue leaves "0" on traded candles (live 2026-10-14, CL-USD 1HOUR: baseTokenVolume "0" with
+ * usdVolume "52534.48506" on every row; startingOpenInterest / orderbookMidPrice* are "0" too).
+ * A base "0" next to a non-zero USD volume is a placeholder → null (unknown), never 0; when
+ * both are zero the candle really had no volume.
+ */
+export function qfexCandleVolumes(c: { baseTokenVolume: unknown; usdVolume: unknown }): { volume: string | null; quoteVolume: string } {
+  const decimal = (v: unknown, what: string): string => {
+    if (typeof v !== "string" || v.trim() === "" || !Number.isFinite(Number(v))) {
+      throw new PerpError("EXCHANGE_ERROR", `QFEX candles: ${what} is not a decimal string (${JSON.stringify(v)})`, { exchange: "qfex" });
+    }
+    return v;
+  };
+  const quoteVolume = decimal(c.usdVolume, "usdVolume");
+  const base = decimal(c.baseTokenVolume, "baseTokenVolume");
+  return { volume: Number(base) === 0 && Number(quoteVolume) !== 0 ? null : base, quoteVolume };
+}
 
 /** Client order id sent to the venue: a fresh UUID (the format the venue itself generates). */
 export function qfexClientOrderId(): string {
@@ -334,7 +353,7 @@ export class QfexAdapter implements ExchangeAdapter, TradingV2 {
     const venueSymbol = qfexVenueSymbol(symbol);
     const i = (await this.instrumentMap()).get(venueSymbol);
     if (i === undefined) {
-      throw new PerpError("SYMBOL_NOT_FOUND", `QFEX has no market ${venueSymbol}`, { exchange: "qfex", remediation: "List markets with: perp market list -e qfex" });
+      throw new PerpError("SYMBOL_NOT_FOUND", `QFEX has no market ${venueSymbol}`, { exchange: "qfex", remediation: "List markets: perp -e qfex market list" });
     }
     return i;
   }
@@ -1143,7 +1162,9 @@ export class QfexAdapter implements ExchangeAdapter, TradingV2 {
   }
 
   async getOrderbook(symbol: string): Promise<{ bids: [string, string][]; asks: [string, string][] }> {
-    const venueSymbol = qfexVenueSymbol(symbol);
+    // Resolved against refdata first: an unknown symbol is SYMBOL_NOT_FOUND, not the venue's
+    // HTTP 404 surfacing as a retryable EXCHANGE_ERROR.
+    const venueSymbol = (await this.instrumentOf(symbol)).venueSymbol;
     const book = await this.client.publicGet<{ bids?: unknown; asks?: unknown }>(`/md/orderbook/${encodeURIComponent(venueSymbol)}`, null);
     // The venue lists empty price levels (quantity "0"); they are not part of the book.
     const side = (v: unknown, what: string): [string, string][] => listOf<string[]>(v, what)
@@ -1152,13 +1173,13 @@ export class QfexAdapter implements ExchangeAdapter, TradingV2 {
     return { bids: side(book.bids, "orderbook bids"), asks: side(book.asks, "orderbook asks") };
   }
 
-  async getRecentTrades(): Promise<ExchangeTrade[]> {
+  async getRecentTrades(): Promise<ExchangePublicTrade[]> {
     throw unsupported("qfex", "recentTrades", "the documented public trade endpoint (GET /public/trades) answers 404", "Use the order book: perp market book <symbol> -e qfex");
   }
 
   /** Hourly funding windows (GET /funding/{symbol}, intervalMinutes 60). `limit` = hours back (default 24). */
   async getFundingHistory(symbol: string, limit?: number): Promise<{ time: number; rate: string; price: string | null }[]> {
-    const venueSymbol = qfexVenueSymbol(symbol);
+    const venueSymbol = (await this.instrumentOf(symbol)).venueSymbol;
     const hours = limit === undefined ? 24 : limit;
     if (!Number.isInteger(hours) || hours < 1) throw new PerpError("INVALID_PARAMS", `funding history limit must be a positive integer of hours (got ${hours})`);
     const to = Date.now();
@@ -1180,13 +1201,14 @@ export class QfexAdapter implements ExchangeAdapter, TradingV2 {
     if (resolution === undefined) {
       throw new PerpError("INVALID_PARAMS", `Unsupported kline interval "${interval}" on QFEX`, { remediation: `Use one of: ${Object.keys(KLINE_RESOLUTION).join(", ")}` });
     }
-    const body = await this.client.publicGet<{ candles?: unknown }>(`/candles/${encodeURIComponent(qfexVenueSymbol(symbol))}`, {
+    const venueSymbol = (await this.instrumentOf(symbol)).venueSymbol;
+    const body = await this.client.publicGet<{ candles?: unknown }>(`/candles/${encodeURIComponent(venueSymbol)}`, {
       resolution, fromISO: new Date(startTime).toISOString(), toISO: new Date(endTime).toISOString(),
     });
     return listOf<QfexCandle>(body.candles, "candles").map(c => {
       const time = Date.parse(c.startedAt);
       if (!Number.isFinite(time)) throw new PerpError("EXCHANGE_ERROR", `QFEX candles: invalid startedAt "${c.startedAt}"`);
-      return { time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.baseTokenVolume, trades: null };
+      return { time, open: c.open, high: c.high, low: c.low, close: c.close, ...qfexCandleVolumes(c), trades: null };
     }).sort((a, b) => a.time - b.time);
   }
 

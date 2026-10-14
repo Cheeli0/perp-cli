@@ -333,7 +333,7 @@ export async function enforceOrderRisk(
     const markets = await adapter.getMarkets();
     const m = markets.find((mk) => symbolMatch(mk.symbol, p.symbol));
     if (!m) {
-      throw new PerpError("SYMBOL_NOT_FOUND", `${p.symbol} not found on ${adapter.name}`, { exchange: adapter.name });
+      throw new PerpError("SYMBOL_NOT_FOUND", `${p.symbol} not found on ${adapter.name}`, { exchange: adapter.name, remediation: `List markets: perp -e ${adapter.name} market list` });
     }
     price = Number(m.markPrice);
   }

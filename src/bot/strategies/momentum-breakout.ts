@@ -51,7 +51,10 @@ export class MomentumBreakoutStrategy implements Strategy {
     const closes = klines.map(k => parseFloat(k.close));
     const highs = klines.map(k => parseFloat(k.high));
     const lows = klines.map(k => parseFloat(k.low));
-    const volumes = klines.map(k => parseFloat(k.volume));
+    // A venue without candle volume (null) cannot confirm a breakout: no entry, exits still run.
+    const volumeKnown = klines.every(k => k.volume !== null);
+    if (!volumeKnown) ctx.log("  [BREAKOUT] venue publishes no candle volume — volume confirmation unavailable, no new entries");
+    const volumes = klines.map(k => (k.volume === null ? NaN : parseFloat(k.volume)));
     const price = snapshot.price;
 
     // Compute indicators
@@ -73,7 +76,7 @@ export class MomentumBreakoutStrategy implements Strategy {
     const avgVolSma = calculateSMA(volumes, this.lookbackPeriod);
     const avgVolume = avgVolSma.length > 0 ? avgVolSma[avgVolSma.length - 1] : 0;
     const currentVolume = volumes[volumes.length - 1];
-    const volumeConfirmed = avgVolume > 0 && currentVolume > avgVolume * this.volumeMultiplier;
+    const volumeConfirmed = volumeKnown && avgVolume > 0 && currentVolume > avgVolume * this.volumeMultiplier;
 
     const position = ctx.state.get("position") as {
       side: "buy" | "sell"; entry: number; stop: number; tp: number;

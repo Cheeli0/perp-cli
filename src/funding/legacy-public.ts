@@ -212,6 +212,9 @@ async function hyperliquidRows(net: Network): Promise<Row[]> {
   const unclassified: string[] = [];
   const unpriced: string[] = [];
   universe.forEach((a, i) => {
+    // Delisted assets stay in meta (isDelisted: true) with zeroed funding / volume / OI
+    // (live 2026-10-14: 56 of 234) — not a market: excluded from listings, prices and scans.
+    if (a.isDelisted === true) return;
     const ctx = ctxs[i];
     const symbol = String(a.name ?? "");
     const assetClass = classifyHyperliquid(symbol);
@@ -243,7 +246,7 @@ async function hyperliquidRows(net: Network): Promise<Row[]> {
         maxLeverage: Number.isFinite(maxLeverage) && maxLeverage > 0 ? maxLeverage : null,
         marginTiers: null,
         session: null,
-        tradable: a.isDelisted !== true,
+        tradable: true, // delisted assets are skipped above
       },
       nextFundingTime: null, // not published in metaAndAssetCtxs
     });

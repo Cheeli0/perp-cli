@@ -29,7 +29,7 @@ import { OwsEvmSigner } from "../../signer/ows-evm.js";
 import { OwsSolanaSigner } from "../../signer/ows-solana.js";
 import type {
   ExchangeAdapter, ExchangeBalance, ExchangeFundingPayment, ExchangeKline, ExchangeMarketInfo,
-  ExchangeOrder, ExchangePosition, ExchangeTrade,
+  ExchangeOrder, ExchangePosition, ExchangeTrade, ExchangePublicTrade,
 } from "../interface.js";
 import type { ResolvedSlippage } from "../slippage.js";
 import { alignProtectionPrice, floorSize, mulDecimal, requirePositive, slippagePrice, subDecimal, toUnitsExact, unitsToString } from "../precision.js";
@@ -1026,12 +1026,12 @@ export class ArcusAdapter implements ExchangeAdapter, TradingV2 {
     return { bids: ob.bids, asks: ob.asks };
   }
 
-  async getRecentTrades(symbol: string, limit = 50): Promise<ExchangeTrade[]> {
+  async getRecentTrades(symbol: string, limit = 50): Promise<ExchangePublicTrade[]> {
     const m = await this.market(symbol);
     const res = await this.client.get<{ trades: Array<{ side: "BUY" | "SELL"; price: string; size: string; timestamp: number }> }>(
       "/v1/trades", "trades", { market: m.marketDisplayName, limit });
     // Public tape carries no fee; "0" follows the legacy ExchangeTrade convention for public trades.
-    return res.trades.map(t => ({ time: usToMs(t.timestamp), symbol: m.baseAsset, side: sideLower(t.side), price: t.price, size: t.size, fee: "0" }));
+    return res.trades.map(t => ({ time: usToMs(t.timestamp), symbol: m.baseAsset, side: sideLower(t.side), price: t.price, size: t.size, fee: null }));
   }
 
   async getFundingHistory(symbol: string, limit = 100): Promise<{ time: number; rate: string; price: string | null }[]> {
@@ -1064,7 +1064,7 @@ export class ArcusAdapter implements ExchangeAdapter, TradingV2 {
         "/v1/candles", "candles", { market: m.marketDisplayName, timeframe: interval, from: from * 1000, to: to * 1000 });
       for (const c of res.candles) {
         const time = usToMs(c.openTime);
-        byTime.set(time, { time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume, trades: c.tradeCount });
+        byTime.set(time, { time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume, quoteVolume: null, trades: c.tradeCount });
       }
     }
     return [...byTime.values()].sort((x, y) => x.time - y.time);

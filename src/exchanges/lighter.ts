@@ -5,6 +5,7 @@ import type {
   ExchangeOrder,
   ExchangeBalance,
   ExchangeTrade,
+  ExchangePublicTrade,
   ExchangeFundingPayment,
   ExchangeKline,
 } from "./interface.js";
@@ -963,7 +964,7 @@ export class LighterAdapter implements ExchangeAdapter {
 
   getMarketIndex(symbol: string): number {
     const idx = this._marketMap.get(symbol.toUpperCase());
-    if (idx === undefined) throw new PerpError("SYMBOL_NOT_FOUND", `Unknown Lighter market: ${symbol}`, { exchange: this.name });
+    if (idx === undefined) throw new PerpError("SYMBOL_NOT_FOUND", `Unknown Lighter market: ${symbol}`, { exchange: this.name, remediation: `List markets: perp -e ${this.name} market list` });
     return idx;
   }
 
@@ -2124,7 +2125,7 @@ export class LighterAdapter implements ExchangeAdapter {
     return this.updateLeverage(symbol, leverage, marginMode);
   }
 
-  async getRecentTrades(symbol: string, limit = 20): Promise<ExchangeTrade[]> {
+  async getRecentTrades(symbol: string, limit = 20): Promise<ExchangePublicTrade[]> {
     await this.ensureMarketMap();
     const marketId = this.getMarketIndex(symbol);
     const res = await this.restGet("/recentTrades", { market_id: String(marketId), limit: String(limit) }) as Record<string, unknown>;
@@ -2138,7 +2139,8 @@ export class LighterAdapter implements ExchangeAdapter {
       side: t.is_maker_ask ? "buy" as const : "sell" as const,
       price: String(t.price ?? "0"),
       size: String(t.size ?? t.base_amount ?? t.amount ?? ""),
-      fee: String(t.fee ?? "0"),
+      // The tape's taker_fee / maker_fee are the parties' fee RATES, not a fee the viewer paid.
+      fee: null,
     }));
   }
 
@@ -2162,7 +2164,10 @@ export class LighterAdapter implements ExchangeAdapter {
       low: String(c.low ?? c.l ?? "0"),
       close: String(c.close ?? c.c ?? "0"),
       volume: String(c.base_token_volume ?? c.v ?? ""),
-      trades: Number(c.trades_count ?? c.n ?? 0),
+      // /candles: v = base volume, V = quote (USD) volume; no per-candle trade count (live
+      // 2026-10-14 keys: t o h l c v V i — `i` is the last trade id, not a count).
+      quoteVolume: typeof c.V === "number" || typeof c.V === "string" ? String(c.V) : null,
+      trades: typeof c.trades_count === "number" ? c.trades_count : typeof c.n === "number" ? c.n : null,
     }));
   }
 

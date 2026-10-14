@@ -7,6 +7,7 @@ import type {
   ExchangeOrder,
   ExchangeBalance,
   ExchangeTrade,
+  ExchangePublicTrade,
   ExchangeFundingPayment,
   ExchangeKline,
 } from "./interface.js";
@@ -1444,7 +1445,7 @@ export class PacificaAdapter implements ExchangeAdapter {
       .catch((e: unknown) => { throw pacificaWithdrawRejection(e, amount); });
   }
 
-  async getRecentTrades(symbol: string, _limit = 20): Promise<ExchangeTrade[]> {
+  async getRecentTrades(symbol: string, _limit = 20): Promise<ExchangePublicTrade[]> {
     const trades = await this.client.getTrades(symbol);
     // Deduplicate by time+price+size+side (API sometimes returns duplicate entries)
     const seen = new Set<string>();
@@ -1460,7 +1461,7 @@ export class PacificaAdapter implements ExchangeAdapter {
       side: t.side === "bid" ? "buy" as const : "sell" as const,
       price: t.price,
       size: t.amount,
-      fee: String((t as unknown as Record<string, unknown>).fee ?? "0"),
+      fee: null, // the public tape carries no fee
     }));
   }
 
@@ -1489,6 +1490,7 @@ export class PacificaAdapter implements ExchangeAdapter {
       low: k.l,
       close: k.c,
       volume: k.v,
+      quoteVolume: null, // /kline carries base volume only
       trades: k.n,
     }));
   }

@@ -122,11 +122,11 @@ export class EngineMmStrategy implements Strategy {
     // Mid-price (always available)
     components.push(snapshot.price);
 
-    // VWAP from klines
-    if (snapshot.klines.length > 0) {
+    // VWAP from klines — only when the venue publishes candle volume (null = unknown, never weighted as 0)
+    if (snapshot.klines.length > 0 && snapshot.klines.every(k => k.volume !== null)) {
       const candles = snapshot.klines.map(k => ({
         close: parseFloat(k.close),
-        volume: parseFloat(k.volume),
+        volume: parseFloat(k.volume as string),
       }));
       const vwap = calculateVWAP(candles);
       if (vwap > 0) components.push(vwap);

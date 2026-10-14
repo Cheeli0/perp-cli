@@ -27,6 +27,7 @@ import type {
   ExchangeOrder,
   ExchangeBalance,
   ExchangeTrade,
+  ExchangePublicTrade,
   ExchangeFundingPayment,
   ExchangeKline,
 } from "./interface.js";
@@ -550,7 +551,7 @@ export class AsterAdapter implements ExchangeAdapter {
       this._ingestPriceFilters(info.symbols);
     }
     if (!this._priceFilters.has(apiSymbol)) {
-      throw new PerpError("SYMBOL_NOT_FOUND", `Aster market ${apiSymbol} not found in exchangeInfo`, { exchange: "aster" });
+      throw new PerpError("SYMBOL_NOT_FOUND", `Aster market ${apiSymbol} not found in exchangeInfo`, { exchange: "aster", remediation: "List markets: perp -e aster market list" });
     }
     const f = this._priceFilters.get(apiSymbol);
     if (!f) {
@@ -635,7 +636,7 @@ export class AsterAdapter implements ExchangeAdapter {
     };
   }
 
-  async getRecentTrades(symbol: string, limit = 20): Promise<ExchangeTrade[]> {
+  async getRecentTrades(symbol: string, limit = 20): Promise<ExchangePublicTrade[]> {
     const trades = await this._publicGet("/fapi/v3/trades", {
       symbol: this._toApi(symbol),
       limit: String(limit),
@@ -647,7 +648,7 @@ export class AsterAdapter implements ExchangeAdapter {
       side: t.isBuyerMaker ? "sell" as const : "buy" as const,
       price: String(t.price ?? "0"),
       size: String(t.qty ?? "0"),
-      fee: "0",
+      fee: null, // the public tape carries no fee
     }));
   }
 
@@ -704,7 +705,7 @@ export class AsterAdapter implements ExchangeAdapter {
         if (!Number.isFinite(time) || !Number.isFinite(trades)) {
           throw new PerpError("EXCHANGE_ERROR", `Aster kline row without open time / trade count: ${JSON.stringify(k).slice(0, 120)}`, { exchange: "aster" });
         }
-        out.push({ time, open: String(k[1]), high: String(k[2]), low: String(k[3]), close: String(k[4]), volume: String(k[5]), trades });
+        out.push({ time, open: String(k[1]), high: String(k[2]), low: String(k[3]), close: String(k[4]), volume: String(k[5]), quoteVolume: String(k[7]), trades });
       }
       if (data.length < ASTER_KLINE_PAGE) break;
       const next = Number((data[data.length - 1] as unknown[])[0]) + 1;

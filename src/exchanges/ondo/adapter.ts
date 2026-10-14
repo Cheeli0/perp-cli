@@ -41,7 +41,7 @@ import { PerpError, orderNotSent, orderOutcomeUnknown } from "../../errors.js";
 import type { OndoAgentMeta } from "../../settings.js";
 import type {
   ExchangeAdapter, ExchangeBalance, ExchangeFundingPayment, ExchangeKline, ExchangeMarketInfo, ExchangeOrder,
-  ExchangePosition, ExchangeTrade,
+  ExchangePosition, ExchangeTrade, ExchangePublicTrade,
 } from "../interface.js";
 import type { ResolvedSlippage } from "../slippage.js";
 import { alignProtectionPrice, floorSize, formatComputedPrice, requireOnTick, slippagePrice, subDecimal } from "../precision.js";
@@ -780,7 +780,7 @@ export class OndoAdapter implements ExchangeAdapter, TradingV2 {
     return { bids: book.bids.map(lvl), asks: book.asks.map(lvl) };
   }
 
-  async getRecentTrades(symbol: string, limit?: number): Promise<ExchangeTrade[]> {
+  async getRecentTrades(symbol: string, limit?: number): Promise<ExchangePublicTrade[]> {
     const trades = await this.client.publicGet<OndoPublicTrade[] | null>("/v1/perps/trades", {
       market: ondoVenueSymbol(symbol), limit: limit === undefined ? null : limit,
     });
@@ -790,7 +790,7 @@ export class OndoAdapter implements ExchangeAdapter, TradingV2 {
       side: t.aggressor_side,
       price: t.price,
       size: t.size,
-      fee: "0", // public tape: no fee applies to the viewer
+      fee: null, // public tape: no fee applies to the viewer
     }));
   }
 
@@ -816,6 +816,7 @@ export class OndoAdapter implements ExchangeAdapter, TradingV2 {
       low: c.low,
       close: c.close,
       volume: c.volume,
+      quoteVolume: null,
       trades: null, // Ondo publishes no per-candle trade count
     }));
   }

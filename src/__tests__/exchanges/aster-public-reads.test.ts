@@ -61,7 +61,7 @@ describe("AsterAdapter.getKlines — 1500-bar pages", () => {
     expect(calls).toHaveLength(2);
     expect(calls[0].limit).toBe("1500");
     expect(Number(calls[1].startTime)).toBe(t0 + 1499 * 60_000 + 1);
-    expect(k[0]).toEqual({ time: t0, open: "1", high: "2", low: "0.5", close: "1.5", volume: "10", trades: 7 });
+    expect(k[0]).toEqual({ time: t0, open: "1", high: "2", low: "0.5", close: "1.5", volume: "10", quoteVolume: "15", trades: 7 });
   });
 
   it("a non-list answer or a row without a trade count → EXCHANGE_ERROR (no 0 default)", async () => {

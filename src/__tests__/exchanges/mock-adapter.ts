@@ -7,6 +7,7 @@ import type {
   ExchangeTrade,
   ExchangeFundingPayment,
   ExchangeKline,
+  ExchangePublicTrade,
 } from "../../exchanges/interface.js";
 
 /**
@@ -100,7 +101,7 @@ export class MockAdapter implements ExchangeAdapter {
     return this.orderResult;
   }
 
-  async getRecentTrades(symbol: string, limit?: number): Promise<ExchangeTrade[]> {
+  async getRecentTrades(symbol: string, limit?: number): Promise<ExchangePublicTrade[]> {
     this.record("getRecentTrades", [symbol, limit]);
     return [];
   }
