@@ -105,6 +105,7 @@ export const arcusVenue: VenueDefinition = {
   // Arcus venue limit per design §13.10 #1.
   maxSlippageBps: 1000,
   builderFee: BUILDER_FEE_CAPABILITIES["arcus"],
+  apiStatus: { kind: "official" },
   async create(ctx) {
     const { ArcusAdapter } = await import("../arcus/adapter.js");
     return new ArcusAdapter(arcusVenue, ctx);

@@ -205,7 +205,7 @@ export function applySetupSettings(change: SetupSettingsChange): Settings {
 
 /** Agent names already registered for `venue` on `network` in settings. */
 function registeredAgentNames(venue: VenueId, network: Network): string[] {
-  if (venue === "ondo" || venue === "arcus" || venue === "qfex") {
+  if (venue === "ondo" || venue === "arcus" || venue === "qfex" || venue === "risex") {
     const map = loadSettings().agents?.[venue];
     return map ? Object.values(map).filter(m => m.network === network).map(m => m.agentName) : [];
   }
@@ -214,7 +214,7 @@ function registeredAgentNames(venue: VenueId, network: Network): string[] {
 
 function rotateHint(venue: VenueId): string {
   if (venue === "qfex") return "perp wallet agent import qfex --replace";
-  return venue === "ondo" || venue === "arcus"
+  return venue === "ondo" || venue === "arcus" || venue === "risex"
     ? `perp wallet agent approve ${venue} --rotate`
     : `perp wallet agent rotate ${venue}`;
 }
@@ -289,6 +289,13 @@ function signingSummary(p: ApproveAgentParams, master: { evm: string | null; sol
       return ["No signature. Your Ondo API key is stored encrypted in ~/.perp/ondo-agents/ and checked with one read-only account request."];
     case "qfex":
       return ["No signature. Your QFEX API key is stored encrypted in ~/.perp/qfex-agents/ and checked with read-only requests."];
+    case "risex":
+      return [
+        `EIP-712 RegisterSigner signed by master EVM ${master.evm} (+ VerifySigner by the new signer): registers a session signer (${expiry}).`,
+        `Then the new signer signs DisablePermission for every permission except trading, and ${master.evm} sends those transactions ON-CHAIN on RISE chain (needs RISE-chain ETH for gas): the signer can trade but never move funds, and only the master could re-enable a permission.`,
+      ];
+    case "txflow":
+      return ["Nothing — TxFlow is market data only (unofficial read-only API)."];
   }
 }
 

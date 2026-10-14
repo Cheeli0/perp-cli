@@ -37,6 +37,8 @@ export interface ExchangeFundingRate {
   historicalAvg: HistoricalAverages | null;  // avg rates over time windows
   /** false = the venue's funding rate is unverified (VenueDefinition.fundingVerified) — shown only on explicit request. */
   fundingVerified: boolean;
+  /** How the row was read: "unofficial" = an undocumented venue API (VenueDefinition.apiStatus) — may change without notice. */
+  apiStatus: "official" | "unofficial";
 }
 
 export interface SymbolFundingComparison {
@@ -68,7 +70,9 @@ export const TOP_SYMBOLS = [
 
 /** Mark-price source preference for `bestMarkPrice` (most liquid first). */
 const MARK_PRICE_PREFERENCE: readonly VenueId[] = [
-  "hyperliquid", "pacifica", "lighter", "aster", "lighter-rh", "ondo", "arcus", "qfex",
+  "hyperliquid", "pacifica", "lighter", "aster", "lighter-rh", "ondo", "arcus", "risex", "qfex",
+  // Unofficial API: last resort as a mark-price source.
+  "txflow",
 ];
 
 // ── Per-venue fetch ──
@@ -98,7 +102,7 @@ async function fetchVenueRates(def: VenueDefinition, net: Network): Promise<Exch
     const markRaw = r.markPrice !== null ? r.markPrice : markBySymbol?.get(r.venueSymbol);
     const markPrice = markRaw === undefined ? NaN : Number(markRaw);
     if (!Number.isFinite(markPrice) || markPrice <= 0) { unpriced.push(r.symbol); continue; }
-    out.push(toExchangeRate(r, r.canonical, markPrice, def.fundingVerified));
+    out.push(toExchangeRate(r, r.canonical, markPrice, def.fundingVerified, def.apiStatus.kind));
   }
   if (unpriced.length > 0) {
     console.warn(`[${def.id}] excluded ${unpriced.length} funding row(s) without a mark price: ${unpriced.join(", ")}`);
@@ -106,7 +110,7 @@ async function fetchVenueRates(def: VenueDefinition, net: Network): Promise<Exch
   return out;
 }
 
-function toExchangeRate(r: VenueFundingRate, canonical: string, markPrice: number, fundingVerified: boolean): ExchangeFundingRate {
+function toExchangeRate(r: VenueFundingRate, canonical: string, markPrice: number, fundingVerified: boolean, apiStatus: "official" | "unofficial"): ExchangeFundingRate {
   const fundingRate = Number(r.rate);
   if (!Number.isFinite(fundingRate)) {
     throw new PerpError("EXCHANGE_ERROR", `${r.venue} ${r.symbol}: non-numeric funding rate "${r.rate}"`);
@@ -124,6 +128,7 @@ function toExchangeRate(r: VenueFundingRate, canonical: string, markPrice: numbe
     nextFundingTime: r.nextFundingTime,
     historicalAvg: null,
     fundingVerified,
+    apiStatus,
   };
 }
 

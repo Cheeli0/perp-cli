@@ -370,8 +370,10 @@ function printSnapshotTable(snapshot: FundingRateSnapshot): void {
       formatAvgRate(bestRate?.historicalAvg?.avg8h), formatAvgRate(bestRate?.historicalAvg?.avg24h), formatAvgRate(bestRate?.historicalAvg?.avg7d),
     ];
   });
-  console.log(makeTable(["Symbol", ...columns.map(v => v.displayName), "Spread", "24h", "Direction", "Avg 8h", "Avg 24h", "Avg 7d"], rows));
+  console.log(makeTable(["Symbol", ...columns.map(v => v.apiStatus.kind === "unofficial" ? `${v.displayName}*` : v.displayName), "Spread", "24h", "Direction", "Avg 8h", "Avg 24h", "Avg 7d"], rows));
   console.log(chalk.gray(`\n  ${snapshot.symbols.length} symbols compared across exchanges.\n`));
+  const unofficial = columns.filter(v => v.apiStatus.kind === "unofficial");
+  if (unofficial.length > 0) console.log(chalk.yellow(`  * ${unofficial.map(v => v.displayName).join(", ")}: UNOFFICIAL API (undocumented, read-only; may change or break). Unverified funding — shown only with --include-unverified.\n`));
 }
 
 function printFundingExchangeStatus(snapshot: FundingRateSnapshot): void {
@@ -404,10 +406,15 @@ function printDetailedComparison(comparison: SymbolFundingComparison): void {
 // ── Exported handler functions for use by arb-auto.ts scan routing ──
 
 /** One-line stderr notice when rows of unverified-funding venues are shown (--include-unverified). */
-function warnUnverifiedFunding(rates: ReadonlyArray<{ exchange: string; fundingVerified: boolean }>): void {
+function warnUnverifiedFunding(rates: ReadonlyArray<{ exchange: string; fundingVerified: boolean; apiStatus: "official" | "unofficial" }>): void {
   const venues = [...new Set(rates.filter(r => !r.fundingVerified).map(r => r.exchange))];
-  if (venues.length === 0) return;
-  process.stderr.write(`[warn] ${venues.join(", ")}: funding rates are UNVERIFIED (unit not confirmed against funding payments; annualized values overstate venues whose funding accrues only during market hours). Shown on request — not for trading decisions.\n`);
+  if (venues.length > 0) {
+    process.stderr.write(`[warn] ${venues.join(", ")}: funding rates are UNVERIFIED (unit not confirmed against funding payments; annualized values overstate venues whose funding accrues only during market hours). Shown on request — not for trading decisions.\n`);
+  }
+  const unofficial = [...new Set(rates.filter(r => r.apiStatus === "unofficial").map(r => r.exchange))];
+  if (unofficial.length > 0) {
+    process.stderr.write(`[warn] ${unofficial.join(", ")}: read through an UNOFFICIAL API (undocumented; may change or be blocked without notice). Rows carry apiStatus "unofficial".\n`);
+  }
 }
 
 export async function handleRates(isJson: () => boolean, opts: { symbol?: string; symbols?: string; all?: boolean; minSpread: string; top?: string; includeUnverified?: boolean }): Promise<void> {

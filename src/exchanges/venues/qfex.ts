@@ -133,6 +133,7 @@ export const qfexVenue: VenueDefinition = {
   // Widest documented price band (equities at the open: 10%). The order's own band is checked before sending.
   maxSlippageBps: 1000,
   builderFee: BUILDER_FEE_CAPABILITIES["qfex"],
+  apiStatus: { kind: "official" },
   create: async ctx => {
     const { QfexAdapter } = await import("../qfex/adapter.js");
     const adapter = new QfexAdapter(qfexVenue, ctx);

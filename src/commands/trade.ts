@@ -78,6 +78,8 @@ const V2_CLIENT_ID_RULES: Readonly<Partial<Record<VenueDefinition["id"], { re: R
   pacifica: { re: PACIFICA_UUID_RE, desc: "a full UUID, e.g. f47ac10b-58cc-4372-a567-0e02b2c3d479" },
   hyperliquid: { re: HL_CLOID_RE, desc: "a 128-bit hex cloid: 0x + 32 lowercase hex chars, e.g. 0x1234567890abcdef1234567890abcdef (or --auto-id)" },
   aster: { re: ASTER_CLIENT_ID_RE, desc: "1-36 chars of A-Z a-z 0-9 . : / _ -" },
+  // uint64 decimal (range checked by the adapter).
+  risex: { re: /^[1-9][0-9]{0,19}$/, desc: "a decimal integer from 1 to 2^64 - 1" },
 };
 
 /**

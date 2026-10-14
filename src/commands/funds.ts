@@ -11,7 +11,8 @@ import { registerFundsRebalanceCommands } from "./rebalance.js";
 import { PerpError, isConnectFailure, isDefiniteOrderFailure, isTransportFailure, orderOutcomeUnknown, parsePositiveDecimal } from "../errors.js";
 import { cliCredentialOptsFrom, requireMasterWallet } from "../config.js";
 import type { VenueId } from "../exchanges/venue-types.js";
-import { getVenue, requireCapabilities, READ_ONLY_CREDENTIALS, type Network as VenueNetwork, type VenueDefinition } from "../exchanges/venue.js";
+import { getVenue, requireCapabilities, roleUnsupported, READ_ONLY_CREDENTIALS, type Network as VenueNetwork, type VenueDefinition } from "../exchanges/venue.js";
+import { RISEX_APP_URL, RISEX_FUNDS_APP_ONLY } from "../exchanges/venues/risex.js";
 import { unsupported } from "../exchanges/trading-v2.js";
 import { registerOnchainFundsCommands } from "./funds-onchain.js";
 import { QFEX_BANKER_NETWORK, QFEX_WITHDRAW_DISABLED, QFEX_WITHDRAW_ENABLED, QFEX_WITHDRAW_NETWORK } from "../exchanges/venues/qfex.js";
@@ -908,6 +909,28 @@ export function registerFundsCommands(
       }
     });
 
+  supportsDryRun(faucet.command("risex"))
+    .description("[testnet tooling] Get the RISEx testnet faucet's 1000 test USDC (once per wallet; also registers the account; refused on mainnet; supports --dry-run)")
+    .action(async () => {
+      const network = getNetwork();
+      if (network !== "testnet") {
+        throw unsupported("RISEx", `the test-USDC faucet on ${network}`, "the faucet exists only on testnet", "Run on testnet: perp -n testnet funds faucet risex");
+      }
+      const adapter = await getAdapterForExchange("risex");
+      const { RisexAdapter } = await import("../exchanges/risex/adapter.js");
+      if (!(adapter instanceof RisexAdapter)) throw new Error("risex venue did not produce a RisexAdapter");
+      const account = adapter.accountAddress();
+      if (isDryRun()) {
+        return printFundsPlan({ action: "deposit", venue: "risex", network, asset: "USDC (test)", amount: "1000", method: "testnet faucet POST /v1/account/deposit", account });
+      }
+      const res = await adapter.testnetFaucet();
+      logExecution({ type: "bridge", exchange: "risex", symbol: "USDC", side: "deposit", size: "1000", status: "success", dryRun: false, meta: { action: "faucet", network, account } });
+      if (isJson()) return printJson(jsonOk({ ...res, account, amount: "1000", network, method: "faucet" }));
+      console.log(chalk.green(`\n  RISEx testnet faucet: 1000 test USDC requested for ${account}`));
+      if (res.txHash !== null) console.log(`  Tx: ${res.txHash}`);
+      console.log();
+    });
+
   // ═══════════════════════════════════════════════════════
   //  WITHDRAW
   // ═══════════════════════════════════════════════════════
@@ -1122,6 +1145,22 @@ export function registerFundsCommands(
       throw unsupported("Ondo Perps", "withdraw", "the Ondo Perps API does not allow withdrawals", "Withdraw from the Ondo Perps web app");
     });
 
+  // RISEx: deposits / withdrawals are app-only (owner decision). The commands stay so the refusal
+  // is explicit — also under --dry-run, before any credential or request.
+  supportsDryRun(withdraw.command("risex [amount]"))
+    .description(`Not available: RISEx withdrawals are done in the RISEx app (${RISEX_APP_URL}) — refused, also with --dry-run`)
+    .option("--to <address>", "Ignored — perp-cli does not move RISEx funds")
+    .action(async () => {
+      throw unsupported("risex", "withdraw", RISEX_FUNDS_APP_ONLY.reason, RISEX_FUNDS_APP_ONLY.remediation);
+    });
+  // TxFlow: market data only (unofficial read-only API).
+  supportsDryRun(withdraw.command("txflow [amount]"))
+    .description("Not available: TxFlow is market data only in perp-cli (unofficial read-only API) — refused")
+    .option("--to <address>", "Ignored")
+    .action(async () => {
+      throw roleUnsupported(getVenue("txflow"), "withdraw");
+    });
+
   for (const venueId of ["arcus"] as const) {
     const def = getVenue(venueId);
     const asset = withdrawAssetOf(def);
@@ -1265,6 +1304,17 @@ export function registerFundsCommands(
       }
     });
 
+  supportsDryRun(deposit.command("risex [amount]"))
+    .description(`Not available: RISEx deposits are done in the RISEx app (${RISEX_APP_URL}) — refused, also with --dry-run`)
+    .action(async () => {
+      throw unsupported("risex", "deposit", RISEX_FUNDS_APP_ONLY.reason, RISEX_FUNDS_APP_ONLY.remediation);
+    });
+  supportsDryRun(deposit.command("txflow [amount]"))
+    .description("Not available: TxFlow is market data only in perp-cli (unofficial read-only API) — refused")
+    .action(async () => {
+      throw roleUnsupported(getVenue("txflow"), "deposit");
+    });
+
   supportsDryRun(deposit.command("qfex"))
     .description("Show the QFEX deposit address for USDC on Arbitrum One (perp-cli sends nothing — transfer from your own wallet; supports --dry-run)")
     // --chain, not --network: the root -n/--network (mainnet | testnet) would swallow a subcommand --network.
@@ -1319,6 +1369,12 @@ export function registerFundsCommands(
       const amountNum = Number(parsePositiveDecimal(amount, "amount"));
       if (isNaN(amountNum) || amountNum <= 0) throw new Error("Invalid amount");
       const exchangeOpt = program.opts().exchange as string | undefined;
+      // -e names a venue this command cannot move funds on: refuse instead of transferring on Hyperliquid.
+      if (exchangeOpt !== undefined) {
+        const def = getVenue(exchangeOpt);
+        if (!def.roles.includes("account")) throw roleUnsupported(def, "transfer");
+        if (def.id === "risex") throw unsupported("risex", "transfer", RISEX_FUNDS_APP_ONLY.reason, RISEX_FUNDS_APP_ONLY.remediation);
+      }
       if (exchangeOpt !== undefined && getVenue(exchangeOpt).id === "qfex") {
         if (isDryRun()) {
           return printFundsPlan({ action: "transfer", venue: "qfex", network: getNetwork(), asset: "USDC", amount, from: opts.from ?? "the key's account", destination });
@@ -1408,6 +1464,8 @@ export function registerFundsCommands(
             qfex: { chain: "Arbitrum", token: "USDC", min: null, method: "address display only: perp funds deposit qfex, then send USDC from your wallet" },
             aster: { chain: "BNB Chain (default) / Arbitrum", token: "USDT (default) / USDC", min: null, gas: "BNB / Arbitrum ETH", method: "approve + vault depositFor(token, forAddress, amount, broker 1) (mainnet only)", command: "perp funds deposit aster <amount> [--chain bsc|arbitrum] [--asset USDT|USDC]" },
             ondo: { chain: "Arbitrum (default) / Ethereum", token: "USDC", min: null, gas: "ETH", method: "USDC transfer to the account's funding address (mainnet only)", command: "perp funds deposit ondo <amount> [--chain arbitrum|ethereum] [--probe <amount>]" },
+            risex: { supported: false, note: `${RISEX_FUNDS_APP_ONLY.reason} — ${RISEX_FUNDS_APP_ONLY.remediation}`, testnet: "perp -n testnet funds faucet risex (1000 test USDC, once)" },
+            txflow: { supported: false, note: "TxFlow is market data only in perp-cli (unofficial read-only API)" },
           },
           withdraw: {
             pacifica: { chain: "Solana", token: "USDC", speed: "~10s", fee: "none" },
@@ -1419,6 +1477,8 @@ export function registerFundsCommands(
               ? { chain: chainLabel(QFEX_WITHDRAW_NETWORK), token: "USDC", command: "perp funds withdraw qfex <amount> --to <allowlisted address>", gate: "settings withdraw.qfex (allowlist, maxPerTx, maxPerDay)", note: "needs a key with the \"Deposit and withdraw\" permission" }
               : { supported: false, note: `${QFEX_WITHDRAW_DISABLED.reason} — ${QFEX_WITHDRAW_DISABLED.remediation}` },
             arcus: { chain: "Robinhood Chain", token: "USDG", command: "perp funds withdraw arcus <amount>" },
+            risex: { supported: false, note: `${RISEX_FUNDS_APP_ONLY.reason} — ${RISEX_FUNDS_APP_ONLY.remediation}` },
+            txflow: { supported: false, note: "TxFlow is market data only in perp-cli (unofficial read-only API)" },
             aster: { chain: "BNB Chain (default) / Arbitrum", token: "USDT (default) / USDC", command: "perp funds withdraw aster <amount> [--chain bsc|arbitrum] [--asset USDT|USDC]", fee: "POST /fapi/v3/aster/user-withdraw-info (taken from the amount)", requires: "mainnet; API wallet approved with --can-withdraw --ip-whitelist; destination = the account's own address" },
           },
         }));

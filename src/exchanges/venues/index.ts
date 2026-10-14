@@ -12,10 +12,12 @@ import { lighterVenue } from "./lighter.js";
 import { ondoVenue } from "./ondo.js";
 import { pacificaVenue } from "./pacifica.js";
 import { qfexVenue } from "./qfex.js";
+import { risexVenue } from "./risex.js";
+import { txflowVenue } from "./txflow.js";
 
 export const ALL_VENUES = [
   pacificaVenue, hyperliquidVenue, lighterVenue, asterVenue,
-  lighterRhVenue, ondoVenue, arcusVenue, qfexVenue,
+  lighterRhVenue, ondoVenue, arcusVenue, qfexVenue, risexVenue, txflowVenue,
 ] as const;
 
 /** Idempotent: registers all venues on first call, no-op afterwards. */
@@ -29,5 +31,5 @@ ensureVenuesRegistered();
 
 export {
   pacificaVenue, hyperliquidVenue, lighterVenue, asterVenue,
-  lighterRhVenue, ondoVenue, arcusVenue, qfexVenue,
+  lighterRhVenue, ondoVenue, arcusVenue, qfexVenue, risexVenue, txflowVenue,
 };

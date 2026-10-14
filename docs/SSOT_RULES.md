@@ -50,6 +50,8 @@
   - **Ondo Perps** (HMAC API key id + secret) → `~/.perp/ondo-agents/<keyId>.json`, AES-256-GCM, mode 0600. `perp wallet agent approve ondo` 가 stdin 으로만 입력받음 (argv/env 금지)
   - **Arcus** (Ed25519 API key) → OWS vault 의 별도 wallet `agent-arcus-<master>` (Aster/HL/PAC 패턴과 동일)
   - **QFEX** (HMAC API public key + secret, 웹사이트에서만 생성) → `~/.perp/qfex-agents/<publicKey>.json`, AES-256-GCM, mode 0600. `perp wallet agent import qfex` 가 숨김 프롬프트 / stdin 으로만 입력받음 (argv/env 금지). settings 에는 메타(`publicKey`, 계정 UUID, network)만. public key 는 WebSocket URL(`?api_key=`)에 실리며 비밀이 아님 — secret 은 로그·에러·argv 어디에도 나오지 않음
+  - **RISEx** (session signer, EVM 키) → OWS vault 의 별도 wallet `agent-risex-<master>[-testnet]` (빈 passphrase, HL/Arcus 패턴과 동일). `perp wallet agent approve risex` 로만 생성 (master 서명 등록 + on-chain trading-only 제한). import 는 거절 (앱에서 만든 signer 는 자금 이동 권한 보유). settings 에는 메타(signer/account 주소, 만료, 권한 상태)만. permit nonce 상태 `~/.perp/risex-nonce/<network>-<account>.json` 은 비밀 아님
+  - **TxFlow** → 자격 증명 없음 (비공식 read-only API, market data 전용)
 - **웹사이트에서 만든 키 import (`perp wallet agent import <venue>`, 2026-10-02):** master 는 공개 주소로만 기록(`masterWalletName: ""`, `source: "imported"`).
   - HL / Aster (EVM) · Pacifica (Solana) · Arcus (Ed25519) → OWS vault wallet `agent-{hl,aster,pac,arcus}-import-<agentName>` (빈 passphrase, 승인형 agent wallet 과 동일 모델)
   - Lighter / Lighter RH → 승인형과 같은 network-tagged keystore (`~/.perp/lighter-agents/<network>-<account>-<slot>.json`, `~/.perp/lighter-rh-agents/…`, atomic write)

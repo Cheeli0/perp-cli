@@ -8,7 +8,7 @@ import { parse as parseDotenv } from "dotenv";
 import type { Network } from "./exchanges/venue-types.js";
 import { PerpError } from "./errors.js";
 import { QFEX_AUTOMATION_VERIFIED, QFEX_REDUCE_ONLY_WIRE, qfexAutomationGate, qfexReduceOnlyGate } from "./exchanges/qfex/signing.js";
-import { startRefusal } from "./exchanges/trading-v2.js";
+import { startRefusal, unsupported } from "./exchanges/trading-v2.js";
 import { scrubSecretEnv, secretEnvNamesIn } from "./secret-env.js";
 
 const JOBS_DIR = join(homedir(), ".perp", "jobs");
@@ -226,6 +226,18 @@ export function startJob(opts: StartJobOpts): JobEntry {
       if (reduceOnly !== null) throw startRefusal(what, "it could open a position it cannot close", reduceOnly);
       const automation = qfexAutomationGate(QFEX_AUTOMATION_VERIFIED);
       if (automation !== null) throw startRefusal(what, "it would trade unattended", automation);
+    }
+    for (const v of new Set([opts.venue, opts.exchange])) {
+      const id = v?.toLowerCase();
+      const what = `Background job "${opts.strategy}"`;
+      // RISEx: unattended trading stays off until its trading path is verified on mainnet (no TP/SL yet).
+      if (id === "risex" || id === "rise") {
+        throw startRefusal(what, "it would trade unattended", unsupported("RISEx", "automation", "unattended trading on RISEx is not enabled until its trading path is verified on mainnet (and it has no TP/SL yet)", "Trade RISEx manually with perp trade …"));
+      }
+      // TxFlow: market data only (unofficial read-only API).
+      if (id === "txflow" || id === "txf") {
+        throw startRefusal(what, "TxFlow has no trading in perp-cli", unsupported("txflow", "trading", "TxFlow is integrated through an unofficial read-only API (market data only)", "Trade on the TxFlow website"));
+      }
     }
   }
   if (!hasTmux()) {

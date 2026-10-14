@@ -7,7 +7,7 @@ import { cliCredentialOptsFrom, hasCredentials, resolveCredentials, type CliCred
 import { PacificaAdapter } from "./exchanges/pacifica.js";
 import { HyperliquidAdapter } from "./exchanges/hyperliquid.js";
 import type { ExchangeAdapter } from "./exchanges/interface.js";
-import { getVenue, listVenues, resolveVenueId, READ_ONLY_CREDENTIALS, type VenueDefinition } from "./exchanges/venue.js";
+import { getVenue, listVenues, resolveVenueId, roleUnsupported, READ_ONLY_CREDENTIALS, type VenueDefinition } from "./exchanges/venue.js";
 import { registerAdapterNetwork } from "./exchanges/adapter-network.js";
 import "./exchanges/venues/index.js";
 import type { Network as VenueNetwork, VenueId } from "./exchanges/venue-types.js";
@@ -96,10 +96,16 @@ export function numericNetworkFlagError(argv: readonly string[]): PerpError | nu
 export function landingData(program: Command, version: string): {
   name: string; version: string; usage: string; help: string;
   commands: { name: string; description: string }[];
+  venues: { id: string; displayName: string; roles: string[]; apiStatus: "official" | "unofficial"; note: string | null }[];
 } {
   return {
     name: program.name(),
     version,
+    // Registry facts only (no reads): an "unofficial" venue is read through an undocumented API.
+    venues: listVenues().map(v => ({
+      id: v.id, displayName: v.displayName, roles: [...v.roles], apiStatus: v.apiStatus.kind,
+      note: v.apiStatus.kind === "unofficial" ? v.apiStatus.note : null,
+    })),
     usage: `${program.name()} [options] <command> [args] (add --json for one JSON document on stdout)`,
     help: `${program.name()} <command> --help`,
     commands: program.commands
@@ -188,6 +194,9 @@ export function buildProgram(opts: { defaultExchange: string; version: string })
         remediation: `${def.id} is market-data only — use the funding/market public commands (e.g. perp arb scan)`,
       });
     }
+    // A market-data-only venue (TxFlow: unofficial read-only API) never gets a credentialed adapter:
+    // every account / trading / funds / bot path refuses here, before any credential or request.
+    if (!publicOnly && !def.roles.includes("account")) throw roleUnsupported(def, "account");
     const network = currentNetwork();
     const hlDex = def.id === "hyperliquid" ? dex : null;
     const key = publicOnly ? `${def.id}:${network}:public:${hlDex ?? "-"}` : adapterCacheKey(def.id, network, hlDex);

@@ -16,6 +16,10 @@ import type { Network } from "../exchanges/venue-types.js";
 import { cliCredentialOptsFrom, type CliCredentialOpts, type Exchange } from "../config.js";
 import type { BridgeEvmSigner } from "../bridge-signers.js";
 import type { SolanaSigner } from "../signer/interface.js";
+import { getVenue, roleUnsupported, tryResolveVenueId } from "../exchanges/venue.js";
+import { unsupported } from "../exchanges/trading-v2.js";
+import { RISEX_FUNDS_APP_ONLY } from "../exchanges/venues/risex.js";
+import "../exchanges/venues/index.js";
 
 export function registerFundsRebalanceCommands(
   parent: Command,
@@ -182,6 +186,14 @@ export function registerFundsRebalanceCommands(
       // before any withdrawal is sent (not after, as a per-move bridge_failed).
       if (opts.autoBridge && !dryRun) assertBridgeNetwork(getNetwork());
       const exchangeNames = opts.exchanges.split(",").map((e) => e.trim());
+      // Venues whose funds perp-cli cannot move are refused before any read (no partial plan).
+      for (const name of exchangeNames) {
+        const id = tryResolveVenueId(name);
+        if (id === null) continue;
+        const def = getVenue(id);
+        if (!def.roles.includes("account")) throw roleUnsupported(def, "rebalance");
+        if (id === "risex") throw unsupported("risex", "rebalance", RISEX_FUNDS_APP_ONLY.reason, RISEX_FUNDS_APP_ONLY.remediation);
+      }
       const adapters = new Map<string, ExchangeAdapter>();
       const unavailable: Array<{ exchange: string; error: string }> = [];
 

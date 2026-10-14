@@ -20,7 +20,7 @@ import type { ExchangeAdapter, ExchangeBalance, ExchangePosition } from "../exch
 import { makeTable, formatUsd, formatPnl, printJson, jsonOk, jsonError, withJsonErrors } from "../utils.js";
 import { isDexCapable } from "../exchanges/capabilities.js";
 import type { DashboardExchange } from "../dashboard/index.js";
-import { getVenue, listVenuesWithRole, tryResolveVenueId } from "../exchanges/venue.js";
+import { getVenue, listVenuesWithRole, roleUnsupported, tryResolveVenueId } from "../exchanges/venue.js";
 import { PerpError } from "../errors.js";
 import "../exchanges/venues/index.js";
 import { listConfiguredAccountVenues } from "../config.js";
@@ -215,6 +215,11 @@ function validateExchanges(list: string[]): string[] {
   const valid = accountVenueIds();
   // Aliases (hl, pac, lt, lrh, ast, …) resolve through the venue registry, like every other command.
   const ids = list.map(s => tryResolveVenueId(s) ?? s.toLowerCase());
+  // A registered market-data-only venue (TxFlow) is a capability refusal, not an unknown name.
+  for (const id of ids) {
+    const known = tryResolveVenueId(id);
+    if (known !== null && !valid.includes(known)) throw roleUnsupported(getVenue(known), "account");
+  }
   const unknown = ids.filter(e => !valid.includes(e));
   if (unknown.length > 0) {
     throw new PerpError("INVALID_PARAMS", `Unknown exchange: ${unknown.join(", ")}`, { remediation: `Use one of: ${valid.join(", ")} (or an alias such as hl, pac, lt, lrh, ast)` });
@@ -994,7 +999,11 @@ export function registerPortfolioCommand(
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (json) {
-          console.log(JSON.stringify(jsonError("INVALID_PARAMS", msg)));
+          // A typed refusal (CAPABILITY_UNSUPPORTED for a market-data-only venue) keeps its code.
+          const s = err instanceof PerpError ? err.structured : null;
+          console.log(JSON.stringify(s !== null
+            ? jsonError(s.code, msg, { ...(s.details !== undefined ? { details: s.details } : {}), ...(s.remediation !== undefined ? { remediation: s.remediation } : {}) })
+            : jsonError("INVALID_PARAMS", msg)));
         } else {
           console.error(chalk.red(`Error: ${msg}`));
         }

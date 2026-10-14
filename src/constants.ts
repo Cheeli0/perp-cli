@@ -30,6 +30,11 @@ export const TAKER_FEES: Record<string, number> = {
   // orders (0.05%) are never under-estimated. Lower tiers / the lifetime-tier promotion: set
   // settings.fees.qfex.
   qfex: 0.001,
+  // RISEx Tier 1 ($0 rolling 14-day volume; docs.risechain.com/docs/risex/trading/fees, read
+  // 2026-10-14): taker 3.00 bps, maker 1.00 bps; higher tiers down to 1.50 / 0.00 bps — set
+  // settings.fees.risex for a higher tier.
+  risex: 0.0003,
+  // TxFlow: no trading in perp-cli (market data only) — no fee entry on purpose.
 };
 
 /**
@@ -44,6 +49,7 @@ export const MAKER_FEES: Record<string, number> = {
   aster: 0,
   "lighter-rh": 0,     // Standard tier (Premium: 0.012% under $1M 14-day volume)
   qfex: 0.0005,        // Tier 5 single stocks 0.05% (indices / commodities 0.02%); see TAKER_FEES.qfex
+  risex: 0.0001,       // Tier 1 maker 1.00 bps; see TAKER_FEES.risex
 };
 
 /**

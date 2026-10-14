@@ -288,6 +288,8 @@ export function newVenueClientOrderId(venue: VenueDefinition): string {
   if (venue.family === "lighter") return String(Date.now() * 100 + Math.floor(Math.random() * 100));
   if (venue.family === "qfex" || venue.family === "pacifica") return randomUUID();
   if (venue.family === "hyperliquid") return `0x${randomBytes(16).toString("hex")}`;
+  // RISEx: uint64 decimal — ms timestamp × 1e6 + 6 random digits (< 2^64).
+  if (venue.family === "risex") return (BigInt(Date.now()) * 1_000_000n + BigInt(randomBytes(4).readUInt32BE(0) % 1_000_000)).toString();
   return newClientOrderId();
 }
 

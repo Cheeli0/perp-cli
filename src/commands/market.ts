@@ -5,7 +5,7 @@ import chalk from "chalk";
 import { PerpError } from "../errors.js";
 import { midDecimal } from "../exchanges/precision.js";
 import { hasPacificaSdk, isDexCapable, klinesNeedAuth } from "../exchanges/capabilities.js";
-import { listVenuesWithRole } from "../exchanges/venue.js";
+import { getVenue, listVenuesWithRole, tryResolveVenueId, unofficialApiNote } from "../exchanges/venue.js";
 import "../exchanges/venues/index.js";
 
 /** Venues with an adapter (market-data-only venues have none — see `perp arb scan`). */
@@ -23,6 +23,15 @@ export function registerMarketCommands(
   getAccountAdapter?: () => Promise<ExchangeAdapter>,
 ) {
   const market = program.command("market").description("Market data commands");
+  // Human output for a venue read through an UNOFFICIAL API carries a footnote (JSON rows carry venueApi).
+  market.hook("postAction", () => {
+    if (isJson()) return;
+    const raw = program.opts().exchange as string | undefined;
+    const id = raw === undefined ? null : tryResolveVenueId(raw);
+    if (id === null) return;
+    const note = unofficialApiNote(getVenue(id));
+    if (note !== null) console.log(chalk.yellow(`  * ${note}\n`));
+  });
 
   market
     .command("list")

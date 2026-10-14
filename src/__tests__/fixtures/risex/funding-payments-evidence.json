@@ -1,0 +1,2055 @@
+{
+ "source": "GET https://api.rise.trade/v1/account/funding-payments?account=<addr> and /v1/markets/id/<id>/funding-rate-history (public, mainnet)",
+ "capturedAt": "2026-10-13T16:55:33.481916Z",
+ "note": "Public on-chain accounts, labelled instead of named; values unmodified so the payment arithmetic can be re-checked.",
+ "records": [
+  {
+   "account": "account-A",
+   "market_id": "3",
+   "side": "short",
+   "position_size": "-31.134",
+   "funding_payment": "-1.28890287641275116",
+   "funding_rate": "0.000055701091934539",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000055701091934539",
+    "index_price": "743.227144660298",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-A",
+   "market_id": "14",
+   "side": "long",
+   "position_size": "6252.24",
+   "funding_payment": "0.007382973285186873",
+   "funding_rate": "0.000014035374664742",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000014035374664742",
+    "index_price": "0.084134021093",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-A",
+   "market_id": "2",
+   "side": "short",
+   "position_size": "-3.186",
+   "funding_payment": "-0.046772058506878653",
+   "funding_rate": "0.000005839373892461",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000005839373892461",
+    "index_price": "2514.052999749021",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-A",
+   "market_id": "41",
+   "side": "long",
+   "position_size": "2763",
+   "funding_payment": "-0.034967775763886193",
+   "funding_rate": "-0.000025072555905359",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "-0.000025072555905359",
+    "index_price": "0.504764165025",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-A",
+   "market_id": "9",
+   "side": "short",
+   "position_size": "-6755.2",
+   "funding_payment": "0.03083051669068144",
+   "funding_rate": "-0.000009804401379611",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "-0.000009804401379611",
+    "index_price": "0.465501954861",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-A",
+   "market_id": "33",
+   "side": "short",
+   "position_size": "-30693.8",
+   "funding_payment": "0.040829480408608307",
+   "funding_rate": "-0.000007207033721443",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "-0.000007207033721443",
+    "index_price": "0.184572349309",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-A",
+   "market_id": "6",
+   "side": "long",
+   "position_size": "7164.7",
+   "funding_payment": "0.123308783560454231",
+   "funding_rate": "0.000012571361235163",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000012571361235163",
+    "index_price": "1.369032307853",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-A",
+   "market_id": "4",
+   "side": "short",
+   "position_size": "-152.682",
+   "funding_payment": "-0.148370853667128783",
+   "funding_rate": "0.000009058054736456",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000009058054736456",
+    "index_price": "107.281741437471",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-A",
+   "market_id": "23",
+   "side": "short",
+   "position_size": "-4176325",
+   "funding_payment": "-1.136305979229274275",
+   "funding_rate": "0.000055262510763581",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000055262510763581",
+    "index_price": "0.004923459746",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-A",
+   "market_id": "40",
+   "side": "short",
+   "position_size": "-589136",
+   "funding_payment": "-0.238675347782062144",
+   "funding_rate": "0.000016746549438435",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000016746549438435",
+    "index_price": "0.024191715499",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-A",
+   "market_id": "8",
+   "side": "short",
+   "position_size": "-2.876",
+   "funding_payment": "-0.038681634136699283",
+   "funding_rate": "0.000011310323429622",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000011310323429622",
+    "index_price": "1189.161683139232",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-A",
+   "market_id": "1",
+   "side": "long",
+   "position_size": "1.731663",
+   "funding_payment": "2.163673764628611526",
+   "funding_rate": "0.000014990672003283",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000014990672003283",
+    "index_price": "83350.325400065601",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-A",
+   "market_id": "5",
+   "side": "short",
+   "position_size": "-1437.02",
+   "funding_payment": "-1.345859647742952196",
+   "funding_rate": "0.000011589014570305",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000011589014570305",
+    "index_price": "80.814715921503",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-A",
+   "market_id": "11",
+   "side": "short",
+   "position_size": "-269.64",
+   "funding_payment": "-0.132256486186393073",
+   "funding_rate": "0.000022754021414002",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000022754021414002",
+    "index_price": "21.556313903401",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-A",
+   "market_id": "7",
+   "side": "short",
+   "position_size": "-5.359",
+   "funding_payment": "-0.008732859402585212",
+   "funding_rate": "0.000005925913412047",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000005925913412047",
+    "index_price": "274.990322106171",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-A",
+   "market_id": "10",
+   "side": "short",
+   "position_size": "-2312.4",
+   "funding_payment": "-0.160629387419087211",
+   "funding_rate": "0.000014044198618005",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000014044198618005",
+    "index_price": "4.946124907188",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-A",
+   "market_id": "38",
+   "side": "short",
+   "position_size": "-86157",
+   "funding_payment": "-0.726576298012479582",
+   "funding_rate": "0.000040279062304096",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000040279062304096",
+    "index_price": "0.209368483056",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-A",
+   "market_id": "12",
+   "side": "short",
+   "position_size": "-3093",
+   "funding_payment": "-0.587595199345695954",
+   "funding_rate": "0.000057415056663612",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000057415056663612",
+    "index_price": "3.308815268807",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-A",
+   "market_id": "16",
+   "side": "long",
+   "position_size": "35.553",
+   "funding_payment": "0.037749459785766541",
+   "funding_rate": "0.000006686390902204",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000006686390902204",
+    "index_price": "158.797157903674",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-A",
+   "market_id": "15",
+   "side": "long",
+   "position_size": "2814",
+   "funding_payment": "-0.058199807583303372",
+   "funding_rate": "-0.000023233953039557",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "-0.000023233953039557",
+    "index_price": "0.890172858587",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-A",
+   "market_id": "14",
+   "side": "long",
+   "position_size": "6697.72",
+   "funding_payment": "0.007504874595330615",
+   "funding_rate": "0.000013260935481847",
+   "block_time": "1791903600000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000013260935481847",
+    "index_price": "0.084497194535",
+    "start_time": "1791900000000000000",
+    "end_time": "1791903600000000000"
+   }
+  },
+  {
+   "account": "account-A",
+   "market_id": "12",
+   "side": "short",
+   "position_size": "-2199.5",
+   "funding_payment": "-0.289508391046799439",
+   "funding_rate": "0.000039526674920819",
+   "block_time": "1791903600000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000039526674920819",
+    "index_price": "3.330020502792",
+    "start_time": "1791900000000000000",
+    "end_time": "1791903600000000000"
+   }
+  },
+  {
+   "account": "account-A",
+   "market_id": "7",
+   "side": "short",
+   "position_size": "-4.812",
+   "funding_payment": "-0.008351225510995369",
+   "funding_rate": "0.000006216767256912",
+   "block_time": "1791903600000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000006216767256912",
+    "index_price": "279.164367372529",
+    "start_time": "1791900000000000000",
+    "end_time": "1791903600000000000"
+   }
+  },
+  {
+   "account": "account-A",
+   "market_id": "40",
+   "side": "short",
+   "position_size": "-30514",
+   "funding_payment": "-0.00713255408413526",
+   "funding_rate": "0.000009644240699311",
+   "block_time": "1791903600000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000009644240699311",
+    "index_price": "0.024236945746",
+    "start_time": "1791900000000000000",
+    "end_time": "1791903600000000000"
+   }
+  },
+  {
+   "account": "account-A",
+   "market_id": "16",
+   "side": "long",
+   "position_size": "34.832",
+   "funding_payment": "0.003288004856466292",
+   "funding_rate": "0.000000595318733238",
+   "block_time": "1791903600000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000000595318733238",
+    "index_price": "158.563962286222",
+    "start_time": "1791900000000000000",
+    "end_time": "1791903600000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "1",
+   "side": "short",
+   "position_size": "-0.00562",
+   "funding_payment": "-0.007022062928648817",
+   "funding_rate": "0.000014990672003283",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000014990672003283",
+    "index_price": "83350.325400065601",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "1",
+   "side": "long",
+   "position_size": "0.004173",
+   "funding_payment": "0.000512767610147821",
+   "funding_rate": "0.00000147575929461",
+   "block_time": "1791892800000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.00000147575929461",
+    "index_price": "83263.885347803254",
+    "start_time": "1791889200000000000",
+    "end_time": "1791892800000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "1",
+   "side": "short",
+   "position_size": "-0.003271",
+   "funding_payment": "-0.001950037686960824",
+   "funding_rate": "0.000007161011164993",
+   "block_time": "1791889200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000007161011164993",
+    "index_price": "83250.741381049374",
+    "start_time": "1791885600000000000",
+    "end_time": "1791889200000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "1",
+   "side": "short",
+   "position_size": "-0.001759",
+   "funding_payment": "-0.000602460560492834",
+   "funding_rate": "0.00000410008308704",
+   "block_time": "1791885600000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.00000410008308704",
+    "index_price": "83535.316878719619",
+    "start_time": "1791882000000000000",
+    "end_time": "1791885600000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "21",
+   "side": "short",
+   "position_size": "-0.7899",
+   "funding_payment": "-0.019973524872575894",
+   "funding_rate": "0.000017632955311992",
+   "block_time": "1791878400000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000017632955311992",
+    "index_price": "1434.027547109999",
+    "start_time": "1791874800000000000",
+    "end_time": "1791878400000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "21",
+   "side": "short",
+   "position_size": "-0.7899",
+   "funding_payment": "-0.034171315868049617",
+   "funding_rate": "0.000030179969404947",
+   "block_time": "1791874800000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000030179969404947",
+    "index_price": "1433.41120133",
+    "start_time": "1791871200000000000",
+    "end_time": "1791874800000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "21",
+   "side": "short",
+   "position_size": "-0.7899",
+   "funding_payment": "-0.046424962290705176",
+   "funding_rate": "0.000040832452785401",
+   "block_time": "1791871200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000040832452785401",
+    "index_price": "1439.375072759999",
+    "start_time": "1791867600000000000",
+    "end_time": "1791871200000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "21",
+   "side": "short",
+   "position_size": "-0.7899",
+   "funding_payment": "-0.119149015218643282",
+   "funding_rate": "0.000105067089831201",
+   "block_time": "1791867600000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000105067089831201",
+    "index_price": "1435.660131489999",
+    "start_time": "1791864000000000000",
+    "end_time": "1791867600000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "21",
+   "side": "short",
+   "position_size": "-0.7899",
+   "funding_payment": "-0.119865298371810279",
+   "funding_rate": "0.000105167889150296",
+   "block_time": "1791864000000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000105167889150296",
+    "index_price": "1442.906533059999",
+    "start_time": "1791860400000000000",
+    "end_time": "1791864000000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "21",
+   "side": "short",
+   "position_size": "-0.7899",
+   "funding_payment": "-0.09956742505130938",
+   "funding_rate": "0.000087796074094462",
+   "block_time": "1791860400000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000087796074094462",
+    "index_price": "1435.72104261",
+    "start_time": "1791856800000000000",
+    "end_time": "1791860400000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "21",
+   "side": "short",
+   "position_size": "-0.7899",
+   "funding_payment": "-0.051660599263834675",
+   "funding_rate": "0.000045668001302174",
+   "block_time": "1791856800000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000045668001302174",
+    "index_price": "1432.10651712",
+    "start_time": "1791853200000000000",
+    "end_time": "1791856800000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "21",
+   "side": "short",
+   "position_size": "-0.7899",
+   "funding_payment": "0",
+   "funding_rate": "0",
+   "block_time": "1791853200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0",
+    "index_price": "1438.482557349999",
+    "start_time": "1791849600000000000",
+    "end_time": "1791853200000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "21",
+   "side": "short",
+   "position_size": "-0.7899",
+   "funding_payment": "-0.002482488912958984",
+   "funding_rate": "0.000002157784595978",
+   "block_time": "1791849600000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000002157784595978",
+    "index_price": "1456.488685799999",
+    "start_time": "1791846000000000000",
+    "end_time": "1791849600000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "21",
+   "side": "short",
+   "position_size": "-0.7899",
+   "funding_payment": "-0.014688162731384856",
+   "funding_rate": "0.000012617438555139",
+   "block_time": "1791846000000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000012617438555139",
+    "index_price": "1473.75117098",
+    "start_time": "1791842400000000000",
+    "end_time": "1791846000000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "21",
+   "side": "short",
+   "position_size": "-0.7899",
+   "funding_payment": "0",
+   "funding_rate": "0",
+   "block_time": "1791842400000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0",
+    "index_price": "1478.988594109999",
+    "start_time": "1791838800000000000",
+    "end_time": "1791842400000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "21",
+   "side": "short",
+   "position_size": "-0.7899",
+   "funding_payment": "0",
+   "funding_rate": "0",
+   "block_time": "1791838800000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0",
+    "index_price": "1486.1483954",
+    "start_time": "1791835200000000000",
+    "end_time": "1791838800000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "21",
+   "side": "short",
+   "position_size": "-0.7899",
+   "funding_payment": "0",
+   "funding_rate": "0",
+   "block_time": "1791835200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0",
+    "index_price": "1488.9014548",
+    "start_time": "1791831600000000000",
+    "end_time": "1791835200000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "21",
+   "side": "short",
+   "position_size": "-0.7899",
+   "funding_payment": "0",
+   "funding_rate": "0",
+   "block_time": "1791831600000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0",
+    "index_price": "1481.27697033",
+    "start_time": "1791828000000000000",
+    "end_time": "1791831600000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "21",
+   "side": "short",
+   "position_size": "-0.7899",
+   "funding_payment": "0",
+   "funding_rate": "0",
+   "block_time": "1791828000000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0",
+    "index_price": "1482.784345139999",
+    "start_time": "1791824400000000000",
+    "end_time": "1791828000000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "21",
+   "side": "short",
+   "position_size": "-0.7899",
+   "funding_payment": "0",
+   "funding_rate": "0",
+   "block_time": "1791824400000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0",
+    "index_price": "1484.167366229999",
+    "start_time": "1791820800000000000",
+    "end_time": "1791824400000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "21",
+   "side": "short",
+   "position_size": "-0.7899",
+   "funding_payment": "0",
+   "funding_rate": "0",
+   "block_time": "1791820800000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0",
+    "index_price": "1493.930202009999",
+    "start_time": "1791817200000000000",
+    "end_time": "1791820800000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "21",
+   "side": "short",
+   "position_size": "-0.7899",
+   "funding_payment": "-0.003645062820251141",
+   "funding_rate": "0.000003117760091965",
+   "block_time": "1791817200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000003117760091965",
+    "index_price": "1480.097107809999",
+    "start_time": "1791813600000000000",
+    "end_time": "1791817200000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "21",
+   "side": "short",
+   "position_size": "-0.7899",
+   "funding_payment": "-0.007665761778003537",
+   "funding_rate": "0.000006556546465053",
+   "block_time": "1791813600000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000006556546465053",
+    "index_price": "1480.157948909999",
+    "start_time": "1791810000000000000",
+    "end_time": "1791813600000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "21",
+   "side": "short",
+   "position_size": "-0.7899",
+   "funding_payment": "-0.004158109501195766",
+   "funding_rate": "0.000003389137105945",
+   "block_time": "1791810000000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000003389137105945",
+    "index_price": "1553.226064649999",
+    "start_time": "1791806400000000000",
+    "end_time": "1791810000000000000"
+   }
+  },
+  {
+   "account": "account-B",
+   "market_id": "21",
+   "side": "short",
+   "position_size": "-0.7899",
+   "funding_payment": "-0.038700839395203681",
+   "funding_rate": "0.000031559331089138",
+   "block_time": "1791806400000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000031559331089138",
+    "index_price": "1552.460221929999",
+    "start_time": "1791802800000000000",
+    "end_time": "1791806400000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "10",
+   "side": "short",
+   "position_size": "-17829.3",
+   "funding_payment": "-1.238500924196130263",
+   "funding_rate": "0.000014044198618005",
+   "block_time": "1791907200000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "0.000014044198618005",
+    "index_price": "4.946124907188",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "2",
+   "side": "short",
+   "position_size": "-36.206",
+   "funding_payment": "-0.531522018298822508",
+   "funding_rate": "0.000005839373892461",
+   "block_time": "1791907200000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "0.000005839373892461",
+    "index_price": "2514.052999749021",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "3",
+   "side": "long",
+   "position_size": "193.105",
+   "funding_payment": "7.994269607171719433",
+   "funding_rate": "0.000055701091934539",
+   "block_time": "1791907200000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "0.000055701091934539",
+    "index_price": "743.227144660298",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "8",
+   "side": "long",
+   "position_size": "5.798",
+   "funding_payment": "0.077981959222733813",
+   "funding_rate": "0.000011310323429622",
+   "block_time": "1791907200000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "0.000011310323429622",
+    "index_price": "1189.161683139232",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "4",
+   "side": "short",
+   "position_size": "-2194.791",
+   "funding_payment": "-2.132818631475427687",
+   "funding_rate": "0.000009058054736456",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000009058054736456",
+    "index_price": "107.281741437471",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "1",
+   "side": "short",
+   "position_size": "-6.463621",
+   "funding_payment": "-8.076148293404981607",
+   "funding_rate": "0.000014990672003283",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000014990672003283",
+    "index_price": "83350.325400065601",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "5",
+   "side": "short",
+   "position_size": "-3449.52",
+   "funding_payment": "-3.230692524865533158",
+   "funding_rate": "0.000011589014570305",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000011589014570305",
+    "index_price": "80.814715921503",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "3",
+   "side": "long",
+   "position_size": "193.105",
+   "funding_payment": "6.967866296152336461",
+   "funding_rate": "0.00004851623833195",
+   "block_time": "1791903600000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "0.00004851623833195",
+    "index_price": "743.736625196715",
+    "start_time": "1791900000000000000",
+    "end_time": "1791903600000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "8",
+   "side": "long",
+   "position_size": "5.798",
+   "funding_payment": "0.069519150612684201",
+   "funding_rate": "0.000010041984498441",
+   "block_time": "1791903600000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "0.000010041984498441",
+    "index_price": "1194.006523543669",
+    "start_time": "1791900000000000000",
+    "end_time": "1791903600000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "1",
+   "side": "short",
+   "position_size": "-5.672112",
+   "funding_payment": "-7.301776729953707511",
+   "funding_rate": "0.00001542917667812",
+   "block_time": "1791903600000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.00001542917667812",
+    "index_price": "83433.603142546999",
+    "start_time": "1791900000000000000",
+    "end_time": "1791903600000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "10",
+   "side": "short",
+   "position_size": "-18736.3",
+   "funding_payment": "-0.403982205260993592",
+   "funding_rate": "0.00000430759376533",
+   "block_time": "1791903600000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.00000430759376533",
+    "index_price": "5.005456186754",
+    "start_time": "1791900000000000000",
+    "end_time": "1791903600000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "5",
+   "side": "short",
+   "position_size": "-4813.09",
+   "funding_payment": "-7.088618968168117494",
+   "funding_rate": "0.000018144201119999",
+   "block_time": "1791903600000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000018144201119999",
+    "index_price": "81.170794842119",
+    "start_time": "1791900000000000000",
+    "end_time": "1791903600000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "2",
+   "side": "short",
+   "position_size": "-25.96",
+   "funding_payment": "-0.472833467172324168",
+   "funding_rate": "0.000007243716763745",
+   "block_time": "1791903600000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000007243716763745",
+    "index_price": "2514.444531605435",
+    "start_time": "1791900000000000000",
+    "end_time": "1791903600000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "4",
+   "side": "short",
+   "position_size": "-2194.791",
+   "funding_payment": "-2.319950161015869094",
+   "funding_rate": "0.000009840058164212",
+   "block_time": "1791903600000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000009840058164212",
+    "index_price": "107.420660634478",
+    "start_time": "1791900000000000000",
+    "end_time": "1791903600000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "3",
+   "side": "long",
+   "position_size": "194.848",
+   "funding_payment": "0.690850041661541733",
+   "funding_rate": "0.000004788262609137",
+   "block_time": "1791900000000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000004788262609137",
+    "index_price": "740.47410376726",
+    "start_time": "1791896400000000000",
+    "end_time": "1791900000000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "8",
+   "side": "long",
+   "position_size": "5.912",
+   "funding_payment": "0.078048434094297443",
+   "funding_rate": "0.000011125475805072",
+   "block_time": "1791900000000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000011125475805072",
+    "index_price": "1186.618664517045",
+    "start_time": "1791896400000000000",
+    "end_time": "1791900000000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "5",
+   "side": "short",
+   "position_size": "-4813.09",
+   "funding_payment": "-6.303576383372046217",
+   "funding_rate": "0.000016121104309648",
+   "block_time": "1791900000000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000016121104309648",
+    "index_price": "81.239688421074",
+    "start_time": "1791896400000000000",
+    "end_time": "1791900000000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "4",
+   "side": "short",
+   "position_size": "-2194.791",
+   "funding_payment": "-1.566770373387890076",
+   "funding_rate": "0.000006692085732433",
+   "block_time": "1791900000000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000006692085732433",
+    "index_price": "106.672060475059",
+    "start_time": "1791896400000000000",
+    "end_time": "1791900000000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "2",
+   "side": "short",
+   "position_size": "-25.96",
+   "funding_payment": "-0.030522142044909795",
+   "funding_rate": "0.000000470207823512",
+   "block_time": "1791900000000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000000470207823512",
+    "index_price": "2500.463216723045",
+    "start_time": "1791896400000000000",
+    "end_time": "1791900000000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "1",
+   "side": "short",
+   "position_size": "-5.581788",
+   "funding_payment": "-8.052915909028168804",
+   "funding_rate": "0.000017344020407296",
+   "block_time": "1791900000000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000017344020407296",
+    "index_price": "83182.132611470558",
+    "start_time": "1791896400000000000",
+    "end_time": "1791900000000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "10",
+   "side": "short",
+   "position_size": "-18736.3",
+   "funding_payment": "1.218993741840398033",
+   "funding_rate": "-0.000013040796713462",
+   "block_time": "1791900000000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "-0.000013040796713462",
+    "index_price": "4.989000178452",
+    "start_time": "1791896400000000000",
+    "end_time": "1791900000000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "3",
+   "side": "long",
+   "position_size": "194.848",
+   "funding_payment": "1.08143608991087703",
+   "funding_rate": "0.00000749693524486",
+   "block_time": "1791896400000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.00000749693524486",
+    "index_price": "740.322837726606",
+    "start_time": "1791892800000000000",
+    "end_time": "1791896400000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "10",
+   "side": "short",
+   "position_size": "-17736.3",
+   "funding_payment": "0.870703030049009995",
+   "funding_rate": "-0.000009620722336382",
+   "block_time": "1791896400000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "-0.000009620722336382",
+    "index_price": "5.102691931189",
+    "start_time": "1791892800000000000",
+    "end_time": "1791896400000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "8",
+   "side": "long",
+   "position_size": "5.912",
+   "funding_payment": "0.07892910069675505",
+   "funding_rate": "0.000011233109965146",
+   "block_time": "1791896400000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000011233109965146",
+    "index_price": "1188.509667804864",
+    "start_time": "1791892800000000000",
+    "end_time": "1791896400000000000"
+   }
+  },
+  {
+   "account": "account-C",
+   "market_id": "5",
+   "side": "short",
+   "position_size": "-4875.39",
+   "funding_payment": "-5.13334384302717939",
+   "funding_rate": "0.00001293149811134",
+   "block_time": "1791896400000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.00001293149811134",
+    "index_price": "81.422072447482",
+    "start_time": "1791892800000000000",
+    "end_time": "1791896400000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "15",
+   "side": "long",
+   "position_size": "1196",
+   "funding_payment": "-0.024735952334623608",
+   "funding_rate": "-0.000023233953039557",
+   "block_time": "1791907200000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "-0.000023233953039557",
+    "index_price": "0.890172858587",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "11",
+   "side": "short",
+   "position_size": "-1522.21",
+   "funding_payment": "-0.746633087960945706",
+   "funding_rate": "0.000022754021414002",
+   "block_time": "1791907200000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "0.000022754021414002",
+    "index_price": "21.556313903401",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "10",
+   "side": "long",
+   "position_size": "2200",
+   "funding_payment": "0.1528215932892198",
+   "funding_rate": "0.000014044198618005",
+   "block_time": "1791907200000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "0.000014044198618005",
+    "index_price": "4.946124907188",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "38",
+   "side": "long",
+   "position_size": "23231",
+   "funding_payment": "0.195910883377182506",
+   "funding_rate": "0.000040279062304096",
+   "block_time": "1791907200000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "0.000040279062304096",
+    "index_price": "0.209368483056",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "12",
+   "side": "long",
+   "position_size": "1162.9",
+   "funding_payment": "0.220922876598483616",
+   "funding_rate": "0.000057415056663612",
+   "block_time": "1791907200000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "0.000057415056663612",
+    "index_price": "3.308815268807",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "5",
+   "side": "long",
+   "position_size": "243.76",
+   "funding_payment": "0.228296577454608862",
+   "funding_rate": "0.000011589014570305",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000011589014570305",
+    "index_price": "80.814715921503",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "12",
+   "side": "long",
+   "position_size": "1162.9",
+   "funding_payment": "0.15306629140637557",
+   "funding_rate": "0.000039526674920819",
+   "block_time": "1791903600000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "0.000039526674920819",
+    "index_price": "3.330020502792",
+    "start_time": "1791900000000000000",
+    "end_time": "1791903600000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "10",
+   "side": "long",
+   "position_size": "2200",
+   "funding_payment": "0.0474352380979268",
+   "funding_rate": "0.00000430759376533",
+   "block_time": "1791903600000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "0.00000430759376533",
+    "index_price": "5.005456186754",
+    "start_time": "1791900000000000000",
+    "end_time": "1791903600000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "11",
+   "side": "short",
+   "position_size": "-1522.21",
+   "funding_payment": "-1.145761284752221339",
+   "funding_rate": "0.00003415144631355",
+   "block_time": "1791903600000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "0.00003415144631355",
+    "index_price": "22.039943249434",
+    "start_time": "1791900000000000000",
+    "end_time": "1791903600000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "38",
+   "side": "long",
+   "position_size": "23231",
+   "funding_payment": "0.142249126049618354",
+   "funding_rate": "0.000029012463690937",
+   "block_time": "1791903600000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "0.000029012463690937",
+    "index_price": "0.21105570312",
+    "start_time": "1791900000000000000",
+    "end_time": "1791903600000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "15",
+   "side": "long",
+   "position_size": "1196",
+   "funding_payment": "-0.01613150769136764",
+   "funding_rate": "-0.000014908633622",
+   "block_time": "1791903600000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "-0.000014908633622",
+    "index_price": "0.904702806915",
+    "start_time": "1791900000000000000",
+    "end_time": "1791903600000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "5",
+   "side": "long",
+   "position_size": "218",
+   "funding_payment": "0.321065871417457312",
+   "funding_rate": "0.000018144201119999",
+   "block_time": "1791903600000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000018144201119999",
+    "index_price": "81.170794842119",
+    "start_time": "1791900000000000000",
+    "end_time": "1791903600000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "15",
+   "side": "long",
+   "position_size": "1196",
+   "funding_payment": "-0.013444587755012232",
+   "funding_rate": "-0.000012665147083504",
+   "block_time": "1791900000000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "-0.000012665147083504",
+    "index_price": "0.887577067635",
+    "start_time": "1791896400000000000",
+    "end_time": "1791900000000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "11",
+   "side": "short",
+   "position_size": "-1522.21",
+   "funding_payment": "-1.055766228293307293",
+   "funding_rate": "0.000031680772725219",
+   "block_time": "1791900000000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "0.000031680772725219",
+    "index_price": "21.892604386459",
+    "start_time": "1791896400000000000",
+    "end_time": "1791900000000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "12",
+   "side": "long",
+   "position_size": "1162.9",
+   "funding_payment": "0.086099899911832177",
+   "funding_rate": "0.000022029001037218",
+   "block_time": "1791900000000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "0.000022029001037218",
+    "index_price": "3.360976475392",
+    "start_time": "1791896400000000000",
+    "end_time": "1791900000000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "38",
+   "side": "long",
+   "position_size": "23231",
+   "funding_payment": "0.055530136569186474",
+   "funding_rate": "0.00001137892276022",
+   "block_time": "1791900000000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "0.00001137892276022",
+    "index_price": "0.210067896797",
+    "start_time": "1791896400000000000",
+    "end_time": "1791900000000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "10",
+   "side": "long",
+   "position_size": "2200",
+   "funding_payment": "-0.1431331816873596",
+   "funding_rate": "-0.000013040796713462",
+   "block_time": "1791900000000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "-0.000013040796713462",
+    "index_price": "4.989000178452",
+    "start_time": "1791896400000000000",
+    "end_time": "1791900000000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "5",
+   "side": "long",
+   "position_size": "218",
+   "funding_payment": "0.285508821064037048",
+   "funding_rate": "0.000016121104309648",
+   "block_time": "1791900000000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000016121104309648",
+    "index_price": "81.239688421074",
+    "start_time": "1791896400000000000",
+    "end_time": "1791900000000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "38",
+   "side": "long",
+   "position_size": "23231",
+   "funding_payment": "0.051833049145057284",
+   "funding_rate": "0.000010553940185665",
+   "block_time": "1791896400000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "0.000010553940185665",
+    "index_price": "0.2114093662",
+    "start_time": "1791892800000000000",
+    "end_time": "1791896400000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "11",
+   "side": "short",
+   "position_size": "-1522.21",
+   "funding_payment": "-1.59043189477792095",
+   "funding_rate": "0.000047449790755201",
+   "block_time": "1791896400000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "0.000047449790755201",
+    "index_price": "22.019436679478",
+    "start_time": "1791892800000000000",
+    "end_time": "1791896400000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "12",
+   "side": "long",
+   "position_size": "1162.9",
+   "funding_payment": "0.157155721448587335",
+   "funding_rate": "0.000040784993647044",
+   "block_time": "1791896400000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "0.000040784993647044",
+    "index_price": "3.313503450335",
+    "start_time": "1791892800000000000",
+    "end_time": "1791896400000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "10",
+   "side": "long",
+   "position_size": "1795",
+   "funding_payment": "-0.08811939011732847",
+   "funding_rate": "-0.000009620722336382",
+   "block_time": "1791896400000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "-0.000009620722336382",
+    "index_price": "5.102691931189",
+    "start_time": "1791892800000000000",
+    "end_time": "1791896400000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "5",
+   "side": "long",
+   "position_size": "218",
+   "funding_payment": "0.229534243984568436",
+   "funding_rate": "0.00001293149811134",
+   "block_time": "1791896400000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.00001293149811134",
+    "index_price": "81.422072447482",
+    "start_time": "1791892800000000000",
+    "end_time": "1791896400000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "12",
+   "side": "long",
+   "position_size": "1162.9",
+   "funding_payment": "0.07086815225087712",
+   "funding_rate": "0.000018480709113564",
+   "block_time": "1791892800000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "0.000018480709113564",
+    "index_price": "3.297540268521",
+    "start_time": "1791889200000000000",
+    "end_time": "1791892800000000000"
+   }
+  },
+  {
+   "account": "account-D",
+   "market_id": "11",
+   "side": "short",
+   "position_size": "-1522.21",
+   "funding_payment": "-1.952242612083624193",
+   "funding_rate": "0.000058175918360412",
+   "block_time": "1791892800000000000",
+   "is_settled": false,
+   "history": {
+    "funding_rate": "0.000058175918360412",
+    "index_price": "22.045297784005",
+    "start_time": "1791889200000000000",
+    "end_time": "1791892800000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "2",
+   "side": "short",
+   "position_size": "-0.006",
+   "funding_payment": "-0.000088082972705986",
+   "funding_rate": "0.000005839373892461",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000005839373892461",
+    "index_price": "2514.052999749021",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "1",
+   "side": "long",
+   "position_size": "0.004206",
+   "funding_payment": "0.005255301899981659",
+   "funding_rate": "0.000014990672003283",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000014990672003283",
+    "index_price": "83350.325400065601",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "1",
+   "side": "short",
+   "position_size": "-0.016044",
+   "funding_payment": "-0.020653630579822345",
+   "funding_rate": "0.00001542917667812",
+   "block_time": "1791903600000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.00001542917667812",
+    "index_price": "83433.603142546999",
+    "start_time": "1791900000000000000",
+    "end_time": "1791903600000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "2",
+   "side": "long",
+   "position_size": "0.099",
+   "funding_payment": "0.001803178476504626",
+   "funding_rate": "0.000007243716763745",
+   "block_time": "1791903600000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000007243716763745",
+    "index_price": "2514.444531605435",
+    "start_time": "1791900000000000000",
+    "end_time": "1791903600000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "2",
+   "side": "short",
+   "position_size": "-0.006",
+   "funding_payment": "-0.000007054424201442",
+   "funding_rate": "0.000000470207823512",
+   "block_time": "1791900000000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000000470207823512",
+    "index_price": "2500.463216723045",
+    "start_time": "1791896400000000000",
+    "end_time": "1791900000000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "1",
+   "side": "short",
+   "position_size": "-0.015989",
+   "funding_payment": "-0.023067531849911066",
+   "funding_rate": "0.000017344020407296",
+   "block_time": "1791900000000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000017344020407296",
+    "index_price": "83182.132611470558",
+    "start_time": "1791896400000000000",
+    "end_time": "1791900000000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "1",
+   "side": "short",
+   "position_size": "-0.006421",
+   "funding_payment": "-0.005369187778577692",
+   "funding_rate": "0.000010043277206348",
+   "block_time": "1791896400000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000010043277206348",
+    "index_price": "83258.862496850677",
+    "start_time": "1791892800000000000",
+    "end_time": "1791896400000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "2",
+   "side": "short",
+   "position_size": "-0.096",
+   "funding_payment": "0.002396849265624012",
+   "funding_rate": "-0.000009977526015526",
+   "block_time": "1791896400000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "-0.000009977526015526",
+    "index_price": "2502.341743975287",
+    "start_time": "1791892800000000000",
+    "end_time": "1791896400000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "1",
+   "side": "short",
+   "position_size": "-0.009272",
+   "funding_payment": "-0.00113931974150266",
+   "funding_rate": "0.00000147575929461",
+   "block_time": "1791892800000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.00000147575929461",
+    "index_price": "83263.885347803254",
+    "start_time": "1791889200000000000",
+    "end_time": "1791892800000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "2",
+   "side": "long",
+   "position_size": "0.016",
+   "funding_payment": "-0.000821859368901667",
+   "funding_rate": "-0.000020564540132171",
+   "block_time": "1791892800000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "-0.000020564540132171",
+    "index_price": "2497.804970411048",
+    "start_time": "1791889200000000000",
+    "end_time": "1791892800000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "1",
+   "side": "long",
+   "position_size": "0.003157",
+   "funding_payment": "0.001882075505269129",
+   "funding_rate": "0.000007161011164993",
+   "block_time": "1791889200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000007161011164993",
+    "index_price": "83250.741381049374",
+    "start_time": "1791885600000000000",
+    "end_time": "1791889200000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "2",
+   "side": "long",
+   "position_size": "0.226",
+   "funding_payment": "-0.00883413305833498",
+   "funding_rate": "-0.000015659420502301",
+   "block_time": "1791889200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "-0.000015659420502301",
+    "index_price": "2496.202482280368",
+    "start_time": "1791885600000000000",
+    "end_time": "1791889200000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "1",
+   "side": "long",
+   "position_size": "0.003157",
+   "funding_payment": "0.001081277992879975",
+   "funding_rate": "0.00000410008308704",
+   "block_time": "1791885600000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.00000410008308704",
+    "index_price": "83535.316878719619",
+    "start_time": "1791882000000000000",
+    "end_time": "1791885600000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "2",
+   "side": "long",
+   "position_size": "0.226",
+   "funding_payment": "-0.008356713329534543",
+   "funding_rate": "-0.000014719828841073",
+   "block_time": "1791885600000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "-0.000014719828841073",
+    "index_price": "2512.027011457581",
+    "start_time": "1791882000000000000",
+    "end_time": "1791885600000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "2",
+   "side": "long",
+   "position_size": "0.226",
+   "funding_payment": "-0.006716475280579784",
+   "funding_rate": "-0.000011814124235206",
+   "block_time": "1791882000000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "-0.000011814124235206",
+    "index_price": "2515.541277460488",
+    "start_time": "1791878400000000000",
+    "end_time": "1791882000000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "1",
+   "side": "long",
+   "position_size": "0.003157",
+   "funding_payment": "-0.000809319103863934",
+   "funding_rate": "-0.000003070215961267",
+   "block_time": "1791882000000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "-0.000003070215961267",
+    "index_price": "83498.040728285122",
+    "start_time": "1791878400000000000",
+    "end_time": "1791882000000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "1",
+   "side": "long",
+   "position_size": "0.003157",
+   "funding_payment": "-0.001270387658123751",
+   "funding_rate": "-0.000004803482168841",
+   "block_time": "1791878400000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "-0.000004803482168841",
+    "index_price": "83773.276393245992",
+    "start_time": "1791874800000000000",
+    "end_time": "1791878400000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "2",
+   "side": "long",
+   "position_size": "0.226",
+   "funding_payment": "0.003733348367619454",
+   "funding_rate": "0.000006536907921461",
+   "block_time": "1791878400000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000006536907921461",
+    "index_price": "2527.072549156513",
+    "start_time": "1791874800000000000",
+    "end_time": "1791878400000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "2",
+   "side": "short",
+   "position_size": "-0.002",
+   "funding_payment": "-0.000091645238945488",
+   "funding_rate": "0.00001810018938365",
+   "block_time": "1791874800000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.00001810018938365",
+    "index_price": "2531.609946254834",
+    "start_time": "1791871200000000000",
+    "end_time": "1791874800000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "1",
+   "side": "long",
+   "position_size": "0.005121",
+   "funding_payment": "-0.00027550176338328",
+   "funding_rate": "-0.000000642936532723",
+   "block_time": "1791874800000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "-0.000000642936532723",
+    "index_price": "83676.114074525452",
+    "start_time": "1791871200000000000",
+    "end_time": "1791874800000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "1",
+   "side": "short",
+   "position_size": "-0.013265",
+   "funding_payment": "-0.006451299574516626",
+   "funding_rate": "0.000005818368289353",
+   "block_time": "1791871200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000005818368289353",
+    "index_price": "83587.001750245792",
+    "start_time": "1791867600000000000",
+    "end_time": "1791871200000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "2",
+   "side": "short",
+   "position_size": "-0.002",
+   "funding_payment": "-0.000074354161580215",
+   "funding_rate": "0.000014699260246323",
+   "block_time": "1791871200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000014699260246323",
+    "index_price": "2529.180391877705",
+    "start_time": "1791867600000000000",
+    "end_time": "1791871200000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "2",
+   "side": "short",
+   "position_size": "-0.125",
+   "funding_payment": "-0.004315622047308666",
+   "funding_rate": "0.000013726776359899",
+   "block_time": "1791867600000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000013726776359899",
+    "index_price": "2515.1554504326",
+    "start_time": "1791864000000000000",
+    "end_time": "1791867600000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "17",
+   "side": "short",
+   "position_size": "-0.006",
+   "funding_payment": "0.000007575883386334",
+   "funding_rate": "-0.000000300571633497",
+   "block_time": "1791867600000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "-0.000000300571633497",
+    "index_price": "4200.81967272",
+    "start_time": "1791864000000000000",
+    "end_time": "1791867600000000000"
+   }
+  },
+  {
+   "account": "account-E",
+   "market_id": "1",
+   "side": "short",
+   "position_size": "-0.024116",
+   "funding_payment": "-0.005190104348089981",
+   "funding_rate": "0.000002581727673906",
+   "block_time": "1791867600000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000002581727673906",
+    "index_price": "83360.514087520932",
+    "start_time": "1791864000000000000",
+    "end_time": "1791867600000000000"
+   }
+  },
+  {
+   "account": "account-F",
+   "market_id": "26",
+   "side": "long",
+   "position_size": "1.8093",
+   "funding_payment": "0.021000377075807676",
+   "funding_rate": "0.000015637445643462",
+   "block_time": "1791907200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000015637445643462",
+    "index_price": "742.250838",
+    "start_time": "1791903600000000000",
+    "end_time": "1791907200000000000"
+   }
+  },
+  {
+   "account": "account-F",
+   "market_id": "41",
+   "side": "long",
+   "position_size": "1055.4",
+   "funding_payment": "0.007908649935308894",
+   "funding_rate": "0.000013538737849001",
+   "block_time": "1791784800000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000013538737849001",
+    "index_price": "0.553486565152",
+    "start_time": "1791781200000000000",
+    "end_time": "1791784800000000000"
+   }
+  },
+  {
+   "account": "account-F",
+   "market_id": "41",
+   "side": "long",
+   "position_size": "1055.4",
+   "funding_payment": "0.017280756020161695",
+   "funding_rate": "0.000029288409601624",
+   "block_time": "1791781200000000000",
+   "is_settled": true,
+   "history": {
+    "funding_rate": "0.000029288409601624",
+    "index_price": "0.559048979712",
+    "start_time": "1791777600000000000",
+    "end_time": "1791781200000000000"
+   }
+  }
+ ]
+}

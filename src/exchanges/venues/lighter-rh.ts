@@ -57,5 +57,6 @@ export const lighterRhVenue: VenueDefinition = {
   },
   maxSlippageBps: 5000,
   builderFee: BUILDER_FEE_CAPABILITIES["lighter-rh"],
+  apiStatus: { kind: "official" },
   create: async ctx => (await import("./create-helpers.js")).createLighterFamily("lighter-rh", ctx),
 };

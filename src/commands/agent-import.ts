@@ -28,7 +28,8 @@ import {
   acquireLock, releaseLock, getAgent, setAgent, deleteAgent, listAgents, agentNetworkOf, agentSourceOf,
   getVenueAgent, setVenueAgent, deleteVenueAgent,
 } from "../agent-wallet/store.js";
-import { getVenue, networkConfig } from "../exchanges/venue.js";
+import { getVenue, networkConfig, roleUnsupported } from "../exchanges/venue.js";
+import { unsupported } from "../exchanges/trading-v2.js";
 import type { Network, VenueId } from "../exchanges/venue-types.js";
 import { LIGHTER_RH_RESERVED_KEY_INDEXES, type LighterVenueId } from "../exchanges/venues/lighter-family.js";
 import { loadOws } from "../signer/ows-loader.js";
@@ -141,6 +142,8 @@ export function importSecretLabel(venue: VenueId): string {
     case "arcus": return "Arcus API key private key (Ed25519)";
     case "ondo": return "Ondo API secret";
     case "qfex": return "QFEX API secret";
+    case "risex": return "RISEx signer private key";
+    case "txflow": return "TxFlow key (not supported)";
   }
 }
 
@@ -224,6 +227,22 @@ function redacted(err: unknown, secrets: readonly string[], venue: VenueId): Per
   const details: Record<string, unknown> = { ...(e.details ?? {}), exchange: venue };
   if (e.remediation !== undefined) details.remediation = scrub(e.remediation, forms);
   return new PerpError(e.code, scrub(e.message, forms), details);
+}
+
+/**
+ * Venues whose keys cannot be imported. TxFlow: market-data-only (unofficial read-only API).
+ * RISEx: perp-cli trades only with a signer it registered itself and then restricted ON-CHAIN to
+ * the trading permission; a signer created in the RISEx app keeps every permission (including
+ * deposit / withdraw), so it is never stored here.
+ */
+export function assertImportSupported(venue: VenueId, network: Network): void {
+  const def = getVenue(venue);
+  if (!def.roles.includes("trading")) throw roleUnsupported(def, "agentImport");
+  if (venue === "risex") {
+    throw unsupported("risex", "agentImport",
+      "perp-cli only uses RISEx signers it registered and restricted on-chain to trading-only permissions; an app-created signer keeps deposit / withdraw permissions",
+      `Register a restricted signer with your master wallet: perp${network === "testnet" ? " -n testnet" : ""} wallet agent approve risex --master <ows-wallet>`);
+  }
 }
 
 /** Venues whose import cannot be checked against the venue (stored as "unverified"). */
@@ -791,6 +810,8 @@ async function importQfex(p: ImportAgentParams, agentName: string, s: { publicKe
  * appears in a thrown error.
  */
 export async function importVenueAgent(p: ImportAgentParams): Promise<ImportAgentOutcome> {
+  // Refused before the secret is even inspected (nothing read, stored or sent).
+  assertImportSupported(p.venue, p.network);
   const secrets = secretsOf(p.secret);
   if (secrets.some(x => x.trim().length === 0)) throw new PerpError("INVALID_PARAMS", "Empty key — nothing was imported");
   const agentName = p.agentName ?? defaultImportAgentName(p.venue, p.network);
@@ -816,6 +837,10 @@ export async function importVenueAgent(p: ImportAgentParams): Promise<ImportAgen
       case "lighter":
       case "lighter-rh":
         return await importLighter(p, p.venue, agentName, key, replacing as AgentMeta | null);
+      case "risex":
+      case "txflow":
+        // Unreachable: assertImportSupported() refused these before the lock.
+        throw new PerpError("CAPABILITY_UNSUPPORTED", `${p.venue} keys cannot be imported`);
     }
   } catch (err) {
     throw redacted(err, secrets, p.venue);

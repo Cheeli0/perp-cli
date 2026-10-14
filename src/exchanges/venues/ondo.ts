@@ -143,6 +143,7 @@ export const ondoVenue: VenueDefinition = {
   },
   maxSlippageBps: 5000,
   builderFee: BUILDER_FEE_CAPABILITIES["ondo"],
+  apiStatus: { kind: "official" },
   create: async ctx => {
     const adapter = new (await import("../ondo/adapter.js")).OndoAdapter(ondoVenue, ctx);
     // Builder code: only settings builder.ondo (off by default). Ondo has no approval step.

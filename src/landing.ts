@@ -10,6 +10,8 @@ export type LandingExchangeStatus = {
   exchange: string;
   /** Venue has no account API — rendered as market data only. */
   marketDataOnly?: boolean;
+  /** Venue is read through an undocumented API (VenueDefinition.apiStatus) — labelled "unofficial API". */
+  unofficialApi?: boolean;
   ok: boolean;
   equity: number;
   positions: number;
@@ -46,7 +48,7 @@ export function renderLandingExchangeLine(
   }
 
   if (status.marketDataOnly) {
-    return `    ${chalk.gray("◇")} ${chalk.cyan(exchangeLabel(status.exchange).padEnd(14))} ${chalk.gray("market data only")}`;
+    return `    ${chalk.gray("◇")} ${chalk.cyan(exchangeLabel(status.exchange).padEnd(14))} ${chalk.gray("market data only")}${status.unofficialApi ? chalk.yellow(" (unofficial API)") : ""}`;
   }
 
   const icon = status.ok ? chalk.green("●") : chalk.red("○");
