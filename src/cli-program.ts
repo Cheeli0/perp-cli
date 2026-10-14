@@ -333,6 +333,9 @@ export function buildProgram(opts: { defaultExchange: string; version: string })
   registerInitCommand(program);
   registerAlertCommands(program, isJson);
 
+  installNestedHelp(program);
+  installMissingSubcommandError(program);
+
   // Switch shared API URLs if --network testnet is used
 
   // Validates -n and enforces default-deny --dry-run before any action runs.
@@ -348,4 +351,54 @@ export function buildProgram(opts: { defaultExchange: string; version: string })
   program.hook("preAction", () => setQuarantineNetwork(networkOf(program)));
 
   return { program, getAdapterForExchange, isJson };
+}
+
+/** `perp a b c` path of a command (root name excluded). */
+function commandPath(cmd: Command): string {
+  const names: string[] = [];
+  for (let c: Command | null = cmd; c !== null && c.parent !== null; c = c.parent) names.unshift(c.name());
+  return names.join(" ");
+}
+
+/**
+ * `perp help <group> <leaf> ...` shows the help of the deepest named command. Commander's built-in
+ * root help command resolves only its first operand, so `perp help market list` printed the
+ * `market` group help. Groups keep their own built-in `help` subcommand (`perp market help list`).
+ */
+function installNestedHelp(program: Command): void {
+  program.helpCommand(false);
+  program
+    .command("help [command...]")
+    .description("display help for command (any depth: perp help trade limit)")
+    .action((names: string[]) => {
+      let cmd: Command = program;
+      for (const name of names) {
+        const sub = cmd.commands.find(c => c.name() === name || c.aliases().includes(name));
+        if (sub === undefined) {
+          const where = cmd === program ? "perp" : `perp ${commandPath(cmd)}`;
+          throw new PerpError("INVALID_PARAMS", `Unknown command '${name}' under '${where}'`, {
+            remediation: `Available: ${cmd.commands.map(c => c.name()).join(", ")} — see: ${where} --help`,
+          });
+        }
+        cmd = sub;
+      }
+      cmd.help();
+    });
+}
+
+/**
+ * A command group run without a subcommand (`perp history`): Commander prints the group's help as
+ * an error. In --json mode that reached stdout as a CLI_ERROR whose message was the usage text;
+ * it is now one INVALID_PARAMS document naming the subcommands, with remediation (exit 1).
+ * Human mode keeps the usage listing on stderr.
+ */
+function installMissingSubcommandError(program: Command): void {
+  program.on("beforeAllHelp", (ctx: { error: boolean; command: Command }) => {
+    if (!ctx.error || program.opts().json !== true) return;
+    const path = `perp ${commandPath(ctx.command)}`.trim();
+    const subs = ctx.command.commands.map(c => c.name()).filter(n => n !== "help");
+    throw new PerpError("INVALID_PARAMS", `'${path}' needs a subcommand: ${subs.join(", ")}`, {
+      remediation: `Run one of them, e.g. ${path} ${subs[0]} — list them with: ${path} --help`,
+    });
+  });
 }
