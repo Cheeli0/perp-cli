@@ -109,6 +109,25 @@ export interface ExchangePublicTrade extends Omit<ExchangeTrade, "fee"> {
   fee: null;
 }
 
+/**
+ * Rows of a public tape the adapter left out because they carry a value the venue documents but
+ * does not declare exhaustive (e.g. a new Pacifica event_type) — never guessed into a direction.
+ * Attached to the returned array under this symbol key (not serialized); `market trades` reports
+ * it as `meta.skippedRows`. Absent = nothing skipped.
+ */
+export const TAPE_SKIPPED: unique symbol = Symbol.for("perp-cli.tapeSkipped");
+export interface TapeSkipped { count: number; reason: string }
+
+export function withTapeSkipped<T>(rows: T[], skipped: TapeSkipped | null): T[] {
+  if (skipped !== null && skipped.count > 0) Object.defineProperty(rows, TAPE_SKIPPED, { value: skipped, enumerable: false });
+  return rows;
+}
+
+export function tapeSkippedOf(rows: readonly unknown[]): TapeSkipped | null {
+  const v = (rows as unknown as { [TAPE_SKIPPED]?: TapeSkipped })[TAPE_SKIPPED];
+  return v === undefined ? null : v;
+}
+
 export interface ExchangeFundingPayment {
   time: number;       // unix ms
   symbol: string;

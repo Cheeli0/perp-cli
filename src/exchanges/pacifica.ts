@@ -1,4 +1,5 @@
 import { nonEmptyOrListed, symbolNotFound } from "./unknown-symbol.js";
+import { withTapeSkipped } from "./interface.js";
 import { Keypair } from "@solana/web3.js";
 import { PacificaClient, type Network } from "../pacifica/index.js";
 import type {
@@ -1475,22 +1476,31 @@ export class PacificaAdapter implements ExchangeAdapter {
     if (!Array.isArray(trades)) {
       throw new PerpError("EXCHANGE_ERROR", `Pacifica /trades returned no trade list (${JSON.stringify(trades).slice(0, 120)})`, { exchange: "pacifica" });
     }
-    const taker = trades.filter((t) => {
+    // The docs list event_type fulfill_taker / fulfill_maker and side open_long / open_short /
+    // close_long / close_short without declaring the sets closed: a row with any other value is
+    // skipped (stderr warning + meta.skippedRows), never given a guessed direction, and does not
+    // fail the rest of the tape.
+    const skippedWhy: string[] = [];
+    const rows: ExchangePublicTrade[] = [];
+    for (const t of trades) {
       const ev = pacificaField(t, "event_type", "/trades");
-      if (ev !== "fulfill_taker" && ev !== "fulfill_maker") {
-        throw new PerpError("EXCHANGE_ERROR", `Pacifica /trades row with unknown event_type "${ev}"`, { exchange: "pacifica" });
-      }
-      return ev === "fulfill_taker";
-    });
-    const rows = taker.slice(0, _limit).map((t): ExchangePublicTrade => ({
-      time: pacificaTime(t, "/trades"),
-      symbol,
-      side: pacificaFillSide(pacificaField(t, "side", "/trades"), "/trades"),
-      price: pacificaField(t, "price", "/trades"),
-      size: pacificaField(t, "amount", "/trades"),
-      fee: null, // the public tape carries no fee
-    }));
-    return nonEmptyOrListed(this, symbol, rows);
+      if (ev === "fulfill_maker") continue;
+      if (ev !== "fulfill_taker") { skippedWhy.push(`undocumented event_type "${ev}"`); continue; }
+      const side = pacificaField(t, "side", "/trades");
+      if (!PACIFICA_FILL_BUY_SIDES.has(side) && !PACIFICA_FILL_SELL_SIDES.has(side)) { skippedWhy.push(`undocumented side "${side}"`); continue; }
+      if (rows.length >= _limit) continue;
+      rows.push({
+        time: pacificaTime(t, "/trades"),
+        symbol,
+        side: pacificaFillSide(side, "/trades"),
+        price: pacificaField(t, "price", "/trades"),
+        size: pacificaField(t, "amount", "/trades"),
+        fee: null, // the public tape carries no fee
+      });
+    }
+    const skipped = skippedWhy.length === 0 ? null : { count: skippedWhy.length, reason: [...new Set(skippedWhy)].join(", ") };
+    if (skipped !== null) process.stderr.write(`[pacifica] /trades: skipped ${skipped.count} row(s) — ${skipped.reason}\n`);
+    return withTapeSkipped(await nonEmptyOrListed(this, symbol, rows), skipped);
   }
 
   async getFundingHistory(symbol: string, limit = 10): Promise<{ time: number; rate: string; price: string | null }[]> {

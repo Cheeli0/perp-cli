@@ -31,6 +31,7 @@ import { OndoAdapter } from "../../exchanges/ondo/adapter.js";
 import { HyperliquidAdapter } from "../../exchanges/hyperliquid.js";
 import { LighterAdapter } from "../../exchanges/lighter.js";
 import { listsSymbol, nonEmptyOrListed } from "../../exchanges/unknown-symbol.js";
+import { tapeSkippedOf } from "../../exchanges/interface.js";
 
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
@@ -104,9 +105,23 @@ describe("Pacifica", () => {
     expect(t.every((x) => x.fee === null)).toBe(true);
   });
 
-  it("an unknown side or event_type is a payload error, never a guessed direction", async () => {
-    await expect(pac({ getTrades: vi.fn(async () => [{ ...TAPE[0], side: "flip" }]) }).getRecentTrades("BTC")).rejects.toMatchObject({ structured: expect.objectContaining({ code: "EXCHANGE_ERROR" }) });
-    await expect(pac({ getTrades: vi.fn(async () => [{ ...TAPE[0], event_type: "liquidation" }]) }).getRecentTrades("BTC")).rejects.toMatchObject({ structured: expect.objectContaining({ code: "EXCHANGE_ERROR" }) });
+  it("an undocumented event_type / side row is skipped (stderr warning + count), never given a guessed direction", async () => {
+    // docs (api/rest-api/markets/get-recent-trades) list event_type fulfill_taker / fulfill_maker and
+    // side open_long / open_short / close_long / close_short, without stating the sets are closed.
+    const warn = vi.spyOn(process.stderr, "write").mockImplementation((() => true) as never);
+    const rows = await pac({ getTrades: vi.fn(async () => [
+      TAPE[0],
+      { ...TAPE[0], event_type: "fulfill_rfq_taker", created_at: 9 },
+      { ...TAPE[2], side: "flip", created_at: 8 },
+    ]) }).getRecentTrades("BTC");
+    expect(rows.map((r) => r.time)).toEqual([3]);
+    expect(tapeSkippedOf(rows)).toEqual({ count: 2, reason: expect.stringMatching(/undocumented event_type "fulfill_rfq_taker".*side "flip"/) });
+    expect(String(warn.mock.calls.flat().join(""))).toMatch(/\[pacifica\] \/trades: skipped 2 row\(s\)/);
+  });
+
+  it("nothing skipped → no annotation", async () => {
+    const rows = await pac({ getTrades: vi.fn(async () => TAPE) }).getRecentTrades("BTC");
+    expect(tapeSkippedOf(rows)).toBeNull();
   });
 
   it("pacificaFillSide is the one mapping (public tape and account fills)", () => {

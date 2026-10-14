@@ -106,6 +106,17 @@ describe("4. market info <unknown symbol>", () => {
   });
 });
 
+describe("4c. market trades: rows an adapter skipped are counted in meta", () => {
+  it("meta.skippedRows = { count, reason } when the adapter annotated the tape", async () => {
+    const { TAPE_SKIPPED } = await import("../../exchanges/interface.js");
+    const rows = Object.assign([{ time: 1, symbol: "BTC", side: "buy", price: "1", size: "1", fee: null }], { [TAPE_SKIPPED]: { count: 2, reason: "undocumented event_type \"x\"" } });
+    const { out } = await run({ getRecentTrades: async () => rows } as Partial<ExchangeAdapter>, ["market", "trades", "BTC"], true);
+    const env = JSON.parse(out[out.length - 1]);
+    expect(env.data).toHaveLength(1);
+    expect(env.meta.skippedRows).toEqual({ count: 2, reason: "undocumented event_type \"x\"" });
+  });
+});
+
 describe("4b. market info <delisted>", () => {
   it("SYMBOL_NOT_FOUND says the market is delisted (positions / history still readable)", async () => {
     const { out, exitCode } = await run({

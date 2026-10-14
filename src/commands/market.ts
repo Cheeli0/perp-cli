@@ -1,5 +1,6 @@
 import { Command } from "commander";
 import type { ExchangeAdapter } from "../exchanges/index.js";
+import { tapeSkippedOf } from "../exchanges/interface.js";
 import { makeTable, formatUsd, formatPercent, printJson, jsonOk, jsonError, withJsonErrors, normalizeSymbolArg } from "../utils.js";
 import chalk from "chalk";
 import { PerpError } from "../errors.js";
@@ -304,7 +305,9 @@ export function registerMarketCommands(
     .action(async (symbol: string, opts: { limit: string }) => {
       const adapter = await getAdapter();
       const trades = await adapter.getRecentTrades(normalizeSymbolArg(symbol), parseInt(opts.limit));
-      if (isJson()) return printJson(jsonOk(trades));
+      const skipped = tapeSkippedOf(trades);
+      if (isJson()) return printJson(jsonOk(trades, skipped !== null ? { skippedRows: skipped } : undefined));
+      if (skipped !== null) console.log(chalk.yellow(`  ${skipped.count} tape row(s) skipped: ${skipped.reason}`));
       if (trades.length === 0) {
         console.log(chalk.gray("\n  No recent trades.\n"));
         return;
