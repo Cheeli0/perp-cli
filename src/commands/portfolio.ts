@@ -29,6 +29,7 @@ import { fetchValuedSpotBalances, getSpotAdapter, spotSharesPerpMargin, withSpot
 import { scrubSecretEnv } from "../secret-env.js";
 import { networkOf } from "../cli-flags.js";
 import type { Network } from "../exchanges/venue-types.js";
+import { probeVenueHealth, type VenueProbe } from "../venue-health.js";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -112,6 +113,10 @@ interface ArbOpportunityOut {
 interface HealthBlock {
   exchanges: Record<string, "ok" | "error">;
   anyDown: boolean;
+  /** Per-venue probe detail (latency, HTTP status, error, probe kind, apiStatus) — src/venue-health.ts. */
+  probes: VenueProbe[];
+  /** Requested venues with no environment on the network: not probed. */
+  skipped: Array<{ venue: string; reason: string }>;
 }
 
 interface ServeBlock {
@@ -120,6 +125,20 @@ interface ServeBlock {
   exchanges: string[];
   /** Venue (or hl:<dex>) adapters that could not be initialized and are NOT monitored. */
   errors: Record<string, string>;
+}
+
+/**
+ * `--health` is connectivity only: no balance / position is read, so there are no exchange
+ * entries, totals or risk to report — they are null (unknown), never zero-filled.
+ */
+interface PortfolioHealthEnvelopeData {
+  version: string;
+  scope: "all" | "single";
+  mode: "health";
+  exchanges: null;
+  totals: null;
+  risk: null;
+  health: HealthBlock;
 }
 
 interface PortfolioEnvelopeData {
@@ -470,44 +489,11 @@ function buildTotals(entries: ExchangeEntry[]): { totals: Totals; risk: RiskBloc
 // ── Health check (no balance fetches) ──────────────────────────────────────
 
 async function runHealth(exchangeList: string[], network: Network): Promise<HealthBlock> {
-  const { pingPacifica, pingHyperliquid, pingLighter } = await import("../shared-api.js");
-
-  const pingAster = async (): Promise<{ ok: boolean; latencyMs: number; status: number }> => {
-    const start = Date.now();
-    try {
-      const res = await fetch("https://fapi.asterdex.com/fapi/v1/time");
-      return { ok: res.ok, latencyMs: Date.now() - start, status: res.status };
-    } catch {
-      return { ok: false, latencyMs: Date.now() - start, status: 0 };
-    }
-  };
-
-  const pingMap: Record<string, () => Promise<{ ok: boolean; latencyMs: number; status: number }>> = {
-    pacifica: pingPacifica,
-    hyperliquid: pingHyperliquid,
-    lighter: pingLighter,
-    aster: pingAster,
-  };
-
+  // The same probe as `perp health` and the MCP health_check, over the selected venues.
+  const h = await probeVenueHealth(network, exchangeList);
   const exchanges: Record<string, "ok" | "error"> = {};
-  await Promise.all(exchangeList.map(async (ex) => {
-    const fn = pingMap[ex];
-    try {
-      if (!fn) {
-        // No dedicated ping helper: probe the venue's public market-data path.
-        await getVenue(ex).publicData.fetchMarkets(network);
-        exchanges[ex] = "ok";
-        return;
-      }
-      const r = await fn();
-      exchanges[ex] = r.ok ? "ok" : "error";
-    } catch {
-      exchanges[ex] = "error";
-    }
-  }));
-
-  const anyDown = Object.values(exchanges).some(v => v === "error");
-  return { exchanges, anyDown };
+  for (const p of h.probes) exchanges[p.venue] = p.ok ? "ok" : "error";
+  return { exchanges, anyDown: !h.allHealthy, probes: h.probes, skipped: h.skipped };
 }
 
 // ── Arb top-5 ──────────────────────────────────────────────────────────────
@@ -718,11 +704,14 @@ function renderSnapshotText(data: PortfolioEnvelopeData): void {
 
 function renderHealthText(h: HealthBlock): void {
   console.log(chalk.cyan.bold("\n  Exchange Health Check\n"));
-  const rows = Object.entries(h.exchanges).map(([ex, status]) => {
-    const statusIcon = status === "ok" ? chalk.green("OK") : chalk.red("DOWN");
-    return [chalk.white.bold(ex), statusIcon];
-  });
-  console.log(makeTable(["Exchange", "Status"], rows));
+  const rows = h.probes.map((p) => [
+    chalk.white.bold(p.venue),
+    p.ok ? chalk.green("OK") : chalk.red("DOWN"),
+    `${p.latencyMs}ms`,
+    p.error !== null ? chalk.red(p.error) : chalk.gray("-"),
+  ]);
+  console.log(makeTable(["Exchange", "Status", "Latency", "Error"], rows));
+  for (const s of h.skipped) console.log(chalk.gray(`  ${s.venue}: not probed — ${s.reason}`));
   const overall = h.anyDown ? chalk.red("ISSUES DETECTED") : chalk.green("ALL HEALTHY");
   console.log(`\n  Overall: ${overall}\n`);
 }
@@ -1021,13 +1010,13 @@ export function registerPortfolioCommand(
       await withJsonErrors(json, async () => {
         if (resolved.health) {
           const health = await runHealth(resolved.exchangeList, resolved.network);
-          const data: PortfolioEnvelopeData = {
+          const data: PortfolioHealthEnvelopeData = {
             version,
             scope: resolved.scope,
             mode: "health",
-            exchanges: [],
-            totals: { equity: 0, spotValueUsd: 0, accountValueUsd: 0, marginUsed: 0, marginPct: 0, funding24h: 0, fundingIncomplete: false },
-            risk: { level: "LOW", marginPct: 0 },
+            exchanges: null,
+            totals: null,
+            risk: null,
             health,
           };
           if (json) return printJson(jsonOk(data));

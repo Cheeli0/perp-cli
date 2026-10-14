@@ -4,72 +4,65 @@ import chalk from "chalk";
 import type { ExchangeAdapter } from "../exchanges/index.js";
 import { printJson, jsonOk, makeTable, formatUsd, withJsonErrors } from "../utils.js";
 import { loadRiskLimits, saveRiskLimits, assessRisk, getLiquidationDistances, type RiskLimits } from "../risk.js";
-import { pingPacifica, pingHyperliquid, pingLighter } from "../shared-api.js";
+import { probeVenueHealth } from "../venue-health.js";
+import { networkOf } from "../cli-flags.js";
+import type { Network } from "../exchanges/venue-types.js";
 
 interface HealthResult {
   exchange: string;
-  status: "ok" | "degraded" | "down";
+  status: "ok" | "down";
   latency_ms: number;
-  error?: string;
+  /** null when ok */
+  error: string | null;
+  /** "ping" = REST ping; "markets" = the venue's public market-data read (read-only venues included) */
+  probe: "ping" | "markets";
+  /** "unofficial" = read through an undocumented venue API (e.g. TxFlow) */
+  apiStatus: "official" | "unofficial";
 }
 
-/** Run health check and return results + render. Exported for use by status --health. */
-export async function runHealthCheck(isJson: () => boolean): Promise<void> {
-      const pingAster = async (): Promise<{ ok: boolean; latencyMs: number; status: number }> => {
-        const start = Date.now();
-        try {
-          const res = await fetch("https://fapi.asterdex.com/fapi/v1/time");
-          return { ok: res.ok, latencyMs: Date.now() - start, status: res.status };
-        } catch {
-          return { ok: false, latencyMs: Date.now() - start, status: 0 };
-        }
-      };
-      const [pacPing, hlPing, ltPing, astPing] = await Promise.all([
-        pingPacifica(),
-        pingHyperliquid(),
-        pingLighter(),
-        pingAster(),
-      ]);
-      const toPingResult = (name: string, p: { ok: boolean; latencyMs: number; status: number }): HealthResult => ({
-        exchange: name,
+/**
+ * `perp health`: probe EVERY registered venue on the selected network — the same probe as
+ * `perp portfolio --health` and the MCP health_check (src/venue-health.ts). A venue with no
+ * environment on that network is listed under `skipped`, never silently dropped.
+ */
+export async function runHealthCheck(isJson: () => boolean, network: Network): Promise<void> {
+      const health = await probeVenueHealth(network);
+      const checks: HealthResult[] = health.probes.map(p => ({
+        exchange: p.venue,
         status: p.ok ? "ok" : "down",
         latency_ms: p.latencyMs,
-        error: p.ok ? undefined : `HTTP ${p.status}`,
-      });
-      const checks: HealthResult[] = [
-        toPingResult("pacifica", pacPing),
-        toPingResult("hyperliquid", hlPing),
-        toPingResult("lighter", ltPing),
-        toPingResult("aster", astPing),
-      ];
-
-      const allOk = checks.every(c => c.status === "ok");
+        error: p.error,
+        probe: p.probe,
+        apiStatus: p.apiStatus,
+      }));
+      const allOk = health.allHealthy;
 
       if (isJson()) {
-        return printJson(jsonOk({ healthy: allOk, exchanges: checks }));
+        return printJson(jsonOk({ healthy: allOk, network, exchanges: checks, skipped: health.skipped }));
       }
 
-      console.log(chalk.cyan.bold("\n  Exchange Health Check\n"));
+      console.log(chalk.cyan.bold(`\n  Exchange Health Check (${network})\n`));
       const rows = checks.map(c => {
-        const statusIcon = c.status === "ok"
-          ? chalk.green("OK")
-          : c.status === "degraded"
-          ? chalk.yellow("DEGRADED")
-          : chalk.red("DOWN");
+        const statusIcon = c.status === "ok" ? chalk.green("OK") : chalk.red("DOWN");
         const latency = c.latency_ms < 500
           ? chalk.green(`${c.latency_ms}ms`)
           : c.latency_ms < 2000
           ? chalk.yellow(`${c.latency_ms}ms`)
           : chalk.red(`${c.latency_ms}ms`);
         return [
-          chalk.white.bold(c.exchange),
+          chalk.white.bold(c.exchange) + (c.apiStatus === "unofficial" ? chalk.yellow(" *") : ""),
           statusIcon,
           latency,
-          c.error ? chalk.red(c.error) : chalk.gray("-"),
+          c.probe,
+          c.error !== null ? chalk.red(c.error) : chalk.gray("-"),
         ];
       });
 
-      console.log(makeTable(["Exchange", "Status", "Latency", "Error"], rows));
+      console.log(makeTable(["Exchange", "Status", "Latency", "Probe", "Error"], rows));
+      if (checks.some(c => c.apiStatus === "unofficial")) {
+        console.log(chalk.yellow("  * unofficial (undocumented) venue API — may change without notice"));
+      }
+      for (const s of health.skipped) console.log(chalk.gray(`  ${s.venue}: not probed — ${s.reason}`));
 
       const overall = allOk ? chalk.green("ALL HEALTHY") : chalk.red("ISSUES DETECTED");
       console.log(`\n  Overall: ${overall}\n`);
@@ -420,7 +413,7 @@ export function registerRiskCommands(
     .command("health")
     .description("Adapter health check: ping venue REST endpoints (connectivity + latency)")
     .action(async () => {
-      await runHealthCheck(isJson);
+      await runHealthCheck(isJson, networkOf(program));
     });
 
 }
