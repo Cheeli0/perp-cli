@@ -2145,6 +2145,8 @@ export class LighterAdapter implements ExchangeAdapter {
   }
 
   async getFundingHistory(symbol: string, limit = 10): Promise<{ time: number; rate: string; price: string | null }[]> {
+    await this.ensureMarketMap();
+    this.getMarketIndex(symbol); // unlisted market: SYMBOL_NOT_FOUND, not an empty history
     const rates = await this.getFundingRates();
     const r = rates.get(symbol.toUpperCase());
     if (!r) return [];

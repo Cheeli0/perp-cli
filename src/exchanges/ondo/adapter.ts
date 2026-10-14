@@ -36,6 +36,7 @@
  * floored to the step (SIZE_TOO_SMALL when that reaches zero).
  */
 
+import { nonEmptyOrListed } from "../unknown-symbol.js";
 import { randomUUID } from "node:crypto";
 import { PerpError, orderNotSent, orderOutcomeUnknown } from "../../errors.js";
 import type { OndoAgentMeta } from "../../settings.js";
@@ -784,14 +785,15 @@ export class OndoAdapter implements ExchangeAdapter, TradingV2 {
     const trades = await this.client.publicGet<OndoPublicTrade[] | null>("/v1/perps/trades", {
       market: ondoVenueSymbol(symbol), limit: limit === undefined ? null : limit,
     });
-    return listOf(trades).map(t => ({
+    // `200 []` for an unlisted market (live 2026-10-14): checked against the market directory.
+    return nonEmptyOrListed(this, symbol, listOf(trades).map(t => ({
       time: parseOndoTime(t.time, "trade"),
       symbol: ondoPlainSymbol(t.market),
       side: t.aggressor_side,
       price: t.price,
       size: t.size,
       fee: null, // public tape: no fee applies to the viewer
-    }));
+    })));
   }
 
   async getFundingHistory(symbol: string, limit?: number): Promise<{ time: number; rate: string; price: string | null }[]> {
@@ -809,7 +811,7 @@ export class OndoAdapter implements ExchangeAdapter, TradingV2 {
       from: Math.floor(startTime / 1000),
       to: Math.floor(endTime / 1000),
     });
-    return listOf(candles).map(c => ({
+    return nonEmptyOrListed(this, symbol, listOf(candles).map(c => ({
       time: parseOndoTime(c.startTime, "candle"),
       open: c.open,
       high: c.high,
@@ -818,7 +820,7 @@ export class OndoAdapter implements ExchangeAdapter, TradingV2 {
       volume: c.volume,
       quoteVolume: null,
       trades: null, // Ondo publishes no per-candle trade count
-    }));
+    })));
   }
 
   // ── Legacy ExchangeAdapter: account ──

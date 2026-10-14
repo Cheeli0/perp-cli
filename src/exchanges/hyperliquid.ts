@@ -2073,6 +2073,7 @@ export class HyperliquidAdapter implements ExchangeAdapter {
   }
 
   async getFundingHistory(symbol: string, limit = 10): Promise<{ time: number; rate: string; price: string | null }[]> {
+    await this.getAssetIndex(symbol); // unlisted coin: SYMBOL_NOT_FOUND (fundingHistory answers HTTP 500)
     const now = Date.now();
     const history = await this._infoPost({ type: "fundingHistory", coin: this._venueCoin(symbol), startTime: now - 24 * 60 * 60 * 1000 }) as Record<string, unknown>[];
     return (history ?? []).slice(-limit).map((h) => ({

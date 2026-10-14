@@ -19,6 +19,7 @@
  * Base: https://fapi.asterdex.com
  */
 
+import { nonEmptyOrListed } from "./unknown-symbol.js";
 import { accountCacheEpoch } from "../cache.js";
 import type {
   ExchangeAdapter,
@@ -670,7 +671,8 @@ export class AsterAdapter implements ExchangeAdapter {
     if (!Array.isArray(data)) {
       throw new PerpError("EXCHANGE_ERROR", `Aster fundingRate history is not a list (${JSON.stringify(data).slice(0, 120)})`, { exchange: "aster" });
     }
-    return (data as Array<Record<string, unknown>>).map((d) => {
+    // `200 []` for an unlisted symbol (live 2026-10-14): checked against the market directory.
+    return nonEmptyOrListed(this, symbol, (data as Array<Record<string, unknown>>).map((d) => {
       const time = Number(d.fundingTime);
       if (d.fundingTime === undefined || d.fundingTime === null || !Number.isFinite(time) || time <= 0) {
         throw new PerpError("EXCHANGE_ERROR", `Aster fundingRate row without a numeric fundingTime: ${JSON.stringify(d).slice(0, 160)}`, { exchange: "aster" });
@@ -680,7 +682,7 @@ export class AsterAdapter implements ExchangeAdapter {
         rate: venueRateField(d.fundingRate, "fundingRate fundingRate", "aster"),
         price: d.markPrice ? String(d.markPrice) : null,
       };
-    });
+    }));
   }
 
   /**
