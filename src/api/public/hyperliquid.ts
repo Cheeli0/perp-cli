@@ -34,6 +34,7 @@ export function fetchHyperliquidMeta(): Promise<HyperliquidAsset[]> {
     const ctxs = (json[1] ?? []) as Record<string, unknown>[];
     const out: HyperliquidAsset[] = [];
     (universe as Record<string, unknown>[]).forEach((asset, i) => {
+      if (asset.isDelisted === true) return; // delisted: zeroed funding / mark history, not a market
       const ctx = (ctxs[i] ?? {}) as Record<string, unknown>;
       const symbol = String(asset.name ?? "");
       const funding = Number(ctx.funding);
@@ -63,6 +64,7 @@ export function parseHyperliquidMetaRaw(raw: unknown): { rates: Map<string, numb
   const ctxs = ((raw as unknown[])[1] ?? []) as Record<string, unknown>[];
   const assets = (universe?.universe ?? []) as Record<string, unknown>[];
   assets.forEach((a, i) => {
+    if (a.isDelisted === true) return; // delisted: not a market (zeroed funding)
     const ctx = (ctxs[i] ?? {}) as Record<string, unknown>;
     const sym = String(a.name ?? "");
     if (!sym) return;

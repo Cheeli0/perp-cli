@@ -36,12 +36,13 @@
  * floored to the step (SIZE_TOO_SMALL when that reaches zero).
  */
 
+import { nonEmptyOrListed } from "../unknown-symbol.js";
 import { randomUUID } from "node:crypto";
 import { PerpError, orderNotSent, orderOutcomeUnknown } from "../../errors.js";
 import type { OndoAgentMeta } from "../../settings.js";
 import type {
   ExchangeAdapter, ExchangeBalance, ExchangeFundingPayment, ExchangeKline, ExchangeMarketInfo, ExchangeOrder,
-  ExchangePosition, ExchangeTrade,
+  ExchangePosition, ExchangeTrade, ExchangePublicTrade,
 } from "../interface.js";
 import type { ResolvedSlippage } from "../slippage.js";
 import { alignProtectionPrice, floorSize, formatComputedPrice, requireOnTick, slippagePrice, subDecimal } from "../precision.js";
@@ -780,18 +781,19 @@ export class OndoAdapter implements ExchangeAdapter, TradingV2 {
     return { bids: book.bids.map(lvl), asks: book.asks.map(lvl) };
   }
 
-  async getRecentTrades(symbol: string, limit?: number): Promise<ExchangeTrade[]> {
+  async getRecentTrades(symbol: string, limit?: number): Promise<ExchangePublicTrade[]> {
     const trades = await this.client.publicGet<OndoPublicTrade[] | null>("/v1/perps/trades", {
       market: ondoVenueSymbol(symbol), limit: limit === undefined ? null : limit,
     });
-    return listOf(trades).map(t => ({
+    // `200 []` for an unlisted market (live 2026-10-14): checked against the market directory.
+    return nonEmptyOrListed(this, symbol, listOf(trades).map(t => ({
       time: parseOndoTime(t.time, "trade"),
       symbol: ondoPlainSymbol(t.market),
       side: t.aggressor_side,
       price: t.price,
       size: t.size,
-      fee: "0", // public tape: no fee applies to the viewer
-    }));
+      fee: null, // public tape: no fee applies to the viewer
+    })), ondoPlainSymbol(ondoVenueSymbol(symbol)));
   }
 
   async getFundingHistory(symbol: string, limit?: number): Promise<{ time: number; rate: string; price: string | null }[]> {
@@ -809,15 +811,16 @@ export class OndoAdapter implements ExchangeAdapter, TradingV2 {
       from: Math.floor(startTime / 1000),
       to: Math.floor(endTime / 1000),
     });
-    return listOf(candles).map(c => ({
+    return nonEmptyOrListed(this, symbol, listOf(candles).map(c => ({
       time: parseOndoTime(c.startTime, "candle"),
       open: c.open,
       high: c.high,
       low: c.low,
       close: c.close,
       volume: c.volume,
+      quoteVolume: null,
       trades: null, // Ondo publishes no per-candle trade count
-    }));
+    })), ondoPlainSymbol(ondoVenueSymbol(symbol)));
   }
 
   // ── Legacy ExchangeAdapter: account ──

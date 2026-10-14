@@ -36,11 +36,7 @@ import { fillSizeString, sizeDecimalsOf } from "./exchanges/spot-result.js";
 import { tradingV2Of } from "./exchanges/legacy-trading-v2.js";
 import { PerpError, classifyError, extractErrorMessage, isDefiniteOrderFailure, orderOutcomeUnknown, parsePositiveDecimal } from "./errors.js";
 import { invalidateCache } from "./cache.js";
-import {
-  pingPacifica,
-  pingHyperliquid,
-  pingLighter,
-} from "./shared-api.js";
+import { probeVenueHealth } from "./venue-health.js";
 import { fetchAllFundingRates } from "./funding-rates.js";
 import { loadArbState } from "./arb/state.js";
 import { validateTrade } from "./trade-validator.js";
@@ -306,17 +302,18 @@ server.tool(
 
 server.tool(
   "get_funding_rates",
-  "Compare funding rates across every market-data venue. Returns rates per symbol with spread analysis",
+  "Compare funding rates across every market-data venue whose funding rate is verified. Returns rates per symbol with spread analysis. includeUnverified also returns venues whose rate is unverified (QFEX; TxFlow — unofficial API), each row tagged fundingVerified / apiStatus — display only, never a basis for trading (mirrors the CLI `arb scan --include-unverified`).",
   {
     symbols: z
       .array(z.string())
       .optional()
       .describe("Filter to specific symbols (e.g. ['BTC','ETH']). Omit for all available"),
     minSpread: z.number().optional().describe("Minimum annualized spread % to include (default: 0)"),
+    includeUnverified: z.boolean().optional().describe("Also include venues whose funding rate is unverified (default false); rows carry fundingVerified:false / apiStatus"),
   },
-  async ({ symbols, minSpread }) => {
+  async ({ symbols, minSpread, includeUnverified }) => {
     try {
-      const snapshot = await fetchAllFundingRates({ symbols, minSpread });
+      const snapshot = await fetchAllFundingRates({ symbols, minSpread, includeUnverified: includeUnverified === true });
       return {
         content: [{
           type: "text",
@@ -331,7 +328,7 @@ server.tool(
 
 server.tool(
   "get_prices",
-  "Get cross-exchange prices for symbols. Fetches mark prices from every market-data venue for comparison",
+  "Get cross-exchange prices for symbols. Fetches mark prices from every market-data venue for comparison; a venue appears in a row only when it lists that symbol (e.g. QFEX lists no BTC). Each row's unofficialApiVenues names the venues in it read through an undocumented API (TxFlow) — like get_markets' venueApi tag.",
   {
     symbols: z
       .array(z.string())
@@ -361,8 +358,12 @@ server.tool(
         }
       });
 
-      const data = Array.from(priceMap.entries()).map(([symbol, prices]) => ({ symbol, prices }));
-      const unofficial = listVenuesWithRole("marketData").filter(v => v.apiStatus.kind === "unofficial").map(v => v.id);
+      const unofficial: string[] = listVenuesWithRole("marketData").filter(v => v.apiStatus.kind === "unofficial").map(v => v.id);
+      const data = Array.from(priceMap.entries()).map(([symbol, prices]) => ({
+        symbol,
+        prices,
+        unofficialApiVenues: Object.keys(prices).filter(ex => unofficial.includes(ex)),
+      }));
       return { content: [{ type: "text", text: ok(data, { count: data.length, errors, unofficialApiVenues: unofficial }) }] };
     } catch (e) {
       return { content: [{ type: "text", text: errOf(e) }], isError: true };
@@ -1405,46 +1406,13 @@ server.tool(
   {},
   async () => {
     try {
-      type Probe = { ok: boolean; latencyMs: number; status: number | null; error: string | null; probe: "ping" | "markets" };
-      const timed = async (probe: Probe["probe"], fn: () => Promise<{ ok: boolean; status: number | null }>): Promise<Probe> => {
-        const start = Date.now();
-        try {
-          const r = await fn();
-          return { ok: r.ok, latencyMs: Date.now() - start, status: r.status, error: r.ok ? null : `HTTP ${r.status}`, probe };
-        } catch (e) {
-          return { ok: false, latencyMs: Date.now() - start, status: probe === "ping" ? 0 : null, error: extractErrorMessage(e), probe };
-        }
-      };
-      const restPing = (url: string) => timed("ping", async () => {
-        const res = await fetch(url);
-        return { ok: res.ok, status: res.status };
-      });
-      // Shared-api helpers report a transport failure as status 0 (no message).
-      const helperPing = (fn: () => Promise<{ ok: boolean; latencyMs: number; status: number }>) => async (): Promise<Probe> => {
-        const r = await fn();
-        return { ...r, error: r.ok ? null : r.status === 0 ? "no response" : `HTTP ${r.status}`, probe: "ping" };
-      };
-      const pings: Record<string, () => Promise<Probe>> = {
-        pacifica: helperPing(pingPacifica),
-        hyperliquid: helperPing(pingHyperliquid),
-        lighter: helperPing(pingLighter),
-        aster: () => restPing(`${networkConfig(getVenue("aster"), MCP_NETWORK).restUrl}/fapi/v1/time`),
-        // QFEX: public GET /refdata for one instrument on the server's network.
-        qfex: () => restPing(`${networkConfig(getVenue("qfex"), MCP_NETWORK).restUrl}/refdata?ticker=AAPL-USD`),
-      };
-      // A venue without an environment on the server's network (TxFlow has no testnet) is not probed.
-      const venues = listVenues().filter(v => v.networks[MCP_NETWORK] !== null);
-      const probes = await Promise.all(venues.map(v => {
-        const ping = pings[v.id];
-        return ping !== undefined
-          ? ping()
-          : timed("markets", async () => { await v.publicData.fetchMarkets(MCP_NETWORK); return { ok: true, status: null }; });
-      }));
-
+      const health = await probeVenueHealth(MCP_NETWORK);
       const result: Record<string, unknown> = {};
-      venues.forEach((v, i) => { result[v.id] = { ...probes[i], statusText: probes[i].ok ? "healthy" : "unreachable", apiStatus: v.apiStatus.kind }; });
-      result.covered = venues.map(v => v.id);
-      result.allHealthy = probes.every(p => p.ok);
+      for (const { venue, ...p } of health.probes) result[venue] = { ...p, statusText: p.ok ? "healthy" : "unreachable" };
+      result.covered = health.probes.map(p => p.venue);
+      // A venue without an environment on the server's network (TxFlow has no testnet) is not probed.
+      result.skipped = health.skipped;
+      result.allHealthy = health.allHealthy;
 
       return { content: [{ type: "text", text: ok(result) }] };
     } catch (e) {

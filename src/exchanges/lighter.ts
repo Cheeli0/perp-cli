@@ -5,6 +5,7 @@ import type {
   ExchangeOrder,
   ExchangeBalance,
   ExchangeTrade,
+  ExchangePublicTrade,
   ExchangeFundingPayment,
   ExchangeKline,
 } from "./interface.js";
@@ -502,6 +503,13 @@ export interface LighterAdapterOpts {
   apiKeyIndex?: number;
 }
 
+/** A candle volume field: a finite number / numeric string → its string form; absent or non-numeric → null (never "" / "undefined"). */
+function candleNumber(v: unknown): string | null {
+  if (typeof v === "number" && Number.isFinite(v)) return String(v);
+  if (typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v))) return v;
+  return null;
+}
+
 export class LighterAdapter implements ExchangeAdapter {
   /** GTC→GTT resting-order lifetime (28 days) for the execution record (§13.10 #14). */
   static readonly gttExpiryMs = LIGHTER_GTT_EXPIRY_MS;
@@ -963,7 +971,7 @@ export class LighterAdapter implements ExchangeAdapter {
 
   getMarketIndex(symbol: string): number {
     const idx = this._marketMap.get(symbol.toUpperCase());
-    if (idx === undefined) throw new PerpError("SYMBOL_NOT_FOUND", `Unknown Lighter market: ${symbol}`, { exchange: this.name });
+    if (idx === undefined) throw new PerpError("SYMBOL_NOT_FOUND", `Unknown Lighter market: ${symbol}`, { exchange: this.name, remediation: `List markets: perp -e ${this.name} market list` });
     return idx;
   }
 
@@ -2124,7 +2132,7 @@ export class LighterAdapter implements ExchangeAdapter {
     return this.updateLeverage(symbol, leverage, marginMode);
   }
 
-  async getRecentTrades(symbol: string, limit = 20): Promise<ExchangeTrade[]> {
+  async getRecentTrades(symbol: string, limit = 20): Promise<ExchangePublicTrade[]> {
     await this.ensureMarketMap();
     const marketId = this.getMarketIndex(symbol);
     const res = await this.restGet("/recentTrades", { market_id: String(marketId), limit: String(limit) }) as Record<string, unknown>;
@@ -2138,11 +2146,14 @@ export class LighterAdapter implements ExchangeAdapter {
       side: t.is_maker_ask ? "buy" as const : "sell" as const,
       price: String(t.price ?? "0"),
       size: String(t.size ?? t.base_amount ?? t.amount ?? ""),
-      fee: String(t.fee ?? "0"),
+      // The tape's taker_fee / maker_fee are the parties' fee RATES, not a fee the viewer paid.
+      fee: null,
     }));
   }
 
   async getFundingHistory(symbol: string, limit = 10): Promise<{ time: number; rate: string; price: string | null }[]> {
+    await this.ensureMarketMap();
+    this.getMarketIndex(symbol); // unlisted market: SYMBOL_NOT_FOUND, not an empty history
     const rates = await this.getFundingRates();
     const r = rates.get(symbol.toUpperCase());
     if (!r) return [];
@@ -2161,8 +2172,11 @@ export class LighterAdapter implements ExchangeAdapter {
       high: String(c.high ?? c.h ?? "0"),
       low: String(c.low ?? c.l ?? "0"),
       close: String(c.close ?? c.c ?? "0"),
-      volume: String(c.base_token_volume ?? c.v ?? ""),
-      trades: Number(c.trades_count ?? c.n ?? 0),
+      volume: candleNumber(c.base_token_volume ?? c.v),
+      // /candles: v = base volume, V = quote (USD) volume; no per-candle trade count (live
+      // 2026-10-14 keys: t o h l c v V i — `i` is the last trade id, not a count).
+      quoteVolume: candleNumber(c.V),
+      trades: typeof c.trades_count === "number" ? c.trades_count : typeof c.n === "number" ? c.n : null,
     }));
   }
 

@@ -24,7 +24,7 @@ import type { RisexAgentMeta } from "../../settings.js";
 import type { EvmSigner } from "../../signer/interface.js";
 import type {
   ExchangeAdapter, ExchangeBalance, ExchangeFundingPayment, ExchangeKline, ExchangeMarketInfo, ExchangeOrder,
-  ExchangePosition, ExchangeTrade,
+  ExchangePosition, ExchangeTrade, ExchangePublicTrade,
 } from "../interface.js";
 import { alignProtectionPrice, exactUnits, mulDecimal, slippagePrice, subDecimal } from "../precision.js";
 import type { ResolvedSlippage } from "../slippage.js";
@@ -300,7 +300,7 @@ export class RisexAdapter implements ExchangeAdapter, TradingV2 {
     return { bids: side(d.bids, "bids"), asks: side(d.asks, "asks") };
   }
 
-  async getRecentTrades(symbol: string, limit = 50): Promise<ExchangeTrade[]> {
+  async getRecentTrades(symbol: string, limit = 50): Promise<ExchangePublicTrade[]> {
     const m = await this.market(symbol);
     const d = await this.client.get<{ trades?: unknown }>(`/v1/markets/id/${m.market_id}/trade-history`, { limit: Math.min(limit, 1000) });
     if (!Array.isArray(d.trades)) throw new PerpError("EXCHANGE_ERROR", "RISEx trade-history: no trades array", { exchange: "risex" });
@@ -310,7 +310,7 @@ export class RisexAdapter implements ExchangeAdapter, TradingV2 {
       if (x.maker_side !== "BUY" && x.maker_side !== "SELL") throw new PerpError("EXCHANGE_ERROR", `RISEx trade maker_side ${String(x.maker_side)}`, { exchange: "risex" });
       // The tape side is the taker's: a SELL maker means a buy took it.
       // Public tape carries no fee; "0" follows the legacy ExchangeTrade convention for public trades.
-      return { time: nsToMs(str(x.time, "trade time")), symbol: sym, side: x.maker_side === "SELL" ? "buy" : "sell", price: decReq(x.price, "trade price"), size: decReq(x.size, "trade size"), fee: "0" };
+      return { time: nsToMs(str(x.time, "trade time")), symbol: sym, side: x.maker_side === "SELL" ? "buy" : "sell", price: decReq(x.price, "trade price"), size: decReq(x.size, "trade size"), fee: null };
     });
   }
 
@@ -341,7 +341,7 @@ export class RisexAdapter implements ExchangeAdapter, TradingV2 {
       return {
         time: nsToMs(str(x.time, "candle time")),
         open: decReq(x.open, "open"), high: decReq(x.high, "high"), low: decReq(x.low, "low"), close: decReq(x.close, "close"),
-        volume: decReq(x.volume, "volume"), trades: null,
+        volume: decReq(x.volume, "volume"), quoteVolume: null, trades: null,
       };
     });
   }

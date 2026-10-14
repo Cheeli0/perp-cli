@@ -35,7 +35,7 @@ export interface BotTuiState {
   exchange: string;
   price: number;
   volume24h: number;
-  openInterest: string;
+  openInterest: string | null;
   fundingRate: number;
   volatility24h: number;
   positions: Position[];
@@ -219,7 +219,7 @@ export function BotDashboard({ initialState, onQuit, onPause, subscribe }: Dashb
             </Text>
           </Text>
           <Text color="gray">
-            OI: <Text color="white">{state.openInterest}</Text>
+            OI: <Text color="white">{state.openInterest ?? "-"}</Text>
           </Text>
         </Box>
       )}

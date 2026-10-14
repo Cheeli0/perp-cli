@@ -136,12 +136,12 @@ export class ApexStrategy implements Strategy {
     }
 
     // ── Phase 2: Record pulse history ──
-    const currentOi = parseFloat(snapshot.openInterest);
+    // Unknown OI (null) is not recorded: a fake 0 in the history would read as an OI jump later.
     const currentVolume = snapshot.volume24h;
     const historyKey = ctx.symbol;
 
     const existing = this.pulseHistory.get(historyKey) ?? [];
-    existing.push({ oi: currentOi, volume: currentVolume });
+    if (snapshot.openInterest !== null) existing.push({ oi: parseFloat(snapshot.openInterest), volume: currentVolume });
     // Keep last 10 entries
     if (existing.length > 10) existing.shift();
     this.pulseHistory.set(historyKey, existing);

@@ -13,6 +13,26 @@ All notable changes to `perp-cli`. Format follows [Keep a Changelog](https://kee
 - Remediation texts name both packages (`perp-cli/ws/node or @hypurrquant/perp-ws/node`); the skill reference code blocks import `@hypurrquant/perp-ws` (the release gate typechecks them against both packages).
 - Release gate: packs `@hypurrquant/perp-ws`, asserts a clean install has 0 transitive dependencies, the `/node` entry without `ws` (clear error) and with it (live stream), consumer tsc (bundler / node16 / node10), attw and the Next 13.5 build + chunk purity against it.
 
+### JSON contract changes (CLI / MCP) — pre-release QA sweep
+
+Consumers of `--json` / MCP output: these fields changed shape or meaning. Rule: unknown is `null`, never `0` / `-1` / `""`.
+
+- **`risk status`** — `metrics.minLiquidationDistancePct` is `null` when no position reports a liquidation price (no positions, or none reported). Was the sentinel `-1`.
+- **`portfolio --health`** — `exchanges`, `totals` and `risk` are `null` (connectivity mode reads no balance). Were `[]` and an all-zero totals / `LOW` risk block. `health` adds `probes` (per-venue latency / HTTP status / error / probe kind / apiStatus) and `skipped`.
+- **`perp health`** — probes **every registered venue** on `-n` (was pacifica / hyperliquid / lighter / aster). `exchanges` lists the official-API venues; venues read through an undocumented API (TxFlow) are listed separately under `unofficial`. Every entry carries `error` (always present, `null` when ok), `probe` (`"ping"` | `"markets"`) and `apiStatus`. `healthy` is computed from **official venues only**; `allHealthy` includes the unofficial ones. New `network` and `skipped` (venues with no environment on the network, e.g. TxFlow on testnet). MCP `health_check` adds `skipped`.
+- **Klines** (`market kline`, `ExchangeKline`) — `volume` is `string | null` (null = the venue publishes no base volume for the candle, e.g. QFEX, whose `baseTokenVolume` is a "0" placeholder); new `quoteVolume: string | null` (USD notional: Lighter `V`, QFEX `usdVolume`, Aster `k[7]`; null elsewhere); `trades` is `null` on Lighter / Lighter RH (no per-candle count; was `0`).
+- **Public trades** (`market trades`, `getRecentTrades`) — `fee` is `null` on every venue (the public tape has no fee for the viewer; was `"0"`). Type `ExchangePublicTrade`. Pacifica's tape is now the taker rows with the taker's direction (was every row of both parties as `"sell"`).
+- **Hyperliquid delisted markets** (meta `isDelisted`, 56 on mainnet with `"0.0"` funding / volume / OI) are excluded from `market list` / `prices`, the funding and basis scans and MCP market data. `market info <delisted>` is `SYMBOL_NOT_FOUND` saying so; orders, positions and history still resolve the symbol.
+- **Ondo** `indexPrice` is `null` where the venue reports `"0"` (disabled contracts).
+- **Unknown symbols** — `market info | book | trades | kline | funding | mid` with a symbol the venue does not list is `SYMBOL_NOT_FOUND` (exit 1, `retryable: false`, remediation `List markets: perp -e <venue> market list`) on every venue. Was, depending on the venue, `ok: true` with `[]` / an empty book, a retryable `EXCHANGE_ERROR` (HTTP 404 / 500), or `UNKNOWN`. Venues without that read stay `CAPABILITY_UNSUPPORTED`. Hyperliquid public reads (book / trades / kline / funding) now resolve the coin against the venue's asset map (`meta`) first — a failed metadata read surfaces as that error instead of a per-request 500.
+- **`arb scan --basis`** — rows are unchanged in shape, but prices now come from every **trading** venue's market list grouped by canonical symbol (funding-independent; TxFlow excluded); same-ticker unrelated assets and pairs > 5% apart are excluded.
+- **Bare command group in `--json`** (`perp --json history`) — `INVALID_PARAMS` naming the subcommands (was `CLI_ERROR` whose message was the usage text).
+- **MCP** `get_prices` rows add `unofficialApiVenues`; `get_funding_rates` adds `includeUnverified` (default false).
+- **`market trades`** JSON may carry `meta.skippedRows: { count, reason }` — tape rows an adapter left out because they carry a value the venue documents but does not declare exhaustive (Pacifica `event_type` / `side`); they are never given a guessed direction.
+- **Pacifica `market funding`** — `price` (oracle) is `null` when the row has none (was `"0"`); a non-list answer or a row without `created_at` is `EXCHANGE_ERROR` (was `[]` / time `0`).
+- **Bot snapshots** (`EnrichedSnapshot.openInterest`, bot TUI state) — `null` (not read); was a hard-coded `"0"`. Strategies that use OI treat it as "no OI signal".
+- Human output: open interest is shown in base units (`218.4 BTC (≈ $18.3M at mark)`; `market list` column `OI (base)`), never `$`; kline times are ISO UTC.
+
 ### NEW: `perp-cli/ws` — composable WebSocket library (@experimental)
 
 - **New public entry points** `perp-cli/ws` (browser: native `WebSocket` / `fetch`, ESM, ES2020, no side effects, no top-level await, no global touched at module load) and `perp-cli/ws/node` (same API + a `ws` transport). Venues: hyperliquid (native + HIP-3), pacifica, lighter, lighter-rh, aster, arcus.

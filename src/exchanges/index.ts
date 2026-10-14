@@ -5,6 +5,7 @@ export type {
   ExchangeOrder,
   ExchangeBalance,
   ExchangeTrade,
+  ExchangePublicTrade,
   ExchangeFundingPayment,
   ExchangeKline,
   ExchangeAdapter,

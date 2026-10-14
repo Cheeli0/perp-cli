@@ -1,6 +1,6 @@
 import type { Strategy, StrategyContext, StrategyAction, EnrichedSnapshot } from "../strategy-types.js";
 import { registerStrategy } from "../strategy-registry.js";
-import { calculateATR, calculateSMA } from "../indicators.js";
+import { calculateATR, calculateSMA, klineVolumes } from "../indicators.js";
 
 /**
  * Momentum breakout strategy.
@@ -13,6 +13,7 @@ export class MomentumBreakoutStrategy implements Strategy {
   readonly name = "momentum-breakout";
 
   private _config: Record<string, unknown> = {};
+  private _noVolumeLogged = false;
 
   describe() {
     return {
@@ -51,7 +52,14 @@ export class MomentumBreakoutStrategy implements Strategy {
     const closes = klines.map(k => parseFloat(k.close));
     const highs = klines.map(k => parseFloat(k.high));
     const lows = klines.map(k => parseFloat(k.low));
-    const volumes = klines.map(k => parseFloat(k.volume));
+    // Unknown candle volume (null / non-numeric) cannot confirm a breakout: no entry, exits still run.
+    const known = klineVolumes(klines);
+    const volumeKnown = known !== null;
+    if (!volumeKnown && !this._noVolumeLogged) {
+      this._noVolumeLogged = true; // once per run, not every tick
+      ctx.log("  [BREAKOUT] no candle volume from the venue — volume confirmation unavailable, no new entries");
+    }
+    const volumes = known ?? klines.map(() => NaN);
     const price = snapshot.price;
 
     // Compute indicators
@@ -73,7 +81,7 @@ export class MomentumBreakoutStrategy implements Strategy {
     const avgVolSma = calculateSMA(volumes, this.lookbackPeriod);
     const avgVolume = avgVolSma.length > 0 ? avgVolSma[avgVolSma.length - 1] : 0;
     const currentVolume = volumes[volumes.length - 1];
-    const volumeConfirmed = avgVolume > 0 && currentVolume > avgVolume * this.volumeMultiplier;
+    const volumeConfirmed = volumeKnown && avgVolume > 0 && currentVolume > avgVolume * this.volumeMultiplier;
 
     const position = ctx.state.get("position") as {
       side: "buy" | "sell"; entry: number; stop: number; tp: number;

@@ -207,7 +207,7 @@ export async function lotStepOf(adapter: ExchangeAdapter, symbol: string): Promi
     m = bare[0];
   }
   if (m === undefined) {
-    throw new PerpError("SYMBOL_NOT_FOUND", `${adapter.name}: market ${symbol} not found — lot step unknown`, { exchange: adapter.name });
+    throw new PerpError("SYMBOL_NOT_FOUND", `${adapter.name}: market ${symbol} not found — lot step unknown`, { exchange: adapter.name, remediation: `List markets: perp -e ${adapter.name} market list` });
   }
   if (m.stepSize !== null) return m.stepSize;
   if (m.sizeDecimals !== null && Number.isInteger(m.sizeDecimals) && m.sizeDecimals >= 0) {

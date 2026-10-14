@@ -138,6 +138,17 @@ export function strOrNull(v: string | undefined | null): string | null {
   return v === undefined || v === null || v === "" ? null : v;
 }
 
+/**
+ * A price field that the venue zeroes when it has no value: /v1/perps/contracts reports
+ * indexPrice "0" (and lastPrice "0") on disabled contracts (live 2026-10-14: ADBE, BE, CELH, IBM,
+ * NOK, OKLO, RDDT, SHEIN, SMCI, IBB, VXX, EURUSD — all `disabled: true`). A price is never 0, so
+ * "0" means "no index" → null (unknown), never $0.00. Volume / OI zeros stay: 0 is a real amount.
+ */
+export function priceOrNull(v: string | undefined | null): string | null {
+  const s = strOrNull(v);
+  return s === null || Number(s) === 0 ? null : s;
+}
+
 export function parseOndoTime(iso: string, what: string): number {
   const t = Date.parse(iso);
   if (!Number.isFinite(t)) throw new PerpError("EXCHANGE_ERROR", `Ondo Perps: invalid ${what} timestamp "${iso}"`);
@@ -247,7 +258,7 @@ async function fetchMarkets(net: Network): Promise<VenueMarket[]> {
       settle: "USDC",
       quoteAsset: pair.pair.quote,
       markPrice: mark.markPrice,
-      indexPrice: strOrNull(contract.indexPrice),
+      indexPrice: priceOrNull(contract.indexPrice),
       fundingRate: strOrNull(contract.fundingRate),
       fundingRateBasis: ONDO_FUNDING_BASIS,
       settlementIntervalHours: ONDO_SETTLEMENT_HOURS,

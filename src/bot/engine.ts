@@ -234,7 +234,7 @@ export async function runBot(
   if (mode === "tui") {
     try {
       const { startDashboard } = await import("./tui/index.js");
-      const initialTuiState = buildTuiState(state, config, { price: 0, volatility24h: 0, fundingRate: 0, volume24h: 0 }, [], [], strategyCtx);
+      const initialTuiState = buildTuiState(state, config, { price: 0, volatility24h: 0, fundingRate: 0, volume24h: 0, openInterest: null }, [], [], strategyCtx);
       const result = startDashboard({
         initialState: initialTuiState,
         onQuit: () => { running = false; state.phase = "stopped"; },
@@ -918,7 +918,7 @@ export { filledOf };
  * read): the empty arrays in `snapshot` then are NOT data — the engine skips the tick of a
  * strategy that reads them (MARKET_DATA_STRATEGIES).
  */
-async function getEnrichedSnapshot(
+export async function getEnrichedSnapshot(
   adapter: ExchangeAdapter,
   symbol: string,
   log: BotLog,
@@ -929,7 +929,7 @@ async function getEnrichedSnapshot(
       snapshot: {
         price: 0, high24h: 0, low24h: 0, volume24h: 0,
         fundingRate: 0, volatility24h: 0, rsi: NaN, spreadPct: 0,
-        klines: [], orderbook: { bids: [], asks: [] }, openInterest: "0",
+        klines: [], orderbook: { bids: [], asks: [] }, openInterest: null,
       },
       unknown: null,
     };
@@ -942,7 +942,8 @@ async function getEnrichedSnapshot(
     adapter.getKlines(symbol, "1h", Date.now() - 24 * 60 * 60 * 1000, Date.now()).catch(why("klines")),
   ]);
   return {
-    snapshot: { ...base, klines: klines ?? [], orderbook: orderbook ?? { bids: [], asks: [] }, openInterest: "0" },
+    // Open interest is not read for the bot snapshot: null (unknown), never a "0" stand-in.
+    snapshot: { ...base, klines: klines ?? [], orderbook: orderbook ?? { bids: [], asks: [] }, openInterest: null },
     unknown: failed.length > 0 ? failed.join("; ") : null,
   };
 }
@@ -1127,7 +1128,7 @@ export async function fetchOpenOrders(adapter: ExchangeAdapter, symbol: string):
 function buildTuiState(
   state: BotState,
   config: BotConfig,
-  snapshot: { price: number; volatility24h: number; fundingRate: number; volume24h: number; openInterest?: string },
+  snapshot: { price: number; volatility24h: number; fundingRate: number; volume24h: number; openInterest: string | null },
   positions: import("./tui/index.js").Position[],
   openOrders: import("./tui/index.js").OpenOrder[],
   strategyCtx: StrategyContext,
@@ -1161,7 +1162,7 @@ function buildTuiState(
     exchange: config.exchange,
     price: snapshot.price,
     volume24h: snapshot.volume24h ?? 0,
-    openInterest: snapshot.openInterest ?? "0",
+    openInterest: snapshot.openInterest,
     fundingRate: snapshot.fundingRate,
     volatility24h: snapshot.volatility24h,
     positions,

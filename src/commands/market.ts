@@ -1,6 +1,7 @@
 import { Command } from "commander";
 import type { ExchangeAdapter } from "../exchanges/index.js";
-import { makeTable, formatUsd, formatPercent, printJson, jsonOk, jsonError, withJsonErrors } from "../utils.js";
+import { tapeSkippedOf } from "../exchanges/interface.js";
+import { makeTable, formatUsd, formatPercent, printJson, jsonOk, jsonError, withJsonErrors, normalizeSymbolArg } from "../utils.js";
 import chalk from "chalk";
 import { PerpError } from "../errors.js";
 import { midDecimal } from "../exchanges/precision.js";
@@ -13,6 +14,23 @@ const EXCHANGES = listVenuesWithRole("account").map(v => v.id);
 
 /** null = venue does not publish the value → "-" (never rendered as $0). */
 const usdOrDash = (v: string | null): string => (v === null ? chalk.gray("-") : `$${formatUsd(v)}`);
+
+/** Base asset of a market symbol: "BTC-PERP" → "BTC", "xyz:XYZ100" → "XYZ100". */
+const baseAssetOf = (symbol: string): string => (symbol.split(":").pop() as string).replace(/-PERP$/i, "");
+
+/**
+ * Open interest is published in BASE-asset units by every venue (ExchangeMarketInfo.openInterest),
+ * so it is shown as "<n> <BASE>" — never with a "$". `withUsd` adds the notional at the mark
+ * price, labelled as such; null (not published) → "-".
+ */
+function formatOpenInterest(m: { symbol: string; markPrice: string; openInterest: string | null }, withUsd: boolean): string {
+  if (m.openInterest === null) return chalk.gray("-");
+  const oi = Number(m.openInterest);
+  const base = `${Number.isFinite(oi) ? oi.toLocaleString("en-US", { maximumFractionDigits: 4 }) : m.openInterest} ${baseAssetOf(m.symbol)}`;
+  const mark = Number(m.markPrice);
+  if (!withUsd || !Number.isFinite(oi) || !(mark > 0)) return base;
+  return `${base} ${chalk.gray(`(≈ $${formatUsd(oi * mark)} at mark)`)}`;
+}
 
 export function registerMarketCommands(
   program: Command,
@@ -40,14 +58,14 @@ export function registerMarketCommands(
     .action(async (opts: { hip3?: boolean }) => {
       const explicitExchange = program.getOptionValueSource?.("exchange") === "cli";
 
-      const HEADERS = ["Symbol", "Mark", "Index", "Funding", "24h Vol", "OI", "Max Lev"];
+      const HEADERS = ["Symbol", "Mark", "Index", "Funding", "24h Vol", "OI (base)", "Max Lev"];
       const marketRow = (m: { symbol: string; markPrice: string; indexPrice: string | null; fundingRate: string | null; volume24h: string | null; openInterest: string | null; maxLeverage: number | null }) => [
         chalk.white.bold(m.symbol),
         `$${formatUsd(m.markPrice)}`,
         usdOrDash(m.indexPrice),
         m.fundingRate != null ? formatPercent(m.fundingRate) : chalk.gray("N/A"),
         usdOrDash(m.volume24h),
-        usdOrDash(m.openInterest),
+        formatOpenInterest(m, false),
         m.maxLeverage === null ? chalk.gray("-") : String(m.maxLeverage) + "x",
       ];
 
@@ -199,9 +217,16 @@ export function registerMarketCommands(
         }
       );
       if (!m) {
-        if (isJson()) return printJson(jsonError("SYMBOL_NOT_FOUND", `Market ${sym} not found`));
-        console.log(chalk.red(`\n  Market "${sym}" not found.\n`));
-        return process.exit(1);
+        // Printed (envelope / Error + Remediation) and exit 1 via withJsonErrors.
+        return void await withJsonErrors(isJson(), async () => {
+          const delisted = typeof (adapter as { delistedMessage?: unknown }).delistedMessage === "function"
+            ? (adapter as unknown as { delistedMessage(s: string): string | null }).delistedMessage(symbol)
+            : null;
+          throw new PerpError("SYMBOL_NOT_FOUND", delisted ?? `Market ${normalizeSymbolArg(symbol)} not found on ${adapter.name}`, {
+            exchange: adapter.name,
+            remediation: `List markets: perp -e ${adapter.name} market list`,
+          });
+        });
       }
       if (isJson()) return printJson(jsonOk(m));
 
@@ -210,7 +235,7 @@ export function registerMarketCommands(
       console.log(`  Index Price:    ${usdOrDash(m.indexPrice)}`);
       console.log(`  Funding Rate:   ${m.fundingRate != null ? formatPercent(m.fundingRate) : chalk.gray("N/A")}`);
       console.log(`  24h Volume:     ${usdOrDash(m.volume24h)}`);
-      console.log(`  Open Interest:  ${usdOrDash(m.openInterest)}`);
+      console.log(`  Open Interest:  ${formatOpenInterest(m, true)}`);
       console.log(`  Max Leverage:   ${m.maxLeverage === null ? chalk.gray("-") : `${m.maxLeverage}x`}`);
       console.log();
     });
@@ -221,7 +246,8 @@ export function registerMarketCommands(
     .option("-d, --depth <n>", "Number of levels", "10")
     .action(async (symbol: string, opts: { depth: string }) => {
       const adapter = await getAdapter();
-      const book = await adapter.getOrderbook(symbol.toUpperCase());
+      const sym = normalizeSymbolArg(symbol);
+      const book = await adapter.getOrderbook(sym);
       if (isJson()) return printJson(jsonOk(book));
 
       const depth = parseInt(opts.depth);
@@ -247,7 +273,7 @@ export function registerMarketCommands(
         return "█".repeat(len);
       };
 
-      console.log(chalk.cyan.bold(`\n  Orderbook: ${symbol.toUpperCase()} (${adapter.name})\n`));
+      console.log(chalk.cyan.bold(`\n  Orderbook: ${sym} (${adapter.name})\n`));
       console.log(chalk.gray("  Price          Size          Cum$              Depth"));
       console.log(chalk.gray("  " + "─".repeat(60)));
       asks.forEach(([p, a], i) => {
@@ -278,8 +304,10 @@ export function registerMarketCommands(
     .option("--limit <n>", "Number of recent trades to show", "20")
     .action(async (symbol: string, opts: { limit: string }) => {
       const adapter = await getAdapter();
-      const trades = await adapter.getRecentTrades(symbol.toUpperCase(), parseInt(opts.limit));
-      if (isJson()) return printJson(jsonOk(trades));
+      const trades = await adapter.getRecentTrades(normalizeSymbolArg(symbol), parseInt(opts.limit));
+      const skipped = tapeSkippedOf(trades);
+      if (isJson()) return printJson(jsonOk(trades, skipped !== null ? { skippedRows: skipped } : undefined));
+      if (skipped !== null) console.log(chalk.yellow(`  ${skipped.count} tape row(s) skipped: ${skipped.reason}`));
       if (trades.length === 0) {
         console.log(chalk.gray("\n  No recent trades.\n"));
         return;
@@ -299,7 +327,7 @@ export function registerMarketCommands(
     .option("-l, --limit <n>", "Number of records", "10")
     .action(async (symbol: string, opts: { limit: string }) => {
       const adapter = await getAdapter();
-      const history = await adapter.getFundingHistory(symbol.toUpperCase(), parseInt(opts.limit));
+      const history = await adapter.getFundingHistory(normalizeSymbolArg(symbol), parseInt(opts.limit));
       if (isJson()) return printJson(jsonOk(history));
       if (history.length === 0) {
         console.log(chalk.gray("\n  No funding history.\n"));
@@ -323,7 +351,7 @@ export function registerMarketCommands(
     .command("mid <symbol>")
     .description("Get mid price for a single symbol (fast)")
     .action(async (symbol: string) => {
-      const sym = symbol.toUpperCase();
+      const sym = normalizeSymbolArg(symbol);
       // withJsonErrors: every failure (incl. an empty book) is an error envelope AND exit code 1.
       await withJsonErrors(isJson(), async () => {
         const adapter = await getAdapter();
@@ -382,20 +410,21 @@ export function registerMarketCommands(
         const startTime = opts.start ? parseInt(opts.start) : now - 24 * 60 * 60 * 1000;
         const endTime = opts.end ? parseInt(opts.end) : now;
 
-        const klines = await adapter.getKlines(symbol.toUpperCase(), interval, startTime, endTime);
+        const klines = await adapter.getKlines(normalizeSymbolArg(symbol), interval, startTime, endTime);
         if (isJson()) return printJson(jsonOk(klines));
         if (klines.length === 0) {
           console.log(chalk.gray("\n  No kline data.\n"));
           return;
         }
+        // ISO (UTC) candle open times — one format for every venue, independent of the host locale.
         const rows = klines.slice(-20).map((k) => [
-          new Date(k.time).toLocaleString(),
+          new Date(k.time).toISOString(),
           `$${formatUsd(k.open)}`,
           `$${formatUsd(k.high)}`,
           `$${formatUsd(k.low)}`,
           `$${formatUsd(k.close)}`,
-          k.volume,
-          String(k.trades),
+          k.volume === null ? chalk.gray("-") : k.volume,
+          k.trades === null ? chalk.gray("-") : String(k.trades),
         ]);
         console.log(makeTable(["Time", "Open", "High", "Low", "Close", "Volume", "Trades"], rows));
       }

@@ -1,3 +1,5 @@
+import { nonEmptyOrListed, symbolNotFound } from "./unknown-symbol.js";
+import { withTapeSkipped } from "./interface.js";
 import { Keypair } from "@solana/web3.js";
 import { PacificaClient, type Network } from "../pacifica/index.js";
 import type {
@@ -7,6 +9,7 @@ import type {
   ExchangeOrder,
   ExchangeBalance,
   ExchangeTrade,
+  ExchangePublicTrade,
   ExchangeFundingPayment,
   ExchangeKline,
 } from "./interface.js";
@@ -393,6 +396,17 @@ export function isPacificaStopType(type: string): boolean {
 const PACIFICA_FILL_BUY_SIDES: ReadonlySet<string> = new Set(["open_long", "close_short", "bid"]);
 const PACIFICA_FILL_SELL_SIDES: ReadonlySet<string> = new Set(["open_short", "close_long", "ask"]);
 
+/**
+ * Trade direction of a Pacifica fill `side` (position effect): open_long / close_short buy,
+ * open_short / close_long sell; bid / ask for rows that carry an order side. Anything else →
+ * EXCHANGE_ERROR (never a guessed direction). Used by the public tape and the account fills.
+ */
+export function pacificaFillSide(side: string, endpoint: string): "buy" | "sell" {
+  if (PACIFICA_FILL_BUY_SIDES.has(side)) return "buy";
+  if (PACIFICA_FILL_SELL_SIDES.has(side)) return "sell";
+  throw new PerpError("EXCHANGE_ERROR", `Pacifica ${endpoint} row with unknown side "${side}"`, { exchange: "pacifica" });
+}
+
 /** `created_at` (ms) of a Pacifica history row; non-numeric → EXCHANGE_ERROR (never NaN). */
 function pacificaTime(row: Record<string, unknown>, endpoint: string): number {
   const t = Number(pacificaField(row, "created_at", endpoint));
@@ -662,7 +676,11 @@ export class PacificaAdapter implements ExchangeAdapter {
   }
 
   async getOrderbook(symbol: string) {
-    const book = await this.client.getBook(symbol);
+    const book = await this.client.getBook(symbol).catch((e: unknown) => {
+      // GET /book for an unlisted symbol: HTTP 400 {"error":"Book not found: NOPE"} (live 2026-10-14).
+      if (e instanceof Error && /^GET \/book failed \(400\):.*Book not found/.test(e.message)) throw symbolNotFound("pacifica", symbol);
+      throw e;
+    });
     return {
       bids: book.l[0].map((e) => [e.p, e.a] as [string, string]),
       asks: book.l[1].map((e) => [e.p, e.a] as [string, string]),
@@ -1444,34 +1462,62 @@ export class PacificaAdapter implements ExchangeAdapter {
       .catch((e: unknown) => { throw pacificaWithdrawRejection(e, amount); });
   }
 
-  async getRecentTrades(symbol: string, _limit = 20): Promise<ExchangeTrade[]> {
-    const trades = await this.client.getTrades(symbol);
-    // Deduplicate by time+price+size+side (API sometimes returns duplicate entries)
-    const seen = new Set<string>();
-    const unique = trades.filter((t) => {
-      const key = `${t.created_at}:${t.price}:${t.amount}:${t.side}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-    return unique.slice(0, _limit).map((t) => ({
-      time: Number(t.created_at ?? 0),
-      symbol,
-      side: t.side === "bid" ? "buy" as const : "sell" as const,
-      price: t.price,
-      size: t.amount,
-      fee: String((t as unknown as Record<string, unknown>).fee ?? "0"),
-    }));
+  /**
+   * Public tape (GET /trades). Every fill is listed TWICE — a `fulfill_taker` row and a
+   * `fulfill_maker` row, each with that party's position effect as `side` (live 2026-10-14:
+   * taker `open_short` paired with maker `close_short` at the same time / price / amount). The
+   * tape is the taker rows, with the taker's direction: open_long / close_short buy, open_short /
+   * close_long sell (the same mapping as the account fills, PACIFICA_FILL_*_SIDES). Was every row
+   * of both parties mapped through `side === "bid"` → all "sell". No de-duplication: two taker
+   * rows with equal time / price / amount are two fills (one order filling two makers).
+   */
+  async getRecentTrades(symbol: string, _limit = 20): Promise<ExchangePublicTrade[]> {
+    const trades = await this.client.getTrades(symbol) as unknown as Array<Record<string, unknown>>;
+    if (!Array.isArray(trades)) {
+      throw new PerpError("EXCHANGE_ERROR", `Pacifica /trades returned no trade list (${JSON.stringify(trades).slice(0, 120)})`, { exchange: "pacifica" });
+    }
+    // The docs list event_type fulfill_taker / fulfill_maker and side open_long / open_short /
+    // close_long / close_short without declaring the sets closed: a row with any other value is
+    // skipped (stderr warning + meta.skippedRows), never given a guessed direction, and does not
+    // fail the rest of the tape.
+    const skippedWhy: string[] = [];
+    const rows: ExchangePublicTrade[] = [];
+    for (const t of trades) {
+      const ev = pacificaField(t, "event_type", "/trades");
+      if (ev === "fulfill_maker") continue;
+      if (ev !== "fulfill_taker") { skippedWhy.push(`undocumented event_type "${ev}"`); continue; }
+      const side = pacificaField(t, "side", "/trades");
+      if (!PACIFICA_FILL_BUY_SIDES.has(side) && !PACIFICA_FILL_SELL_SIDES.has(side)) { skippedWhy.push(`undocumented side "${side}"`); continue; }
+      if (rows.length >= _limit) continue;
+      rows.push({
+        time: pacificaTime(t, "/trades"),
+        symbol,
+        side: pacificaFillSide(side, "/trades"),
+        price: pacificaField(t, "price", "/trades"),
+        size: pacificaField(t, "amount", "/trades"),
+        fee: null, // the public tape carries no fee
+      });
+    }
+    const skipped = skippedWhy.length === 0 ? null : { count: skippedWhy.length, reason: [...new Set(skippedWhy)].join(", ") };
+    if (skipped !== null) process.stderr.write(`[pacifica] /trades: skipped ${skipped.count} row(s) — ${skipped.reason}\n`);
+    return withTapeSkipped(await nonEmptyOrListed(this, symbol, rows), skipped);
   }
 
   async getFundingHistory(symbol: string, limit = 10): Promise<{ time: number; rate: string; price: string | null }[]> {
-    const result = await this.client.getFundingHistory(symbol, { limit });
-    const data = ((result as Record<string, unknown>).data ?? result) as Record<string, unknown>[];
-    if (!Array.isArray(data)) return [];
-    return data.map((h) => ({
-      time: Number(h.created_at ?? 0),
-      rate: venueRateField(h.funding_rate, "funding history funding_rate", "pacifica"),
-      price: String(h.oracle_price ?? "0"),
+    // The client unwraps the {success, data} envelope: the answer is the row list itself.
+    const data = await this.client.getFundingHistory(symbol, { limit });
+    if (!Array.isArray(data)) {
+      throw new PerpError("EXCHANGE_ERROR", `Pacifica /funding_rate/history returned no row list (${JSON.stringify(data).slice(0, 120)})`, { exchange: "pacifica" });
+    }
+    // `200 []` for an unlisted symbol (live): checked against the market directory.
+    return nonEmptyOrListed(this, symbol, (data as Array<Record<string, unknown>>).map((h) => {
+      const oracle = h.oracle_price;
+      return {
+        time: pacificaTime(h, "/funding_rate/history"),
+        rate: venueRateField(h.funding_rate, "funding history funding_rate", "pacifica"),
+        // absent → null (unknown), never "0"
+        price: (typeof oracle === "string" && oracle !== "") || (typeof oracle === "number" && Number.isFinite(oracle)) ? String(oracle) : null,
+      };
     }));
   }
 
@@ -1482,15 +1528,17 @@ export class PacificaAdapter implements ExchangeAdapter {
       startTime,
       endTime
     );
-    return klines.map((k) => ({
+    // `200 []` for an unlisted symbol (live): checked against the market directory.
+    return nonEmptyOrListed(this, symbol, klines.map((k) => ({
       time: k.t,
       open: k.o,
       high: k.h,
       low: k.l,
       close: k.c,
       volume: k.v,
+      quoteVolume: null, // /kline carries base volume only
       trades: k.n,
-    }));
+    })));
   }
 
   /**
@@ -1537,15 +1585,11 @@ export class PacificaAdapter implements ExchangeAdapter {
       throw new PerpError("EXCHANGE_ERROR", `Pacifica /trades/history returned no list (${JSON.stringify(rows).slice(0, 120)})`, { exchange: "pacifica" });
     }
     return (rows as Array<Record<string, unknown>>).slice(0, limit).map((t) => {
-      const side = pacificaField(t, "side", "/trades/history");
-      const buy = PACIFICA_FILL_BUY_SIDES.has(side);
-      if (!buy && !PACIFICA_FILL_SELL_SIDES.has(side)) {
-        throw new PerpError("EXCHANGE_ERROR", `Pacifica /trades/history row with unknown side "${side}"`, { exchange: "pacifica" });
-      }
+      const side = pacificaFillSide(pacificaField(t, "side", "/trades/history"), "/trades/history");
       return {
         time: pacificaTime(t, "/trades/history"),
         symbol: pacificaField(t, "symbol", "/trades/history"),
-        side: buy ? "buy" as const : "sell" as const,
+        side,
         price: pacificaField(t, "price", "/trades/history"),
         size: pacificaField(t, "amount", "/trades/history"),
         fee: pacificaField(t, "fee", "/trades/history"),

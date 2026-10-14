@@ -32,6 +32,21 @@ export function calculateSMA(prices: number[], period: number): number[] {
 }
 
 /** Calculate Volume Weighted Average Price */
+/**
+ * Candle volumes as numbers, or null when ANY candle's volume is unknown — null (the venue does
+ * not publish it) or not a finite number ("", "undefined", NaN). Never a 0 stand-in.
+ */
+export function klineVolumes(klines: ReadonlyArray<{ volume: string | null }>): number[] | null {
+  const out: number[] = [];
+  for (const k of klines) {
+    if (k.volume === null || k.volume.trim() === "") return null;
+    const v = Number(k.volume);
+    if (!Number.isFinite(v)) return null;
+    out.push(v);
+  }
+  return out;
+}
+
 export function calculateVWAP(candles: { close: number; volume: number }[]): number {
   let cumVolPrice = 0;
   let cumVol = 0;

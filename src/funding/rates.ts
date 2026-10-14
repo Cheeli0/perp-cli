@@ -170,7 +170,7 @@ const _warnedPriceMismatch = new Set<string>();
  * venue whose mark price deviates more than MAX_PRICE_DEVIATION_PCT from the
  * group median, with a one-time stderr warning per (symbol, venue).
  */
-function dropPriceOutliers(canonical: string, list: ExchangeFundingRate[]): ExchangeFundingRate[] {
+function dropPriceOutliers<T extends { exchange: VenueId; markPrice: number }>(canonical: string, list: T[], tag = "funding"): T[] {
   if (list.length < 2) return list;
   const sorted = list.map(r => r.markPrice).sort((x, y) => x - y);
   const mid = sorted.length % 2 === 1
@@ -183,14 +183,14 @@ function dropPriceOutliers(canonical: string, list: ExchangeFundingRate[]): Exch
     const key = `${canonical}:${r.exchange}`;
     if (!_warnedPriceMismatch.has(key)) {
       _warnedPriceMismatch.add(key);
-      process.stderr.write(`[funding] excluded ${r.exchange} ${canonical}: mark ${r.markPrice} deviates ${devPct.toFixed(1)}% from cross-venue median ${mid} (likely a different asset with the same ticker)\n`);
+      process.stderr.write(`[${tag}] excluded ${r.exchange} ${canonical}: mark ${r.markPrice} deviates ${devPct.toFixed(1)}% from cross-venue median ${mid} (likely a different asset with the same ticker)\n`);
     }
     return false;
   });
 }
 
-function groupByCanonical(rates: ExchangeFundingRate[], symbols: string[] | undefined): Map<string, ExchangeFundingRate[]> {
-  const out = new Map<string, ExchangeFundingRate[]>();
+function groupByCanonical<T extends { exchange: VenueId; canonical: string; markPrice: number }>(rates: T[], symbols: string[] | undefined, tag = "funding"): Map<string, T[]> {
+  const out = new Map<string, T[]>();
   for (const r of rates) {
     if (symbols && !symbols.includes(r.canonical)) continue;
     const list = out.get(r.canonical);
@@ -198,11 +198,61 @@ function groupByCanonical(rates: ExchangeFundingRate[], symbols: string[] | unde
     else out.set(r.canonical, [r]);
   }
   for (const [canonical, list] of [...out]) {
-    const kept = dropPriceOutliers(canonical, list);
+    const kept = dropPriceOutliers(canonical, list, tag);
     if (kept.length === 0) out.delete(canonical); // every venue disagreed — not comparable
     else out.set(canonical, kept);
   }
   return out;
+}
+
+// ── Price groups (basis) ──
+
+export interface VenuePrice {
+  exchange: VenueId;
+  /** Venue display symbol. */
+  symbol: string;
+  canonical: string;
+  markPrice: number;
+  apiStatus: "official" | "unofficial";
+}
+
+export interface PriceGroupSnapshot {
+  /** canonical → venue prices, after the median price-outlier drop (same guard as the funding scan). */
+  groups: Map<string, VenuePrice[]>;
+  exchangeStatus: Record<string, "ok" | "error">;
+  exchangeErrors: Record<string, string>;
+}
+
+/**
+ * Mark prices of `venues`, grouped by canonical symbol — the grouping and price-outlier guard of
+ * the funding comparison, WITHOUT any funding dependency: read from each venue's market directory
+ * (publicData.fetchMarkets), so a market with a null funding rate or a venue whose funding is
+ * unverified is still priced. Rows without a canonical symbol, not tradable, or without a
+ * positive mark are excluded. A venue that fails is reported in exchangeStatus / exchangeErrors.
+ */
+export async function fetchCanonicalPriceGroups(venues: VenueDefinition[], opts?: { symbols?: string[]; network?: Network; tag?: string }): Promise<PriceGroupSnapshot> {
+  ensureVenuesRegistered();
+  const net = opts?.network ?? sharedApiNetwork();
+  const settled = await Promise.allSettled(venues.map(v => v.publicData.fetchMarkets(net)));
+  const exchangeStatus: Record<string, "ok" | "error"> = {};
+  const exchangeErrors: Record<string, string> = {};
+  const prices: VenuePrice[] = [];
+  settled.forEach((res, i) => {
+    const def = venues[i];
+    if (res.status === "rejected") {
+      exchangeStatus[def.id] = "error";
+      exchangeErrors[def.id] = errorMessage(res.reason);
+      return;
+    }
+    exchangeStatus[def.id] = "ok";
+    for (const m of res.value) {
+      if (m.canonical === null || !m.tradable) continue;
+      const markPrice = Number(m.markPrice);
+      if (!Number.isFinite(markPrice) || markPrice <= 0) continue;
+      prices.push({ exchange: def.id, symbol: m.symbol, canonical: m.canonical, markPrice, apiStatus: def.apiStatus.kind });
+    }
+  });
+  return { groups: groupByCanonical(prices, opts?.symbols, opts?.tag ?? "prices"), exchangeStatus, exchangeErrors };
 }
 
 function bestMarkPrice(rates: ExchangeFundingRate[]): number {

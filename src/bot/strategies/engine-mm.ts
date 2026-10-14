@@ -1,6 +1,6 @@
 import type { Strategy, StrategyContext, StrategyAction, EnrichedSnapshot } from "../strategy-types.js";
 import { registerStrategy } from "../strategy-registry.js";
-import { calculateEMA, calculateVWAP, calculateATR } from "../indicators.js";
+import { calculateEMA, calculateVWAP, calculateATR, klineVolumes } from "../indicators.js";
 
 interface EngineMmConfig {
   baseSpread: number;   // basis points
@@ -122,11 +122,12 @@ export class EngineMmStrategy implements Strategy {
     // Mid-price (always available)
     components.push(snapshot.price);
 
-    // VWAP from klines
-    if (snapshot.klines.length > 0) {
-      const candles = snapshot.klines.map(k => ({
+    // VWAP from klines — only when every candle volume is known (unknown is never weighted as 0)
+    const volumes = klineVolumes(snapshot.klines);
+    if (snapshot.klines.length > 0 && volumes !== null) {
+      const candles = snapshot.klines.map((k, i) => ({
         close: parseFloat(k.close),
-        volume: parseFloat(k.volume),
+        volume: volumes[i],
       }));
       const vwap = calculateVWAP(candles);
       if (vwap > 0) components.push(vwap);

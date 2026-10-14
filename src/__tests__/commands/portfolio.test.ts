@@ -426,6 +426,12 @@ describe("Test 5: --health mode", () => {
     const exchangeKeys = Object.keys(health.exchanges as object);
     expect(exchangeKeys).toHaveLength(4);
     expect(typeof health.anyDown).toBe("boolean");
+    // Same probe detail as `perp health` / MCP health_check, one per venue.
+    expect((health.probes as Array<{ venue: string }>).map((p) => p.venue).sort()).toEqual([...exchangeKeys].sort());
+    // Connectivity only: nothing was read, so exchanges / totals / risk are unknown (null), not zero-filled.
+    expect(data.exchanges).toBeNull();
+    expect(data.totals).toBeNull();
+    expect(data.risk).toBeNull();
   });
 });
 

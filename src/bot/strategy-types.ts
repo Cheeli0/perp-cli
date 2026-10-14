@@ -11,7 +11,8 @@ import type { MarketSnapshot } from "./conditions.js";
 export interface EnrichedSnapshot extends MarketSnapshot {
   klines: ExchangeKline[];
   orderbook: { bids: [string, string][]; asks: [string, string][] };
-  openInterest: string;
+  /** Base-asset open interest; null = not read / not published (never "0" as a stand-in). */
+  openInterest: string | null;
 }
 
 // ── Actions a strategy can return ──

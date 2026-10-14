@@ -11,9 +11,13 @@ export interface ExchangeMarketInfo {
   /** null = venue does not publish an index/oracle price for this market */
   indexPrice: string | null;
   fundingRate: string | null;  // null = rate unavailable (don't assume 0)
-  /** null = venue does not publish 24h volume */
+  /** 24h volume in USD notional; null = venue does not publish 24h volume */
   volume24h: string | null;
-  /** null = venue does not publish open interest (never "0" as a stand-in) */
+  /**
+   * Open interest in BASE-asset units (contracts of the underlying, e.g. BTC) — every venue
+   * publishes it that way, so it is never a USD figure. null = venue does not publish it
+   * (never "0" as a stand-in).
+   */
   openInterest: string | null;
   /** null = the venue does not publish it (Aster: the public exchangeInfo carries no leverage) */
   maxLeverage: number | null;
@@ -96,6 +100,34 @@ export interface ExchangeTrade {
   fee: string;
 }
 
+/**
+ * A row of the PUBLIC trade tape (getRecentTrades). The tape carries no fee for the viewer —
+ * a fee exists only on the account's own fills (getTradeHistory) — so `fee` is always null
+ * here, never "0" as a stand-in.
+ */
+export interface ExchangePublicTrade extends Omit<ExchangeTrade, "fee"> {
+  fee: null;
+}
+
+/**
+ * Rows of a public tape the adapter left out because they carry a value the venue documents but
+ * does not declare exhaustive (e.g. a new Pacifica event_type) — never guessed into a direction.
+ * Attached to the returned array under this symbol key (not serialized); `market trades` reports
+ * it as `meta.skippedRows`. Absent = nothing skipped.
+ */
+export const TAPE_SKIPPED: unique symbol = Symbol.for("perp-cli.tapeSkipped");
+export interface TapeSkipped { count: number; reason: string }
+
+export function withTapeSkipped<T>(rows: T[], skipped: TapeSkipped | null): T[] {
+  if (skipped !== null && skipped.count > 0) Object.defineProperty(rows, TAPE_SKIPPED, { value: skipped, enumerable: false });
+  return rows;
+}
+
+export function tapeSkippedOf(rows: readonly unknown[]): TapeSkipped | null {
+  const v = (rows as unknown as { [TAPE_SKIPPED]?: TapeSkipped })[TAPE_SKIPPED];
+  return v === undefined ? null : v;
+}
+
 export interface ExchangeFundingPayment {
   time: number;       // unix ms
   symbol: string;
@@ -108,7 +140,10 @@ export interface ExchangeKline {
   high: string;
   low: string;
   close: string;
-  volume: string;
+  /** Base-asset volume of the candle; null = venue does not publish it (never "0" as a stand-in) */
+  volume: string | null;
+  /** Quote (USD) notional volume of the candle; null = venue does not publish it */
+  quoteVolume: string | null;
   /** null = venue does not publish a trade count for the candle */
   trades: number | null;
 }
@@ -124,7 +159,7 @@ export interface ExchangeAdapter {
   // ── Market Data ──
   getMarkets(): Promise<ExchangeMarketInfo[]>;
   getOrderbook(symbol: string): Promise<{ bids: [string, string][]; asks: [string, string][] }>;
-  getRecentTrades(symbol: string, limit?: number): Promise<ExchangeTrade[]>;
+  getRecentTrades(symbol: string, limit?: number): Promise<ExchangePublicTrade[]>;
   getFundingHistory(symbol: string, limit?: number): Promise<{ time: number; rate: string; price: string | null }[]>;
   getKlines(symbol: string, interval: string, startTime: number, endTime: number): Promise<ExchangeKline[]>;
 

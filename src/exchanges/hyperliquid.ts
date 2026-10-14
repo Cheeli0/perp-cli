@@ -5,6 +5,7 @@ import type {
   ExchangeOrder,
   ExchangeBalance,
   ExchangeTrade,
+  ExchangePublicTrade,
   ExchangeFundingPayment,
   ExchangeKline,
 } from "./interface.js";
@@ -716,7 +717,7 @@ export class HyperliquidAdapter implements ExchangeAdapter {
       // A dex-prefixed symbol must name THIS adapter's dex — never rewritten onto another dex.
       const [prefix, base] = sym.split(":");
       if (prefix.toLowerCase() !== this._dex.toLowerCase()) {
-        throw new PerpError("SYMBOL_NOT_FOUND", `Hyperliquid symbol ${symbol} is on dex "${prefix.toLowerCase()}", not ${this._dex ? `this adapter's dex "${this._dex}"` : "the native perp dex"}`, {
+        throw new PerpError("SYMBOL_NOT_FOUND", `Hyperliquid symbol ${prefix.toLowerCase()}:${base} is on dex "${prefix.toLowerCase()}", not ${this._dex ? `this adapter's dex "${this._dex}"` : "the native perp dex"}`, {
           exchange: "hyperliquid", remediation: `Select the dex: perp -e hyperliquid --dex ${prefix.toLowerCase()} ...`,
         });
       }
@@ -783,7 +784,15 @@ export class HyperliquidAdapter implements ExchangeAdapter {
       }
       return idx;
     }
-    throw new PerpError("SYMBOL_NOT_FOUND", `Unknown asset: ${symbol}`, { exchange: "hyperliquid" });
+    throw this._unknownSymbol(symbol, `Unknown asset: ${symbol}`);
+  }
+
+  /** SYMBOL_NOT_FOUND for a coin the venue does not list (on this adapter's dex), with the listing command. */
+  private _unknownSymbol(symbol: string, message?: string): PerpError {
+    return new PerpError("SYMBOL_NOT_FOUND", message ?? `Hyperliquid has no market ${symbol.toUpperCase()}${this._dex ? ` on dex "${this._dex}"` : ""}`, {
+      exchange: "hyperliquid",
+      remediation: `List markets: perp -e hyperliquid${this._dex ? ` --dex ${this._dex}` : ""} market list`,
+    });
   }
 
   async getMarkets(): Promise<ExchangeMarketInfo[]> {
@@ -841,11 +850,17 @@ export class HyperliquidAdapter implements ExchangeAdapter {
       });
     }
 
-    const result = universe.map((asset: Record<string, unknown>, i: number) => {
+    // Delisted assets (meta `isDelisted: true`; live 2026-10-14: 56 of 234 native perps, all with
+    // funding / dayNtlVlm / openInterest "0.0") are not markets: excluded from the listing and
+    // everything built on it. They stay in the asset map (_loadAssetMap), so an explicit symbol
+    // still resolves for orders / position reads.
+    const delisted = new Set<string>();
+    const result = universe.flatMap((asset: Record<string, unknown>, i: number) => {
+      if (asset.isDelisted === true) { delisted.add(String(asset.name)); return []; }
       const ctx = (ctxs[i] ?? {}) as Record<string, unknown>;
       const sym = String(asset.name);
       const szDec = this._szDecimalsMap.get(sym) ?? (asset.szDecimals !== undefined ? Number(asset.szDecimals) : null);
-      return {
+      return [{
         symbol: sym,
         markPrice: String(ctx.markPx ?? mids[sym] ?? "0"),
         indexPrice: ctx.oraclePx != null ? String(ctx.oraclePx) : null,
@@ -859,25 +874,44 @@ export class HyperliquidAdapter implements ExchangeAdapter {
         // HL funding is uniform (venue definition), not per-market.
         fundingHours: null,
         marginTiers: tierMap.get(Number(asset.marginTableId)) ?? null,
-      };
+      }];
     });
+    this._delisted = delisted;
     this._marketsCache = result; this._marketsCacheTime = Date.now(); return result;
+  }
+
+  /** Display names of the delisted assets seen by the last getMarkets() (meta isDelisted). */
+  private _delisted = new Set<string>();
+
+  /**
+   * Why `symbol` is not in getMarkets(): it is delisted (message), or null when it is not a
+   * delisted asset. Read after getMarkets(). `market info` uses it to say "delisted" rather than
+   * "not found" — the asset map still resolves it for orders / positions / history.
+   */
+  delistedMessage(symbol: string): string | null {
+    const resolved = this.resolveSymbol(symbol.toUpperCase());
+    if (!this._delisted.has(resolved)) return null;
+    return `${resolved.replace(/-PERP$/, "")} is delisted on Hyperliquid (positions / history still readable)`;
   }
 
   async getOrderbook(symbol: string) {
     let levels: Record<string, unknown>[][];
 
+    // l2Book answers `null` for a coin the venue does not list (live 2026-10-14, coin "NOPE"):
+    // SYMBOL_NOT_FOUND, never an empty book (which reads as "no liquidity").
     if (this._dex) {
       // HIP-3 dex: full dex-prefixed coin (e.g. "US500" → "km:US500") + dex param
       const book = await this._infoPost({
         type: "l2Book",
         coin: this._venueCoin(symbol),
         dex: this._dex,
-      }) as { levels?: Record<string, unknown>[][] };
-      levels = book?.levels ?? [[], []];
+      }) as { levels?: Record<string, unknown>[][] } | null;
+      if (book === null) throw this._unknownSymbol(symbol);
+      levels = book.levels ?? [[], []];
     } else {
-      const book = await this._infoPost({ type: "l2Book", coin: this._venueCoin(symbol) }) as { levels?: Record<string, unknown>[][] };
-      levels = book?.levels ?? [[], []];
+      const book = await this._infoPost({ type: "l2Book", coin: this._venueCoin(symbol) }) as { levels?: Record<string, unknown>[][] } | null;
+      if (book === null) throw this._unknownSymbol(symbol);
+      levels = book.levels ?? [[], []];
     }
 
     return {
@@ -1876,9 +1910,13 @@ export class HyperliquidAdapter implements ExchangeAdapter {
     });
   }
 
-  async getRecentTrades(symbol: string, limit = 20): Promise<ExchangeTrade[]> {
-    const trades = await this._infoPost({ type: "recentTrades", coin: this._venueCoin(symbol) }) as Record<string, unknown>[];
-    return (trades ?? [])
+  async getRecentTrades(symbol: string, limit = 20): Promise<ExchangePublicTrade[]> {
+    // recentTrades answers HTTP 500 "null" for an unlisted coin (live 2026-10-14), which would read
+    // as a retryable venue error: resolve the coin against the asset map first (SYMBOL_NOT_FOUND).
+    await this.getAssetIndex(symbol);
+    const trades = await this._infoPost({ type: "recentTrades", coin: this._venueCoin(symbol) }) as Record<string, unknown>[] | null;
+    if (trades === null) throw this._unknownSymbol(symbol);
+    return trades
       .slice(0, limit)
       .map((t) => ({
         time: Number(t.time ?? 0),
@@ -1886,11 +1924,12 @@ export class HyperliquidAdapter implements ExchangeAdapter {
         side: String(t.side) === "B" ? "buy" as const : "sell" as const,
         price: String(t.px ?? "0"),
         size: String(t.sz ?? ""),
-        fee: "0",
+        fee: null, // the public tape carries no fee
       }));
   }
 
   async getKlines(symbol: string, interval: string, startTime: number, endTime: number): Promise<ExchangeKline[]> {
+    await this.getAssetIndex(symbol); // unlisted coin: SYMBOL_NOT_FOUND (candleSnapshot answers HTTP 500 "null")
     const candles = await this._infoPost({
       type: "candleSnapshot",
       req: { coin: this._venueCoin(symbol), interval, startTime, endTime },
@@ -1901,7 +1940,10 @@ export class HyperliquidAdapter implements ExchangeAdapter {
       high: String(c.h ?? "0"),
       low: String(c.l ?? "0"),
       close: String(c.c ?? "0"),
-      volume: String(c.v ?? ""),
+      // absent / non-numeric → null (never "")
+      volume: typeof c.v === "string" && c.v.trim() !== "" && Number.isFinite(Number(c.v)) ? c.v
+        : typeof c.v === "number" && Number.isFinite(c.v) ? String(c.v) : null,
+      quoteVolume: null, // candleSnapshot carries base volume only
       trades: Number(c.n ?? 0),
     }));
   }
@@ -2049,6 +2091,7 @@ export class HyperliquidAdapter implements ExchangeAdapter {
   }
 
   async getFundingHistory(symbol: string, limit = 10): Promise<{ time: number; rate: string; price: string | null }[]> {
+    await this.getAssetIndex(symbol); // unlisted coin: SYMBOL_NOT_FOUND (fundingHistory answers HTTP 500)
     const now = Date.now();
     const history = await this._infoPost({ type: "fundingHistory", coin: this._venueCoin(symbol), startTime: now - 24 * 60 * 60 * 1000 }) as Record<string, unknown>[];
     return (history ?? []).slice(-limit).map((h) => ({

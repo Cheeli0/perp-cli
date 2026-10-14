@@ -19,6 +19,7 @@
  * Base: https://fapi.asterdex.com
  */
 
+import { nonEmptyOrListed } from "./unknown-symbol.js";
 import { accountCacheEpoch } from "../cache.js";
 import type {
   ExchangeAdapter,
@@ -27,6 +28,7 @@ import type {
   ExchangeOrder,
   ExchangeBalance,
   ExchangeTrade,
+  ExchangePublicTrade,
   ExchangeFundingPayment,
   ExchangeKline,
 } from "./interface.js";
@@ -101,6 +103,16 @@ export function asterIocOutcome(raw: unknown): { filledSize: string; final: true
   if (tif !== null && tif !== "IOC" && type !== "MARKET") return null;
   const filledSize = plainQty(r.executedQty);
   return filledSize === null ? null : { filledSize, final: true };
+}
+
+/** The numeric `code` of an Aster error body ({"code":-1121,"msg":"Invalid symbol."}); null when absent. */
+function asterErrorCode(body: string): number | null {
+  try {
+    const j = JSON.parse(body) as { code?: unknown };
+    return typeof j.code === "number" ? j.code : null;
+  } catch {
+    return null; // not JSON (e.g. an HTML error page): no venue code
+  }
 }
 
 /**
@@ -550,7 +562,7 @@ export class AsterAdapter implements ExchangeAdapter {
       this._ingestPriceFilters(info.symbols);
     }
     if (!this._priceFilters.has(apiSymbol)) {
-      throw new PerpError("SYMBOL_NOT_FOUND", `Aster market ${apiSymbol} not found in exchangeInfo`, { exchange: "aster" });
+      throw new PerpError("SYMBOL_NOT_FOUND", `Aster market ${apiSymbol} not found in exchangeInfo`, { exchange: "aster", remediation: "List markets: perp -e aster market list" });
     }
     const f = this._priceFilters.get(apiSymbol);
     if (!f) {
@@ -635,7 +647,7 @@ export class AsterAdapter implements ExchangeAdapter {
     };
   }
 
-  async getRecentTrades(symbol: string, limit = 20): Promise<ExchangeTrade[]> {
+  async getRecentTrades(symbol: string, limit = 20): Promise<ExchangePublicTrade[]> {
     const trades = await this._publicGet("/fapi/v3/trades", {
       symbol: this._toApi(symbol),
       limit: String(limit),
@@ -647,7 +659,7 @@ export class AsterAdapter implements ExchangeAdapter {
       side: t.isBuyerMaker ? "sell" as const : "buy" as const,
       price: String(t.price ?? "0"),
       size: String(t.qty ?? "0"),
-      fee: "0",
+      fee: null, // the public tape carries no fee
     }));
   }
 
@@ -659,7 +671,8 @@ export class AsterAdapter implements ExchangeAdapter {
     if (!Array.isArray(data)) {
       throw new PerpError("EXCHANGE_ERROR", `Aster fundingRate history is not a list (${JSON.stringify(data).slice(0, 120)})`, { exchange: "aster" });
     }
-    return (data as Array<Record<string, unknown>>).map((d) => {
+    // `200 []` for an unlisted symbol (live 2026-10-14): checked against the market directory.
+    return nonEmptyOrListed(this, symbol, (data as Array<Record<string, unknown>>).map((d) => {
       const time = Number(d.fundingTime);
       if (d.fundingTime === undefined || d.fundingTime === null || !Number.isFinite(time) || time <= 0) {
         throw new PerpError("EXCHANGE_ERROR", `Aster fundingRate row without a numeric fundingTime: ${JSON.stringify(d).slice(0, 160)}`, { exchange: "aster" });
@@ -669,7 +682,7 @@ export class AsterAdapter implements ExchangeAdapter {
         rate: venueRateField(d.fundingRate, "fundingRate fundingRate", "aster"),
         price: d.markPrice ? String(d.markPrice) : null,
       };
-    });
+    }), this._fromApi(this._toApi(symbol)));
   }
 
   /**
@@ -701,10 +714,11 @@ export class AsterAdapter implements ExchangeAdapter {
       for (const k of data as unknown[][]) {
         const time = Number(k[0]);
         const trades = Number(k[8]);
-        if (!Number.isFinite(time) || !Number.isFinite(trades)) {
-          throw new PerpError("EXCHANGE_ERROR", `Aster kline row without open time / trade count: ${JSON.stringify(k).slice(0, 120)}`, { exchange: "aster" });
+        const numeric = (v: unknown) => (typeof v === "string" || typeof v === "number") && String(v).trim() !== "" && Number.isFinite(Number(v));
+        if (!Number.isFinite(time) || !Number.isFinite(trades) || !numeric(k[5]) || !numeric(k[7])) {
+          throw new PerpError("EXCHANGE_ERROR", `Aster kline row without open time / volume / quote volume / trade count: ${JSON.stringify(k).slice(0, 120)}`, { exchange: "aster" });
         }
-        out.push({ time, open: String(k[1]), high: String(k[2]), low: String(k[3]), close: String(k[4]), volume: String(k[5]), trades });
+        out.push({ time, open: String(k[1]), high: String(k[2]), low: String(k[3]), close: String(k[4]), volume: String(k[5]), quoteVolume: String(k[7]), trades });
       }
       if (data.length < ASTER_KLINE_PAGE) break;
       const next = Number((data[data.length - 1] as unknown[])[0]) + 1;
@@ -1938,6 +1952,11 @@ export class AsterAdapter implements ExchangeAdapter {
     if (!res.ok) {
       const text = await res.text();
       const clean = text.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 120);
+      // -1121 BAD_SYMBOL ("Invalid symbol.", live on /fapi/v3/depth for an unlisted symbol): the
+      // symbol does not exist — SYMBOL_NOT_FOUND, not an UNKNOWN 500.
+      if (asterErrorCode(text) === -1121) {
+        throw new PerpError("SYMBOL_NOT_FOUND", `Aster: ${clean} [${method} ${path}]`, { exchange: "aster", remediation: "List markets: perp -e aster market list" });
+      }
       throw new Error(`${method} ${path} failed (${res.status}): ${clean}`);
     }
     return res.json();
