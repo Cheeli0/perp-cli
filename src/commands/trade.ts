@@ -1,7 +1,7 @@
 import { Command } from "commander";
 import { networkOf, supportsDryRun } from "../cli-flags.js";
 import type { ExchangeAdapter, ExchangePosition } from "../exchanges/index.js";
-import { printJson, errorAndExit, withJsonErrors, jsonOk, jsonError, symbolMatch, formatUsd, formatOrderResult, orderResultJson } from "../utils.js";
+import { printJson, errorAndExit, withJsonErrors, jsonOk, jsonError, symbolMatch, formatUsd, formatOrderResult, orderResultJson, normalizeSymbolArg } from "../utils.js";
 import { ERROR_CODES, extractErrorMessage, isDefiniteOrderFailure, parsePositiveDecimal, PerpError, type ErrorCode } from "../errors.js";
 import { logExecution } from "../execution-log.js";
 import { validateTrade, enforceOrderRisk } from "../trade-validator.js";
@@ -494,7 +494,7 @@ export function registerTradeCommands(
     logExecution({
       type: action.includes("split") ? "split_order" : action.includes("limit") ? "limit_order" : action.includes("stop") ? "stop_order" : action.includes("cancel") ? "cancel" : "market_order",
       exchange: details.exchange as string ?? "unknown",
-      symbol: (details.symbol as string ?? "").toUpperCase(),
+      symbol: normalizeSymbolArg(details.symbol as string ?? ""),
       side: details.side as string ?? "",
       size: String(details.size ?? details.totalUsd ?? "0"),
       price: details.price as string,
@@ -908,7 +908,7 @@ export function registerTradeCommands(
     .action(async (symbol: string, side: string, size: string, opts: MarketOpts & { split?: boolean; maxSlippage?: string }) => {
       const s = side.toLowerCase();
       if (s !== "buy" && s !== "sell") errorAndExit("Side must be buy or sell");
-      const sym = symbol.toUpperCase();
+      const sym = normalizeSymbolArg(symbol);
 
       // ── Split execution branch ──
       if (opts.split) {
@@ -941,7 +941,7 @@ export function registerTradeCommands(
     .option("--tp <price>", "Take-profit trigger protecting this entry's verified fill (every venue; separate-order venues need a market / IOC entry)")
     .option("--sl <price>", "Stop-loss trigger protecting this entry's verified fill (every venue; separate-order venues need a market / IOC entry)")
     .action(async (symbol: string, size: string, opts: MarketOpts) => {
-      await runMarketOrder(symbol.toUpperCase(), "buy", size, opts);
+      await runMarketOrder(normalizeSymbolArg(symbol), "buy", size, opts);
     });
 
   supportsDryRun(trade.command("sell <symbol> <size>"))
@@ -955,7 +955,7 @@ export function registerTradeCommands(
     .option("--tp <price>", "Take-profit trigger protecting this entry's verified fill (every venue; separate-order venues need a market / IOC entry)")
     .option("--sl <price>", "Stop-loss trigger protecting this entry's verified fill (every venue; separate-order venues need a market / IOC entry)")
     .action(async (symbol: string, size: string, opts: MarketOpts) => {
-      await runMarketOrder(symbol.toUpperCase(), "sell", size, opts);
+      await runMarketOrder(normalizeSymbolArg(symbol), "sell", size, opts);
     });
 
   // ── Split Order (orderbook-aware) ──
@@ -969,7 +969,7 @@ export function registerTradeCommands(
     .action(async (symbol: string, side: string, usd: string, opts: {
       maxSlippage: string; maxSlices: string; delay: string; minSlice: string; force?: boolean;
     }) => {
-      const sym = symbol.toUpperCase();
+      const sym = normalizeSymbolArg(symbol);
       const orderSide = side.toLowerCase() as "buy" | "sell";
       const totalUsd = parseFloat(usd);
 
@@ -1002,7 +1002,7 @@ export function registerTradeCommands(
     .action(async (symbol: string, side: string, price: string, rawSize: string, opts: { tif?: string; reduceOnly?: boolean; clientId?: string; autoId?: boolean; force?: boolean; tp?: string; sl?: string; slippageBps?: string }) => {
       const s = side.toLowerCase();
       if (s !== "buy" && s !== "sell") errorAndExit("Side must be buy or sell");
-      const sym = symbol.toUpperCase();
+      const sym = normalizeSymbolArg(symbol);
       // One parsed size for the risk check and the order ("1,000" / "abc" refused up front).
       const size = parsePositiveDecimal(rawSize, "size");
 
@@ -1117,7 +1117,7 @@ export function registerTradeCommands(
 
       if (orderId) {
         // cancel <symbol> <orderId>
-        await cancelOne(symbolOrOrderId.toUpperCase(), orderId);
+        await cancelOne(normalizeSymbolArg(symbolOrOrderId), orderId);
         return;
       }
 
@@ -1152,7 +1152,7 @@ export function registerTradeCommands(
       }
 
       // cancel <symbol> — cancel all open orders for this symbol
-      const symbol = symbolOrOrderId.toUpperCase();
+      const symbol = normalizeSymbolArg(symbolOrOrderId);
       const orders = await adapter.getOpenOrders();
       const matching = orders.filter((o) => symbolMatch(o.symbol, symbol));
       if (matching.length === 0) {
@@ -1219,16 +1219,16 @@ export function registerTradeCommands(
         const bgAdapter = await getAdapter();
         const exchange = bgAdapter.name;
         // Risk check (and its --force bypass) runs here: the child `strategy twap` has none.
-        await openingOrderGate(bgAdapter, { symbol: symbol.toUpperCase(), size: Number(size), reduceOnly: opts.reduceOnly, force: opts.force });
+        await openingOrderGate(bgAdapter, { symbol: normalizeSymbolArg(symbol), size: Number(size), reduceOnly: opts.reduceOnly, force: opts.force });
         const cliArgs = [
-          "strategy", "twap", symbol.toUpperCase(), s, size, duration,
+          "strategy", "twap", normalizeSymbolArg(symbol), s, size, duration,
           ...(opts.slices ? ["--slices", opts.slices] : []),
           ...(opts.reduceOnly ? ["--reduce-only"] : []),
         ];
         const job = startJob({
           strategy: "twap",
           exchange,
-          params: { symbol: symbol.toUpperCase(), side: s, size, duration, slices: opts.slices, reduceOnly: opts.reduceOnly === true },
+          params: { symbol: normalizeSymbolArg(symbol), side: s, size, duration, slices: opts.slices, reduceOnly: opts.reduceOnly === true },
           venue: exchange, network: networkOf(program), dryRun: isDryRun(), selectors: jobSelectorsOf(program),
           cliArgs,
         });
@@ -1243,7 +1243,7 @@ export function registerTradeCommands(
 
       const adapter = await getAdapter();
 
-      await openingOrderGate(adapter, { symbol: symbol.toUpperCase(), size: Number(size), reduceOnly: opts.reduceOnly, force: opts.force });
+      await openingOrderGate(adapter, { symbol: normalizeSymbolArg(symbol), size: Number(size), reduceOnly: opts.reduceOnly, force: opts.force });
 
       // Native TWAP: Pacifica (SDK) or Hyperliquid (twapOrder)
       // Fallback: client-side TWAP for any exchange without native support
@@ -1255,7 +1255,7 @@ export function registerTradeCommands(
         const sdk = adapter.sdk as Record<string, (...args: any[]) => any>;
         result = await sdk.createTWAP(
           {
-            symbol: symbol.toUpperCase(),
+            symbol: normalizeSymbolArg(symbol),
             amount: size,
             side: s === "buy" ? "bid" : "ask",
             slippage_percent: String(slippage.bps / 100),
@@ -1271,7 +1271,7 @@ export function registerTradeCommands(
         if (!/^\d+$/.test(duration.trim())) errorAndExit("HL TWAP duration must be a whole number of minutes");
         const minutes = Number(duration.trim());
         result = await adapter.twapOrder(
-          symbol.toUpperCase(),
+          normalizeSymbolArg(symbol),
           s as "buy" | "sell",
           size,
           minutes,
@@ -1281,7 +1281,7 @@ export function registerTradeCommands(
         // Client-side TWAP (foreground) for exchanges without native TWAP
         const { runTWAP } = await import("../strategies/twap.js");
         const twapResult = await runTWAP(adapter, {
-          symbol: symbol.toUpperCase(),
+          symbol: normalizeSymbolArg(symbol),
           side: s as "buy" | "sell",
           totalSize: parseFloat(size),
           durationSec: parseInt(duration),
@@ -1294,7 +1294,7 @@ export function registerTradeCommands(
       }
 
       if (isJson()) return printJson(jsonOk(result));
-      console.log(chalk.green(`\n  TWAP ${s.toUpperCase()} ${size} ${symbol.toUpperCase()} over ${duration} placed on ${adapter.name}.\n`));
+      console.log(chalk.green(`\n  TWAP ${s.toUpperCase()} ${size} ${normalizeSymbolArg(symbol)} over ${duration} placed on ${adapter.name}.\n`));
     });
 
   // === Stop / Trigger orders (every trading venue) ===
@@ -1313,7 +1313,7 @@ export function registerTradeCommands(
       if (opts.triggerType && !["mark", "last", "mid"].includes(opts.triggerType)) {
         errorAndExit("--trigger-type must be one of: mark, last, mid");
       }
-      const sym = symbol.toUpperCase();
+      const sym = normalizeSymbolArg(symbol);
 
       const adapter = await getAdapter();
       const { def: venueDef, caps: venueCaps } = tradingVenueOf(adapter);
@@ -1379,7 +1379,7 @@ export function registerTradeCommands(
       if (prices.tp === null && prices.sl === null) throw new PerpError("INVALID_PARAMS", "Must specify --tp and/or --sl");
       const tpLimit = positivePriceOpt(opts.tpLimit, "--tp-limit");
       if (tpLimit !== null && prices.tp === null) throw new PerpError("INVALID_PARAMS", "--tp-limit needs --tp");
-      const sym = symbol.toUpperCase();
+      const sym = normalizeSymbolArg(symbol);
 
       const adapter = await getAdapter();
       const { def, caps } = tradingVenueOf(adapter);
@@ -1480,7 +1480,7 @@ export function registerTradeCommands(
     .requiredOption("--levels <levels>", "[required] Comma-separated price:percent pairs (e.g., 72000:25,75000:25,80000:50)")
     .option("--size <size>", "Override total position size (default: uses current position)")
     .action(async (symbol: string, opts: { levels: string; size?: string }) => {
-      const sym = symbol.toUpperCase();
+      const sym = normalizeSymbolArg(symbol);
       const adapter = await getAdapter();
       if (adapter.name === "ondo") {
         // docs.ondoperps.xyz take-profit-and-stop-loss: position TP/SL "Via Risk Management Module
@@ -1564,8 +1564,8 @@ export function registerTradeCommands(
       const { def: venueDef, caps: venueCaps } = tradingVenueOf(adapter);
       const amendTif: TimeInForce | null = opts.tif !== undefined ? validateLegacyTif(venueDef, venueCaps, opts.tif) : null;
       if (opts.forceTif === true && amendTif === null) throw new PerpError("INVALID_PARAMS", "--force-tif needs --tif");
-      if (dryRunGuard("edit_order", { exchange: adapter.name, symbol: symbol.toUpperCase(), orderId, price, size })) return;
-      const result = await v2Of(adapter).amendOrder({ symbol: symbol.toUpperCase(), ref: parseOrderRef(orderId), price, size, tif: amendTif, forceTif: opts.forceTif === true });
+      if (dryRunGuard("edit_order", { exchange: adapter.name, symbol: normalizeSymbolArg(symbol), orderId, price, size })) return;
+      const result = await v2Of(adapter).amendOrder({ symbol: normalizeSymbolArg(symbol), ref: parseOrderRef(orderId), price, size, tif: amendTif, forceTif: opts.forceTif === true });
       if (isJson()) return printJson(jsonOk(orderResultJson(result)));
       printOrder(`Edit of ${orderId} → $${price} x ${size} on ${adapter.name}`, result);
     });
@@ -1577,7 +1577,7 @@ export function registerTradeCommands(
       const adapter = await getAdapter();
       if (adapter.name === "qfex" && isTradingV2(adapter)) {
         // QFEX: cancelByRef reads the row first and routes a TAKE_PROFIT / STOP_LOSS row to cancel_stop_order.
-        const sym = symbol.toUpperCase();
+        const sym = normalizeSymbolArg(symbol);
         if (dryRunGuard("cancel_stop", { exchange: adapter.name, symbol: sym, stopOrderId })) return;
         const r = await adapter.cancelByRef(sym, parseOrderRef(stopOrderId));
         const incomplete = cancelIncompleteError(r, sym);
@@ -1589,7 +1589,7 @@ export function registerTradeCommands(
       const pac = adapter as ExchangeAdapter & Partial<Pick<PacificaAdapter, "cancelStopOrder">>;
       if (typeof pac.cancelStopOrder !== "function") {
         const { def } = tradingVenueOf(adapter);
-        throw unsupported(def.displayName, "cancelStop", "stop orders are cancelled like any other order on this venue", `Use: perp trade cancel ${symbol.toUpperCase()} <orderId> -e ${def.id}`);
+        throw unsupported(def.displayName, "cancelStop", "stop orders are cancelled like any other order on this venue", `Use: perp trade cancel ${normalizeSymbolArg(symbol)} <orderId> -e ${def.id}`);
       }
       const result = await pac.cancelStopOrder(symbol, stopOrderId);
       if (isJson()) return printJson(jsonOk(result));
@@ -1612,12 +1612,12 @@ export function registerTradeCommands(
         requirePacificaTwapSigner(adapter, "TWAP cancel");
         const sdk = adapter.sdk as Record<string, (...args: any[]) => any>;
         result = await sdk.cancelTWAP(
-          { symbol: symbol.toUpperCase(), order_id: Number(twapOrderId) },
+          { symbol: normalizeSymbolArg(symbol), order_id: Number(twapOrderId) },
           adapter.publicKey,
           adapter.signer
         );
       } else if (isTwapCapable(adapter)) {
-        result = await adapter.twapCancel(symbol.toUpperCase(), Number(twapOrderId));
+        result = await adapter.twapCancel(normalizeSymbolArg(symbol), Number(twapOrderId));
       } else {
         errorAndExit("Cancel TWAP requires --exchange pacifica or hyperliquid");
       }
@@ -1640,21 +1640,21 @@ export function registerTradeCommands(
       const lev = Number(leverage.trim());
       const adapter = await getAdapter();
       const mode = opts.isolated ? "isolated" : "cross";
-      if (dryRunGuard("set_leverage", { exchange: adapter.name, symbol: symbol.toUpperCase(), leverage: lev, mode })) return;
+      if (dryRunGuard("set_leverage", { exchange: adapter.name, symbol: normalizeSymbolArg(symbol), leverage: lev, mode })) return;
       try {
-        const result = await adapter.setLeverage(symbol.toUpperCase(), lev, mode);
+        const result = await adapter.setLeverage(normalizeSymbolArg(symbol), lev, mode);
 
         logExecution({
-          type: "rebalance", exchange: adapter.name, symbol: symbol.toUpperCase(), side: mode,
+          type: "rebalance", exchange: adapter.name, symbol: normalizeSymbolArg(symbol), side: mode,
           size: leverage, status: "success", dryRun: false,
           meta: { action: "set_leverage", leverage: lev, mode },
         });
 
         if (isJson()) return printJson(jsonOk(result));
-        console.log(chalk.green(`\n  Leverage set to ${leverage}x (${mode}) for ${symbol.toUpperCase()} on ${adapter.name}.\n`));
+        console.log(chalk.green(`\n  Leverage set to ${leverage}x (${mode}) for ${normalizeSymbolArg(symbol)} on ${adapter.name}.\n`));
       } catch (err) {
         logExecution({
-          type: "rebalance", exchange: adapter.name, symbol: symbol.toUpperCase(), side: mode,
+          type: "rebalance", exchange: adapter.name, symbol: normalizeSymbolArg(symbol), side: mode,
           size: leverage, status: "failed", dryRun: false,
           error: extractErrorMessage(err),
           meta: { action: "set_leverage", leverage: lev, mode },
@@ -1805,7 +1805,7 @@ export function registerTradeCommands(
     .option("--slippage-bps <n>", "Slippage bound in bps (default: settings defaultSlippageBps)")
     .action(async (symbol: string, opts: { smart?: boolean; slippageBps?: string }) => {
       await withJsonErrors(isJson(), async () => {
-        const sym = symbol.toUpperCase();
+        const sym = normalizeSymbolArg(symbol);
         const adapter = await getAdapter();
         refuseGatedReduceOnly(adapter);
         const slippage = resolveAdapterSlippage(adapter, parseSlippageBpsFlag(opts.slippageBps));
@@ -1881,7 +1881,7 @@ export function registerTradeCommands(
     .option("--slippage-bps <n>", "Slippage bound in bps (default: settings defaultSlippageBps)")
     .action(async (symbol: string, percent: string, opts: { smart?: boolean; slippageBps?: string }) => {
       await withJsonErrors(isJson(), async () => {
-        const sym = symbol.toUpperCase();
+        const sym = normalizeSymbolArg(symbol);
         const pct = parseFloat(percent);
         if (isNaN(pct) || pct <= 0 || pct > 100) errorAndExit("Percent must be between 0 and 100");
 
@@ -1938,7 +1938,7 @@ export function registerTradeCommands(
               remediation: `Pass --symbol <SYM>: perp trade status ${orderId} --symbol <SYM> -e ${adapter.venue.id}`,
             });
           }
-          const r = await adapter.getOrderStatus(opts.symbol.toUpperCase(), parseOrderRef(orderId));
+          const r = await adapter.getOrderStatus(normalizeSymbolArg(opts.symbol), parseOrderRef(orderId));
           if (isJson()) return printJson(jsonOk(orderResultJson(r)));
           printOrder(`Order ${orderId} (${r.symbol}) on ${adapter.name}`, r);
           return;
@@ -1959,7 +1959,7 @@ export function registerTradeCommands(
               remediation: `Pass --symbol <SYM>: perp trade status ${orderId} --symbol <SYM> -e ${def.id}`,
             });
           }
-          const r = await v2Of(adapter).getOrderStatus(opts.symbol !== undefined ? opts.symbol.toUpperCase() : "", ref);
+          const r = await v2Of(adapter).getOrderStatus(opts.symbol !== undefined ? normalizeSymbolArg(opts.symbol) : "", ref);
           if (isJson()) return printJson(jsonOk(orderResultJson(r)));
           printOrder(`Order ${orderId} (${r.symbol}) on ${adapter.name}`, r);
           return;
@@ -2022,14 +2022,14 @@ export function registerTradeCommands(
 
         let filtered = trades;
         if (symbol) {
-          const sym = symbol.toUpperCase();
+          const sym = normalizeSymbolArg(symbol);
           filtered = trades.filter(t => symbolMatch(t.symbol, sym));
         }
 
         if (isJson()) return printJson(jsonOk(filtered));
 
         if (filtered.length === 0) {
-          console.log(chalk.gray(`\n  No fills${symbol ? ` for ${symbol.toUpperCase()}` : ""}.\n`));
+          console.log(chalk.gray(`\n  No fills${symbol ? ` for ${normalizeSymbolArg(symbol)}` : ""}.\n`));
           return;
         }
 
@@ -2066,7 +2066,7 @@ export function registerTradeCommands(
 
         const adapter = await getAdapter();
         const validation = await validateTrade(adapter, {
-          symbol: symbol.toUpperCase(),
+          symbol: normalizeSymbolArg(symbol),
           side: s as "buy" | "sell",
           size: parseFloat(size),
           price: opts.price ? parseFloat(opts.price) : undefined,
@@ -2077,7 +2077,7 @@ export function registerTradeCommands(
 
         if (isJson()) return printJson(jsonOk(validation));
 
-        console.log(chalk.cyan.bold(`\n  Pre-Trade Check: ${symbol.toUpperCase()} ${s.toUpperCase()} ${size}\n`));
+        console.log(chalk.cyan.bold(`\n  Pre-Trade Check: ${normalizeSymbolArg(symbol)} ${s.toUpperCase()} ${size}\n`));
 
         for (const check of validation.checks) {
           const icon = check.passed ? chalk.green("✓") : chalk.red("✗");
@@ -2114,7 +2114,7 @@ export function registerTradeCommands(
     .option("--size <base>", "Total base amount (e.g., 0.01 BTC)")
     .option("--force", "Bypass local risk-limit checks (maxPosition / total exposure)")
     .action(async (symbol: string, side: string, opts: { levels: string; sizeUsd?: string; size?: string; force?: boolean }) => {
-      const sym = symbol.toUpperCase();
+      const sym = normalizeSymbolArg(symbol);
       const s = side.toLowerCase();
       if (s !== "buy" && s !== "sell") errorAndExit("Side must be buy or sell");
       if (!opts.sizeUsd && !opts.size) errorAndExit("Must specify --size-usd or --size");
@@ -2436,7 +2436,7 @@ export function registerTradeCommands(
           const slippageFlag = parseSlippageBpsFlag(opts.slippageBps);
           const { def, spotDef, spot } = await spotContext(opts.yes === true);
           const slippage = resolveSlippage(def.id, slippageFlag);
-          const sym = symbol.toUpperCase();
+          const sym = normalizeSymbolArg(symbol);
 
           if (dryRunGuard(`spot ${verb}`, { exchange: def.id, symbol: sym, side, size })) return;
 
@@ -2464,7 +2464,7 @@ export function registerTradeCommands(
         if (s !== "buy" && s !== "sell") throw new PerpError("INVALID_PARAMS", `Side must be buy or sell (got "${side}")`);
         const { def, spotDef, spot } = await spotContext(false);
         requireSpotCapability(def, spotDef, "limitOrder", "limit orders");
-        const sym = symbol.toUpperCase();
+        const sym = normalizeSymbolArg(symbol);
 
         if (dryRunGuard("spot limit", { exchange: def.id, symbol: sym, side: s, price, size, tif: opts.tif ?? null })) return;
 
@@ -2486,7 +2486,7 @@ export function registerTradeCommands(
       await withJsonErrors(isJson(), async () => {
         const { def, spotDef, spot } = await spotContext(false);
         requireSpotCapability(def, spotDef, "cancel", "order cancel");
-        const sym = symbol.toUpperCase();
+        const sym = normalizeSymbolArg(symbol);
 
         if (dryRunGuard("spot cancel", { exchange: def.id, symbol: sym, orderId })) return;
 
@@ -2511,7 +2511,7 @@ export function registerTradeCommands(
           throw unsupported(def.displayName, "spotOpenOrders", spotDef.accountModel === "wallet" ? "spot is an on-chain swap that settles immediately — there are no resting orders" : "the spot adapter cannot list open orders",
             spotDef.accountModel === "wallet" ? `Check the wallet balance: perp -e ${def.id} trade spot-balance` : "Use the venue UI to inspect open spot orders");
         }
-        const orders = await spot.getSpotOpenOrders(symbol === undefined ? null : symbol.toUpperCase());
+        const orders = await spot.getSpotOpenOrders(symbol === undefined ? null : normalizeSymbolArg(symbol));
         if (isJson()) return printJson(jsonOk({ exchange: def.id, orders }));
         console.log(chalk.cyan(`\n  Open spot orders (${def.id}):\n`));
         if (orders.length === 0) {
@@ -2654,7 +2654,7 @@ function parseMultiLeg(spec: string): MultiLeg {
     throw new Error(`Invalid size "${size}" — must be a positive number`);
   }
 
-  return { exchange: normalizedExchange, symbol: symbol.toUpperCase(), side, size };
+  return { exchange: normalizedExchange, symbol: normalizeSymbolArg(symbol), side, size };
 }
 
 function registerMultiAction(

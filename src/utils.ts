@@ -32,6 +32,15 @@ export function formatUsd(value: string | number): string {
   });
 }
 
+/**
+ * Symbol argument as typed, normalized for display and lookup: upper case, except a HIP-3 dex
+ * prefix, which is lower case on the venue ("xyz:xyz100" / "XYZ:XYZ100" → "xyz:XYZ100").
+ */
+export function normalizeSymbolArg(symbol: string): string {
+  const i = symbol.indexOf(":");
+  return i === -1 ? symbol.toUpperCase() : `${symbol.slice(0, i).toLowerCase()}:${symbol.slice(i + 1).toUpperCase()}`;
+}
+
 export function formatPnl(value: string | number): string {
   const num = Number(value);
   if (isNaN(num)) return String(value);
