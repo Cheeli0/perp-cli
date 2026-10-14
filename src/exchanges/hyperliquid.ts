@@ -1913,6 +1913,7 @@ export class HyperliquidAdapter implements ExchangeAdapter {
   }
 
   async getKlines(symbol: string, interval: string, startTime: number, endTime: number): Promise<ExchangeKline[]> {
+    await this.getAssetIndex(symbol); // unlisted coin: SYMBOL_NOT_FOUND (candleSnapshot answers HTTP 500 "null")
     const candles = await this._infoPost({
       type: "candleSnapshot",
       req: { coin: this._venueCoin(symbol), interval, startTime, endTime },

@@ -104,6 +104,16 @@ export function asterIocOutcome(raw: unknown): { filledSize: string; final: true
   return filledSize === null ? null : { filledSize, final: true };
 }
 
+/** The numeric `code` of an Aster error body ({"code":-1121,"msg":"Invalid symbol."}); null when absent. */
+function asterErrorCode(body: string): number | null {
+  try {
+    const j = JSON.parse(body) as { code?: unknown };
+    return typeof j.code === "number" ? j.code : null;
+  } catch {
+    return null; // not JSON (e.g. an HTML error page): no venue code
+  }
+}
+
 /**
  * Order-placement refusals by documented venue code (asterdex/api-docs V3 futures "Error
  * Codes"; "Codes are universal,but messages can vary"). [PerpError code, docs name, remediation].
@@ -1939,6 +1949,11 @@ export class AsterAdapter implements ExchangeAdapter {
     if (!res.ok) {
       const text = await res.text();
       const clean = text.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 120);
+      // -1121 BAD_SYMBOL ("Invalid symbol.", live on /fapi/v3/depth for an unlisted symbol): the
+      // symbol does not exist — SYMBOL_NOT_FOUND, not an UNKNOWN 500.
+      if (asterErrorCode(text) === -1121) {
+        throw new PerpError("SYMBOL_NOT_FOUND", `Aster: ${clean} [${method} ${path}]`, { exchange: "aster", remediation: "List markets: perp -e aster market list" });
+      }
       throw new Error(`${method} ${path} failed (${res.status}): ${clean}`);
     }
     return res.json();

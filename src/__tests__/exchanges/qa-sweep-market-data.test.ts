@@ -175,6 +175,37 @@ describe("6. unknown-symbol errors carry remediation", () => {
     });
   });
 
+  it("Hyperliquid klines of an unlisted coin → SYMBOL_NOT_FOUND before the request (candleSnapshot answers HTTP 500)", async () => {
+    const candleSnapshot = vi.fn(() => { throw new Error("Hyperliquid info candleSnapshot failed (500): null"); });
+    const a = hl({ candleSnapshot });
+    await expect(a.getKlines("NOPE", "1h", 0, 1)).rejects.toMatchObject({ structured: expect.objectContaining({ code: "SYMBOL_NOT_FOUND", retryable: false }) });
+    expect(candleSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("Aster public read answering -1121 Invalid symbol → SYMBOL_NOT_FOUND (was UNKNOWN 500)", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ code: -1121, msg: "Invalid symbol." }), { status: 400 })));
+    try {
+      const { AsterAdapter } = await import("../../exchanges/aster.js");
+      const a = new AsterAdapter(undefined, false);
+      await expect(a.getOrderbook("NOPE")).rejects.toMatchObject({
+        structured: expect.objectContaining({ code: "SYMBOL_NOT_FOUND", remediation: "List markets: perp -e aster market list" }),
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("Aster: any other HTTP error stays a plain venue error", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("<html>bad gateway</html>", { status: 502 })));
+    try {
+      const { AsterAdapter } = await import("../../exchanges/aster.js");
+      const a = new AsterAdapter(undefined, false);
+      await expect(a.getOrderbook("BTC")).rejects.toThrow(/failed \(502\)/);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("QFEX book / klines / funding resolve the symbol against refdata first (no 404 → EXCHANGE_ERROR)", async () => {
     const { QfexAdapter } = await import("../../exchanges/qfex/adapter.js");
     const a = Object.create(QfexAdapter.prototype) as InstanceType<typeof QfexAdapter>;
