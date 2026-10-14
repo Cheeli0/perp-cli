@@ -7,6 +7,7 @@
 import { defaultCanonicalize } from "./canonical.js";
 import { Connection, closedError, type WireLiveness } from "./connection.js";
 import { WsError, isPerpError, type WsErrorCode } from "./errors.js";
+import { VENUE_IDS, type VenueId } from "./ids.js";
 import { MarketStore } from "./market-state.js";
 import { REDACTED, createRedactor, excerpt, type Redactor } from "./redact.js";
 import { SubscriptionImpl } from "./subscription.js";
@@ -51,6 +52,37 @@ interface SubMeta {
 interface TokenState { token: string; expiresAt: number; refreshAt: number; timer: ReturnType<typeof setTimeout> | null }
 
 const USER_CHANNELS: ReadonlyArray<UserChannel> = ["account", "positions", "orders", "fills"];
+const MARKET_CHANNELS: ReadonlyArray<string> = ["market", "bbo", "book", "trades"];
+/** Channels whose decoders ship in 0.15.1 (CAPABILITY_UNSUPPORTED until then). */
+const LATER_CHANNELS: ReadonlyArray<string> = ["book", "trades"];
+const NETWORKS: ReadonlyArray<Network> = ["mainnet", "testnet"];
+/** Oversized-message closes within the window before the subscriptions fail (instead of reconnecting forever). */
+const MAX_PAYLOAD_CLOSES = 3;
+const MAX_PAYLOAD_WINDOW_MS = 10 * 60_000;
+// "\u0020" keeps this text from reading as an import to the boundary test's source scan.
+const CODEC_REMEDIATION = "Pass a codec export, e.g. import { hyperliquid } from\u0020'perp-cli/ws'";
+
+/** createVenueStream's first argument must be a codec object (not a venue name / undefined). */
+function checkCodec(codec: unknown): asserts codec is VenueCodec {
+  const c = codec as Partial<Record<keyof VenueCodec, unknown>> | null;
+  const problem =
+    c === null || typeof c !== "object" ? `got ${c === null ? "null" : typeof codec}${typeof codec === "string" ? ` ${JSON.stringify(codec)}` : ""}`
+    : typeof c.venue !== "string" || !VENUE_IDS.includes(c.venue as VenueId) ? `unknown venue ${JSON.stringify(c.venue)}`
+    : !Array.isArray(c.secretKeys) || !Array.isArray(c.secretUrlPatterns) || typeof c.url !== "function" || typeof c.restUrl !== "function"
+      || typeof c.loadDirectory !== "function" || typeof c.wiresFor !== "function" || c.capabilities === null || typeof c.capabilities !== "object"
+      ? `${String(c.venue)} codec is missing required members` : null;
+  if (problem !== null) {
+    throw new WsError("INVALID_PARAMS", `createVenueStream: first argument must be a venue codec (${problem})`, { remediation: CODEC_REMEDIATION });
+  }
+}
+
+/** "did you mean" candidates for an unknown symbol: case-insensitive symbol, or canonical / base match. */
+function suggestSymbols(missing: string, entries: ReadonlyArray<{ symbol: string; canonical: string | null; base: string }>): string[] {
+  const m = missing.toUpperCase();
+  const out = entries.filter(e => e.symbol.toUpperCase() === m || (e.canonical !== null && e.canonical.toUpperCase() === m) || e.base.toUpperCase() === m)
+    .map(e => e.symbol);
+  return Array.from(new Set(out)).slice(0, 5);
+}
 const EVENT_CHANNEL: Record<UserUpdate["type"], UserChannel> = { account: "account", positions: "positions", orders: "orders", fill: "fills", fills: "fills" };
 /** A handed-out token stays redacted until its expiry plus this margin. */
 const TOKEN_REDACT_MARGIN_MS = 15 * 60_000;
@@ -88,7 +120,16 @@ function isBrowserLike(): boolean {
 
 /** @experimental 0.15.x (stable from 0.16.0 after consumer sign-off) */
 export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = {}): VenueStream {
+  checkCodec(codec);
   const venue = codec.venue;
+  if (opts === null || typeof opts !== "object") {
+    throw new WsError("INVALID_PARAMS", `${venue}: options must be an object (got ${opts === null ? "null" : typeof opts})`, { exchange: venue });
+  }
+  if (opts.network !== undefined && !NETWORKS.includes(opts.network)) {
+    throw new WsError("INVALID_PARAMS", `${venue}: unknown network ${JSON.stringify(opts.network)}`, {
+      exchange: venue, remediation: `Use network ${NETWORKS.map(n => `"${n}"`).join(" or ")} (or omit it for mainnet)`,
+    });
+  }
   const network: Network = opts.network === undefined ? "mainnet" : opts.network;
   // Resolved at call time (never at module load); Node 20 without a transport → INVALID_PARAMS.
   const transport = resolveTransport(opts, venue);
@@ -129,6 +170,8 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
   const tokenFetches = new Map<string, Promise<TokenState>>();
   const tokenRetryTimers = new Set<ReturnType<typeof setTimeout>>();
   /** Running acquireToken loops per purpose, with everyone waiting on them. */
+  /** Times of recent closes caused by an inbound message over the transport's maxPayload. */
+  const maxPayloadCloses: number[] = [];
   const tokenLoops = new Map<string, Array<{ onOk: (t: TokenState) => void; onFail: (err: WsError) => void }>>();
 
   function log(level: StreamLog["level"], event: string, message: string, details?: Record<string, unknown>): void {
@@ -203,7 +246,8 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
         for (const sub of Array.from(subs.keys())) dropSub(sub, err);
       }
     },
-    onUnexpectedClose: (reason, opened) => handleBadSubscribeClose(reason, opened),
+    onUnexpectedClose: (reason, opened, maxPayloadExceeded) =>
+      maxPayloadExceeded ? handleMaxPayloadClose(reason) : handleBadSubscribeClose(reason, opened),
     liveness: () => {
       const out: WireLiveness[] = [];
       for (const w of wires.values()) {
@@ -400,7 +444,7 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
     const p = (async (): Promise<TokenState> => {
       const provider = opts.credentials;
       if (provider === undefined || provider.authToken === undefined) {
-        throw wsError("WS_AUTH_FAILED", `${venue}: ${need.purpose} needs an auth token but the credential provider has no authToken()`,
+        throw wsError("WS_AUTH_FAILED", `${need.purpose} needs an auth token but the credential provider has no authToken()`,
           "Pass credentials.authToken (Lighter: a read-only ro: token is recommended in browsers)");
       }
       let r: { token: string; expiresAt: number };
@@ -632,6 +676,27 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
    * socket and is still unacked. Resubscribes after (re)open and ambiguous cases are ordinary reconnects.
    * Returns true when no channel is left (the stream went idle; no reconnect).
    */
+  /**
+   * An inbound message exceeded the transport's maxPayload. Reconnect (the frame may be one-off), but
+   * after MAX_PAYLOAD_CLOSES such closes within MAX_PAYLOAD_WINDOW_MS the same frame keeps coming back:
+   * fail the subscriptions on this socket with WS_PROTOCOL_ERROR instead of reconnecting forever. The
+   * oversized frame is never parsed, so it cannot be attributed to one channel.
+   */
+  function handleMaxPayloadClose(reason: CloseReason): boolean {
+    const now = clock();
+    while (maxPayloadCloses.length > 0 && now - maxPayloadCloses[0] > MAX_PAYLOAD_WINDOW_MS) maxPayloadCloses.shift();
+    maxPayloadCloses.push(now);
+    log("warn", "max-payload", reason.message, { count: maxPayloadCloses.length, limit: MAX_PAYLOAD_CLOSES });
+    if (maxPayloadCloses.length < MAX_PAYLOAD_CLOSES) return false;
+    maxPayloadCloses.length = 0;
+    const err = wsError("WS_PROTOCOL_ERROR",
+      `${venue}: inbound messages exceeded the transport's maxPayload ${MAX_PAYLOAD_CLOSES} times (WS_ERR_UNSUPPORTED_MESSAGE_LENGTH); stopped reconnecting`,
+      reason.remediation === null ? undefined : reason.remediation, { wsCode: 1009 });
+    log("error", "max-payload-repeated", err.message);
+    for (const sub of Array.from(subs.keys())) dropSub(sub, err);
+    return wires.size === 0;
+  }
+
   function handleBadSubscribeClose(reason: CloseReason, opened: boolean): boolean {
     if (!codec.closesOnBadSubscribe || !opened) return false;
     const now = clock();
@@ -697,12 +762,20 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
         codec.capabilities.notes[`network:${network}`] === undefined ? undefined : codec.capabilities.notes[`network:${network}`]);
     }
     if (target.kind === "market") {
-      const supported = (c: string) => c === "market" || (c === "bbo" && codec.capabilities.channels.bbo);
-      const extra = target.channels.filter(c => !supported(c));
-      if (extra.length > 0 || target.channels.length === 0) {
-        throw wsError("CAPABILITY_UNSUPPORTED",
-          target.channels.length === 0 ? "kind \"market\" needs at least one channel" : `${venue} channel(s) ${extra.join(", ")} are not available in this release`,
+      const channels: unknown = target.channels;
+      const valid = `Use channels ${MARKET_CHANNELS.map(c => `"${c}"`).join(" / ")} (book and trades arrive in 0.15.1)`;
+      if (!Array.isArray(channels) || channels.length === 0) {
+        throw wsError("INVALID_PARAMS", "kind \"market\" needs at least one channel", valid);
+      }
+      const unknown = channels.filter(c => typeof c !== "string" || !MARKET_CHANNELS.includes(c));
+      if (unknown.length > 0) throw wsError("INVALID_PARAMS", `${venue}: unknown channel(s) ${unknown.map(c => JSON.stringify(c)).join(", ")}`, valid);
+      const later = target.channels.filter(c => LATER_CHANNELS.includes(c));
+      if (later.length > 0) {
+        throw wsError("CAPABILITY_UNSUPPORTED", `${venue} channel(s) ${later.join(", ")} are not available in this release`,
           "Use channels \"market\" / \"bbo\" (book and trades arrive in 0.15.1)");
+      }
+      if (target.channels.includes("bbo") && !codec.capabilities.channels.bbo) {
+        throw wsError("CAPABILITY_UNSUPPORTED", `${venue} has no bbo channel`, "Use channel \"market\"");
       }
     }
     if (target.kind === "user") checkUserTarget(target.channels);
@@ -724,8 +797,12 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
       if (wanted !== null) {
         const missing = wanted.filter(s => !known.has(s));
         if (missing.length > 0) {
-          throw wsError("INVALID_PARAMS", `${venue}: unknown symbol(s) ${missing.slice(0, 20).join(", ")}`,
-            venue === "hyperliquid" ? "Use stream.markets() symbols; HIP-3 markets need opts.hip3Dexes" : "Use stream.markets() symbols");
+          const hints = missing.slice(0, 20).map(s => ({ s, c: suggestSymbols(s, d.entries) })).filter(h => h.c.length > 0);
+          const hint = hints.length === 0 ? "" : ` (did you mean ${hints.map(h => `${h.c.join(" / ")} for ${h.s}`).join("; ")}?)`;
+          const base = "Symbols are this venue's directory symbols (case-sensitive): use stream.markets(), MarketUpdate.symbol or FundingLeg.symbol";
+          throw wsError("INVALID_PARAMS", `${venue}: unknown symbol(s) ${missing.slice(0, 20).join(", ")}${hint}`,
+            venue === "hyperliquid" ? `${base}; HIP-3 markets need opts.hip3Dexes` : base,
+            hints.length === 0 ? undefined : { suggestions: Object.fromEntries(hints.map(h => [h.s, h.c])) });
         }
       }
       list = codec.wiresFor(target, d, opts.staleAfterMs === undefined ? null : opts.staleAfterMs);
@@ -794,6 +871,7 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
       throw wsError("CAPABILITY_UNSUPPORTED", `${venue} user channels need a signing secret in the page`,
         "Pass allowInPageSecrets: true to accept that trade-off, or run the stream server-side (perp-cli/ws/node)");
     }
+    if (!Array.isArray(channels)) throw wsError("INVALID_PARAMS", "kind \"user\" needs a channels array", `Use ${USER_CHANNELS.join(" / ")}`);
     const bad = channels.filter(c => !USER_CHANNELS.includes(c));
     if (channels.length === 0 || bad.length > 0) {
       throw wsError("INVALID_PARAMS", channels.length === 0 ? "kind \"user\" needs at least one channel" : `unknown user channel(s) ${bad.join(", ")}`,

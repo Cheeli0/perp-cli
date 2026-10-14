@@ -7,6 +7,7 @@ custom live dashboard, funding comparison or price/account feed for **hyperliqui
 > **Stability:** ships in **0.15.0** and is **@experimental** through 0.15.x — breaking changes only in a
 > minor bump (CHANGELOG callouts); every event carries `schema: 1`. **@stable from 0.16.0** after consumer
 > sign-off. Planned for **0.15.1**: Aster user channels, Ondo / QFEX, `book` / `trades`, `perp stream`.
+> The `VenueId` type already includes `"ondo"` and `"qfex"`, but there are no codecs for them until 0.15.1.
 
 Runnable examples: `examples/ws-funding-compare-browser`, `examples/ws-next-smoke`,
 `examples/ws-node-stream` in the perp-cli repository.
@@ -26,6 +27,10 @@ npm install perp-cli
   SSR / prerendering). Next.js 13.5+: `transpilePackages: ["perp-cli"]`.
 - TypeScript: `moduleResolution` `"bundler"`, `"node16"` / `"nodenext"`, or `"node"` (via `typesVersions`).
 - Only `perp-cli/ws`, `perp-cli/ws/node` and `perp-cli/package.json` are importable (no deep imports).
+- `perp-cli/ws/node` caps one inbound message at 16 MiB (`DEFAULT_MAX_PAYLOAD`; real frames are ≤ ~150 KB).
+  An oversized message closes the socket (`reconnecting` reason `WS_PROTOCOL_ERROR`, naming
+  `WS_ERR_UNSUPPORTED_MESSAGE_LENGTH`); 3 within 10 min fail the subscriptions with `WS_PROTOCOL_ERROR`.
+  Raise the cap with `createVenueStream(codec, { transport: createNodeTransport({ maxPayload }) })`.
 - `perp-cli/ws` in Node 20 without a `transport` throws `INVALID_PARAMS` ("import from perp-cli/ws/node or
   pass transport").
 
@@ -119,10 +124,17 @@ await Promise.all(streams.map((s) => s.close()));
 - `subscribe(target)`:
   - `{ kind: "allMarkets", symbols? }` → `MarketUpdate` for every (or the listed) market;
   - `{ kind: "market", symbol, channels: ["market" | "bbo"] }`. `"book"` and `"trades"` are already in
-    the types but **reject with `CAPABILITY_UNSUPPORTED` until 0.15.1** — don't ship UI that needs them;
+    the types but **reject with `CAPABILITY_UNSUPPORTED` until 0.15.1** — don't ship UI that needs them.
+    Any other channel name (e.g. `"ticker"`) or an empty `channels` rejects with `INVALID_PARAMS`;
   - `{ kind: "user", channels: ["account" | "positions" | "orders" | "fills"] }` (needs `credentials`).
-  Unknown symbols reject with `INVALID_PARAMS` before anything is sent.
-- `Subscription`: `on(cb)` (unbuffered), `for await` (bounded buffer, `opts.buffer.size`, default 1024),
+- **Symbols are the venue's directory symbols, case-sensitive** — not canonical names. `BTC` is `"BTC"` on
+  hyperliquid / pacifica / lighter, `"BTC-USD"` on arcus and `"BTCUSDT"` / `"BTCUSD1"` on aster. Pass
+  `MarketUpdate.symbol` / `FundingLeg.symbol`, or look them up in `stream.markets()`. Unknown symbols reject
+  with `INVALID_PARAMS` before anything is sent; the message carries a "did you mean …" hint
+  (`details.suggestions`) when a directory symbol matches case-insensitively or by canonical / base name.
+- `Subscription`: `on(cb)` (unbuffered; a listener that throws is isolated — the other listeners and the
+  stream keep running — and reported to `opts.logger` as `{ event: "listener-error" }`, not as a stream
+  event), `for await` (bounded buffer, `opts.buffer.size`, default 1024),
   `ready` (resolves when every wire channel is acknowledged; rejects with a `WsError`), `status`,
   `unsubscribe()`. Wire channels are ref-counted: two subscriptions on one venue channel = one wire
   subscription.
@@ -162,7 +174,7 @@ Funding:
 | Venue | `rate` kind | `predictedRate` | interval | OI | notes |
 |---|---|---|---|---|---|
 | hyperliquid | accruing | null | 1 h | base, one side | bid/ask/last null → `bbo` channel |
-| pacifica | lastSettled | next_funding | 1 h | base | bid/ask/last/nextFundingTime null |
+| pacifica | lastSettled | next_funding | 1 h | base, `sides` null | bid/ask/last/nextFundingTime null |
 | lighter / lighter-rh | lastSettled | current_funding_rate | 1 h | **usd** | wire values are percent/h, emitted as fractions/h |
 | aster | accruing | null | per market (`rest:/fapi/v3/fundingInfo`, null if missing) | null | all quotes (USDT, USD1, …) with `quote` set |
 | arcus | lastSettled | nextFundingRate | 1 h | base, one side | bid/ask null → `bbo` channel |
@@ -254,7 +266,9 @@ cmp.subscribe((rows) => {
       .map((l) => ({ venue: l.venue, h: toHourly(l.rate, l.funding.rateIntervalHours) }))
       .filter((x): x is { venue: typeof x.venue; h: number } => x.h !== null)
       .sort((a, b) => a.h - b.h);
-    if (legs.length >= 2) console.log(row.canonical, legs[0].venue, legs[legs.length - 1].venue);
+    const lo = legs[0];
+    const hi = legs[legs.length - 1];
+    if (lo !== undefined && hi !== undefined && legs.length >= 2) console.log(row.canonical, lo.venue, hi.venue);
   }
 });
 ```
@@ -268,10 +282,33 @@ const credentials: CredentialProvider = {
   user: async () => ({ venue: "lighter", accountIndex: 12345 }),
   // Only Lighter's orders channel needs a token. Your backend mints it; the page never sees the key.
   authToken: async ({ purpose, maxTtlSec }) => {
-    const res = await fetch(`/api/lighter-token?purpose=${purpose}&ttl=${maxTtlSec}`);
-    return (await res.json()) as { token: string; expiresAt: number }; // expiresAt: epoch ms
+    const qs = `purpose=${encodeURIComponent(purpose)}&ttl=${encodeURIComponent(String(maxTtlSec))}`;
+    // Same-origin request carrying the user's session cookie: the endpoint must authenticate the caller.
+    const res = await fetch(`/api/lighter-token?${qs}`, { credentials: "same-origin" });
+    if (!res.ok) throw new Error(`lighter-token: HTTP ${res.status}`);
+    const body = (await res.json()) as { token: string; expiresAt: number }; // expiresAt: epoch ms
+    // Only accept a READ-ONLY auth token in the page; a full token could be used to trade.
+    if (typeof body.token !== "string" || !body.token.startsWith("ro:")) throw new Error("lighter-token: expected a read-only ro: token");
+    return body;
   },
 };
+
+// Server side (sketch of the /api/lighter-token handler; your framework and session store will differ).
+interface Session { accountIndex: number }
+declare function getSession(req: Request): Promise<Session | null>; // your auth (cookie → session)
+declare function mintLighterReadOnlyToken(accountIndex: number, ttlSec: number): Promise<string>; // "ro:…"
+const MAX_TOKEN_TTL_SEC = 600; // server-side cap: never trust the client's ttl
+export async function handleLighterToken(req: Request): Promise<Response> {
+  const session = await getSession(req);
+  if (session === null) return new Response("unauthorized", { status: 401 });
+  const url = new URL(req.url);
+  // purpose is "<venue>:account_all_orders" (lighter or lighter-rh); refresh follows the expiresAt you return.
+  if (!/^lighter(-rh)?:account_all_orders$/.test(url.searchParams.get("purpose") ?? "")) return new Response("bad purpose", { status: 400 });
+  const asked = Number(url.searchParams.get("ttl"));
+  const ttlSec = Math.min(Number.isFinite(asked) && asked > 0 ? Math.floor(asked) : MAX_TOKEN_TTL_SEC, MAX_TOKEN_TTL_SEC);
+  const token = await mintLighterReadOnlyToken(session.accountIndex, ttlSec); // the session's own account only
+  return Response.json({ token, expiresAt: Date.now() + ttlSec * 1000 });
+}
 const stream = createVenueStream(lighter, { credentials });
 const sub = stream.subscribe({ kind: "user", channels: ["account", "positions", "orders", "fills"] });
 sub.on((e) => {
@@ -329,6 +366,17 @@ Mark price in `PositionRow` is null except on Arcus — join the `MarketUpdate` 
 `StreamControl { type: "error", code, message, remediation, raw (redacted ≤ 200 chars), fatal }` — always
 check `fatal`: a fatal error ended that subscription, a non-fatal one is informational (it keeps running);
 `ready` rejects with a `WsError` whose `structured = { code, message, status, retryable, remediation? }`.
+
+Where an error surfaces:
+- **Thrown synchronously** (`WsError`, `INVALID_PARAMS`) — bad options, before anything starts:
+  `createVenueStream` (codec not a codec export, unknown `network`, bad `buffer.size`, no `WebSocket` /
+  `fetch` in the runtime and none passed) and `createFundingComparator` (unknown `kind`, bad `streams`,
+  `minVenues`, `include`, `staleAfterMs`, or a non-function `canonicalize` / `onControl` / `clock`).
+- **`ready` rejects** (and the subscription ends with a fatal error event) — per-subscription problems:
+  unknown symbol / channel, `book` / `trades` or an unsupported network (`CAPABILITY_UNSUPPORTED`), budget
+  limits, credentials, REST bootstrap failures, ack timeout, a closed stream.
+- **Error events** (`{ type: "error" }` via `on()` / the iterator / comparator `onControl`) — everything
+  after `ready`: malformed frames, token-refresh retries, reconnects, overflow.
 
 | Code | Meaning / what to do |
 |---|---|
