@@ -18,108 +18,13 @@ import {
 import type { ExchangeAdapter } from "../exchanges/index.js";
 import { getVenue, listVenuesWithRole, tryResolveVenueId } from "../exchanges/venue.js";
 import "../exchanges/venues/index.js";
+import { MAX_PRICE_DEVIATION_PCT } from "../exchanges/index.js";
 import {
-  fetchPacificaPrices, fetchHyperliquidMeta,
-  fetchLighterOrderBookDetails, fetchLighterFundingRates,
   fetchPacificaPricesRaw, parsePacificaRaw,
   fetchHyperliquidAllMidsRaw,
   fetchLighterOrderBookDetailsRaw,
 } from "../shared-api.js";
 import { scanDexArb } from "../dex-asset-map.js";
-
-interface FundingRate {
-  exchange: string;
-  symbol: string;
-  fundingRate: number;
-  markPrice: number;
-}
-
-async function fetchPacificaRates(): Promise<FundingRate[]> {
-  const assets = await fetchPacificaPrices();
-  return assets.map(p => ({
-    exchange: "pacifica",
-    symbol: p.symbol,
-    fundingRate: p.funding,
-    markPrice: p.mark,
-  }));
-}
-
-async function fetchHyperliquidRates(): Promise<FundingRate[]> {
-  const assets = await fetchHyperliquidMeta();
-  return assets.map(a => ({
-    exchange: "hyperliquid",
-    symbol: a.symbol,
-    fundingRate: a.funding,
-    markPrice: a.markPx,
-  }));
-}
-
-async function fetchAsterRates(): Promise<FundingRate[]> {
-  // SSOT rule #2: do NOT silently coerce missing markPrice / lastFundingRate
-  // to 0 — that would corrupt comparisons against other DEXs. Skip symbols
-  // whose Aster row is malformed instead. An endpoint failure PROPAGATES: the
-  // caller (handleBasisScan) runs every DEX under Promise.allSettled and reports
-  // the rejection on stderr — Aster is never silently absent from the scan.
-  const res = await fetch("https://fapi.asterdex.com/fapi/v1/premiumIndex");
-  if (!res.ok) throw new Error(`Aster premiumIndex HTTP ${res.status}`);
-  const premiums = await res.json() as unknown;
-  if (!Array.isArray(premiums)) throw new Error("Aster premiumIndex returned a non-array response");
-  const out: FundingRate[] = [];
-  for (const p of premiums as Array<Record<string, unknown>>) {
-    const rawSym = String(p.symbol ?? "");
-    if (!rawSym.endsWith("USDT")) continue;
-    const fundingRate = Number(p.lastFundingRate);
-    const markPrice = Number(p.markPrice);
-    if (!Number.isFinite(fundingRate) || !Number.isFinite(markPrice) || markPrice <= 0) {
-      continue;
-    }
-    out.push({
-      exchange: "aster",
-      symbol: rawSym.replace(/USDT$/, ""),
-      fundingRate,
-      markPrice,
-    });
-  }
-  return out;
-}
-
-async function fetchLighterRates(): Promise<FundingRate[]> {
-  // SSOT rule #2: error must propagate. Caller (handleBasisScan) uses
-  // Promise.allSettled to keep multi-DEX comparison alive when one DEX is
-  // down, with explicit stderr logging.
-  const [details, funding] = await Promise.all([
-    fetchLighterOrderBookDetails(),
-    fetchLighterFundingRates(),
-  ]);
-
-  const priceMap = new Map(details.map(d => [d.marketId, d.lastTradePrice]));
-  const symMap = new Map(details.map(d => [d.marketId, d.symbol]));
-
-  const rates: FundingRate[] = [];
-  for (const fr of funding) {
-    const symbol = fr.symbol || symMap.get(fr.marketId);
-    if (!symbol) continue;
-    // Prefer fr.markPrice; fall back to orderBook last-trade as documented
-    // price-source preference (NOT error fallback). Skip if neither resolves
-    // — never publish a 0 markPrice downstream.
-    const directMark = fr.markPrice;
-    const fallbackMark = priceMap.get(fr.marketId);
-    let markPrice: number | undefined;
-    if (directMark !== null && Number.isFinite(directMark) && directMark > 0) {
-      markPrice = directMark;
-    } else if (fallbackMark !== undefined && Number.isFinite(fallbackMark) && fallbackMark > 0) {
-      markPrice = fallbackMark;
-    }
-    if (markPrice === undefined || !Number.isFinite(fr.rate)) continue;
-    rates.push({
-      exchange: "lighter",
-      symbol,
-      fundingRate: fr.rate,
-      markPrice,
-    });
-  }
-  return rates;
-}
 
 // annualize moved to ../funding.ts — use annualizeRate() / computeAnnualSpread()
 
@@ -449,41 +354,37 @@ export async function handleRates(isJson: () => boolean, opts: { symbol?: string
   printSnapshotTable(snapshot); printFundingExchangeStatus(snapshot);
 }
 
+/**
+ * Cross-venue price basis. Markets are matched by `canonical` symbol across every verified
+ * market-data venue (fetchAllFundingRates — the perp-perp scan's grouping, so the same guards
+ * apply: unclassified / ambiguous tickers have no canonical and never pair, and a venue whose
+ * mark deviates more than MAX_PRICE_DEVIATION_PCT from the group median is dropped). The chosen
+ * cheap / rich pair must itself agree within MAX_PRICE_DEVIATION_PCT: a wider gap is a
+ * different asset under the same ticker (BB on Lighter 8.50 vs Aster 0.0091), not a basis.
+ * A venue that fails is reported on stderr and is absent from the scan, never silently empty.
+ */
 export async function handleBasisScan(isJson: () => boolean, opts: { minBasis: string; symbol?: string }): Promise<void> {
   if (!isJson()) console.log(chalk.cyan("  Fetching prices for basis calculation...\n"));
-  // SSOT rule #2: each DEX is independent. allSettled keeps the comparison
-  // alive when one DEX errors out, while rejection reasons get logged to
-  // stderr (explicit failure, never silent [] downgrade).
-  const settled = await Promise.allSettled([
-    fetchPacificaRates(),
-    fetchHyperliquidRates(),
-    fetchLighterRates(),
-    fetchAsterRates(),
-  ]);
-  logSettledRejections(settled, ["pacifica", "hyperliquid", "lighter", "aster"], "basis-scan");
-  const pacRates = settled[0].status === "fulfilled" ? settled[0].value : [];
-  const hlRates = settled[1].status === "fulfilled" ? settled[1].value : [];
-  const ltRates = settled[2].status === "fulfilled" ? settled[2].value : [];
-  const astRates = settled[3].status === "fulfilled" ? settled[3].value : [];
-  const exchangePrices = new Map<string, Map<string, number>>();
   const filterSymbol = opts.symbol?.toUpperCase();
-  for (const r of [...pacRates, ...hlRates, ...ltRates, ...astRates]) {
-    if (r.markPrice <= 0) continue;
-    if (filterSymbol && r.symbol.toUpperCase() !== filterSymbol) continue;
-    if (!exchangePrices.has(r.symbol)) exchangePrices.set(r.symbol, new Map());
-    exchangePrices.get(r.symbol)!.set(r.exchange, r.markPrice);
-  }
+  const snapshot = await fetchAllFundingRates(filterSymbol !== undefined ? { symbols: [filterSymbol] } : undefined);
+  for (const [venue, msg] of Object.entries(snapshot.exchangeErrors)) console.error(`[basis-scan] ${venue} fetch failed: ${msg}`);
+
   type BasisOpp = { symbol: string; prices: Record<string, number>; priceDiff: number; pctDiff: number; buyOn: string; sellOn: string };
   const opps: BasisOpp[] = [];
-  for (const [symbol, prices] of exchangePrices.entries()) {
-    if (prices.size < 2) continue;
-    let minEx = "", maxEx = "", minPrice = Infinity, maxPrice = 0;
-    for (const [ex, price] of prices) { if (price < minPrice) { minPrice = price; minEx = ex; } if (price > maxPrice) { maxPrice = price; maxEx = ex; } }
-    if (minEx === maxEx) continue;
-    const diff = maxPrice - minPrice; const avgPrice = (maxPrice + minPrice) / 2; const pctDiff = (diff / avgPrice) * 100;
+  for (const group of snapshot.symbols) {
+    const priced = group.rates.filter(r => r.markPrice > 0);
+    if (priced.length < 2) continue;
+    let min = priced[0], max = priced[0];
+    for (const r of priced) { if (r.markPrice < min.markPrice) min = r; if (r.markPrice > max.markPrice) max = r; }
+    if (min.exchange === max.exchange) continue;
+    const diff = max.markPrice - min.markPrice; const avgPrice = (max.markPrice + min.markPrice) / 2; const pctDiff = (diff / avgPrice) * 100;
+    if (!(pctDiff <= MAX_PRICE_DEVIATION_PCT)) {
+      console.error(`[basis-scan] excluded ${group.symbol} ${min.exchange}↔${max.exchange}: mark gap ${pctDiff.toFixed(1)}% > ${MAX_PRICE_DEVIATION_PCT}% (likely a different asset with the same ticker)`);
+      continue;
+    }
     if (pctDiff * 365 >= parseFloat(opts.minBasis)) {
-      const priceObj: Record<string, number> = {}; for (const [ex, p] of prices) priceObj[ex] = p;
-      opps.push({ symbol, prices: priceObj, priceDiff: diff, pctDiff, buyOn: minEx, sellOn: maxEx });
+      const priceObj: Record<string, number> = {}; for (const r of priced) priceObj[r.exchange] = r.markPrice;
+      opps.push({ symbol: group.symbol, prices: priceObj, priceDiff: diff, pctDiff, buyOn: min.exchange, sellOn: max.exchange });
     }
   }
   opps.sort((a, b) => b.pctDiff - a.pctDiff);
@@ -493,12 +394,12 @@ export async function handleBasisScan(isJson: () => boolean, opts: { minBasis: s
   console.log(chalk.gray("  Strategy: Buy cheap, sell expensive, profit from convergence.\n"));
   const rows = opps.map((o) => [
     chalk.white.bold(o.symbol),
-    o.prices.pacifica ? `$${formatUsd(o.prices.pacifica)}` : chalk.gray("-"),
-    o.prices.hyperliquid ? `$${formatUsd(o.prices.hyperliquid)}` : chalk.gray("-"),
-    o.prices.lighter ? `$${formatUsd(o.prices.lighter)}` : chalk.gray("-"),
+    `$${formatUsd(o.prices[o.buyOn])}`,
+    `$${formatUsd(o.prices[o.sellOn])}`,
     `$${formatUsd(o.priceDiff)}`, `${o.pctDiff.toFixed(4)}%`, chalk.green(o.buyOn), chalk.red(o.sellOn),
+    chalk.gray(String(Object.keys(o.prices).length)),
   ]);
-  console.log(makeTable(["Symbol", "Pacifica", "Hyperliquid", "Lighter", "Diff", "Basis %", "Buy On", "Sell On"], rows));
+  console.log(makeTable(["Symbol", "Buy Price", "Sell Price", "Diff", "Basis %", "Buy On", "Sell On", "Venues"], rows));
 }
 
 export async function handleDexScan(isJson: () => boolean, opts: { minSpread: string; maxGap: string; includeNative: boolean; top: string }): Promise<void> {
