@@ -39,7 +39,7 @@
       "5..9": "revert (enum out of range)"
     },
     "sessionKeysWord1": "0x00000000000000000000000000000000000000000000000000000000ffffffff (permission bitmap of a new signer = all)",
-    "names": "unknown \u2014 the implementation source is not verified on the explorer; only the ids are known"
+    "names": "unknown — the implementation source is not verified on the explorer; only the ids are known"
   },
   "tradingPermission": {
     "id": 2,
@@ -47,14 +47,14 @@
     "routerTxs": {
       "placePerpsOrder(bytes) 0xf22aeaaa": "0x46e3a2583cc7a0b62708a2592bdd5599aa4d16819cfc4c0e9f4e3816b7767310",
       "cancelPerpsOrder(bytes) 0xb521f2fb": "0x5010efa007c5957e08dc183b38a8d47d38de93f7c2744d78191e5fa4d177482a",
-      "0x0dd51555 (operator wrapper \u2192 placePerpsOrder)": "0x820d0bcbfd77ed61bad4d1ccaf3cad32814f0ab2b54ef8e2f8b603d58d839270",
-      "0x4ade0d04 (operator wrapper \u2192 cancelPerpsOrder)": "0x3e69a4e0135c7c8a1d5bf06798705b02f89ed5b929a2eeced1c7b6488c5f6d5e",
-      "0x66b4ec48 (wrapper \u2192 0x994b13b7, cancel-all)": "0x7f93a1a5eb6dad42013cf13b5ea84035f1303305128ff9bbc7fb8db19e831ac9"
+      "0x0dd51555 (operator wrapper → placePerpsOrder)": "0x820d0bcbfd77ed61bad4d1ccaf3cad32814f0ab2b54ef8e2f8b603d58d839270",
+      "0x4ade0d04 (operator wrapper → cancelPerpsOrder)": "0x3e69a4e0135c7c8a1d5bf06798705b02f89ed5b929a2eeced1c7b6488c5f6d5e",
+      "0x66b4ec48 (wrapper → 0x994b13b7, cancel-all)": "0x7f93a1a5eb6dad42013cf13b5ea84035f1303305128ff9bbc7fb8db19e831ac9"
     },
-    "whyItCannotMoveFunds": "Every router action traced (place / cancel / cancel-all and their operator wrappers) checks permission 2 and only reaches OrdersManager / PerpsManager / FeeManager plus one CollateralManager margin-accounting call (0xdf3e62dd) inside order settlement. Withdrawals are CollateralManager.withdraw called directly by the ACCOUNT (msg.sender, tx 0x74d5cc53ae8de64ce2f9c60da2e110f50faad3f428d09757f9bed3fcc3e8ee41), deposits CollateralManager.deposit(address,address,uint256) \u2014 neither goes through a signer permit. perp-cli additionally disables 0, 1, 3 and 4. Residual: without verified source a future permission-2 router action that moves funds cannot be ruled out; verify (perp wallet agent verify risex) re-reads the on-chain state."
+    "whyItCannotMoveFunds": "Every router action traced (place / cancel / cancel-all and their operator wrappers) checks permission 2 and only reaches OrdersManager / PerpsManager / FeeManager plus one CollateralManager margin-accounting call (0xdf3e62dd) inside order settlement. Withdrawals are CollateralManager.withdraw called directly by the ACCOUNT (msg.sender, tx 0x74d5cc53ae8de64ce2f9c60da2e110f50faad3f428d09757f9bed3fcc3e8ee41), deposits CollateralManager.deposit(address,address,uint256) — neither goes through a signer permit. perp-cli additionally disables 0, 1, 3 and 4. Residual: without verified source a future permission-2 router action that moves funds cannot be ruled out; verify (perp wallet agent verify risex) re-reads the on-chain state."
   },
   "signerOnlyDisable": {
-    "network": "testnet (throwaway account + signer, registered, then eth_call only \u2014 nothing sent)",
+    "network": "testnet (throwaway account + signer, registered, then eth_call only — nothing sent)",
     "disablePermission(account, signer, anchor, bit, permission=4, sig)": {
       "signed by account (master)": "revert 0x3492c099 InvalidSignerSignature(address,address)",
       "signed by signer": "ok (0x), from either address, anchor current or current+1"
@@ -67,8 +67,8 @@
   },
   "argumentOrder": {
     "method": "mainnet eth_call disablePermission with (bitmapOrPermission) swapped and an unregistered signer",
-    "(uint8 a=250, uint8 b=1)": "revert 0x3b94fe24 SignerNotAuthorized(address) \u2014 b is a valid permission",
-    "(a=1, b=250)": "empty revert \u2014 b out of the permission enum",
+    "(uint8 a=250, uint8 b=1)": "revert 0x3b94fe24 SignerNotAuthorized(address) — b is a valid permission",
+    "(a=1, b=250)": "empty revert — b out of the permission enum",
     "conclusion": "argument order (account, signer, nonceAnchor, nonceBitmap, permission, signature)"
   },
   "sessionKeysBitmap": {
@@ -83,18 +83,47 @@
       "bitmap=0xffffffff status=0 (registration tx failed)": 1
     },
     "idsAbove4": {
-      "disablePermission(acct, unregistered signer, anchor, 0, permission, sig) permission=4": "revert 0x3b94fe24 SignerNotAuthorized(address) \u2014 the id is accepted, the signature check fails",
+      "disablePermission(acct, unregistered signer, anchor, 0, permission, sig) permission=4": "revert 0x3b94fe24 SignerNotAuthorized(address) — the id is accepted, the signature check fails",
       "permission=5": "empty revert (ABI enum decoding)",
       "permission=6": "empty revert",
       "permission=31": "empty revert",
-      "hasPermission(\u00b7,\u00b7,5) on mainnet and testnet": "revert (CALL_EXCEPTION, no data)",
+      "hasPermission(·,·,5) on mainnet and testnet": "revert (CALL_EXCEPTION, no data)",
       "other setters": "none in the bytecode selector list: registerSigner / registerSenderSigner take no permission argument; enablePermission / disablePermission take the same uint8 enum"
     },
     "implementations": {
       "mainnet": "0xCCCb0483342d77AbC4337f3e12514eC8E78b3e28",
       "testnet": "0xc5B84461547EB5397A7C3fD067ABfcbc24b53663",
-      "slot": "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc (EIP-1967)"
+      "slot": "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc (EIP-1967)",
+      "router": {
+        "mainnet": "0xe2da7a94a81fe9ee58f70ebce862a176280092ae",
+        "testnet": "0x9218cd0d7626d9611b62e55dc3659936f9e57f68"
+      },
+      "accountRegistry": {
+        "source": "Authorization getAccountRegistry() (0x0ab142ed)",
+        "mainnet": {
+          "proxy": "0x1238991cac4e65902c08213e79909a9c813eebc3",
+          "implementation": "0x531a0c7687cbaf02383b21443619487eb18b91e5"
+        },
+        "testnet": {
+          "proxy": "0xf733038054cfb47fa9da1a1d6e79be6fb61f0a70",
+          "implementation": "0x99ccc05d52b69bd889a8ab4bc7c12b47aca94b58"
+        }
+      },
+      "admins": {
+        "slot": "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103 (EIP-1967 admin)",
+        "mainnet": {
+          "auth": "0xc0df16856eba73ffddfade73275c7d76a5ce156a",
+          "router": "0x96e4dbf5bebff545c909c7cc47f843d7ae3025e0",
+          "accountRegistry": "0xacc374b51349ea0892072c3211c46f601de1ed4b"
+        },
+        "testnet": {
+          "auth": "0xee984496c815ef7cceb6f60135b3b1751c449714",
+          "router": "0xa41af56f91a9304e6742469403f7f75da661dfe4",
+          "accountRegistry": "0xcc03e5475a430a7792693a688512a0bd5d3be08c"
+        }
+      }
     },
-    "conclusion": "Bits 5\u201331 of a new signer's bitmap cannot be cleared by any function of the reviewed implementation and map to no permission id (ids \u22655 are rejected at ABI decoding). Requiring the raw bitmap to equal exactly 1<<2 would reject every signer. perp-cli instead requires bits 0..4 == 0b00100 on the raw bitmap, status 1, the pinned implementation, and that permission id 5 does not exist \u2014 refusing trading the moment the contract is upgraded or gains an id \u22655. Unverified (no gas on testnet): that disablePermission(p) clears exactly bit p; the check fails closed (approve fails \u2192 auto-revoke) if it does not."
+    "conclusion": "Bits 5–31 of a new signer's bitmap cannot be cleared by any function of the reviewed implementation and map to no permission id (ids ≥5 are rejected at ABI decoding). Requiring the raw bitmap to equal exactly 1<<2 would reject every signer. perp-cli instead requires bits 0..4 == 0b00100 on the raw bitmap, status 1, the pinned implementation, and that permission id 5 does not exist — refusing trading the moment the contract is upgraded or gains an id ≥5. Unverified (no gas on testnet): that disablePermission(p) clears exactly bit p; the check fails closed (approve fails → auto-revoke) if it does not.",
+    "residual": "All three contracts are upgradeable proxies controlled by RISEx admin keys; a RISEx-side upgrade can change what a registered signer may do. perp-cli cannot prevent that: it pins each implementation (and the registry address) and refuses every signed action, including cancels, the moment any of them changes (re-checked at least every 60 s in long-lived processes). The window between an upgrade and the next check is not covered."
   }
 }

@@ -87,6 +87,12 @@ describe("RISEx sessionKeys bitmap evidence (M1)", () => {
     expect(ev.idsAbove4["permission=5"]).toMatch(/revert/);
     expect(ev.implementations.mainnet.toLowerCase()).toBe(RISEX_PINS.mainnet.authImplementation.toLowerCase());
     expect(ev.implementations.testnet.toLowerCase()).toBe(RISEX_PINS.testnet.authImplementation.toLowerCase());
+    for (const net of ["mainnet", "testnet"] as const) {
+      expect(ev.implementations.router[net].toLowerCase()).toBe(RISEX_PINS[net].routerImplementation.toLowerCase());
+      expect(ev.implementations.accountRegistry[net].proxy.toLowerCase()).toBe(RISEX_PINS[net].accountRegistry.toLowerCase());
+      expect(ev.implementations.accountRegistry[net].implementation.toLowerCase()).toBe(RISEX_PINS[net].accountRegistryImplementation.toLowerCase());
+    }
+    expect(ev.residual).toMatch(/refuses every signed action/);
     // After disabling 0,1,3,4 the permission bits are exactly {2}; bits 5–31 stay set (cannot be cleared).
     expect(0xffffffe4n & RISEX_PERMISSION_ID_MASK).toBe(RISEX_TRADING_ONLY_BITS);
   });
