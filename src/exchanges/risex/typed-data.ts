@@ -40,6 +40,11 @@ export interface RisexPins {
   router: string;
   /** JSON-RPC for the on-chain permission restriction / reads; null = none known. */
   rpcUrl: string | null;
+  /**
+   * EIP-1967 implementation of the Authorization proxy whose permission model was reviewed
+   * (ids 0..4; ids ≥5 rejected by ABI enum decoding). An upgrade refuses trading until re-reviewed.
+   */
+  authImplementation: string;
 }
 
 /** Verified 2026-10-14 from GET /v1/system/config and /v1/auth/eip712-domain on each network. */
@@ -49,6 +54,8 @@ export const RISEX_PINS: Readonly<Record<Network, RisexPins>> = {
     auth: "0x0D919DAA3f12AE715744Eb648c00066c5DBd66f0",
     router: "0xaadde0cea454f2bcb26f46ed54c5709b7bb34a7e",
     rpcUrl: "https://rpc.risechain.com",
+    // eth_getStorageAt(auth, EIP-1967 implementation slot), 2026-10-14.
+    authImplementation: "0xCCCb0483342d77AbC4337f3e12514eC8E78b3e28",
   },
   testnet: {
     chainId: 11155931,
@@ -56,6 +63,7 @@ export const RISEX_PINS: Readonly<Record<Network, RisexPins>> = {
     router: "0x980b8621b8e03c3f396e1dc34c00b14d84f2a20f",
     // eth_chainId 0xaa39db = 11155931 (verified); the testnet system config lists no RPC.
     rpcUrl: "https://testnet.riselabs.xyz",
+    authImplementation: "0xc5b84461547eb5397a7c3fd067abfcbc24b53663",
   },
 };
 
@@ -133,6 +141,20 @@ export const RISEX_GOLDEN_TYPEHASHES: Readonly<Record<RisexPrimaryType, string>>
 
 /** The permission every router action checks (place / cancel / cancel-all / leverage / margin). */
 export const RISEX_TRADING_PERMISSION = 2;
+/** EIP-1967 implementation slot (keccak256("eip1967.proxy.implementation") − 1). */
+export const EIP1967_IMPLEMENTATION_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
+
+/**
+ * The low bits of `sessionKeys(account, signer)` word 1 that map to permission ids 0..4; a
+ * trading-only signer has exactly bit 2 set among them. Bits 5–31 (set to 1 on every new signer,
+ * bitmap 0xffffffff) have no permission id in the reviewed implementation: hasPermission and
+ * disablePermission both reject ids ≥5 at ABI decoding, so those bits can neither be read as a
+ * permission nor cleared. They are guarded instead by the implementation pin and the "no id 5" probe
+ * (assertTradingOnlyOnChain, session.ts).
+ */
+export const RISEX_PERMISSION_ID_MASK = 0x1fn;
+export const RISEX_TRADING_ONLY_BITS = 1n << 2n;
+
 /** Valid permission ids (hasPermission reverts above 4). */
 export const RISEX_PERMISSION_IDS: readonly number[] = [0, 1, 2, 3, 4];
 /** Permissions perp-cli disables right after registration (all except trading). */

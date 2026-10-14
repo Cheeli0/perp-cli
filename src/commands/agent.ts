@@ -554,8 +554,8 @@ async function verifyRisex(network: Network, opts: VerifyOpts): Promise<VerifyRe
   if (v.expired) warnings.push(`RISEx signer ${meta.signerAddress} expired at ${meta.expiresAt}`);
   if (v.active && (!v.tradingOnly || meta.permissions.tradingOnly !== true)) {
     // An active signer that can do more than trade is a failure, never ok:true.
-    throw new PerpError("POLICY_DENIED", `RISEx signer ${meta.signerAddress} ("${meta.agentName}") is NOT restricted to trading-only (on-chain ${JSON.stringify(v.permissions)}; recorded tradingOnly=${String(meta.permissions.tradingOnly)})`, {
-      exchange: "risex", signer: meta.signerAddress, permissions: v.permissions,
+    throw new PerpError("POLICY_DENIED", `RISEx signer ${meta.signerAddress} ("${meta.agentName}") is NOT restricted to trading-only (on-chain ${JSON.stringify(v.permissions)}, bitmap ${String(v.bitmap)}; recorded tradingOnly=${String(meta.permissions.tradingOnly)})${v.reason !== null ? ` — ${v.reason}` : ""}`, {
+      exchange: "risex", signer: meta.signerAddress, permissions: v.permissions, bitmap: v.bitmap,
       remediation: `Revoke it: perp${network === "testnet" ? " -n testnet" : ""} wallet agent revoke risex ${meta.agentName}, then approve a new one`,
     });
   }

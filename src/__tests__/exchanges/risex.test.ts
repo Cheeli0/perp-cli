@@ -25,6 +25,15 @@ import { RisexAdapter } from "../../exchanges/risex/adapter.js";
 import { restrictSignerToTrading } from "../../exchanges/risex/agent.js";
 import { newVenueClientOrderId } from "../../exchanges/trading-v2.js";
 
+
+/** On-chain reader extras: the reviewed implementation, no permission id ≥5, a bitmap from `low` (bits 5–31 set, as on a new signer). */
+const chainExtras = (low: () => number) => ({
+  sessionKey: async () => ({ expiration: 2_000_000_000, bitmap: 0xffffffe0n | BigInt(low()), status: 1 }),
+  permissionIdExists: async () => false,
+  authImplementation: async () => RISEX_PINS.mainnet.authImplementation,
+});
+const bitsOf = (perms: Map<number, boolean>) => [...perms].reduce((acc, [p, on]) => acc | (on ? 1 << p : 0), 0);
+
 const MAINNET = "https://api.rise.trade";
 const DOMAIN = { name: "RISEx", version: "1", chainId: 4153, verifyingContract: RISEX_PINS.mainnet.auth };
 const CFG = { addresses: { router: RISEX_PINS.mainnet.router, auth: RISEX_PINS.mainnet.auth }, is_maintenance_mode: false };
@@ -301,7 +310,7 @@ async function adapter(opts: { signer?: boolean; chain?: { isNonceUsed: () => Pr
     account: ACCOUNT, signer, meta: null,
     noSignerReason: signer === null ? new PerpError("AGENT_NOT_REGISTERED", "no signer") : null,
     nonceDir, sleep: async () => undefined,
-    chain: { hasPermission: async () => true, isNonceUsed: opts.chain?.isNonceUsed ?? (async () => false) },
+    chain: { hasPermission: async () => true, isNonceUsed: opts.chain?.isNonceUsed ?? (async () => false), ...chainExtras(() => 0b00100) },
     quarantine: opts.quarantine ?? (() => undefined),
   });
 }
@@ -447,7 +456,7 @@ describe("adapter: placeOrder", () => {
     const signer = await LocalEvmSigner.create(Wallet.createRandom().privateKey);
     const a = new RisexAdapter(getVenue("risex"), "mainnet", {
       account: ACCOUNT, signer, meta: null, noSignerReason: null, nonceDir, sleep: async () => undefined,
-      chain: { hasPermission: async () => true, isNonceUsed: async () => { throw new Error("rpc down"); } },
+      chain: { hasPermission: async () => true, isNonceUsed: async () => { throw new Error("rpc down"); }, ...chainExtras(() => 0b00100) },
     });
     vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const e = await a.placeOrder(req({ clientOrderId: "424242" })).catch((x: unknown) => x as PerpError) as PerpError;
@@ -531,7 +540,7 @@ describe("signer restriction (on-chain, trading-only)", () => {
       client: new RisexClient(MAINNET, getVenue("risex").rateLimit, "risex:test"), network: "mainnet",
       ctx: { domain: DOMAIN, router: RISEX_PINS.mainnet.router, auth: RISEX_PINS.mainnet.auth },
       account: ACCOUNT, signer, nonceDir,
-      chain: { hasPermission: async (_a, _s, p) => perms.get(p) as boolean, isNonceUsed: async () => false },
+      chain: { hasPermission: async (_a, _s, p) => perms.get(p) as boolean, isNonceUsed: async () => false, ...chainExtras(() => bitsOf(perms)) },
       send: async (permission, slot, signature) => {
         const rec = verifyTypedData({ ...DOMAIN, verifyingContract: getAddress(DOMAIN.verifyingContract) }, { DisablePermission: RISEX_TYPES.DisablePermission },
           { account: ACCOUNT, signer: signer.getAddress(), permission, nonceAnchor: slot.anchor, nonceBitmap: slot.bit }, signature);
@@ -552,7 +561,7 @@ describe("signer restriction (on-chain, trading-only)", () => {
       client: new RisexClient(MAINNET, getVenue("risex").rateLimit, "risex:test"), network: "mainnet",
       ctx: { domain: DOMAIN, router: RISEX_PINS.mainnet.router, auth: RISEX_PINS.mainnet.auth },
       account: ACCOUNT, signer, nonceDir,
-      chain: { hasPermission: async () => true, isNonceUsed: async () => false },
+      chain: { hasPermission: async () => true, isNonceUsed: async () => false, ...chainExtras(() => 0b11111) },
       send: async () => "0xtx",
     })).rejects.toMatchObject({ structured: { code: "APPROVE_FAILED" } });
   });

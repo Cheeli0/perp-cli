@@ -40,7 +40,7 @@ import {
 } from "../venue-types.js";
 import { RisexClient, RisexSendUnknown } from "./client.js";
 import { fetchRisexRawMarkets, isListedRisexMarket, risexSymbolOf, toRisexVenueMarkets, type RisexRawMarket } from "./public.js";
-import { allocateAccountNonce, chainReader, loadSigningContext, type RisexChainReader } from "./session.js";
+import { allocateAccountNonce, assertTradingOnlyOnChain, chainReader, loadSigningContext, type RisexChainReader } from "./session.js";
 import {
   cancelAllHash, cancelOrderHash, leverageHash, marginModeHash, MARGIN_MODE_CODE, ORDER_TYPE, packOrder, placeOrderHash,
   SIDE, signPermit, STP_EXPIRE_MAKER, TIF_CODE, type NonceSlot, type RisexPermit,
@@ -217,7 +217,16 @@ export class RisexAdapter implements ExchangeAdapter, TradingV2 {
     return risexSymbolOf(m);
   }
 
+  /** Once per adapter session, before the first permit: the signer must be trading-only ON CHAIN. */
+  private tradingOnlyProof: Promise<unknown> | null = null;
+
   private async permit(account: string, signer: EvmSigner, actionHash: string): Promise<{ permit: RisexPermit; slot: NonceSlot }> {
+    if (this.tradingOnlyProof === null) {
+      this.tradingOnlyProof = assertTradingOnlyOnChain(this.chainRead(), this.network, account, signer.getAddress());
+      // A failed proof (refusal or RPC error) is not cached: the next action re-checks.
+      this.tradingOnlyProof.catch(() => { this.tradingOnlyProof = null; });
+    }
+    await this.tradingOnlyProof;
     const ctx = await loadSigningContext(this.client, this.network);
     const slot = await allocateAccountNonce(this.client, this.network, account, this.deps.nonceDir);
     const deadline = Math.floor(Date.now() / 1000) + RISEX_PERMIT_TTL_S;

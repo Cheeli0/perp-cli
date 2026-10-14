@@ -17,6 +17,14 @@ import { RISEX_PINS } from "../../exchanges/risex/typed-data.js";
 import { approveRisexAgentWith, risexAgentWalletName, type RisexApproveDeps } from "../../exchanges/risex/agent.js";
 import { PerpError } from "../../errors.js";
 
+/** On-chain reader extras: the reviewed implementation, no permission id ≥5, a bitmap from `low` (bits 5–31 set, as on a new signer). */
+const chainExtras = (low: () => number) => ({
+  sessionKey: async () => ({ expiration: 2_000_000_000, bitmap: 0xffffffe0n | BigInt(low()), status: 1 }),
+  permissionIdExists: async () => false,
+  authImplementation: async () => RISEX_PINS.mainnet.authImplementation,
+});
+const bitsOf = (perms: Map<number, boolean>) => [...perms].reduce((acc, [p, on]) => acc | (on ? 1 << p : 0), 0);
+
 const ok = (data: unknown, status = 200) => new Response(JSON.stringify({ data, request_id: "r" }), { status });
 const err = (status: number, code: string, message: string) => new Response(JSON.stringify({ error: { code, message }, request_id: "r" }), { status });
 
@@ -61,7 +69,7 @@ function deps(o: { sendFails?: boolean; gasFails?: boolean } = {}): RisexApprove
       deleteWallet: n => { wallets.delete(n); deleted.push(n); },
     },
     client: new RisexClient("https://api.rise.trade", getVenue("risex").rateLimit, "risex:approve-test"),
-    chain: { hasPermission: async (_a, _s, p) => perms.get(p) as boolean, isNonceUsed: async () => false },
+    chain: { hasPermission: async (_a, _s, p) => perms.get(p) as boolean, isNonceUsed: async () => false, ...chainExtras(() => bitsOf(perms)) },
     sender: () => async (permission) => {
       if (o.sendFails) throw new PerpError("INSUFFICIENT_BALANCE", "no gas");
       perms.set(permission, false);
@@ -158,6 +166,15 @@ describe("approveRisexAgentWith", () => {
     expect(wallets.has(WALLET)).toBe(true);
     expect(saved).toHaveLength(1);
     expect(saved[0].permissions.tradingOnly).toBe(false);
+  });
+
+  it("bits that stay set after the disable transactions (raw bitmap not trading-only) fail the approve → auto-revoke", async () => {
+    routes();
+    const d = deps();
+    d.chain = { ...d.chain, ...chainExtras(() => 0b11111) };
+    await expect(approveRisexAgentWith(OPTS, d)).rejects.toMatchObject({ structured: { code: "APPROVE_FAILED" } });
+    expect(posts).toContain("/v1/auth/revoke-signer");
+    expect(d.deleted).toEqual([WALLET]);
   });
 
   it("register outcome unknown → ORDER_PENDING, key kept and recorded (verify / revoke can see it)", async () => {

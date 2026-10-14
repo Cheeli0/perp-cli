@@ -16,7 +16,10 @@
  *     wallet sends Authorization.disablePermission(...) as an on-chain transaction (its signature;
  *     needs RISE-chain ETH for gas). Re-enabling needs an EnablePermission signed by the ACCOUNT
  *     (a signer-signed one reverts), so a leaked signer key cannot undo the restriction.
- *  5. Prove it: hasPermission(account, signer, p) is true for trading and false for every other p.
+ *  5. Prove it (assertTradingOnlyOnChain): the reviewed Authorization implementation, no permission
+ *     id ≥5, and the raw sessionKeys bitmap's permission bits 0..4 equal exactly {2}. Bits 5–31 of a new
+ *     signer's bitmap (0xffffffff) cannot be cleared (ids ≥5 are rejected at ABI decoding) and map to
+ *     no permission; the pin + probe refuse trading the moment that changes.
  *  A signer that is not Active after polling, or that fails 4–5, is revoked (master-signed, gasless
  *  REST) and its key deleted (APPROVE_FAILED). Every exit that KEEPS a key (unknown register outcome,
  *  failed revoke) records its meta with permissions.tradingOnly false, so `wallet agent verify /
@@ -33,7 +36,7 @@ import type { EvmSigner } from "../../signer/interface.js";
 import type { Network } from "../venue-types.js";
 import { RisexSendUnknown, type RisexClient } from "./client.js";
 import { risexClient } from "./public.js";
-import { allocateAccountNonce, chainReader, loadSigningContext, type RisexChainReader, type RisexSigningContext } from "./session.js";
+import { allocateAccountNonce, assertTradingOnlyOnChain, chainReader, loadSigningContext, type RisexChainReader, type RisexSigningContext } from "./session.js";
 import {
   RISEX_AUTH_IFACE, RISEX_NON_TRADING_PERMISSIONS, RISEX_PERMISSION_IDS, RISEX_PINS, RISEX_TRADING_PERMISSION, signChecked,
   type NonceSlot,
@@ -132,10 +135,15 @@ export async function restrictSignerToTrading(p: {
     });
     disabled.push({ permission, txHash: await p.send(permission, slot, signature) });
   }
-  const state = await Promise.all(RISEX_PERMISSION_IDS.map(async q => [q, await p.chain.hasPermission(account, signer, q)] as const));
-  const wrong = state.filter(([q, on]) => (q === RISEX_TRADING_PERMISSION) !== on);
-  if (wrong.length > 0) {
-    throw new PerpError("APPROVE_FAILED", `RISEx signer ${signer} is not trading-only on-chain: ${wrong.map(([q, on]) => `permission ${q}=${on}`).join(", ")}`, { exchange: "risex" });
+  // The final state is proven from the raw bitmap (plus the implementation pin and the "no id ≥5"
+  // probe), not just per-id reads; anything else fails the approve (→ auto-revoke by the caller).
+  try {
+    await assertTradingOnlyOnChain(p.chain, p.network, account, signer);
+  } catch (e) {
+    if (e instanceof PerpError && e.structured.code === "POLICY_DENIED") {
+      throw new PerpError("APPROVE_FAILED", e.message, { ...(e.structured.details ?? {}), exchange: "risex" });
+    }
+    throw e;
   }
   return { disabled, verifiedAt: new Date().toISOString() };
 }
@@ -399,12 +407,27 @@ export async function revokeRisexAgent(opts: { meta: RisexAgentMeta; masterOwsWa
 }
 
 /** Verify a stored signer: Active on the venue and trading-only on-chain. */
-export async function verifyRisexAgent(meta: RisexAgentMeta): Promise<{ status: number | null; active: boolean; permissions: Record<number, boolean>; tradingOnly: boolean; expired: boolean }> {
+export async function verifyRisexAgent(meta: RisexAgentMeta, chain: RisexChainReader = chainReader(meta.network)): Promise<{
+  status: number | null; active: boolean; permissions: Record<number, boolean>; bitmap: string | null;
+  tradingOnly: boolean; reason: string | null; expired: boolean;
+}> {
   const client = risexClient(meta.network);
   const status = await sessionKeyStatus(client, meta.accountAddress, meta.signerAddress);
-  const chain = chainReader(meta.network);
   const permissions: Record<number, boolean> = {};
   for (const p of RISEX_PERMISSION_IDS) permissions[p] = await chain.hasPermission(meta.accountAddress, meta.signerAddress, p);
-  const tradingOnly = RISEX_PERMISSION_IDS.every(p => permissions[p] === (p === RISEX_TRADING_PERMISSION));
-  return { status, active: status === STATUS_ACTIVE, permissions, tradingOnly, expired: !(Date.parse(meta.expiresAt) > Date.now()) };
+  let tradingOnly = true;
+  let reason: string | null = null;
+  let bitmap: string | null = null;
+  try {
+    bitmap = `0x${(await assertTradingOnlyOnChain(chain, meta.network, meta.accountAddress, meta.signerAddress)).bitmap.toString(16)}`;
+  } catch (e) {
+    if (!(e instanceof PerpError && e.structured.code === "POLICY_DENIED")) throw e;
+    tradingOnly = false;
+    reason = e.message;
+    const b = e.structured.details?.bitmap;
+    bitmap = typeof b === "string" ? b : null;
+  }
+  // Per-id reads must agree with the bitmap verdict (belt and braces).
+  if (!RISEX_PERMISSION_IDS.every(p => permissions[p] === (p === RISEX_TRADING_PERMISSION))) tradingOnly = false;
+  return { status, active: status === STATUS_ACTIVE, permissions, bitmap, tradingOnly, reason, expired: !(Date.parse(meta.expiresAt) > Date.now()) };
 }

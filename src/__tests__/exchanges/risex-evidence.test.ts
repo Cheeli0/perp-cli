@@ -77,3 +77,17 @@ describe("RISEx signer-permission evidence", () => {
     expect(id("InvalidSignature(address)").slice(0, 10)).toBe("0xd855c4f4");
   });
 });
+
+describe("RISEx sessionKeys bitmap evidence (M1)", () => {
+  it("layout decodes as (expiration, bitmap, status) and the recorded ids ≥5 are unaddressable", async () => {
+    const { decodeSessionKey } = await import("../../exchanges/risex/session.js");
+    const { RISEX_PINS, RISEX_PERMISSION_ID_MASK, RISEX_TRADING_ONLY_BITS } = await import("../../exchanges/risex/typed-data.js");
+    const ev = perms.sessionKeysBitmap;
+    expect(decodeSessionKey(ev.sampleReturn)).toEqual({ expiration: ev.sampleRegisterSignerExpiration, bitmap: 0xffffffffn, status: 1 });
+    expect(ev.idsAbove4["permission=5"]).toMatch(/revert/);
+    expect(ev.implementations.mainnet.toLowerCase()).toBe(RISEX_PINS.mainnet.authImplementation.toLowerCase());
+    expect(ev.implementations.testnet.toLowerCase()).toBe(RISEX_PINS.testnet.authImplementation.toLowerCase());
+    // After disabling 0,1,3,4 the permission bits are exactly {2}; bits 5–31 stay set (cannot be cleared).
+    expect(0xffffffe4n & RISEX_PERMISSION_ID_MASK).toBe(RISEX_TRADING_ONLY_BITS);
+  });
+});
