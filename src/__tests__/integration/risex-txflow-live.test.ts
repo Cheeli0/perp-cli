@@ -9,7 +9,8 @@ import { describe, it, expect } from "vitest";
 import "../../exchanges/venues/index.js";
 import { getVenue } from "../../exchanges/venue.js";
 import { risexClient, fetchRisexRawMarkets } from "../../exchanges/risex/public.js";
-import { loadSigningContext } from "../../exchanges/risex/session.js";
+import { assertReviewedContracts, chainReader, loadSigningContext } from "../../exchanges/risex/session.js";
+import { RISEX_PINS } from "../../exchanges/risex/typed-data.js";
 import { RisexAdapter } from "../../exchanges/risex/adapter.js";
 import { TxflowClient, fetchAllAssetCtxsOnce } from "../../exchanges/txflow/client.js";
 import { fetchTxflowDirectory, fetchTxflowFundingRates } from "../../exchanges/txflow/public.js";
@@ -26,6 +27,16 @@ describe.skipIf(process.env.PERP_RISEX_LIVE !== "1")("RISEx live public reads", 
       // A fraction per hour, not percent (mainnet; testnet markets can sit at extreme rates).
       if (net === "mainnet") for (const r of rates) expect(Math.abs(Number(r.rate))).toBeLessThan(0.01);
       await loadSigningContext(risexClient(net), net); // throws when the router / auth / chain moved
+      // The reviewed permission model still holds: same implementations, same registry, no permission id ≥5.
+      const chain = chainReader(net);
+      const pin = RISEX_PINS[net];
+      expect((await chain.implementationOf(pin.auth)).toLowerCase()).toBe(pin.authImplementation.toLowerCase());
+      expect((await chain.implementationOf(pin.router)).toLowerCase()).toBe(pin.routerImplementation.toLowerCase());
+      expect((await chain.accountRegistry()).toLowerCase()).toBe(pin.accountRegistry.toLowerCase());
+      expect((await chain.implementationOf(pin.accountRegistry)).toLowerCase()).toBe(pin.accountRegistryImplementation.toLowerCase());
+      await assertReviewedContracts(chain, net);
+      expect(await chain.permissionIdExists(5)).toBe(false);
+      expect(await chain.permissionIdExists(4)).toBe(true);
       const a = new RisexAdapter(def, net, { account: null, signer: null, meta: null, noSignerReason: null });
       const book = await a.getOrderbook("BTC");
       expect(book.bids.length + book.asks.length).toBeGreaterThan(0);

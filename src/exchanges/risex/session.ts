@@ -4,12 +4,16 @@
  * anything is signed. Also the master / signer nonce allocation and on-chain permission reads.
  */
 
+import { Interface, getAddress } from "ethers";
 import { PerpError } from "../../errors.js";
 import { assertRpcChainId, evmProvider } from "../../evm-master-tx.js";
 import type { Network } from "../venue-types.js";
 import type { RisexClient } from "./client.js";
 import { allocateNonce, parseRemoteNonceState } from "./nonce.js";
-import { assertPinned, RISEX_AUTH_IFACE, RISEX_PERMISSION_IDS, RISEX_PINS, type NonceSlot, type RisexDomain } from "./typed-data.js";
+import {
+  assertPinned, EIP1967_IMPLEMENTATION_SLOT, RISEX_AUTH_IFACE, RISEX_PERMISSION_ID_MASK, RISEX_PERMISSION_IDS, RISEX_PINS,
+  RISEX_TRADING_ONLY_BITS, RISEX_TRADING_PERMISSION, type NonceSlot, type RisexDomain,
+} from "./typed-data.js";
 
 export interface RisexSigningContext {
   domain: RisexDomain;
@@ -59,10 +63,99 @@ export function allocateAccountNonce(client: RisexClient, net: Network, account:
   return allocateNonce(net, account, async () => parseRemoteNonceState(await client.get(`/v1/nonce-state/${account.toLowerCase()}`)), dir);
 }
 
+export interface RisexSessionKey {
+  /** uint32 unix seconds (word 0). */
+  expiration: number;
+  /** Permission bitmap (word 1); a new signer has 0xffffffff. */
+  bitmap: bigint;
+  /** 1 = Active, 3 = Revoked (word 2). */
+  status: number;
+}
+
 export interface RisexChainReader {
   hasPermission(account: string, signer: string, permission: number): Promise<boolean>;
   isNonceUsed(account: string, slot: NonceSlot): Promise<boolean>;
+  /** Raw `sessionKeys(account, signer)` (selector 0x96ade1f9): three 32-byte words. */
+  sessionKey(account: string, signer: string): Promise<RisexSessionKey>;
+  /** Whether permission id `id` exists (hasPermission does not revert for it). RPC failures throw. */
+  permissionIdExists(id: number): Promise<boolean>;
+  /** EIP-1967 implementation address of `proxy`. */
+  implementationOf(proxy: string): Promise<string>;
+  /** Authorization.getAccountRegistry(). */
+  accountRegistry(): Promise<string>;
 }
+
+/** Decode the 96-byte `sessionKeys` return (expiration, bitmap, status). */
+export function decodeSessionKey(raw: string): RisexSessionKey {
+  if (!/^0x[0-9a-fA-F]{192}$/.test(raw)) {
+    throw new PerpError("EXCHANGE_ERROR", `RISEx sessionKeys returned ${raw.length} hex chars (expected 3 words)`, { exchange: "risex" });
+  }
+  const word = (k: number) => BigInt(`0x${raw.slice(2 + 64 * k, 66 + 64 * k)}`);
+  return { expiration: Number(word(0)), bitmap: word(1), status: Number(word(2)) };
+}
+
+/** What to do when a pinned RISEx contract changed (F4): everything signed is refused until re-review. */
+export function risexUpgradeRemediation(net: Network): string {
+  const n = net === "testnet" ? " -n testnet" : "";
+  return "Every signed RISEx action is refused through perp-cli until the new contract is reviewed — this includes cancel and cancel-all, which also go through a permit. " +
+    "Manage open orders and positions in the RISEx app (app.rise.trade). If you do not trust the new implementation, revoke the signer: " +
+    `perp${n} wallet agent revoke risex <name>. Update perp-cli once a release has reviewed the new implementation.`;
+}
+
+/**
+ * The contracts perp-cli reviewed are still the ones deployed (read-only): the EIP-1967
+ * implementations of the Authorization, the router and the account registry, the registry address
+ * the Authorization reads, and no permission id ≥ 5. Any change → POLICY_DENIED (fail closed).
+ * The RISEx admin can upgrade any of them; this is the detection, not a prevention.
+ */
+export async function assertReviewedContracts(chain: RisexChainReader, net: Network): Promise<void> {
+  const pin = RISEX_PINS[net];
+  const refuse = (what: string) => new PerpError("POLICY_DENIED", `RISEx ${what} — its permission model must be re-reviewed before perp-cli signs anything`, {
+    exchange: "risex", remediation: risexUpgradeRemediation(net),
+  });
+  const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+  const [authImpl, routerImpl, registry] = await Promise.all([
+    chain.implementationOf(pin.auth), chain.implementationOf(pin.router), chain.accountRegistry(),
+  ]);
+  if (!same(authImpl, pin.authImplementation)) throw refuse(`Authorization contract was upgraded (implementation ${authImpl}, reviewed ${pin.authImplementation})`);
+  if (!same(routerImpl, pin.routerImplementation)) throw refuse(`router was upgraded (implementation ${routerImpl}, reviewed ${pin.routerImplementation})`);
+  if (!same(registry, pin.accountRegistry)) throw refuse(`Authorization now reads account registry ${registry} (reviewed ${pin.accountRegistry})`);
+  const registryImpl = await chain.implementationOf(pin.accountRegistry);
+  if (!same(registryImpl, pin.accountRegistryImplementation)) throw refuse(`account registry was upgraded (implementation ${registryImpl}, reviewed ${pin.accountRegistryImplementation})`);
+  if (await chain.permissionIdExists(RISEX_PERMISSION_IDS.length)) {
+    throw refuse(`now has permission id ${RISEX_PERMISSION_IDS.length}: signers approved by perp-cli may hold it (their bitmap bits ≥5 are set)`);
+  }
+}
+
+/**
+ * Prove on chain that `signer` can only trade for `account` (read-only):
+ *  1. assertReviewedContracts (pinned implementations of Authorization / router / account registry,
+ *     no permission id ≥ 5) — bits 5–31 of the bitmap, which a new signer holds and which cannot be
+ *     cleared, map to no permission while this holds;
+ *  2. the signer is Active and its raw bitmap's permission bits 0..4 are exactly {2} (trading);
+ *  3. hasPermission(0..4) agrees ({2} only) — so the verdict does not rest on the bit mapping alone.
+ * Throws POLICY_DENIED (never a default) when any check fails; RPC failures propagate.
+ */
+export async function assertTradingOnlyOnChain(chain: RisexChainReader, net: Network, account: string, signer: string): Promise<RisexSessionKey> {
+  await assertReviewedContracts(chain, net);
+  const sk = await chain.sessionKey(account, signer);
+  const low = sk.bitmap & RISEX_PERMISSION_ID_MASK;
+  const notTradingOnly = (why: string) => new PerpError("POLICY_DENIED", `RISEx signer ${signer} is not trading-only on chain (${why})`, {
+    exchange: "risex", signer, bitmap: `0x${sk.bitmap.toString(16)}`, status: sk.status,
+    remediation: "Revoke it (perp wallet agent revoke risex <name>) and approve a new signer",
+  });
+  if (sk.status !== 1 || low !== RISEX_TRADING_ONLY_BITS) {
+    throw notTradingOnly(`status ${sk.status}, permission bitmap 0x${sk.bitmap.toString(16)}, ids 0..4 = 0b${low.toString(2).padStart(5, "0")}, required 0b00100`);
+  }
+  const per = await Promise.all(RISEX_PERMISSION_IDS.map(async id => [id, await chain.hasPermission(account, signer, id)] as const));
+  const wrong = per.filter(([id, on]) => on !== (id === RISEX_TRADING_PERMISSION));
+  if (wrong.length > 0) throw notTradingOnly(`hasPermission disagrees with the bitmap: ${wrong.map(([id, on]) => `${id}=${on}`).join(", ")}`);
+  return sk;
+}
+
+const SESSION_KEYS_IFACE = new Interface(["function sessionKeys(address account, address signer) view returns (bytes32, bytes32, bytes32)"]);
+const ZERO_ONE = "0x0000000000000000000000000000000000000001";
+const ZERO_TWO = "0x0000000000000000000000000000000000000002";
 
 const NONCE_IFACE_FN = "function isNonceUsed(address account, uint48 nonceAnchor, uint8 nonceBitmap) view returns (bool)";
 
@@ -84,9 +177,34 @@ export function chainReader(net: Network): RisexChainReader {
       const raw = await rpc.call({ to: pin.auth, data: RISEX_AUTH_IFACE.encodeFunctionData("hasPermission", [account, signer, permission]) });
       return RISEX_AUTH_IFACE.decodeFunctionResult("hasPermission", raw)[0] as boolean;
     },
+    async sessionKey(account, signer) {
+      await checked();
+      return decodeSessionKey(await rpc.call({ to: pin.auth, data: SESSION_KEYS_IFACE.encodeFunctionData("sessionKeys", [account, signer]) }));
+    },
+    async permissionIdExists(id) {
+      await checked();
+      try {
+        await rpc.call({ to: pin.auth, data: RISEX_AUTH_IFACE.encodeFunctionData("hasPermission", [ZERO_ONE, ZERO_TWO, id]) });
+        return true;
+      } catch (e) {
+        // A revert (enum decode of an unknown id) answers "no"; anything else is a failed read.
+        if ((e as { code?: unknown }).code === "CALL_EXCEPTION") return false;
+        throw e;
+      }
+    },
+    async implementationOf(proxy) {
+      await checked();
+      const word = await rpc.getStorage(proxy, EIP1967_IMPLEMENTATION_SLOT);
+      return getAddress(`0x${word.slice(-40)}`);
+    },
+    async accountRegistry() {
+      await checked();
+      const word = await rpc.call({ to: pin.auth, data: "0x0ab142ed" }); // getAccountRegistry()
+      if (!/^0x[0-9a-fA-F]{64}$/.test(word)) throw new PerpError("EXCHANGE_ERROR", "RISEx getAccountRegistry(): malformed return", { exchange: "risex" });
+      return getAddress(`0x${word.slice(-40)}`);
+    },
     async isNonceUsed(account, slot) {
       await checked();
-      const { Interface } = await import("ethers");
       const i = new Interface([NONCE_IFACE_FN]);
       const raw = await rpc.call({ to: pin.auth, data: i.encodeFunctionData("isNonceUsed", [account, slot.anchor, slot.bit]) });
       return i.decodeFunctionResult("isNonceUsed", raw)[0] as boolean;

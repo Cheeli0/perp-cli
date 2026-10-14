@@ -1,8 +1,14 @@
 {
   "captured": "2026-10-14",
   "authorization": {
-    "mainnet": { "proxy": "0x0d919daa3f12ae715744eb648c00066c5dbd66f0", "implementation": "0xCCCb0483342d77AbC4337f3e12514eC8E78b3e28", "verifiedSource": false },
-    "testnet": { "proxy": "0x6da86f486b5e6536358f5b122dbe184522ca0ee3" },
+    "mainnet": {
+      "proxy": "0x0d919daa3f12ae715744eb648c00066c5dbd66f0",
+      "implementation": "0xCCCb0483342d77AbC4337f3e12514eC8E78b3e28",
+      "verifiedSource": false
+    },
+    "testnet": {
+      "proxy": "0x6da86f486b5e6536358f5b122dbe184522ca0ee3"
+    },
     "selectorsFromBytecode": {
       "0x06991816": "disablePermission(address,address,uint48,uint8,uint8,bytes)",
       "0x77007534": "enablePermission(address,address,uint48,uint8,uint8,bytes)",
@@ -24,7 +30,14 @@
   },
   "permissionIds": {
     "method": "eth_call hasPermission(account, activeSigner, p) for 6 mainnet signers registered via registerSigner",
-    "result": { "0": true, "1": true, "2": true, "3": true, "4": true, "5..9": "revert (enum out of range)" },
+    "result": {
+      "0": true,
+      "1": true,
+      "2": true,
+      "3": true,
+      "4": true,
+      "5..9": "revert (enum out of range)"
+    },
     "sessionKeysWord1": "0x00000000000000000000000000000000000000000000000000000000ffffffff (permission bitmap of a new signer = all)",
     "names": "unknown — the implementation source is not verified on the explorer; only the ids are known"
   },
@@ -57,5 +70,60 @@
     "(uint8 a=250, uint8 b=1)": "revert 0x3b94fe24 SignerNotAuthorized(address) — b is a valid permission",
     "(a=1, b=250)": "empty revert — b out of the permission enum",
     "conclusion": "argument order (account, signer, nonceAnchor, nonceBitmap, permission, signature)"
+  },
+  "sessionKeysBitmap": {
+    "captured": "2026-10-14 (read-only eth_call / eth_getStorageAt, mainnet + testnet)",
+    "layout": "sessionKeys(address account, address signer) (0x96ade1f9) returns three 32-byte words: [0] expiration (uint32 unix s, equals RegisterSigner.expiration), [1] permission bitmap, [2] status (1 Active, 3 Revoked, 0 none)",
+    "sampleReturn": "0x000000000000000000000000000000000000000000000000000000006af66b1600000000000000000000000000000000000000000000000000000000ffffffff0000000000000000000000000000000000000000000000000000000000000001",
+    "sampleRegisterSignerExpiration": 1794534166,
+    "histogram451Signers": {
+      "bitmap=0xffffffff status=1 (registered ok)": 383,
+      "bitmap=0xffffffff status=3 (revoked; bitmap NOT cleared)": 7,
+      "bitmap=0x0 status=0 (registration tx failed)": 60,
+      "bitmap=0xffffffff status=0 (registration tx failed)": 1
+    },
+    "idsAbove4": {
+      "disablePermission(acct, unregistered signer, anchor, 0, permission, sig) permission=4": "revert 0x3b94fe24 SignerNotAuthorized(address) — the id is accepted, the signature check fails",
+      "permission=5": "empty revert (ABI enum decoding)",
+      "permission=6": "empty revert",
+      "permission=31": "empty revert",
+      "hasPermission(·,·,5) on mainnet and testnet": "revert (CALL_EXCEPTION, no data)",
+      "other setters": "none in the bytecode selector list: registerSigner / registerSenderSigner take no permission argument; enablePermission / disablePermission take the same uint8 enum"
+    },
+    "implementations": {
+      "mainnet": "0xCCCb0483342d77AbC4337f3e12514eC8E78b3e28",
+      "testnet": "0xc5B84461547EB5397A7C3fD067ABfcbc24b53663",
+      "slot": "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc (EIP-1967)",
+      "router": {
+        "mainnet": "0xe2da7a94a81fe9ee58f70ebce862a176280092ae",
+        "testnet": "0x9218cd0d7626d9611b62e55dc3659936f9e57f68"
+      },
+      "accountRegistry": {
+        "source": "Authorization getAccountRegistry() (0x0ab142ed)",
+        "mainnet": {
+          "proxy": "0x1238991cac4e65902c08213e79909a9c813eebc3",
+          "implementation": "0x531a0c7687cbaf02383b21443619487eb18b91e5"
+        },
+        "testnet": {
+          "proxy": "0xf733038054cfb47fa9da1a1d6e79be6fb61f0a70",
+          "implementation": "0x99ccc05d52b69bd889a8ab4bc7c12b47aca94b58"
+        }
+      },
+      "admins": {
+        "slot": "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103 (EIP-1967 admin)",
+        "mainnet": {
+          "auth": "0xc0df16856eba73ffddfade73275c7d76a5ce156a",
+          "router": "0x96e4dbf5bebff545c909c7cc47f843d7ae3025e0",
+          "accountRegistry": "0xacc374b51349ea0892072c3211c46f601de1ed4b"
+        },
+        "testnet": {
+          "auth": "0xee984496c815ef7cceb6f60135b3b1751c449714",
+          "router": "0xa41af56f91a9304e6742469403f7f75da661dfe4",
+          "accountRegistry": "0xcc03e5475a430a7792693a688512a0bd5d3be08c"
+        }
+      }
+    },
+    "conclusion": "Bits 5–31 of a new signer's bitmap cannot be cleared by any function of the reviewed implementation and map to no permission id (ids ≥5 are rejected at ABI decoding). Requiring the raw bitmap to equal exactly 1<<2 would reject every signer. perp-cli instead requires bits 0..4 == 0b00100 on the raw bitmap, status 1, the pinned implementation, and that permission id 5 does not exist — refusing trading the moment the contract is upgraded or gains an id ≥5. Unverified (no gas on testnet): that disablePermission(p) clears exactly bit p; the check fails closed (approve fails → auto-revoke) if it does not.",
+    "residual": "All three contracts are upgradeable proxies controlled by RISEx admin keys; a RISEx-side upgrade can change what a registered signer may do. perp-cli cannot prevent that: it pins each implementation (and the registry address) and refuses every signed action, including cancels, the moment any of them changes (re-checked at least every 60 s in long-lived processes). The window between an upgrade and the next check is not covered."
   }
 }

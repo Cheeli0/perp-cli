@@ -40,7 +40,7 @@ import {
 } from "../venue-types.js";
 import { RisexClient, RisexSendUnknown } from "./client.js";
 import { fetchRisexRawMarkets, isListedRisexMarket, risexSymbolOf, toRisexVenueMarkets, type RisexRawMarket } from "./public.js";
-import { allocateAccountNonce, chainReader, loadSigningContext, type RisexChainReader } from "./session.js";
+import { allocateAccountNonce, assertTradingOnlyOnChain, chainReader, loadSigningContext, type RisexChainReader } from "./session.js";
 import {
   cancelAllHash, cancelOrderHash, leverageHash, marginModeHash, MARGIN_MODE_CODE, ORDER_TYPE, packOrder, placeOrderHash,
   SIDE, signPermit, STP_EXPIRE_MAKER, TIF_CODE, type NonceSlot, type RisexPermit,
@@ -50,6 +50,8 @@ import { compareDecimal, decOrNull, nsToMs, toPriceTicks, toSizeSteps, trimDecim
 const MARKETS_TTL_MS = 30_000;
 /** Permit lifetime: long enough for the server to submit, short enough that an unproven permit expires soon. */
 export const RISEX_PERMIT_TTL_S = 120;
+/** How long a successful on-chain trading-only proof is trusted before the next permit re-checks it. */
+export const RISEX_TRADING_ONLY_TTL_MS = 60_000;
 const ORDER_READ_ATTEMPTS = 3;
 const ORDER_READ_DELAY_MS = 700;
 
@@ -217,7 +219,20 @@ export class RisexAdapter implements ExchangeAdapter, TradingV2 {
     return risexSymbolOf(m);
   }
 
+  /**
+   * The on-chain trading-only proof, re-checked at most every RISEX_TRADING_ONLY_TTL_MS before a
+   * permit (long-lived adapters — perp-mcp, bots — must notice a contract upgrade). A failed proof
+   * (refusal or RPC error) is never cached.
+   */
+  private tradingOnlyProof: { at: number; proof: Promise<unknown> } | null = null;
+
   private async permit(account: string, signer: EvmSigner, actionHash: string): Promise<{ permit: RisexPermit; slot: NonceSlot }> {
+    if (this.tradingOnlyProof === null || Date.now() - this.tradingOnlyProof.at > RISEX_TRADING_ONLY_TTL_MS) {
+      const entry = { at: Date.now(), proof: assertTradingOnlyOnChain(this.chainRead(), this.network, account, signer.getAddress()) };
+      this.tradingOnlyProof = entry;
+      entry.proof.catch(() => { if (this.tradingOnlyProof === entry) this.tradingOnlyProof = null; });
+    }
+    await this.tradingOnlyProof.proof;
     const ctx = await loadSigningContext(this.client, this.network);
     const slot = await allocateAccountNonce(this.client, this.network, account, this.deps.nonceDir);
     const deadline = Math.floor(Date.now() / 1000) + RISEX_PERMIT_TTL_S;
