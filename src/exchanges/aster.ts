@@ -714,8 +714,9 @@ export class AsterAdapter implements ExchangeAdapter {
       for (const k of data as unknown[][]) {
         const time = Number(k[0]);
         const trades = Number(k[8]);
-        if (!Number.isFinite(time) || !Number.isFinite(trades)) {
-          throw new PerpError("EXCHANGE_ERROR", `Aster kline row without open time / trade count: ${JSON.stringify(k).slice(0, 120)}`, { exchange: "aster" });
+        const numeric = (v: unknown) => (typeof v === "string" || typeof v === "number") && String(v).trim() !== "" && Number.isFinite(Number(v));
+        if (!Number.isFinite(time) || !Number.isFinite(trades) || !numeric(k[5]) || !numeric(k[7])) {
+          throw new PerpError("EXCHANGE_ERROR", `Aster kline row without open time / volume / quote volume / trade count: ${JSON.stringify(k).slice(0, 120)}`, { exchange: "aster" });
         }
         out.push({ time, open: String(k[1]), high: String(k[2]), low: String(k[3]), close: String(k[4]), volume: String(k[5]), quoteVolume: String(k[7]), trades });
       }

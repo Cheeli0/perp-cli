@@ -1924,7 +1924,9 @@ export class HyperliquidAdapter implements ExchangeAdapter {
       high: String(c.h ?? "0"),
       low: String(c.l ?? "0"),
       close: String(c.c ?? "0"),
-      volume: String(c.v ?? ""),
+      // absent / non-numeric → null (never "")
+      volume: typeof c.v === "string" && c.v.trim() !== "" && Number.isFinite(Number(c.v)) ? c.v
+        : typeof c.v === "number" && Number.isFinite(c.v) ? String(c.v) : null,
       quoteVolume: null, // candleSnapshot carries base volume only
       trades: Number(c.n ?? 0),
     }));

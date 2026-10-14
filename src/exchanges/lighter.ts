@@ -503,6 +503,13 @@ export interface LighterAdapterOpts {
   apiKeyIndex?: number;
 }
 
+/** A candle volume field: a finite number / numeric string → its string form; absent or non-numeric → null (never "" / "undefined"). */
+function candleNumber(v: unknown): string | null {
+  if (typeof v === "number" && Number.isFinite(v)) return String(v);
+  if (typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v))) return v;
+  return null;
+}
+
 export class LighterAdapter implements ExchangeAdapter {
   /** GTC→GTT resting-order lifetime (28 days) for the execution record (§13.10 #14). */
   static readonly gttExpiryMs = LIGHTER_GTT_EXPIRY_MS;
@@ -2165,10 +2172,10 @@ export class LighterAdapter implements ExchangeAdapter {
       high: String(c.high ?? c.h ?? "0"),
       low: String(c.low ?? c.l ?? "0"),
       close: String(c.close ?? c.c ?? "0"),
-      volume: String(c.base_token_volume ?? c.v ?? ""),
+      volume: candleNumber(c.base_token_volume ?? c.v),
       // /candles: v = base volume, V = quote (USD) volume; no per-candle trade count (live
       // 2026-10-14 keys: t o h l c v V i — `i` is the last trade id, not a count).
-      quoteVolume: typeof c.V === "number" || typeof c.V === "string" ? String(c.V) : null,
+      quoteVolume: candleNumber(c.V),
       trades: typeof c.trades_count === "number" ? c.trades_count : typeof c.n === "number" ? c.n : null,
     }));
   }
