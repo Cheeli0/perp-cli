@@ -24,6 +24,10 @@ interface HealthResult {
  * `perp health`: probe EVERY registered venue on the selected network — the same probe as
  * `perp portfolio --health` and the MCP health_check (src/venue-health.ts). A venue with no
  * environment on that network is listed under `skipped`, never silently dropped.
+ *
+ * JSON: `exchanges` = official-API venues, `unofficial` = venues read through an undocumented API
+ * (TxFlow), each entry with `error` (null when ok). `healthy` = every OFFICIAL venue is up — an
+ * unofficial API being down does not make the CLI unhealthy; `allHealthy` includes them.
  */
 export async function runHealthCheck(isJson: () => boolean, network: Network): Promise<void> {
       const health = await probeVenueHealth(network);
@@ -35,10 +39,12 @@ export async function runHealthCheck(isJson: () => boolean, network: Network): P
         probe: p.probe,
         apiStatus: p.apiStatus,
       }));
-      const allOk = health.allHealthy;
+      const official = checks.filter(c => c.apiStatus === "official");
+      const unofficial = checks.filter(c => c.apiStatus === "unofficial");
+      const allOk = official.every(c => c.status === "ok");
 
       if (isJson()) {
-        return printJson(jsonOk({ healthy: allOk, network, exchanges: checks, skipped: health.skipped }));
+        return printJson(jsonOk({ healthy: allOk, allHealthy: health.allHealthy, network, exchanges: official, unofficial, skipped: health.skipped }));
       }
 
       console.log(chalk.cyan.bold(`\n  Exchange Health Check (${network})\n`));
@@ -59,8 +65,8 @@ export async function runHealthCheck(isJson: () => boolean, network: Network): P
       });
 
       console.log(makeTable(["Exchange", "Status", "Latency", "Probe", "Error"], rows));
-      if (checks.some(c => c.apiStatus === "unofficial")) {
-        console.log(chalk.yellow("  * unofficial (undocumented) venue API — may change without notice"));
+      if (unofficial.length > 0) {
+        console.log(chalk.yellow("  * unofficial (undocumented) venue API — may change without notice; not counted in Overall"));
       }
       for (const s of health.skipped) console.log(chalk.gray(`  ${s.venue}: not probed — ${s.reason}`));
 

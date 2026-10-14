@@ -65,16 +65,32 @@ describe("perp health", () => {
     return out;
   }
 
-  it("--json covers every registered venue (not the former 4) with apiStatus and probe kind", async () => {
+  it("--json covers every registered venue (not the former 4): official venues in exchanges, unofficial ones listed separately", async () => {
     offline();
     const out = await health(["--json", "health"]);
     const env = JSON.parse(out[0]);
     expect(env.ok).toBe(true);
     expect(env.data.network).toBe("mainnet");
+    const official = listVenues().filter((v) => v.apiStatus.kind === "official").map((v) => v.id);
+    expect(env.data.exchanges.map((e: { exchange: string }) => e.exchange)).toEqual(official);
+    expect(env.data.unofficial.map((e: { exchange: string }) => e.exchange)).toEqual(["txflow"]);
+    expect(env.data.unofficial[0]).toMatchObject({ status: "down", probe: "markets", apiStatus: "unofficial", error: expect.any(String) });
+    for (const e of env.data.exchanges) expect(e).toHaveProperty("error"); // always present: null when ok
     expect(env.data.healthy).toBe(false);
-    expect(env.data.exchanges.map((e: { exchange: string }) => e.exchange)).toEqual(listVenues().map((v) => v.id));
-    expect(env.data.exchanges.find((e: { exchange: string }) => e.exchange === "txflow")).toMatchObject({ status: "down", probe: "markets", apiStatus: "unofficial" });
+    expect(env.data.allHealthy).toBe(false);
     expect(env.data.skipped).toEqual([]);
+  });
+
+  it("`healthy` counts official-API venues only: an unofficial venue being down does not flip it", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status: 200 })));
+    for (const v of listVenues()) {
+      if (v.id === "txflow") vi.spyOn(v.publicData, "fetchMarkets").mockRejectedValue(new Error("txflow offline"));
+      else vi.spyOn(v.publicData, "fetchMarkets").mockResolvedValue([]);
+    }
+    const env = JSON.parse((await health(["--json", "health"]))[0]);
+    expect(env.data.healthy).toBe(true);
+    expect(env.data.allHealthy).toBe(false);
+    expect(env.data.unofficial[0]).toMatchObject({ exchange: "txflow", status: "down", error: "txflow offline" });
   });
 
   it("-n testnet reports TxFlow as skipped", async () => {
