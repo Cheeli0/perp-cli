@@ -60,7 +60,7 @@ page's job, like a bundler's resolver):
 <script type="module">
   import { createVenueStream, hyperliquid } from "@hypurrquant/perp-ws";
   const stream = createVenueStream(hyperliquid);
-  stream.subscribe({ kind: "allMarkets", symbols: ["BTC"] }).on((e) => {
+  stream.subscribe({ kind: "allMarkets", canonicals: ["BTC"] }).on((e) => {
     if (e.type === "market") document.title = `BTC ${e.mark ?? "—"}`;
   });
 </script>
@@ -80,15 +80,15 @@ import { createVenueStream, hyperliquid, toApr } from "@hypurrquant/perp-ws/node
 
 const stream = createVenueStream(hyperliquid, { hip3Dexes: ["xyz"] }); // HIP-3 dexes are opt-in
 stream.onState((s) => console.log("state", s.status));
-const sub = stream.subscribe({ kind: "allMarkets", symbols: ["BTC", "ETH", "xyz:TSLA"] });
+const sub = stream.subscribe({ kind: "allMarkets", canonicals: ["BTC", "ETH", "xyz:TSLA"] });
 sub.on((e) => {
   if (e.type === "market") {
     console.log(e.symbol, e.mark, e.funding.rate, e.funding.rateKind, toApr(e.funding.rate, e.funding.rateIntervalHours));
   } else if (e.type === "error") {
-    console.error(e.code, e.message, e.remediation);
+    console.error(e.fatal ? "FATAL" : "warn", e.code, e.message, e.remediation); // fatal = this subscription ended
   }
 });
-await sub.ready; // rejects with a WsError (code + remediation)
+await sub.ready; // rejects with a WsError (code + remediation) — let it throw, or catch and show it
 // …later
 await stream.close();
 ```
@@ -104,6 +104,30 @@ for await (const e of stream.subscribe({ kind: "market", symbol: "BTC", channels
   if (e.type === "market") break; // break → unsubscribes
 }
 await stream.close();
+```
+
+The same markets on several venues (browser) — **`canonicals`, and every rejection made visible**:
+
+```ts
+import { arcus, aster, createVenueStream, hyperliquid, lighter, pacifica, type VenueStream } from "@hypurrquant/perp-ws";
+
+declare function show(venue: string, text: string): void; // your UI: one status cell per venue
+
+const streams: VenueStream[] = [hyperliquid, pacifica, lighter, aster, arcus].map((c) => createVenueStream(c));
+for (const stream of streams) {
+  // canonicals: "BTC" → hyperliquid/pacifica/lighter BTC, aster BTCUSDT + BTCUSD1, arcus BTC-USD.
+  // (symbols would need each venue's directory symbols; ["BTC"] rejects on aster and arcus.)
+  const sub = stream.subscribe({ kind: "allMarkets", canonicals: ["BTC", "ETH"] });
+  sub.ready.then(
+    () => show(stream.venue, "live"),
+    (err: unknown) => show(stream.venue, `FAILED: ${err instanceof Error ? err.message : String(err)}`),
+  );
+  sub.on((e) => {
+    if (e.type === "market") show(stream.venue, `${e.symbol} ${e.mark ?? "—"}`);
+    else if (e.type === "error" && e.fatal) show(stream.venue, `FAILED: ${e.code} ${e.message}`);
+  });
+  stream.onState((st) => { if (st.status === "closed") show(stream.venue, `closed: ${st.reason.message}`); });
+}
 ```
 
 Funding comparison across venues (browser):
@@ -134,12 +158,20 @@ await Promise.all(streams.map((s) => s.close()));
 - `createVenueStream(codec, opts)` — one socket per venue, opened lazily on the first subscription, closed
   (`idle`) when the last one leaves. The market directory is loaded once over REST (`stream.markets()`).
 - `subscribe(target)`:
-  - `{ kind: "allMarkets", symbols? }` → `MarketUpdate` for every (or the listed) market;
+  - `{ kind: "allMarkets", canonicals? | symbols? }` → `MarketUpdate` for every market, or a subset:
+    **`canonicals`** (recommended across venues) selects every directory market whose `canonical` matches
+    — `["BTC"]` is `BTC` on hyperliquid / pacifica / lighter / lighter-rh (USDG), `BTCUSDT` + `BTCUSD1` on
+    aster and `BTC-USD` on arcus; HIP-3 markets are `"<dex>:<BASE>"` (`"xyz:TSLA"`, with `hip3Dexes`) and
+    `"BTC"` never pulls them in. Canonicals come from `opts.canonicalize` (default: USD-like quotes
+    collapse) — see `MarketDirectoryEntry.canonical` in `stream.markets()`. A canonical with no market on
+    that venue rejects `INVALID_PARAMS` (with `details.suggestions`, e.g. `"xyz:TSLA"` for `"TSLA"`).
+    **`symbols`** are this venue's exact directory symbols. Pass **one or the other** — both together
+    reject `INVALID_PARAMS`. Same wire subscription and budget either way (filtering is client-side);
   - `{ kind: "market", symbol, channels: ["market" | "bbo"] }`. `"book"` and `"trades"` are already in
     the types but **reject with `CAPABILITY_UNSUPPORTED` until 0.15.1** — don't ship UI that needs them.
     Any other channel name (e.g. `"ticker"`) or an empty `channels` rejects with `INVALID_PARAMS`;
   - `{ kind: "user", channels: ["account" | "positions" | "orders" | "fills"] }` (needs `credentials`).
-- **Symbols are the venue's directory symbols, case-sensitive** — not canonical names. `BTC` is `"BTC"` on
+- **`symbols` / `symbol` mean the venue's directory symbols, case-sensitive** — not canonical names. `BTC` is `"BTC"` on
   hyperliquid / pacifica / lighter, `"BTC-USD"` on arcus and `"BTCUSDT"` / `"BTCUSD1"` on aster. Pass
   `MarketUpdate.symbol` / `FundingLeg.symbol`, or look them up in `stream.markets()`. Unknown symbols reject
   with `INVALID_PARAMS` before anything is sent; the message carries a "did you mean …" hint
@@ -420,3 +452,8 @@ Where an error surfaces:
 - **Do** handle `gap → refetch-required` (refetch fills / open orders over REST) and `orders.complete`.
 - **Do** respect `SUBSCRIPTION_LIMIT` and the per-IP note above; coalesce UI updates (~1/s).
 - **Don't** pass private keys to the library; return short-lived tokens from `authToken()`.
+- **Do** use `canonicals` for the same markets on several venues; `symbols` are per-venue directory symbols
+  (`["BTC"]` rejects on aster and arcus).
+- **Do** surface every `ready` rejection and every `fatal` error event per venue (see the price-wall
+  pattern in §2). **Never treat `idle` (or a venue with no data) as fine**: `idle` means the stream has no
+  active subscription — usually because a subscribe was rejected — not "connected and quiet".

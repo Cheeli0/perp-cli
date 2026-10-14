@@ -134,3 +134,30 @@ describe("auth error message", () => {
     expect(err?.message).not.toContain("lighter: lighter:");
   });
 });
+
+describe("transport factory errors", () => {
+  const routes = PACIFICA_ROUTES;
+  it("a definite structured error (another bundle's WsError shape) closes the stream with its code — no reconnect", async () => {
+    let calls = 0;
+    const transport = () => {
+      calls++;
+      throw Object.assign(new Error("needs ws"), { structured: { code: "INVALID_PARAMS", message: "needs ws", retryable: false, remediation: "npm install ws" } });
+    };
+    const s = createVenueStream(pacifica, { transport, fetch: fakeFetch(routes), visibility: null });
+    const err = await s.subscribe({ kind: "allMarkets" }).ready.then(() => null, (e: unknown) => e as WsError);
+    expect(err?.structured).toMatchObject({ code: "INVALID_PARAMS", remediation: "npm install ws" });
+    expect(s.state).toMatchObject({ status: "closed", reason: { code: "INVALID_PARAMS", remediation: "npm install ws" } });
+    expect(calls).toBe(1);
+  });
+
+  it("a plain Error (transient) still reconnects with the handshake remediation", async () => {
+    const transport = () => { throw new Error("boom"); };
+    const s = createVenueStream(pacifica, { transport, fetch: fakeFetch(routes), visibility: null });
+    const states: string[] = [];
+    s.onState(st => states.push(st.status));
+    s.subscribe({ kind: "allMarkets" });
+    await new Promise(r => setTimeout(r, 20));
+    expect(s.state).toMatchObject({ status: "reconnecting", reason: { code: "EXCHANGE_UNREACHABLE" } });
+    await s.close();
+  });
+});
