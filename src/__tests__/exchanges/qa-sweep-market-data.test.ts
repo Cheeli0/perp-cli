@@ -152,9 +152,13 @@ describe("5. Hyperliquid delisted assets and unlisted coins", () => {
     });
   });
 
-  it("recentTrades null (unlisted coin) → SYMBOL_NOT_FOUND, not an empty tape", async () => {
-    const a = hl({ recentTrades: () => null });
-    await expect(a.getRecentTrades("NOPE")).rejects.toMatchObject({ structured: expect.objectContaining({ code: "SYMBOL_NOT_FOUND" }) });
+  it("recentTrades of an unlisted coin → SYMBOL_NOT_FOUND before the request (the venue answers HTTP 500 \"null\")", async () => {
+    const recentTrades = vi.fn(() => { throw new Error("Hyperliquid info recentTrades failed (500): null"); });
+    const a = hl({ recentTrades });
+    await expect(a.getRecentTrades("NOPE")).rejects.toMatchObject({
+      structured: expect.objectContaining({ code: "SYMBOL_NOT_FOUND", retryable: false, remediation: "List markets: perp -e hyperliquid market list" }),
+    });
+    expect(recentTrades).not.toHaveBeenCalled();
   });
 
   it("a listed coin with an empty book stays a (two-empty-sides) book", async () => {

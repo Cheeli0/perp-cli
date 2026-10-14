@@ -1895,8 +1895,11 @@ export class HyperliquidAdapter implements ExchangeAdapter {
   }
 
   async getRecentTrades(symbol: string, limit = 20): Promise<ExchangePublicTrade[]> {
+    // recentTrades answers HTTP 500 "null" for an unlisted coin (live 2026-10-14), which would read
+    // as a retryable venue error: resolve the coin against the asset map first (SYMBOL_NOT_FOUND).
+    await this.getAssetIndex(symbol);
     const trades = await this._infoPost({ type: "recentTrades", coin: this._venueCoin(symbol) }) as Record<string, unknown>[] | null;
-    if (trades === null) throw this._unknownSymbol(symbol); // the venue answers null for an unlisted coin
+    if (trades === null) throw this._unknownSymbol(symbol);
     return trades
       .slice(0, limit)
       .map((t) => ({
