@@ -11,6 +11,7 @@
  *    A venue with only a lastSettled rate is flagged (kindUnavailable), not substituted.
  */
 
+import { WsError } from "./errors.js";
 import type { VenueId } from "./ids.js";
 import { VENUE_STATIC } from "./venue-static.js";
 import type {
@@ -18,6 +19,8 @@ import type {
 } from "./types.js";
 
 export type ComparatorKind = RateKind | "current" | "next";
+
+const COMPARATOR_KINDS: ReadonlyArray<ComparatorKind> = ["current", "next", "predicted", "lastSettled", "accruing"];
 
 export interface FundingLeg {
   venue: VenueId;
@@ -106,8 +109,35 @@ function pick(u: MarketUpdate, kind: ComparatorKind, predictedPublished: boolean
   }
 }
 
+/** Bad options throw INVALID_PARAMS synchronously (never a TypeError later from event dispatch / rows()). */
+function checkOptions(opts: FundingComparatorOptions): void {
+  const bad = (message: string, remediation: string): never => {
+    throw new WsError("INVALID_PARAMS", `createFundingComparator: ${message}`, { remediation });
+  };
+  if (opts === null || typeof opts !== "object") bad("options must be an object", "Pass { streams: [...] }");
+  if (!Array.isArray(opts.streams) || opts.streams.some(s => s === null || typeof s !== "object" || typeof s.subscribe !== "function" || typeof s.markets !== "function")) {
+    bad("streams must be an array of VenueStream", "Pass streams created with createVenueStream()");
+  }
+  if (opts.kind !== undefined && !COMPARATOR_KINDS.includes(opts.kind)) {
+    bad(`unknown kind ${JSON.stringify(opts.kind)}`, `Use kind ${COMPARATOR_KINDS.map(k => `"${k}"`).join(" / ")}`);
+  }
+  if (opts.minVenues !== undefined && !(Number.isInteger(opts.minVenues) && opts.minVenues >= 1)) {
+    bad(`minVenues must be a positive integer (got ${String(opts.minVenues)})`, "Pass minVenues ≥ 1, or omit it (default 2)");
+  }
+  if (opts.include !== undefined && !(Array.isArray(opts.include) && opts.include.every(c => typeof c === "string"))) {
+    bad("include must be an array of canonical symbols", "Pass e.g. include: [\"BTC\", \"ETH\"], or omit it");
+  }
+  if (opts.staleAfterMs !== undefined && !(typeof opts.staleAfterMs === "number" && Number.isFinite(opts.staleAfterMs) && opts.staleAfterMs > 0)) {
+    bad(`staleAfterMs must be a positive number (got ${String(opts.staleAfterMs)})`, "Pass milliseconds > 0, or omit it (venue default)");
+  }
+  for (const k of ["canonicalize", "onControl", "clock"] as const) {
+    if (opts[k] !== undefined && typeof opts[k] !== "function") bad(`${k} must be a function`, `Pass a function or omit ${k}`);
+  }
+}
+
 /** @experimental 0.15.x (stable from 0.16.0 after consumer sign-off) */
 export function createFundingComparator(opts: FundingComparatorOptions): FundingComparator {
+  checkOptions(opts);
   const kind: ComparatorKind = opts.kind === undefined ? "current" : opts.kind;
   const minVenues = opts.minVenues === undefined ? 2 : opts.minVenues;
   const include = opts.include === undefined ? null : new Set(opts.include);

@@ -85,7 +85,7 @@ for (const [mr, mod] of [["bundler", "esnext"], ["node16", "node16"], ["node10",
 const md = readFileSync(join(C, "node_modules/perp-cli/skills/perp-cli/references/ws-library.md"), "utf8");
 const blocks = [...md.matchAll(/```ts\n([\s\S]*?)```/g)].map(m => m[1]);
 const files = blocks.map((b, i) => { const f = `skill-block-${i + 1}.ts`; writeFileSync(join(C, f), `${b}\nexport {};\n`); return f; });
-run(`skill reference: typecheck ${files.length} ts code blocks`, "npx", ["tsc", "--noEmit", "--strict", "--target", "es2022", "--lib", "es2022,dom", "--types", "node", "--module", "esnext", "--moduleResolution", "bundler", ...files], { cwd: C });
+run(`skill reference: typecheck ${files.length} ts code blocks (strict, noUncheckedIndexedAccess)`, "npx", ["tsc", "--noEmit", "--strict", "--noUncheckedIndexedAccess", "--target", "es2022", "--lib", "es2022,dom", "--types", "node", "--module", "esnext", "--moduleResolution", "bundler", ...files], { cwd: C });
 
 // 4. attw
 run("@arethetypeswrong/cli (esm-only profile)", "npx", ["-y", "@arethetypeswrong/cli@latest", TGZ, "--profile", "esm-only"], { cwd: WORK });

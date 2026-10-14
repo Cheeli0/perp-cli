@@ -3,6 +3,10 @@
  * line with src/exchanges/venue-types.ts by a parity test. Ids are stable.
  */
 
+/**
+ * Every perp-cli venue id. "ondo" and "qfex" are included for type stability but have no perp-cli/ws
+ * codec until 0.15.1 (there is no `ondo` / `qfex` export to pass to createVenueStream yet).
+ */
 export type VenueId =
   | "pacifica" | "hyperliquid" | "lighter" | "aster"
   | "lighter-rh" | "ondo" | "arcus" | "qfex";
