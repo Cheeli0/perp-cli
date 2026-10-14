@@ -263,7 +263,19 @@ export type StreamControl =
     /** Redacted excerpt (≤ 200 chars) of the offending frame, or null. */
     raw: string | null;
     fatal: boolean;
+    /** Structured context, when the code has any (e.g. SYMBOL_NOT_FOUND: the missing canonicals). */
+    details?: StreamErrorDetails;
   };
+
+/**
+ * `details` of a `{ type: "error" }` control. SYMBOL_NOT_FOUND (non-fatal, kind:"allMarkets" with
+ * `canonicals`): `missing` = requested canonicals with no market on this venue (the others are
+ * subscribed); `suggestions` = per missing canonical, close directory canonicals (may be empty).
+ */
+export interface StreamErrorDetails {
+  missing?: string[];
+  suggestions?: Record<string, string[]>;
+}
 
 export interface StreamLog {
   ts: number;
@@ -290,8 +302,25 @@ export interface VenueWsCapabilities {
 
 // ── Stream ──
 
+/**
+ * All-market state, optionally narrowed (pass at most one of the two filters). With `canonicals`,
+ * the ones this venue lists are subscribed and the rest are reported once as a non-fatal
+ * `{ type: "error", code: "SYMBOL_NOT_FOUND", fatal: false, details: { missing, suggestions } }`;
+ * only when none exist does `ready` reject INVALID_PARAMS.
+ * - `symbols`: this venue's DIRECTORY symbols, exact and case-sensitive (`BTC` on hyperliquid, `BTCUSDT`
+ *   on aster, `BTC-USD` on arcus) — see stream.markets();
+ * - `canonicals`: canonical names (`"BTC"`, HIP-3 `"xyz:TSLA"`) → every directory market whose canonical
+ *   (opts.canonicalize, default USD-like quotes collapse) matches, e.g. aster BTCUSDT + BTCUSD1. Use it
+ *   for the same subscription on several venues.
+ */
+export interface AllMarketsTarget {
+  kind: "allMarkets";
+  symbols?: string[];
+  canonicals?: string[];
+}
+
 export type MarketTarget =
-  | { kind: "allMarkets"; symbols?: string[] }
+  | AllMarketsTarget
   | { kind: "user"; channels: UserChannel[] }
   | { kind: "market"; symbol: string; channels: Array<"market" | "bbo" | "book" | "trades"> };
 
@@ -340,7 +369,7 @@ export interface VenueStream {
   readonly network: Network;
   readonly state: ConnectionState;
   readonly capabilities: VenueWsCapabilities;
-  subscribe(t: { kind: "allMarkets"; symbols?: string[] }): Subscription<MarketUpdate>;
+  subscribe(t: AllMarketsTarget): Subscription<MarketUpdate>;
   subscribe(t: { kind: "market"; symbol: string; channels: Array<"market" | "bbo" | "book" | "trades"> }): Subscription<MarketUpdate | BboUpdate | BookUpdate | TradeUpdate>;
   subscribe(t: { kind: "user"; channels: UserChannel[] }): Subscription<UserUpdate>;
   onState(cb: (s: ConnectionState) => void): () => void;

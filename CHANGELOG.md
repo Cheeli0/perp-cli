@@ -4,6 +4,14 @@ All notable changes to `perp-cli`. Format follows [Keep a Changelog](https://kee
 
 ## [Unreleased]
 
+### NEW: `canonicals` filter for `kind: "allMarkets"`; FIX: missing `ws` never loops
+
+- **`stream.subscribe({ kind: "allMarkets", canonicals: ["BTC", "xyz:TSLA"] })`** selects every directory market whose canonical matches (via `opts.canonicalize`): `"BTC"` → aster `BTCUSDT` + `BTCUSD1`, arcus `BTC-USD`, lighter-rh `BTC` (USDG), hyperliquid `BTC` (HIP-3 markets only as `"<dex>:<BASE>"`). One subscription now works unchanged on every venue (before, `symbols: ["BTC"]` rejected on aster and arcus, which are directory symbols). Canonicals a venue does not list are skipped and reported once per subscription as a non-fatal `{ type: "error", code: "SYMBOL_NOT_FOUND", fatal: false, details: { missing, suggestions } }` (new optional, typed `StreamControl.details`: `StreamErrorDetails`; new `WsErrorCode` `SYMBOL_NOT_FOUND`, same status as the CLI's); only when none exist on the venue does `ready` reject `INVALID_PARAMS`. `canonicals` together with `symbols` rejects `INVALID_PARAMS`. The warning is delivered once and is never evicted from the pre-iterator ring (like fills and gaps).
+- **Typing note (@experimental):** `WsErrorCode` gains the member `"SYMBOL_NOT_FOUND"`. TypeScript code that switches exhaustively over `WsErrorCode` / `StreamControl["code"]` (e.g. an `assertNever` default) will fail to compile until it handles the new code; a `default` branch is unaffected. Additive (new `AllMarketsTarget` type; schema unchanged); same wire subscription, budget and ref-counting.
+- **Docs:** cross-venue examples use `canonicals`; every example surfaces `ready` rejections / fatal errors (price-wall pattern); do/don't: never treat `idle` as fine.
+- **FIX:** a definite (non-retryable) structured error thrown by the transport factory — e.g. the `/node` entry's "`ws` is not installed" — now closes the stream with that code and remediation (subscriptions reject `INVALID_PARAMS`, "npm install ws@^8.21.0") instead of reconnecting forever under "connection refused before open". Before, only `/node`'s `createVenueStream()` with the default transport failed fast; the browser entry's `createVenueStream` with `{ transport: nodeTransport }`, or a wrapper around it, retried with zero events.
+
+
 ### NEW: `@hypurrquant/perp-ws` — the WebSocket library as a standalone, zero-dependency package
 
 - **`@hypurrquant/perp-ws`** (`packages/perp-ws`) is built from the same `src/ws/**` with the same tsup options as `perp-cli/ws` (the bundles are byte-identical): same code, same API, **no `dependencies`** (~97 KB packed vs ~140 MB for `npm i perp-cli`). Entries: `@hypurrquant/perp-ws` (browser / bundlers / Node ≥ 22 with the global `WebSocket`) and `@hypurrquant/perp-ws/node` (`ws` transport). Recommended install for integrators; `perp-cli/ws` keeps working unchanged for perp-cli users.

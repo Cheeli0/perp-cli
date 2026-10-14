@@ -180,16 +180,41 @@ const a = await import("@hypurrquant/perp-ws");
 const b = await import("@hypurrquant/perp-ws/node");
 for (const k of ["createVenueStream", "createFundingComparator", "toApr", "toHourly", "hyperliquid", "pacifica", "lighter", "lighterRh", "aster", "arcus"]) if (typeof a[k] === "undefined") throw new Error("missing export " + k);
 for (const k of ["nodeTransport", "createNodeTransport", "DEFAULT_MAX_PAYLOAD"]) if (typeof b[k] === "undefined") throw new Error("missing node export " + k);
+const okErr = (e) => e?.structured?.code === "INVALID_PARAMS" && String(e.structured.remediation).includes("npm install ws");
+// Every way a consumer can obtain the /node transport must fail fast (never a reconnect loop).
 let err = null;
 try { b.createVenueStream(b.hyperliquid); } catch (e) { err = e; }
-if (err?.structured?.code !== "INVALID_PARAMS" || !String(err.structured.remediation).includes("npm install ws")) throw new Error("expected INVALID_PARAMS + npm install ws, got " + (err?.stack ?? err));
+if (!okErr(err)) throw new Error("/node createVenueStream(hyperliquid): expected INVALID_PARAMS + npm install ws, got " + (err?.stack ?? err));
+const paths = {
+  "/node createVenueStream + { transport: nodeTransport }": () => b.createVenueStream(b.hyperliquid, { transport: b.nodeTransport }),
+  "browser createVenueStream + { transport: nodeTransport }": () => a.createVenueStream(a.hyperliquid, { transport: b.nodeTransport }),
+  "/node createVenueStream + wrapper around nodeTransport": () => b.createVenueStream(b.hyperliquid, { transport: (u) => b.nodeTransport(u) }),
+  "createNodeTransport()": () => b.createNodeTransport(),
+};
+const seen = [];
+for (const [name, mk] of Object.entries(paths)) {
+  let s;
+  try { s = mk(); } catch (e) { if (!okErr(e)) throw new Error(name + ": wrong error " + (e?.stack ?? e)); seen.push(name + " → throws INVALID_PARAMS"); continue; }
+  const states = [];
+  s.onState((st) => states.push(st.status));
+  const r = await Promise.race([
+    s.subscribe({ kind: "allMarkets", symbols: ["BTC"] }).ready.then(() => "ready", (e) => e),
+    new Promise((res) => setTimeout(() => res("timeout"), 10_000)),
+  ]);
+  if (!okErr(r) || s.state.status !== "closed" || states.includes("reconnecting")) {
+    throw new Error(name + ": expected ready to reject INVALID_PARAMS and the stream to close without reconnecting; got " + (r?.message ?? r) + " states " + states.join(">"));
+  }
+  seen.push(name + " → subscribe rejects INVALID_PARAMS, closed, no reconnect");
+}
 console.log("browser entry:", Object.keys(a).length, "exports; /node without ws:", err.structured.code, "-", err.message, "|", err.structured.remediation);
+for (const x of seen) console.log("  " + x);
+process.exit(0);
 `);
 const NODES = nodeMatrix();
 const missingMajors = [20, 22, 24].filter(m => !NODES.some(n => n.major === m));
 check(`perp-ws consumer: Node matrix ${NODES.map(n => n.version).join(", ")}`, NODES.length > 0,
   `${NODES.map(n => `${n.version} (${n.bin})`).join("; ")}${missingMajors.length > 0 ? `; skipped (not installed): Node ${missingMajors.join(", ")}` : ""}`);
-for (const n of NODES) run(`perp-ws consumer [${n.version}]: imports; /node without ws → INVALID_PARAMS (npm install ws)`, n.bin, ["no-ws.mjs"], { cwd: P });
+for (const n of NODES) run(`perp-ws consumer [${n.version}]: imports; /node without ws → INVALID_PARAMS on every transport path (incl. subscribe)`, n.bin, ["no-ws.mjs"], { cwd: P });
 run("perp-ws consumer: npm install ws + typescript (dev tools)", "npm", ["install", "--no-audit", "--no-fund", "--ignore-scripts", "ws@^8.21.0", "typescript@5", "@types/node@20"], { cwd: P });
 writeFileSync(join(P, "with-ws.mjs"), `
 import { createVenueStream, hyperliquid } from "@hypurrquant/perp-ws/node";

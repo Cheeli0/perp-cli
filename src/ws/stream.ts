@@ -15,7 +15,7 @@ import { defaultVisibility, resolveFetch, resolveTransport } from "./transport.j
 import { UserStore } from "./user-state.js";
 import type {
   BboUpdate, BookUpdate, CloseReason, CodecContext, CodecDirectory, ConnectionState, DecodedEvent, MarketDirectoryEntry,
-  MarketTarget, MarketUpdate, Network, StreamControl, StreamLog, Subscription, TradeUpdate, UserChannel, UserRef, UserUpdate,
+  AllMarketsTarget, MarketTarget, MarketUpdate, Network, StreamControl, StreamErrorDetails, StreamLog, Subscription, TradeUpdate, UserChannel, UserRef, UserUpdate,
   VenueCodec, VenueStream, VenueStreamOptions, WireSub,
 } from "./types.js";
 
@@ -74,6 +74,14 @@ function checkCodec(codec: unknown): asserts codec is VenueCodec {
   if (problem !== null) {
     throw new WsError("INVALID_PARAMS", `createVenueStream: first argument must be a venue codec (${problem})`, { remediation: CODEC_REMEDIATION });
   }
+}
+
+/** "did you mean" canonicals: case-insensitive canonical, or a canonical with that base (e.g. "xyz:TSLA" for "TSLA"). */
+function suggestCanonicals(missing: string, entries: ReadonlyArray<{ canonical: string | null; base: string }>): string[] {
+  const m = missing.toUpperCase();
+  const out = entries.filter(e => e.canonical !== null && (e.canonical.toUpperCase() === m || e.base.toUpperCase() === m
+    || e.canonical.toUpperCase().endsWith(`:${m}`))).map(e => e.canonical as string);
+  return Array.from(new Set(out)).slice(0, 5);
 }
 
 /** "did you mean" candidates for an unknown symbol: case-insensitive symbol, or canonical / base match. */
@@ -181,11 +189,12 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
     try { opts.logger(entry); } catch { /* a throwing logger must not break the stream */ }
   }
 
-  function errorEvent(code: WsErrorCode, message: string, remediation: string | null, raw: string | null, fatal: boolean): StreamControl {
+  function errorEvent(code: WsErrorCode, message: string, remediation: string | null, raw: string | null, fatal: boolean, details?: StreamErrorDetails): StreamControl {
     return {
       type: "error", venue, code, message: redact(message),
       remediation: remediation === null ? null : redact(remediation),
       raw: raw === null ? null : excerpt(redact, raw), fatal,
+      ...(details === undefined ? {} : { details }),
     };
   }
 
@@ -778,6 +787,7 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
         throw wsError("CAPABILITY_UNSUPPORTED", `${venue} has no bbo channel`, "Use channel \"market\"");
       }
     }
+    if (target.kind === "allMarkets") checkAllMarketsTarget(target);
     if (target.kind === "user") checkUserTarget(target.channels);
     const d = await loadDirectory();
     if (closed) throw closedError(venue);
@@ -785,6 +795,7 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
     if (sub.closed) return;
     let list: WireSub[];
     let wanted: string[] | null = null;
+    let canonicalWarning: StreamControl | null = null;
     if (target.kind === "user") {
       const ref = await resolveUser();
       list = (codec.user as NonNullable<VenueCodec["user"]>).wires(ref, target.channels, d);
@@ -793,7 +804,13 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
       if (sub.closed) return;
     } else {
       const known = new Set(d.entries.map(e => e.symbol));
-      wanted = target.kind === "allMarkets" ? (target.symbols === undefined ? null : target.symbols) : [target.symbol];
+      if (target.kind === "allMarkets" && target.canonicals !== undefined) {
+        const r = symbolsForCanonicals(target.canonicals, d.entries);
+        wanted = r.symbols;
+        canonicalWarning = r.warning;
+      } else {
+        wanted = target.kind === "allMarkets" ? (target.symbols === undefined ? null : target.symbols) : [target.symbol];
+      }
       if (wanted !== null) {
         const missing = wanted.filter(s => !known.has(s));
         if (missing.length > 0) {
@@ -845,6 +862,11 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
       st.refs.add(sub);
     }
     for (const w of directoryWarnings) sub.emit(errorEvent("EXCHANGE_ERROR", w, null, null, false));
+    if (canonicalWarning !== null && canonicalWarning.type === "error") {
+      // Logged here, after the budget / limit checks passed and the subscription is registered.
+      log("warn", "canonicals-missing", canonicalWarning.message, { missing: canonicalWarning.details?.missing });
+      sub.emit(canonicalWarning);
+    }
     if (target.kind === "user") {
       for (const w of list) {
         const g = w.gaps?.onSubscribe;
@@ -860,6 +882,43 @@ export function createVenueStream(codec: VenueCodec, opts: VenueStreamOptions = 
     }
     maybeReady(sub);
     connection.ensureOpen();
+  }
+
+  function checkAllMarketsTarget(t: AllMarketsTarget): void {
+    const listOf = (v: unknown) => Array.isArray(v) && v.every(x => typeof x === "string");
+    if (t.symbols !== undefined && t.canonicals !== undefined) {
+      throw wsError("INVALID_PARAMS", "kind \"allMarkets\": pass either symbols or canonicals, not both",
+        "canonicals for the same markets on several venues; symbols for this venue's exact directory symbols");
+    }
+    for (const k of ["symbols", "canonicals"] as const) {
+      const v = t[k];
+      if (v !== undefined && (!listOf(v) || v.length === 0)) {
+        throw wsError("INVALID_PARAMS", `kind "allMarkets": ${k} must be a non-empty array of strings`, `Omit ${k} for every market`);
+      }
+    }
+  }
+
+  /**
+   * Directory symbols whose canonical is in `canonicals`. Canonicals this venue does not list are
+   * reported as a non-fatal SYMBOL_NOT_FOUND control (the rest are subscribed); none listed → INVALID_PARAMS.
+   */
+  function symbolsForCanonicals(canonicals: string[], entries: CodecDirectory["entries"]): { symbols: string[]; warning: StreamControl | null } {
+    const want = new Set(canonicals);
+    const symbols = entries.filter(e => e.canonical !== null && want.has(e.canonical)).map(e => e.symbol);
+    const missing = Array.from(new Set(canonicals.filter(c => !entries.some(e => e.canonical === c))));
+    if (missing.length === 0) return { symbols, warning: null };
+    const pairs = missing.map(c => ({ c, s: suggestCanonicals(c, entries) }));
+    const suggestions: Record<string, string[]> = Object.fromEntries(pairs.map(p => [p.c, p.s]));
+    const withHints = pairs.filter(p => p.s.length > 0);
+    const hint = withHints.length === 0 ? "" : ` (did you mean ${withHints.slice(0, 20).map(p => `${p.s.join(" / ")} for ${p.c}`).join("; ")}?)`;
+    const remediation = `Canonicals are "<BASE>" (USD-like quotes) or "<dex>:<BASE>" (HIP-3${venue === "hyperliquid" ? ", needs opts.hip3Dexes" : ""}); see MarketDirectoryEntry.canonical in stream.markets()`;
+    const list = missing.slice(0, 20).join(", ");
+    if (symbols.length === 0) {
+      throw wsError("INVALID_PARAMS", `${venue}: no market with canonical(s) ${list}${hint}`, remediation,
+        withHints.length === 0 ? undefined : { suggestions: Object.fromEntries(withHints.map(p => [p.c, p.s])) });
+    }
+    const message = `${venue}: no market with canonical(s) ${list}${hint}; subscribed to the other ${canonicals.length - missing.length}`;
+    return { symbols, warning: errorEvent("SYMBOL_NOT_FOUND", message, remediation, null, false, { missing, suggestions }) };
   }
 
   function checkUserTarget(channels: UserChannel[]): void {

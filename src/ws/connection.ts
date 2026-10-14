@@ -5,7 +5,7 @@
  * per-venue new-connection budget (delays, never skips) and an outbound rate limiter.
  */
 
-import { WsError } from "./errors.js";
+import { WS_ERROR_CODES, WsError, isPerpError, type WsErrorCode } from "./errors.js";
 import type { Redactor } from "./redact.js";
 import { frameText } from "./transport.js";
 import type { CloseReason, ConnectionState, StreamLog, VenueId, WsFactory, WsLike } from "./types.js";
@@ -206,6 +206,21 @@ export class Connection {
     try {
       ws = this.o.transport(this.o.url);
     } catch (e) {
+      // A definite, non-retryable structured error from the transport factory (e.g. the /node entry's
+      // INVALID_PARAMS "`ws` is not installed") will not fix itself: close the stream with that code and
+      // remediation instead of reconnecting forever. Structural check: the browser and /node bundles
+      // each carry their own WsError class.
+      if (isPerpError(e) && (e.structured as { retryable?: unknown }).retryable === false) {
+        const st = e.structured as { code: string; message: string; remediation?: unknown };
+        const code = (st.code in WS_ERROR_CODES ? st.code : "INVALID_PARAMS") as WsErrorCode;
+        this.fail({
+          code,
+          message: this.o.redact(`WebSocket transport failed: ${st.message}`),
+          wsCode: null,
+          remediation: typeof st.remediation === "string" ? this.o.redact(st.remediation) : null,
+        });
+        return;
+      }
       this.handleClose({
         code: "EXCHANGE_UNREACHABLE",
         message: this.o.redact(`WebSocket constructor failed: ${e instanceof Error ? e.message : String(e)}`),

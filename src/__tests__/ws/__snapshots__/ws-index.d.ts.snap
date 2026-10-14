@@ -52,6 +52,10 @@ declare const WS_ERROR_CODES: {
         readonly status: 502;
         readonly retryable: true;
     };
+    readonly SYMBOL_NOT_FOUND: {
+        readonly status: 404;
+        readonly retryable: false;
+    };
 };
 type WsErrorCode = keyof typeof WS_ERROR_CODES;
 interface WsStructuredError {
@@ -445,7 +449,18 @@ type StreamControl = {
     /** Redacted excerpt (≤ 200 chars) of the offending frame, or null. */
     raw: string | null;
     fatal: boolean;
+    /** Structured context, when the code has any (e.g. SYMBOL_NOT_FOUND: the missing canonicals). */
+    details?: StreamErrorDetails;
 };
+/**
+ * `details` of a `{ type: "error" }` control. SYMBOL_NOT_FOUND (non-fatal, kind:"allMarkets" with
+ * `canonicals`): `missing` = requested canonicals with no market on this venue (the others are
+ * subscribed); `suggestions` = per missing canonical, close directory canonicals (may be empty).
+ */
+interface StreamErrorDetails {
+    missing?: string[];
+    suggestions?: Record<string, string[]>;
+}
 interface StreamLog {
     ts: number;
     venue: VenueId;
@@ -472,10 +487,23 @@ interface VenueWsCapabilities {
     /** Why a field or channel is null / unsupported. */
     notes: Record<string, string>;
 }
-type MarketTarget = {
+/**
+ * All-market state, optionally narrowed (pass at most one of the two filters). With `canonicals`,
+ * the ones this venue lists are subscribed and the rest are reported once as a non-fatal
+ * `{ type: "error", code: "SYMBOL_NOT_FOUND", fatal: false, details: { missing, suggestions } }`;
+ * only when none exist does `ready` reject INVALID_PARAMS.
+ * - `symbols`: this venue's DIRECTORY symbols, exact and case-sensitive (`BTC` on hyperliquid, `BTCUSDT`
+ *   on aster, `BTC-USD` on arcus) — see stream.markets();
+ * - `canonicals`: canonical names (`"BTC"`, HIP-3 `"xyz:TSLA"`) → every directory market whose canonical
+ *   (opts.canonicalize, default USD-like quotes collapse) matches, e.g. aster BTCUSDT + BTCUSD1. Use it
+ *   for the same subscription on several venues.
+ */
+interface AllMarketsTarget {
     kind: "allMarkets";
     symbols?: string[];
-} | {
+    canonicals?: string[];
+}
+type MarketTarget = AllMarketsTarget | {
     kind: "user";
     channels: UserChannel[];
 } | {
@@ -539,10 +567,7 @@ interface VenueStream {
     readonly network: Network;
     readonly state: ConnectionState;
     readonly capabilities: VenueWsCapabilities;
-    subscribe(t: {
-        kind: "allMarkets";
-        symbols?: string[];
-    }): Subscription<MarketUpdate>;
+    subscribe(t: AllMarketsTarget): Subscription<MarketUpdate>;
     subscribe(t: {
         kind: "market";
         symbol: string;
@@ -910,4 +935,4 @@ declare const aster: VenueCodec;
 
 declare const arcus: VenueCodec;
 
-export { type BboUpdate, type BookUpdate, type Canonicalize, type CloseReason, type CodecContext, type CodecDirectory, type ComparatorKind, type ComparatorListenerError, type ConnectionState, type CredentialProvider, type Dec, type DecodedEvent, type FetchLike, type FillRow, type FundingComparator, type FundingComparatorOptions, type FundingLeg, type FundingMeta, type FundingRow, type FundingState, type LabelledRefresh, type MarketDirectoryEntry, type MarketField, type MarketPatch, type MarketTarget, type MarketUpdate, type Network, type OrderRow, type PositionRow, type RateKind, type Source, type StreamControl, type StreamLog, type Subscription, type TradeUpdate, type TypedData, USD_LIKE_QUOTES, type UserChannel, type UserDelta, type UserRef, type UserUpdate, VENUE_IDS, type VenueCodec, type VenueId, type VenueStream, type VenueStreamOptions, type VenueWsCapabilities, WS_ERROR_CODES, type WireSub, WsError, type WsErrorCode, type WsFactory, type WsLike, type WsStructuredError, arcus, aster, createFundingComparator, createVenueStream, defaultCanonicalize, hyperliquid, isPerpError, lighter, lighterRh, pacifica, toApr, toHourly };
+export { type AllMarketsTarget, type BboUpdate, type BookUpdate, type Canonicalize, type CloseReason, type CodecContext, type CodecDirectory, type ComparatorKind, type ComparatorListenerError, type ConnectionState, type CredentialProvider, type Dec, type DecodedEvent, type FetchLike, type FillRow, type FundingComparator, type FundingComparatorOptions, type FundingLeg, type FundingMeta, type FundingRow, type FundingState, type LabelledRefresh, type MarketDirectoryEntry, type MarketField, type MarketPatch, type MarketTarget, type MarketUpdate, type Network, type OrderRow, type PositionRow, type RateKind, type Source, type StreamControl, type StreamErrorDetails, type StreamLog, type Subscription, type TradeUpdate, type TypedData, USD_LIKE_QUOTES, type UserChannel, type UserDelta, type UserRef, type UserUpdate, VENUE_IDS, type VenueCodec, type VenueId, type VenueStream, type VenueStreamOptions, type VenueWsCapabilities, WS_ERROR_CODES, type WireSub, WsError, type WsErrorCode, type WsFactory, type WsLike, type WsStructuredError, arcus, aster, createFundingComparator, createVenueStream, defaultCanonicalize, hyperliquid, isPerpError, lighter, lighterRh, pacifica, toApr, toHourly };

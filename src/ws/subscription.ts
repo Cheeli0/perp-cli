@@ -7,7 +7,8 @@
  * Buffering starts at construction, so an iterator created later still sees the events since
  * subscribe(). Until an iterator exists, state/non-fatal-error control events are kept in a ring of
  * the latest `size` (a subscription held without a consumer on a flapping connection cannot overflow
- * from them); fills and gap events are never evicted — when they alone fill the buffer it overflows;
+ * from them); fills, gap events and the one-time SYMBOL_NOT_FOUND warning are never evicted — when they
+ * alone fill the buffer it overflows;
  * when the iterator attaches, a non-fatal STREAM_OVERFLOW event first reports how many older control
  * events were discarded. Overflow is fatal only once an iterator is attached.
  * A consumer that attaches an on() callback before creating an iterator is a callback consumer: the
@@ -31,9 +32,15 @@ function coalesceKey(e: { type: string }): string | null {
   }
 }
 
-/** Before an iterator exists only these may be evicted from the ring (never fills or gaps). */
+/**
+ * Before an iterator exists only these may be evicted from the ring: never fills, gaps, or the one-time
+ * SYMBOL_NOT_FOUND warning (which canonicals a venue lacks; it is not repeated).
+ */
 function evictable(e: { type: string }): boolean {
-  return e.type === "state" || (e.type === "error" && !(e as Extract<StreamControl, { type: "error" }>).fatal);
+  if (e.type === "state") return true;
+  if (e.type !== "error") return false;
+  const c = e as Extract<StreamControl, { type: "error" }>;
+  return !c.fatal && c.code !== "SYMBOL_NOT_FOUND";
 }
 
 /** Merge a coalesced STATE item: the latest wins; snapshot-ness and market `changed` accumulate. */

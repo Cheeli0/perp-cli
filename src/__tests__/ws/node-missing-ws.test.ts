@@ -45,6 +45,29 @@ describe("perp-cli/ws/node and the optional `ws` peer", () => {
   });
 
   it.each([
+    ["the browser entry's createVenueStream + { transport: nodeTransport }", "browser"],
+    ["/node createVenueStream + a wrapper around nodeTransport", "wrapper"],
+  ] as const)("%s → ready rejects INVALID_PARAMS (install remediation), stream closed, no reconnect", async (_n, how) => {
+    requireError = notFound("ws", ["/app/node_modules/@hypurrquant/perp-ws/dist/node.js"]);
+    const m = await freshNode();
+    const browser = await import("../../ws/stream.js");
+    let calls = 0;
+    const transport = (url: string) => { calls++; return m.nodeTransport(url); };
+    const fetch = async () => ({ ok: true, status: 200, json: async () => ({ success: true, data: [{ symbol: "BTC" }] }) });
+    const opts = { transport, fetch, visibility: null };
+    const stream = how === "browser" ? browser.createVenueStream(m.pacifica, opts) : m.createVenueStream(m.pacifica, opts);
+    const states: string[] = [];
+    stream.onState((st) => states.push(st.status));
+    const err = await stream.subscribe({ kind: "allMarkets" }).ready.then(() => null, (e: unknown) => e as { structured: { code: string; remediation?: string; retryable: boolean } });
+    expect(err?.structured).toMatchObject({ code: "INVALID_PARAMS", retryable: false, remediation: expect.stringContaining("npm install ws@^8.21.0") });
+    expect(states).toEqual(["connecting", "closed"]);
+    await new Promise((r) => setTimeout(r, 1500)); // past the first reconnect backoff (1 s)
+    expect(calls).toBe(1);
+    expect(stream.state).toMatchObject({ status: "closed", reason: { code: "INVALID_PARAMS" } });
+    await expect(stream.subscribe({ kind: "allMarkets" }).ready).rejects.toMatchObject({ structured: { code: "INVALID_PARAMS" } });
+  });
+
+  it.each([
     ["a module required by an installed ws", notFound("./lib/receiver", ["/app/node_modules/ws/index.js", "/app/node_modules/@hypurrquant/perp-ws/dist/node.js"])],
     ["'ws' named, but raised from inside node_modules/ws", notFound("ws", ["/app/node_modules/ws/wrapper.js"])],
     ["another error code", Object.assign(new Error("Unexpected token"), { code: "ERR_SOMETHING" })],
