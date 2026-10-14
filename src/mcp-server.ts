@@ -302,17 +302,18 @@ server.tool(
 
 server.tool(
   "get_funding_rates",
-  "Compare funding rates across every market-data venue. Returns rates per symbol with spread analysis",
+  "Compare funding rates across every market-data venue whose funding rate is verified. Returns rates per symbol with spread analysis. includeUnverified also returns venues whose rate is unverified (QFEX; TxFlow — unofficial API), each row tagged fundingVerified / apiStatus — display only, never a basis for trading (mirrors the CLI `arb scan --include-unverified`).",
   {
     symbols: z
       .array(z.string())
       .optional()
       .describe("Filter to specific symbols (e.g. ['BTC','ETH']). Omit for all available"),
     minSpread: z.number().optional().describe("Minimum annualized spread % to include (default: 0)"),
+    includeUnverified: z.boolean().optional().describe("Also include venues whose funding rate is unverified (default false); rows carry fundingVerified:false / apiStatus"),
   },
-  async ({ symbols, minSpread }) => {
+  async ({ symbols, minSpread, includeUnverified }) => {
     try {
-      const snapshot = await fetchAllFundingRates({ symbols, minSpread });
+      const snapshot = await fetchAllFundingRates({ symbols, minSpread, includeUnverified: includeUnverified === true });
       return {
         content: [{
           type: "text",
@@ -327,7 +328,7 @@ server.tool(
 
 server.tool(
   "get_prices",
-  "Get cross-exchange prices for symbols. Fetches mark prices from every market-data venue for comparison",
+  "Get cross-exchange prices for symbols. Fetches mark prices from every market-data venue for comparison; a venue appears in a row only when it lists that symbol (e.g. QFEX lists no BTC). Each row's unofficialApiVenues names the venues in it read through an undocumented API (TxFlow) — like get_markets' venueApi tag.",
   {
     symbols: z
       .array(z.string())
@@ -357,8 +358,12 @@ server.tool(
         }
       });
 
-      const data = Array.from(priceMap.entries()).map(([symbol, prices]) => ({ symbol, prices }));
-      const unofficial = listVenuesWithRole("marketData").filter(v => v.apiStatus.kind === "unofficial").map(v => v.id);
+      const unofficial: string[] = listVenuesWithRole("marketData").filter(v => v.apiStatus.kind === "unofficial").map(v => v.id);
+      const data = Array.from(priceMap.entries()).map(([symbol, prices]) => ({
+        symbol,
+        prices,
+        unofficialApiVenues: Object.keys(prices).filter(ex => unofficial.includes(ex)),
+      }));
       return { content: [{ type: "text", text: ok(data, { count: data.length, errors, unofficialApiVenues: unofficial }) }] };
     } catch (e) {
       return { content: [{ type: "text", text: errOf(e) }], isError: true };
